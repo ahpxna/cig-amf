@@ -34,7 +34,7 @@ def section(title):
 section("1. SLOT NGỮ NGHĨA — gán đúng 4 vai trò chưa?")
 # =====================================================================
 try:
-    from influence_signature import (
+    from models.influence_signature import (
         ROLE_ANOMALOUS, ROLE_BENEFICIAL, ROLE_HARMFUL, ROLE_NAMES,
         ROLE_NEUTRAL, soft_role_assignment,
     )
@@ -60,7 +60,7 @@ except Exception:
 section("2. SIGNATURE — kênh độ lớn có độc lập với dấu không?")
 # =====================================================================
 try:
-    from influence_signature import InfluenceSignatureTracker
+    from models.influence_signature import InfluenceSignatureTracker
 
     tr = InfluenceSignatureTracker(n_agents=4, window=40)
     r = np.random.RandomState(0)
@@ -84,7 +84,7 @@ except Exception:
 section("3. BELIEF — core size có bám cấu trúc thật không?")
 # =====================================================================
 try:
-    from belief_layer_v2 import BayesLightBeliefStateV2 as B
+    from models.belief_layer import BayesLightBeliefState as B
 
     def run(n_true, seeds=5):
         sizes, f1s = [], []
@@ -118,7 +118,7 @@ section("4. BƠM PHỒNG BẤT ĐỊNH — có thoát được core cũ sau shif
 # =====================================================================
 try:
     import copy
-    from belief_layer_v2 import BayesLightBeliefStateV2 as B
+    from models.belief_layer import BayesLightBeliefState as B
 
     old = {1: +0.6, 2: -0.6, 3: +0.4}
     for j in range(4, 13):
@@ -162,7 +162,7 @@ except Exception:
 section("5. TARGETED ε-FORCING — ngân sách giữ nguyên, positivity còn?")
 # =====================================================================
 try:
-    from intervention import EpsilonForcedActionController as C
+    from models.intervention import EpsilonForcedActionController as C
 
     c = C(n_agents=6, action_dim=4, eps=0.03,
           max_forced_per_step=None, rng=np.random.RandomState(0))
@@ -189,7 +189,7 @@ except Exception:
 section("6. SCHEDULER — cò súng và thời gian trơ")
 # =====================================================================
 try:
-    from scheduler_v2 import TwoTimescaleSchedulerV2
+    from training.scheduler import TwoTimescaleScheduler
 
     class FakeBelief:
         def __init__(self):
@@ -198,7 +198,7 @@ try:
             self.n += 1
             return {"n_pairs_inflated": 5}
 
-    sch = TwoTimescaleSchedulerV2(k0_warmup=3, refractory=5, z_threshold=3.0)
+    sch = TwoTimescaleScheduler(k0_warmup=3, refractory=5, z_threshold=3.0)
     bel = {0: FakeBelief()}
 
     for _ in range(3):
@@ -231,14 +231,14 @@ try:
     import torch
     print(f"       torch {torch.__version__}")
 
-    from peripheral_memory_v2 import PeripheralMultiMemoryV2
-    from structural_proxy_v2 import LocalCounterfactualProxyEnsembleV2
-    from ego_conditioned_latent import EgoConditionedHeads
+    from models.peripheral_memory import PeripheralMultiMemory
+    from models.structural_proxy import LocalCounterfactualProxyEnsemble
+    from models.ego_conditioned_latent import EgoConditionedHeads
 
     A, OD, CD, PD, BD, H = 5, 12, 16, 24, 20, 3
 
     # ---- proxy ----
-    px = LocalCounterfactualProxyEnsembleV2(
+    px = LocalCounterfactualProxyEnsemble(
         obs_dim=OD, action_dim=A, core_dim=CD, periph_dim=PD, belief_dim=BD,
         n_ensemble=3, n_horizons=H, effect_mode="signed_aristocrat",
         use_doubly_robust=True, use_belief_input=False, seed=0,
@@ -281,7 +281,7 @@ try:
           f"disagreement={dis:.5f} (v1 = 0.000)")
 
     # ---- peripheral memory ----
-    pm = PeripheralMultiMemoryV2(action_dim=A, n_free_slots=2,
+    pm = PeripheralMultiMemory(action_dim=A, n_free_slots=2,
                                  lb_coeff=1e-2, orth_coeff=1e-2)
     items = np.zeros((14, 9), dtype=np.float32)
     items[:, 0] = rr.randint(0, A, 14)
@@ -320,7 +320,7 @@ try:
           "cần cùng-j-khác-ego trong batch")
 
     # ---- drift probe ----
-    from drift_probe import DriftDetector, MatrixDriftDetector
+    from models.drift_probe import DriftDetector, MatrixDriftDetector
     det = DriftDetector(obs_dim=OD, action_dim=A, n_horizons=H,
                         warmup_batches=5, batch_size=32)
     for ep in range(4):

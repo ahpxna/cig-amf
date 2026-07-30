@@ -11,11 +11,11 @@ except ImportError:
     print("LỖI: Không tìm thấy FinalCIGAMFRunner trong runners/final_runner.py")
     sys.exit(1)
 
-# Import hàm chẩn đoán đúng từ thư mục cig_amf_v2/ (theo hình bạn chụp)
+# Import hàm chẩn đoán từ models/ego_conditioned_latent.py
 try:
-    from cig_amf_v2.ego_conditioned_latent import pair_specificity_score
+    from models.ego_conditioned_latent import pair_specificity_score
 except ImportError:
-    print("LỖI: Không tìm thấy pair_specificity_score trong cig_amf_v2/ego_conditioned_latent.py")
+    print("LỖI: Không tìm thấy pair_specificity_score trong models/ego_conditioned_latent.py")
     sys.exit(1)
 
 def run_step1():

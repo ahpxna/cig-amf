@@ -3,20 +3,20 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from cig_amf_v2.structural_proxy_v2 import LocalCounterfactualProxyEnsembleV2
-from cig_amf_v2.belief_layer_v2 import BayesLightBeliefStateV2
+from models.structural_proxy import LocalCounterfactualProxyEnsemble
+from models.belief_layer import BayesLightBeliefState
 from models.core_behavior import PairRelationalModule
-from cig_amf_v2.peripheral_memory_v2 import PeripheralMultiMemoryV2
+from models.peripheral_memory import PeripheralMultiMemory
 from models.belief_summary import BeliefSummaryBuilder
 from models.policy_value import PolicyValueNet
-from cig_amf_v2.scheduler_v2 import TwoTimescaleSchedulerV2
+from training.scheduler import TwoTimescaleScheduler
 from training.replay_builder import MultiEgoReplayBuilder
 
-from cig_amf_v2.influence_signature import InfluenceSignatureTracker
-from cig_amf_v2.intervention import EpsilonForcedActionController
-from cig_amf_v2.ego_conditioned_latent import EgoConditionedHeads
-from cig_amf_v2.drift_probe import DriftDetector, MatrixDriftDetector
-from cig_amf_v2.reciprocity import ReciprocityTracker
+from models.influence_signature import InfluenceSignatureTracker
+from models.intervention import EpsilonForcedActionController
+from models.ego_conditioned_latent import EgoConditionedHeads
+from models.drift_probe import DriftDetector, MatrixDriftDetector
+from models.reciprocity import ReciprocityTracker
 
 
 class FinalCIGAMFRunner:
@@ -85,7 +85,7 @@ class FinalCIGAMFRunner:
         self.periph_dim = int(cfg["periph_dim"])
         self.belief_dim = int(cfg["belief_dim"])
 
-        self.proxy = LocalCounterfactualProxyEnsembleV2(
+        self.proxy = LocalCounterfactualProxyEnsemble(
             obs_dim=self.obs_dim,
             action_dim=self.action_dim,
             core_dim=self.core_dim,
@@ -112,7 +112,7 @@ class FinalCIGAMFRunner:
             device=device,
         )
 
-        self.periph_module = PeripheralMultiMemoryV2(
+        self.periph_module = PeripheralMultiMemory(
             action_dim=self.action_dim,
             num_slots=cfg["num_memory_slots"],
             memory_dim=cfg["periph_memory_dim"],
@@ -147,7 +147,7 @@ class FinalCIGAMFRunner:
             lr=cfg["policy_lr"],
         )
 
-        self.scheduler = TwoTimescaleSchedulerV2(
+        self.scheduler = TwoTimescaleScheduler(
             k0_warmup=cfg["k0_warmup"],
             z_threshold=cfg.get("z_threshold", 3.0),
             refractory=cfg.get("refractory", 10),
@@ -171,7 +171,7 @@ class FinalCIGAMFRunner:
         )
 
         self.belief_modules = {
-            ego: BayesLightBeliefStateV2(
+            ego: BayesLightBeliefState(
                 ego_id=ego,
                 neighbor_ids=[j for j in range(self.n_agents) if j != ego],
                 lambda_0=cfg["belief_lambda_0"],

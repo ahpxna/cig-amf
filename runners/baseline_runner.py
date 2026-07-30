@@ -4,17 +4,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cig_amf_v2.structural_proxy_v2  import LocalCounterfactualProxyEnsembleV2
-from cig_amf_v2.belief_layer_v2      import BayesLightBeliefStateV2
-from cig_amf_v2.peripheral_memory_v2 import PeripheralMultiMemoryV2
+from models.structural_proxy  import LocalCounterfactualProxyEnsemble
+from models.belief_layer      import BayesLightBeliefState
+from models.peripheral_memory import PeripheralMultiMemory
 from models.core_behavior import PairRelationalModule
 from models.belief_summary import BeliefSummaryBuilder
 from models.policy_value import PolicyValueNet
-from cig_amf_v2.scheduler_v2 import TwoTimescaleScheduler
+from training.scheduler import TwoTimescaleScheduler
 from training.replay_builder import MultiEgoReplayBuilder
-from cig_amf_v2.influence_signature  import InfluenceSignatureTracker
-from cig_amf_v2.intervention         import EpsilonForcedActionController
-from cig_amf_v2.ego_conditioned_latent import EgoConditionedHeads
+from models.influence_signature  import InfluenceSignatureTracker
+from models.intervention         import EpsilonForcedActionController
+from models.ego_conditioned_latent import EgoConditionedHeads
 
 class PureMeanFieldRunner:
     """
