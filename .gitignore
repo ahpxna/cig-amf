@@ -1,0 +1,18 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Môi trường ảo (Chặn triệt để cái nùi file bác vừa thấy)
+cig-env/
+venv/
+env/
+
+# Trọng số mô hình và kết quả cũ
+*.pt
+*.pth
+results/
+
+# File hệ thống của Mac
+.DS_Store
