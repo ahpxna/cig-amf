@@ -340,12 +340,6 @@ try:
           rel_diff < 0.15,
           f"loss_e1={loss_e1:.4f} loss_e4_m0={loss_e4_m0:.4f} rel_diff={rel_diff:.3f}")
 
-except ImportError as e:
-    print(f"       BỎ QUA phần torch: {e}")
-    SKIP.append("torch tests")
-except Exception:
-    traceback.print_exc(); FAIL.append("torch")
-
     # ---- peripheral memory ----
     pm = PeripheralMultiMemory(action_dim=A, n_free_slots=2,
                                  lb_coeff=1e-2, orth_coeff=1e-2)

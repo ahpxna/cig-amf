@@ -335,6 +335,7 @@ class LocalCounterfactualProxyEnsemble:
         ensemble_dropout: float = 0.0,
         seed: int = 0,
         use_vmap_ensemble: bool = True,
+        compile_ensemble: bool = False,
     ):
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
@@ -395,6 +396,7 @@ class LocalCounterfactualProxyEnsemble:
             )
 
         self.use_vmap_ensemble = bool(use_vmap_ensemble) and _HAS_TORCH_FUNC
+        self._compile_ensemble_flag = bool(compile_ensemble)
 
         if self.use_vmap_ensemble:
             self._setup_vmap_ensemble()
@@ -527,6 +529,33 @@ class LocalCounterfactualProxyEnsemble:
             _fmodel, in_dims=(0, 0, 0, 0, 0, 0, 0, 0),
             randomness="different",
         )
+
+        # ---------------------------------------------------------------
+        # torch.compile — TẮT MẶC ĐỊNH, bật thủ công qua compile_ensemble=True.
+        #
+        # vmap ở chế độ eager KHÔNG tự gộp kernel: mỗi Linear/ReLU bên trong
+        # vẫn launch kernel CUDA riêng, chỉ thêm một chiều batch. Với mạng
+        # nhỏ (hidden=160) thì overhead LAUNCH kernel (vài chục µs cố định
+        # mỗi lần, không phụ thuộc kích thước tensor) áp đảo thời gian tính
+        # thật -> GPU có thể CHẬM HƠN CPU, đúng triệu chứng đang gặp
+        # (12.5 trên CUDA vs ~50 trên Mac). torch.compile(mode="reduce-
+        # overhead") dùng CUDA graphs để gộp toàn bộ chuỗi kernel thành một
+        # lần launch, đây là cách sửa chuẩn cho đúng triệu chứng này.
+        #
+        # KHÔNG bật mặc định vì: (a) cần shape batch CỐ ĐỊNH (batch_size,
+        # holdout_size trong cfg không đổi giữa các lần gọi — kiểm tra
+        # trước khi bật), batch B*A trong _predict_all_actions ĐỔI theo B
+        # nên nhánh đó dễ bị recompile liên tục nếu bật; (b) chưa verify
+        # được trên GPU thật trong môi trường này. Bật thử ở máy bạn, đo
+        # throughput trước/sau, và trước hết nên compile riêng
+        # _vmap_forward_per_member (dùng cho train_step, batch cố định)
+        # chứ đừng compile _vmap_forward_shared (dùng cho
+        # _predict_all_actions, batch đổi theo B).
+        # ---------------------------------------------------------------
+        if bool(getattr(self, "_compile_ensemble_flag", False)):
+            self._vmap_forward_per_member = torch.compile(
+                self._vmap_forward_per_member, mode="reduce-overhead"
+            )
 
     def _ensemble_train_mode(self, training: bool):
         """Bật/tắt training mode (ảnh hưởng Dropout) cho kiến trúc mẫu.

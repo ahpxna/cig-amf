@@ -145,26 +145,43 @@ class BayesLightBeliefState:
         self.adaptive_k_min = int(max(1, adaptive_k_min))
         self.signed_balance = float(np.clip(signed_balance, 0.0, 1.0))
 
-        # ---- state ----
-        self.mu_bar: Dict[int, float] = {j: 0.0 for j in self.neighbor_ids}
-        self.sigma_bar: Dict[int, float] = {j: 1.0 for j in self.neighbor_ids}
-        self.p_core: Dict[int, float] = {j: 0.5 for j in self.neighbor_ids}
-        self.n_updates: Dict[int, int] = {j: 0 for j in self.neighbor_ids}
+        # ---------------------------------------------------------------
+        # [GPU_OPTIMIZATION_CONTRACT.md mục 1.2/1.4] STATE THẬT nằm ở numpy
+        # array (float64 — đây là [n_neighbors] cho MỘT ego, vài trăm số,
+        # chi phí không đáng kể ngay cả ở float64; xem lưu ý precision
+        # trong contract: KHÔNG đưa lên GPU chỉ để "đồng bộ"). Toàn bộ
+        # phép cập nhật (EWMA, debias, LCB, hysteresis, topk capacity)
+        # chạy vector hoá trên các array này thay vì vòng lặp Python qua
+        # từng neighbour.
+        #
+        # self.mu_bar / sigma_bar / p_core / n_updates VẪN là dict như cũ
+        # — models/diagnostics.py đọc trực tiếp `mod.mu_bar.get(j, ...)`
+        # nên không được đổi kiểu — nhưng giờ chỉ là VIEW được đồng bộ
+        # (dict(zip(...)), một lần bulk mỗi update_batch) từ array, không
+        # phải nguồn sự thật.
+        # ---------------------------------------------------------------
+        n = len(self.neighbor_ids)
+        self._pos: Dict[int, int] = {j: i for i, j in enumerate(self.neighbor_ids)}
 
-        # Tích luỹ prod(1-alpha) cho bias correction. Bắt đầu ở 1.0 =
-        # "toàn bộ khối lượng còn nằm ở giá trị khởi tạo".
-        self._bias_corr: Dict[int, float] = {j: 1.0 for j in self.neighbor_ids}
+        self._mu_arr = np.zeros(n, dtype=np.float64)
+        self._sigma_arr = np.ones(n, dtype=np.float64)
+        self._bias_corr_arr = np.ones(n, dtype=np.float64)
+        self._mu_init_arr = np.full(n, self.MU_INIT, dtype=np.float64)
+        self._sigma_init_arr = np.full(n, self.SIGMA_INIT, dtype=np.float64)
+        self._n_updates_arr = np.zeros(n, dtype=np.int64)
+        self._p_core_arr = np.full(n, 0.5, dtype=np.float64)
 
-        # ĐIỂM NEO theo từng cặp. Ban đầu = hằng số lớp, nhưng sau mỗi lần
-        # re-anchor (inflate_uncertainty) nó được đặt lại thành ước lượng
-        # tốt nhất đang có. Nhờ vậy việc "quên có kiểm soát" khi phát hiện
-        # structural shift không xoá trắng những gì đã học.
-        self._mu_init: Dict[int, float] = {
-            j: self.MU_INIT for j in self.neighbor_ids
-        }
-        self._sigma_init: Dict[int, float] = {
-            j: self.SIGMA_INIT for j in self.neighbor_ids
-        }
+        # Views dict — giữ tương thích ngược cho code đọc trực tiếp.
+        self.mu_bar: Dict[int, float] = dict(zip(self.neighbor_ids, self._mu_arr.tolist()))
+        self.sigma_bar: Dict[int, float] = dict(zip(self.neighbor_ids, self._sigma_arr.tolist()))
+        self.p_core: Dict[int, float] = dict(zip(self.neighbor_ids, self._p_core_arr.tolist()))
+        self.n_updates: Dict[int, int] = dict(zip(self.neighbor_ids, self._n_updates_arr.tolist()))
+
+        # Giữ hai dict này cho _apply_capacity/get_state_for_neighbor cũ
+        # (một vài nhánh vẫn đọc qua .get(j, default) kiểu dict-of-float).
+        self._bias_corr: Dict[int, float] = dict(zip(self.neighbor_ids, self._bias_corr_arr.tolist()))
+        self._mu_init: Dict[int, float] = dict(zip(self.neighbor_ids, self._mu_init_arr.tolist()))
+        self._sigma_init: Dict[int, float] = dict(zip(self.neighbor_ids, self._sigma_init_arr.tolist()))
 
         # Đếm số lần bơm phồng, để báo cáo trong paper.
         self.n_inflations = 0
@@ -428,98 +445,112 @@ class BayesLightBeliefState:
     # Cập nhật belief
     # =====================================================================
 
+    def _debiased_arr(self, idx: np.ndarray):
+        """
+        Bản VECTOR HOÁ của debiased_mu/debiased_sigma cho một tập vị trí
+        `idx` cùng lúc — công thức giữ NGUYÊN debiased_mu/debiased_sigma
+        (không đổi, hai hàm đó vẫn còn nguyên bên dưới làm oracle/đối
+        chiếu), chỉ đổi cách thực thi từ per-j sang mảng.
+        """
+        prod = self._bias_corr_arr[idx]
+        denom = 1.0 - prod
+        mu_init = self._mu_init_arr[idx]
+        sigma_init = self._sigma_init_arr[idx]
+
+        small = denom < 1e-3
+        denom_safe = np.where(small, 1.0, denom)
+
+        mu_deb = np.where(small, mu_init, (self._mu_arr[idx] - prod * mu_init) / denom_safe)
+        sig_deb = np.where(
+            small,
+            np.maximum(sigma_init, self.sigma_floor),
+            np.maximum((self._sigma_arr[idx] - prod * sigma_init) / denom_safe, self.sigma_floor),
+        )
+        return mu_deb, sig_deb
+
     def update_pair(self, j: int, mu: float, sigma: float):
-        """
-        Cập nhật một cặp.
-
-        mu: CÓ DẤU (khác v1 — v1 nhận mu không âm vì proxy đã lấy abs).
-        sigma: standard deviation qua ensemble.
-        """
-        j = int(j)
-
-        if j not in self.mu_bar:
-            return
-
-        mu = float(mu)
-        sigma = self._safe_sigma(sigma)
-
-        self.n_updates[j] += 1
-        t = float(self.n_updates[j])
-
-        # ---------------------------------------------------------------
-        # [B3] LỊCH TRÌNH ROBBINS-MONRO
-        #
-        #   alpha_t = lambda_0 / ( t^d * (1 + c * sigma_t) )
-        #
-        # Phần t^-d cho:  sum(alpha) = inf,  sum(alpha^2) < inf  khi d in (0.5, 1]
-        #   -> thoả Assumption 3.3(c) của Pieroth ICML'24
-        #   -> mượn được Theorem 5.6 để phát biểu hội tụ almost surely
-        # Phần (1 + c*sigma) giữ ý tưởng gốc của paper: bất định cao thì
-        #   cập nhật dè dặt hơn.
-        # alpha_decay = 0 -> quay về đúng công thức v1 (dùng cho ablation).
-        # ---------------------------------------------------------------
-        decay_factor = t ** self.alpha_decay if self.alpha_decay > 0.0 else 1.0
-
-        alpha = self.lambda_0 / (
-            decay_factor * (1.0 + self.uncertainty_scale * sigma)
-        )
-        alpha = float(np.clip(alpha, 0.0, 1.0))
-
-        # [B4] Giữ DẤU của mu.
-        self.mu_bar[j] = (1.0 - alpha) * float(self.mu_bar[j]) + alpha * mu
-        self.sigma_bar[j] = (
-            (1.0 - alpha) * float(self.sigma_bar[j]) + alpha * sigma
-        )
-
-        # ---------------------------------------------------------------
-        # HIỆU CHỈNH ĐỘ CHỆCH KHỞI TẠO (bias correction, kiểu Adam)
-        #
-        # Lỗi này bị bắt trong unit test và nó là HỆ QUẢ PHỤ của [B3].
-        # Khi alpha suy giảm theo 1/t^d, tổng trọng số đã tích luỹ được là
-        #     1 - prod_s(1 - alpha_s)
-        # và phần còn lại VẪN THUỘC VỀ GIÁ TRỊ KHỞI TẠO.
-        #
-        # Con số cụ thể từ test: sau 60 lần cập nhật với lambda_0=0.12,
-        # d=0.7, thì prod(1-alpha) ~ 0.38. Nghĩa là:
-        #     mu_bar   chỉ đạt ~62% giá trị thật (bị kéo về 0)
-        #     sigma_bar vẫn giữ ~38% của prior 1.0 -> bị THỔI PHỒNG
-        # Kết hợp lại: LCB = |mu| - kappa*sigma luôn ÂM -> KHÔNG AI vào core
-        # -> core rơi về min_core_size = 1. Đúng như test đã cho thấy.
-        #
-        # Adam giải đúng bài toán này bằng m_hat = m / (1 - beta^t).
-        # Ở đây alpha thay đổi theo bước nên ta tích luỹ tích số trực tiếp.
-        # ---------------------------------------------------------------
-        self._bias_corr[j] = float(self._bias_corr[j]) * (1.0 - alpha)
-
-        # ---------------------------------------------------------------
-        # [B1] p_core KHÔNG CÒN CHIA CHO SIGMA.
-        # Dạng mới: sigmoid trên LCB đã chuẩn hoá bằng một hằng số CỐ ĐỊNH
-        # (không phụ thuộc sigma) -> không bao giờ bão hoà theo sigma.
-        # p_core giờ chỉ còn là một số để log/diagnostics; quyết định core
-        # thật sự nằm ở _select_core_lcb().
-        # ---------------------------------------------------------------
-        lcb = self._lcb_score(j)
-        self.p_core[j] = float(self._sigmoid((lcb - self.tau) / max(self.tau, 1e-3)))
-
-        for hist, val in (
-            (self.mu_history[j], self.mu_bar[j]),
-            (self.sigma_history[j], self.sigma_bar[j]),
-            (self.p_history[j], self.p_core[j]),
-        ):
-            hist.append(float(val))
-            if len(hist) > 500:
-                del hist[:-500]
+        """Cập nhật một cặp — nay chỉ là update_batch với 1 phần tử, để
+        đảm bảo CÙNG một công thức vector hoá, không có hai bản song song
+        dễ lệch nhau."""
+        self.update_batch({int(j): (mu, sigma)})
 
     def update_batch(self, mu_sigma_dict) -> Tuple[Set[int], Set[int]]:
         """
         GIỮ NGUYÊN chữ ký v1: nhận {j: (mu, sigma)}, trả (promoted, demoted).
+
+        [GPU_OPTIMIZATION_CONTRACT.md mục 1.2] Toàn bộ EWMA (Eq. 11-13) +
+        bias correction (Eq. 14) cho MỌI j trong batch chạy trong MỘT lệnh
+        numpy, thay vì gọi update_pair (vòng lặp Python) từng cái — đây là
+        vòng lặp chạy mỗi lần belief cập nhật, tức mỗi bước slow-timescale
+        cho mỗi ego, O(n_neighbors) phép tính Python thuần trước đây.
+        Công thức từng phần tử giữ NGUYÊN 100% so với update_pair cũ.
         """
+        js, mus, sigmas = [], [], []
         for j, pair_value in mu_sigma_dict.items():
             if pair_value is None:
                 continue
-
+            jj = int(j)
+            if jj not in self._pos:
+                continue
             mu, sigma = pair_value
-            self.update_pair(j, mu, sigma)
+            js.append(jj)
+            mus.append(float(mu))
+            sigmas.append(self._safe_sigma(sigma))
+
+        if len(js) > 0:
+            idx = np.array([self._pos[j] for j in js], dtype=np.int64)
+            mus_arr = np.asarray(mus, dtype=np.float64)
+            sigmas_arr = np.asarray(sigmas, dtype=np.float64)
+
+            self._n_updates_arr[idx] += 1
+            t = self._n_updates_arr[idx].astype(np.float64)
+
+            # [B3] Lịch trình Robbins-Monro — công thức KHÔNG đổi.
+            decay_factor = (
+                t ** self.alpha_decay if self.alpha_decay > 0.0 else np.ones_like(t)
+            )
+            alpha = self.lambda_0 / (
+                decay_factor * (1.0 + self.uncertainty_scale * sigmas_arr)
+            )
+            alpha = np.clip(alpha, 0.0, 1.0)
+
+            # [B4] Giữ DẤU của mu.
+            self._mu_arr[idx] = (1.0 - alpha) * self._mu_arr[idx] + alpha * mus_arr
+            self._sigma_arr[idx] = (
+                (1.0 - alpha) * self._sigma_arr[idx] + alpha * sigmas_arr
+            )
+
+            # Bias correction kiểu Adam — công thức KHÔNG đổi.
+            self._bias_corr_arr[idx] = self._bias_corr_arr[idx] * (1.0 - alpha)
+
+            # [B1] p_core — chỉ diagnostic, sigmoid trên LCB đã debias.
+            mu_deb, sig_deb = self._debiased_arr(idx)
+            lcb = np.abs(mu_deb) - self.kappa * np.maximum(sig_deb, self.sigma_floor)
+            p = 1.0 / (1.0 + np.exp(-np.clip((lcb - self.tau) / max(self.tau, 1e-3), -60.0, 60.0)))
+            self._p_core_arr[idx] = p
+
+            # Đồng bộ dict view + history — bulk assignment/append, không
+            # còn phép TÍNH nào ở đây (đã tính hết bằng numpy ở trên).
+            for pos, jj in zip(idx.tolist(), js):
+                mu_v = float(self._mu_arr[pos])
+                sig_v = float(self._sigma_arr[pos])
+                p_v = float(self._p_core_arr[pos])
+
+                self.mu_bar[jj] = mu_v
+                self.sigma_bar[jj] = sig_v
+                self.n_updates[jj] = int(self._n_updates_arr[pos])
+                self._bias_corr[jj] = float(self._bias_corr_arr[pos])
+                self.p_core[jj] = p_v
+
+                self.mu_history[jj].append(mu_v)
+                self.sigma_history[jj].append(sig_v)
+                self.p_history[jj].append(p_v)
+                if len(self.mu_history[jj]) > 500:
+                    del self.mu_history[jj][:-500]
+                if len(self.sigma_history[jj]) > 500:
+                    del self.sigma_history[jj][:-500]
+                if len(self.p_history[jj]) > 500:
+                    del self.p_history[jj][:-500]
 
         return self._update_core_set()
 
@@ -537,21 +568,28 @@ class BayesLightBeliefState:
         Hysteresis giữ nguyên tinh thần v1 (chống nhấp nháy) nhưng áp lên
         thang LCB thay vì thang p_core bão hoà.
         """
-        # Quy đổi tỷ lệ tau_out/tau_in của v1 sang thang LCB.
+        # [GPU_OPTIMIZATION_CONTRACT.md mục 1.4] Luật ngưỡng kép là boolean
+        # elementwise thuần -> vector hoá toàn bộ qua mọi neighbour trong
+        # MỘT lệnh numpy, thay vì gọi _lcb_score (Python) trong vòng lặp.
+        # Công thức KHÔNG đổi so với bản trước.
         ratio = (
             self.tau_out / self.tau_in if self.tau_in > 1e-8 else 0.75
         )
         tau_hold = self.tau * float(np.clip(ratio, 0.0, 1.0))
 
-        new_core = set()
+        idx_all = np.arange(len(self.neighbor_ids), dtype=np.int64)
+        mu_deb, sig_deb = self._debiased_arr(idx_all)
+        g = np.abs(mu_deb) - self.kappa * np.maximum(sig_deb, self.sigma_floor)  # [n]
 
-        for j in self.neighbor_ids:
-            score = self._lcb_score(j)
+        was_in_prev = np.array(
+            [j in self.prev_core_set for j in self.neighbor_ids], dtype=bool
+        )
 
-            if score > self.tau:
-                new_core.add(j)
-            elif (j in self.prev_core_set) and (score > tau_hold):
-                new_core.add(j)
+        enter = g > self.tau
+        stay = was_in_prev & (g > tau_hold)
+        keep = enter | stay
+
+        new_core = set(int(j) for j, k in zip(self.neighbor_ids, keep.tolist()) if k)
 
         return new_core
 
@@ -815,6 +853,24 @@ class BayesLightBeliefState:
 
             # Mở lại tốc độ học.
             self.n_updates[j] = int(max(0, t_reset))
+
+            # ---------------------------------------------------------
+            # QUAN TRỌNG: đồng bộ lại ARRAY — update_batch/_select_core_lcb
+            # đọc state qua self._mu_arr/_sigma_arr/_bias_corr_arr/
+            # _mu_init_arr/_sigma_init_arr/_n_updates_arr (mục 1.2), không
+            # còn qua dict. Nếu quên bước này, sau inflate các hàm vector
+            # hoá vẫn thấy state CŨ (trước inflate) — đúng dạng lỗi thứ tự
+            # mà GPU_OPTIMIZATION_CONTRACT.md mục 1.3 cảnh báo, chỉ khác là
+            # ở tầng đồng bộ dict<->array thay vì thứ tự đọc/ghi trong một
+            # hàm.
+            # ---------------------------------------------------------
+            pos = self._pos[j]
+            self._mu_arr[pos] = mu_hat
+            self._sigma_arr[pos] = new_sigma
+            self._mu_init_arr[pos] = mu_hat
+            self._sigma_init_arr[pos] = new_sigma
+            self._bias_corr_arr[pos] = 1.0
+            self._n_updates_arr[pos] = int(max(0, t_reset))
 
         self.n_inflations += 1
 

@@ -395,23 +395,93 @@ class FinalCIGAMFRunner:
             )
 
     def _core_context_excluding(self, ego, exclude_j):
+        """
+        [GPU_OPTIMIZATION_CONTRACT.md mục 2.1] Bản cũ gọi get_core_summary()
+        (mean pooling từ đầu) cho MỖI (ego, j) -> O(core_size) việc lặp lại
+        N lần mỗi ego, N^2 lần mỗi timestep. get_core_summary_excluding_all
+        đã tồn tại sẵn trong core_behavior.py (thủ thuật sum-trừ-một, CHỈ
+        đúng với mean pooling — đúng loại pooling paper đang dùng) nhưng
+        chưa được gọi ở đây. Cache theo (ego, core_set hiện tại): 1 lệnh
+        sum-minus-one cho CẢ N neighbour của ego đó, N lệnh tra dict còn
+        lại chỉ là O(1) lookup.
+        """
         core_set = self.belief_modules[ego].get_core_set()
+        cache_key = (ego, frozenset(core_set))
+
+        if getattr(self, "_core_excl_cache_key", None) != cache_key:
+            self._core_excl_cache_key = cache_key
+            self._core_excl_cache = (
+                self.pair_rel_module.get_core_summary_excluding_all(ego, core_set)
+            )
+
+        if exclude_j in self._core_excl_cache:
+            return self._core_excl_cache[exclude_j]
+
+        # Fallback an toàn (không nên xảy ra: exclude_j luôn là neighbour
+        # hợp lệ) — giữ đường chậm cũ để KHÔNG BAO GIỜ trả sai kết quả.
         reduced = [x for x in core_set if x != exclude_j]
         return self.pair_rel_module.get_core_summary(ego, reduced)
 
     def _periph_context_excluding(self, ego, exclude_j):
+        """
+        [GPU_OPTIMIZATION_CONTRACT.md mục 2.1] Bản cũ: build_inputs() +
+        forward ĐẦY ĐỦ (chạy lại item_encoder/slot_router cho gần hết tập)
+        RIÊNG cho mỗi (ego, j) -> N lần mỗi ego. forward_excluding_all()
+        tính num/den đầy đủ MỘT LẦN rồi trừ-một vector hoá cho cả N
+        neighbour cùng lúc (sum-trừ-một, chỉ đúng weighted-mean pooling —
+        đã xác nhận đúng loại paper dùng, xem docstring của hàm đó).
+        Cache theo (ego, peripheral_set hiện tại); đồng bộ CPU MỘT LẦN
+        cho cả batch thay vì mỗi exclude_j một lần .cpu().numpy().
+        """
         belief_mod = self.belief_modules[ego]
-        periph_ids = sorted(list(belief_mod.get_peripheral_set() - {exclude_j}))
-        belief_state = belief_mod.get_state_dict()
+        periph_ids = sorted(list(belief_mod.get_peripheral_set()))
+        cache_key = (ego, tuple(periph_ids))
 
+        if getattr(self, "_periph_excl_cache_key", None) != cache_key:
+            self._periph_excl_cache_key = cache_key
+            if len(periph_ids) == 0:
+                self._periph_excl_cache = {}
+            else:
+                belief_state = belief_mod.get_state_dict()
+                inputs = self.periph_module.build_inputs(
+                    ego_id=ego,
+                    peripheral_ids=periph_ids,
+                    env=self.env,
+                    belief_state=belief_state,
+                    prev_core_set=belief_mod.prev_core_set,
+                )
+                raw = self.periph_module.forward_excluding_all(inputs, periph_ids)
+                if raw:
+                    ids_order = list(raw.keys())
+                    stacked = (
+                        torch.stack([raw[j] for j in ids_order], dim=0)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32)
+                    )
+                    self._periph_excl_cache = {
+                        j: stacked[i] for i, j in enumerate(ids_order)
+                    }
+                else:
+                    self._periph_excl_cache = {}
+
+        if exclude_j in self._periph_excl_cache:
+            return self._periph_excl_cache[exclude_j]
+
+        # Fallback an toàn (không nên xảy ra: exclude_j luôn trong peripheral
+        # set hiện tại) — đường chậm cũ, KHÔNG BAO GIỜ trả sai kết quả.
+        periph_ids_reduced = sorted(
+            list(belief_mod.get_peripheral_set() - {exclude_j})
+        )
+        belief_state = belief_mod.get_state_dict()
         inputs = self.periph_module.build_inputs(
             ego_id=ego,
-            peripheral_ids=periph_ids,
+            peripheral_ids=periph_ids_reduced,
             env=self.env,
             belief_state=belief_state,
             prev_core_set=belief_mod.prev_core_set,
         )
-
         return self._periph_summary_np_from_inputs(inputs)
 
     # ============================================================

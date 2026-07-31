@@ -557,6 +557,88 @@ class PeripheralMultiMemory(nn.Module):
             "memories": memories,
         }
 
+    def forward_excluding_all(self, periph_items, item_ids) -> Dict[int, torch.Tensor]:
+        """
+        [GPU_OPTIMIZATION_CONTRACT.md mục 2.1] M_i^{-j} cho MỌI j trong tập
+        peripheral hiện tại của một ego, CÙNG LÚC, bằng thủ thuật sum-trừ-một
+        — thay vì gọi forward_full() riêng cho từng exclusion (bản cũ:
+        build_inputs + forward đầy đủ N lần mỗi ego, tức chạy lại
+        item_encoder/slot_router cho gần hết tập N-1 lần nữa mỗi lần).
+
+        CHỈ ĐÚNG VỚI POOLING KIỂU WEIGHTED-SUM (Eq. 25 — mean pooling có
+        trọng số, permutation-invariant kiểu Deep Sets), vì mỗi item đóng
+        góp qua h[n]/slot_probs[n]/beta[n] ĐỘC LẬP, không có chuẩn hoá chéo
+        item nào trước bước pooling (đã kiểm: item_encoder/semantic gate/
+        free-slot router đều là MLP áp per-item, không có BatchNorm/attention
+        giữa các item). Nếu sau này đổi pooling sang attention hoặc max
+        (paper nhắc Set Transformer là biến thể tương lai), hàm này SAI —
+        phải quay lại forward_full() riêng từng exclusion.
+
+        KHÔNG dùng hàm này để train (không tính lb_loss/orth_loss) — chỉ
+        phục vụ dựng context M_i^{-j} làm input cho proxy. Huấn luyện
+        periph_module vẫn qua forward_full() trên tập ĐẦY ĐỦ.
+
+        Args:
+            periph_items: [N, item_dim] — toàn bộ tập peripheral hiện tại.
+            item_ids: list[int] độ dài N, id neighbour tương ứng từng hàng.
+
+        Returns:
+            {item_id: memory_out [out_dim]} cho mọi id trong item_ids.
+        """
+        items = self._normalise_inputs(periph_items)
+        N = items.shape[0]
+
+        if N == 0:
+            return {}
+
+        with torch.no_grad():
+            enc_in = self._prepare_encoder_input(items)   # [N, enc_in_dim]
+            h = self.item_encoder(enc_in)                 # [N, D]
+            sem_probs = self._semantic_slot_probs(items)  # [N, 4]
+
+            if self.n_free_slots > 0:
+                router_in = torch.cat([enc_in, sem_probs.detach()], dim=-1)
+                free_logits = self.slot_router(router_in)
+                free_probs = F.softmax(free_logits, dim=-1)
+                slot_probs = torch.cat(
+                    [0.5 * sem_probs, 0.5 * free_probs], dim=1
+                )  # [N, K]
+            else:
+                slot_probs = sem_probs  # [N, K]
+
+            beta = self._importance_beta(items)          # [N]
+            weighted = slot_probs * beta.unsqueeze(1)     # [N, K]
+
+            num = weighted.t() @ h                         # [K, D]  tổng ĐẦY ĐỦ
+            den = weighted.sum(dim=0)                       # [K]
+
+            # Đóng góp riêng từng item vào từng slot -> [N, K, D], vector
+            # hoá qua chiều N thay vì vòng lặp Python.
+            contrib = weighted.unsqueeze(2) * h.unsqueeze(1)   # [N, K, D]
+            num_excl = num.unsqueeze(0) - contrib               # [N, K, D]
+            den_excl = torch.clamp(
+                den.unsqueeze(0) - weighted, min=self.eps
+            ).unsqueeze(2)                                       # [N, K, 1]
+            memories = num_excl / den_excl                        # [N, K, D]
+
+            if self.use_uniform_mix:
+                num_u = slot_probs.t() @ h                          # [K, D]
+                den_u = slot_probs.sum(dim=0)                        # [K]
+                contrib_u = slot_probs.unsqueeze(2) * h.unsqueeze(1)  # [N,K,D]
+                num_u_excl = num_u.unsqueeze(0) - contrib_u
+                den_u_excl = torch.clamp(
+                    den_u.unsqueeze(0) - slot_probs, min=self.eps
+                ).unsqueeze(2)
+                uniform_mem = num_u_excl / den_u_excl                  # [N,K,D]
+
+                mix = float(np.clip(self.uniform_mix, 0.0, 1.0))
+                memories = (1.0 - mix) * memories + mix * uniform_mem
+
+            flat = memories.reshape(N, -1)          # [N, K*memory_dim]
+            outs = self.out_proj(flat)              # [N, out_dim]
+
+        return {int(item_ids[n]): outs[n] for n in range(N)}
+
     def forward(self, periph_items) -> torch.Tensor:
         """
         GIỮ NGUYÊN chữ ký v1 — trả đúng [out_dim].
