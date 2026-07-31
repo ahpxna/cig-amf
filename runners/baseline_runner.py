@@ -1097,10 +1097,12 @@ class SharedAblationBase:
             probs = torch.softmax(logits, dim=-1)
             dist = torch.distributions.Categorical(probs=probs)
             sampled = dist.sample().detach().cpu().numpy()
+            # Một sync CPU<->GPU cho toàn bộ values thay vì .item() từng agent.
+            values_np = values.detach().cpu().numpy()
 
         for ego in range(self.n_agents):
             actions[ego] = int(sampled[ego])
-            cache["value_cache"][ego] = float(values[ego].item())
+            cache["value_cache"][ego] = float(values_np[ego])
 
         return actions, cache
 

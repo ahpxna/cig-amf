@@ -142,8 +142,24 @@ try:
     core_no = sorted(b_no.get_core_set())
 
     b_yes = copy.deepcopy(b)
+
+    # ---- T4 [GPU_OPTIMIZATION_CONTRACT.md mục 1.3] ----
+    # Reset Pi phải nằm SAU khi đã đọc debiased_mu/sigma. Nếu ai đó vector
+    # hoá và lỡ reset trước, debiased_mu trả điểm neo CŨ thay vì ước lượng
+    # hiện tại -> bơm phồng biến thành xoá trắng thay vì hạ độ tin cậy.
+    mu_before_1 = b_yes.debiased_mu(1)
+    sig_before_1 = b_yes.debiased_sigma(1)
+
     st = b_yes.inflate_uncertainty(factor=2.5, t_reset=1)
     core_mid = sorted(b_yes.get_core_set())
+
+    check("T4: inflate KHÔNG xoá mu (re-anchor, không reset)",
+          abs(b_yes.debiased_mu(1) - mu_before_1) < 1e-9,
+          f"mu trước={mu_before_1:.4f} mu sau={b_yes.debiased_mu(1):.4f}")
+    check("T4: inflate làm sigma tăng rõ rệt",
+          b_yes.debiased_sigma(1) > 2.0 * sig_before_1,
+          f"sigma trước={sig_before_1:.4f} sigma sau={b_yes.debiased_sigma(1):.4f}")
+
     feed(b_yes, new, np.random.RandomState(1), 40)
     core_yes = sorted(b_yes.get_core_set())
 
@@ -279,6 +295,56 @@ try:
     dis = px.get_diagnostics()["ensemble_disagreement"]
     check("ensemble THẬT SỰ bất đồng", dis > 1e-6,
           f"disagreement={dis:.5f} (v1 = 0.000)")
+
+    # ---- T1 [BB4]: vmap khớp bản tham chiếu (vòng lặp Python) ----
+    # Cùng MỘT input cho cả hai đường -> chênh lệch chỉ có thể đến từ lỗi
+    # layout (repeat_interleave/repeat/view bị đảo), không phải từ dữ liệu
+    # khác nhau.
+    t1_obs = rr.randn(6, OD); t1_ai = rr.randint(0, A, 6)
+    t1_z = rr.randn(6, CD); t1_m = rr.randn(6, PD); t1_b = rr.randn(6, BD)
+    fast = px._predict_all_actions(t1_obs, t1_ai, t1_z, t1_m, t1_b)
+    ref = px._predict_all_actions_reference(t1_obs, t1_ai, t1_z, t1_m, t1_b)
+    check("T1: vmap khớp bản tham chiếu (BB4 — layout B*A)",
+          bool(torch.allclose(fast, ref, atol=1e-5)),
+          f"max diff={float((fast - ref).abs().max()):.2e}")
+
+    # ---- T3 [BB3]: thang gradient member-0 không đổi theo n_ensemble ----
+    # Cùng seed -> member 0 của E=1 và E=4 dùng CHUNG bootstrap mask (mask
+    # chỉ phụ thuộc seed*7919+k, không phụ thuộc n_ensemble) -> cùng dữ
+    # liệu train nếu buffer được nạp giống hệt nhau.
+    def _make_and_train(n_ens):
+        p = LocalCounterfactualProxyEnsemble(
+            obs_dim=OD, action_dim=A, core_dim=CD, periph_dim=PD, belief_dim=BD,
+            n_ensemble=n_ens, n_horizons=H, effect_mode="signed_aristocrat",
+            use_doubly_robust=False, use_belief_input=False, seed=42,
+        )
+        rr2 = np.random.RandomState(7)
+        for _ in range(300):
+            p.add_sample(
+                ego_id=0, neighbor_id=1,
+                obs_i=rr2.randn(OD), action_i=rr2.randint(A),
+                observed_action_j=rr2.randint(A),
+                z_core_excl_j=rr2.randn(CD), m_periph_excl_j=rr2.randn(PD),
+                belief_summary=rr2.randn(BD), target_return_h=float(rr2.randn()),
+                target_returns_multi=rr2.randn(H),
+            )
+        p.train_step(n_steps=50, batch_size=32, holdout_size=0)
+        return p
+
+    px1 = _make_and_train(1)
+    px4 = _make_and_train(4)
+    loss_e1 = float(px1.latest_loss_per_member[0])
+    loss_e4_m0 = float(px4.latest_loss_per_member[0])
+    rel_diff = abs(loss_e1 - loss_e4_m0) / max(abs(loss_e1), 1e-8)
+    check("T3: thang gradient member-0 khớp E=1 vs E=4 (BB3)",
+          rel_diff < 0.15,
+          f"loss_e1={loss_e1:.4f} loss_e4_m0={loss_e4_m0:.4f} rel_diff={rel_diff:.3f}")
+
+except ImportError as e:
+    print(f"       BỎ QUA phần torch: {e}")
+    SKIP.append("torch tests")
+except Exception:
+    traceback.print_exc(); FAIL.append("torch")
 
     # ---- peripheral memory ----
     pm = PeripheralMultiMemory(action_dim=A, n_free_slots=2,

@@ -1,5 +1,5 @@
 """
-structural_proxy_v2.py — Local counterfactual proxy, bản vá.
+structural_proxy.py — Local counterfactual proxy.
 
 =============================================================================
 BỐN LỖI CỦA BẢN v1 ĐƯỢC SỬA Ở ĐÂY
@@ -11,35 +11,79 @@ BỐN LỖI CỦA BẢN v1 ĐƯỢC SỬA Ở ĐÂY
        - p_core buộc phải dùng |mu_bar| (vì mu đã không âm sẵn)
        - không thể phân biệt "thằng ngáng đường" với "thằng hỗ trợ"
        - KHÔNG THỂ khớp với oracle của env (oracle CÓ DẤU) -> Exp3 bất khả thi
-     v2: giữ dấu. Expose 4 chế độ (xem effect_mode) để chạy ablation.
+     Hiện tại: giữ dấu. Expose 4 chế độ (xem effect_mode) để chạy ablation.
 
 [L2] ƯỚC LƯỢNG PLUG-IN, THỪA HƯỞNG TOÀN BỘ BIAS CỦA REWARD MODEL.
      v1: w = f(a') - f(a). Nếu f lệch thì w lệch. Mà a_j không ngẫu nhiên
      nên f học được từ dữ liệu confounded.
-     v2: doubly-robust. Vì trong MARL ta BIẾT CHÍNH XÁC pi_j (ta tự train nó),
-     propensity là exact -> DR không chệch ngay cả khi f sai.
-     Đây là lợi thế mà nhà thống kê y học mơ không được.
+     Hiện tại: doubly-robust. Vì trong MARL ta BIẾT CHÍNH XÁC pi_j (ta tự
+     train nó), propensity là exact -> DR không chệch ngay cả khi f sai.
 
 [L3] ENSEMBLE GIẢ — cả 3 member train trên CÙNG batch, cùng thứ tự.
      v1: `for model, optim in zip(self.models, self.optims)` nằm TRONG vòng
      lặp batch -> mọi member thấy đúng cùng dữ liệu -> hội tụ về gần cùng
-     một hàm -> sigma = 0.000 (đúng như bảng kết quả trong paper).
-     v2: mỗi member có bootstrap mask riêng + batch riêng + khởi tạo riêng.
+     một hàm -> sigma = 0.000.
+     Hiện tại: mỗi member có bootstrap mask riêng + batch riêng + khởi tạo
+     riêng — VÀ toàn bộ ensemble forward/backward/step chạy như MỘT lệnh
+     GPU duy nhất qua torch.func.vmap, không còn vòng lặp Python qua từng
+     model (xem "TỐI ƯU GPU" bên dưới).
 
 [L4] CHỈ MỘT HORIZON -> không có chiều "độ trễ" cho influence signature.
-     v2: multi-horizon head, dự đoán R^(1), R^(2), ..., R^(H) cùng lúc.
-     Rẻ (chỉ đổi output layer) mà cho ngay chiều latency.
+     Multi-horizon head, dự đoán R^(1), R^(2), ..., R^(H) cùng lúc.
+
+=============================================================================
+TỐI ƯU GPU (torch.func.vmap ensemble)
+=============================================================================
+Vấn đề gốc: n_ensemble model riêng biệt, mỗi model là một nn.Module có bộ
+trọng số và optimizer của riêng nó. Chạy forward/backward cho ensemble theo
+kiểu `for model in self.models: ...` nghĩa là GPU thấy n_ensemble lần launch
+kernel TUẦN TỰ cho những phép tính có shape GIỐNG HỆT NHAU — không có gì để
+GPU song song hoá giữa các member, và mỗi lần `.item()`/`.cpu()` trong vòng
+lặp đó là một lần đồng bộ CPU<->GPU (stall pipeline).
+
+Cách sửa — "vectorize the ensemble dimension":
+    1. `torch.func.stack_module_state(models)` gộp trọng số của n_ensemble
+       model thành MỘT cây tensor, mỗi lá có thêm chiều đầu E = n_ensemble.
+    2. `torch.func.functional_call` + `torch.func.vmap` chạy forward cho
+       CẢ n_ensemble model trong MỘT lệnh, y hệt cách vmap chạy batch trong
+       chiều batch — chỉ khác là chiều được vmap ở đây là chiều ENSEMBLE.
+    3. Một Adam DUY NHẤT tối ưu toàn bộ tensor đã stack (Adam là elementwise
+       theo tham số nên vẫn cho mỗi member một moment estimate độc lập —
+       không có rò rỉ gradient giữa các member).
+    4. Grad-clip vẫn phải tính NORM RIÊNG cho từng member (nếu tính chung một
+       norm toàn cục thì một member có gradient lớn sẽ kéo cả ensemble bị
+       clip theo, làm mất tính độc lập) — cài trong `_clip_grad_norm_per_member`,
+       vector hoá theo chiều E, không có vòng lặp Python qua từng member.
+    5. Kết quả: n_ensemble forward + n_ensemble backward + n_ensemble
+       optimizer update chỉ còn là 1 forward + 1 backward + 1 update trên
+       tensor có thêm chiều E — đúng những gì torch.vmap sinh ra để làm.
+
+`self.buffer` CỐ TÌNH vẫn là `deque` các dict Python — `drift_probe.py`
+(`DriftDetector`) đọc trực tiếp cấu trúc này (`buf["obs_i"]`, v.v.) nên đổi
+kiểu dữ liệu ở đây sẽ làm gãy module đó. Việc lấy mẫu (`_sample_for_member`)
+được viết lại để KHÔNG quét toàn bộ buffer bằng vòng lặp Python + hash thủ
+công như trước (O(buffer_size) mỗi member mỗi bước train — với buffer 200k
+phần tử và 4 member thì đó là 800k phép tính Python thuần mỗi train_step).
+
+Thay vào đó mỗi member có một PERMUTATION MASK CỐ ĐỊNH (tính một lần ở
+__init__, numpy — O(buffer_size) một lần duy nhất, không lặp lại mỗi
+train_step) đánh dấu ~bootstrap_ratio phần trăm vị trí (rank) mà member đó
+được phép thấy; `_sample_for_member` chỉ lọc theo mask (numpy, C-level) rồi
+`random.choices` có trọng số để oversample mẫu can thiệp. Mask KHÔNG được
+rút lại ngẫu nhiên mỗi lần gọi — xem [BB1] trong `GPU_OPTIMIZATION_CONTRACT.md`:
+rút ngẫu nhiên mỗi lần khiến mọi member dần "thấy" gần hết buffer, xoá mất
+khác biệt hệ thống giữa các member, và ensemble hội tụ về nhau y hệt lỗi v1.
 
 =============================================================================
 BACKWARD COMPATIBILITY
 =============================================================================
 Giữ nguyên chữ ký các hàm runner đang gọi:
-    add_sample(...)  -> thêm 2 tham số optional, có default
+    add_sample(...)  -> thêm tham số optional, có default
     train_step(...)  -> giữ nguyên
     score_batch(...) -> giữ nguyên, VẪN trả (mu_arr, sigma_arr)
     score_pair(...)  -> giữ nguyên
-Thêm mới:
     score_batch_full(...) -> trả dict đầy đủ để xây influence signature
+    self.buffer      -> vẫn là deque[dict], drift_probe.py phụ thuộc vào nó
 =============================================================================
 """
 
@@ -51,6 +95,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    from torch.func import functional_call, stack_module_state, vmap
+    _HAS_TORCH_FUNC = True
+except ImportError:  # torch < 2.0 fallback — hiếm, nhưng đừng chết cứng
+    _HAS_TORCH_FUNC = False
 
 
 # =============================================================================
@@ -99,13 +149,9 @@ class LocalCounterfactualProxyNet(nn.Module):
         # ---------------------------------------------------------------
         # [H6] CẮT VÒNG LẶP PHẢN HỒI belief -> proxy -> belief
         #
-        # Bản v1 đưa B_i vào input của proxy. Nhưng B_i được SINH RA TỪ
-        # chính w_hat mà proxy này tạo ra. Hệ tự xác nhận: nếu B_i nói
-        # "j là core" thì proxy có thể học dự đoán hiệu ứng lớn hơn cho
-        # core member -> p_core tăng thêm -> belief càng chắc chắn.
-        # Đó là confounder do chính kiến trúc tạo ra.
-        #
-        # Mặc định v2 TẮT belief input. Bật lại chỉ khi muốn chạy ablation.
+        # B_i được SINH RA TỪ chính w_hat mà proxy này tạo ra. Nếu đưa B_i
+        # vào input, proxy có thể "tự xác nhận" -> confounder do chính
+        # kiến trúc tạo ra. Mặc định TẮT belief input.
         # ---------------------------------------------------------------
         self.use_belief_input = bool(use_belief_input)
 
@@ -141,16 +187,21 @@ class LocalCounterfactualProxyNet(nn.Module):
 
     def forward(
         self,
-        obs_i: torch.Tensor,            # [B, obs_dim]
-        action_i_onehot: torch.Tensor,  # [B, action_dim]
-        action_j_onehot: torch.Tensor,  # [B, action_dim]
-        z_core_excl_j: torch.Tensor,    # [B, core_dim]
-        m_periph_excl_j: torch.Tensor,  # [B, periph_dim]
-        belief_summary: torch.Tensor,   # [B, belief_dim]
+        obs_i: torch.Tensor,            # [..., B, obs_dim]
+        action_i_onehot: torch.Tensor,  # [..., B, action_dim]
+        action_j_onehot: torch.Tensor,  # [..., B, action_dim]
+        z_core_excl_j: torch.Tensor,    # [..., B, core_dim]
+        m_periph_excl_j: torch.Tensor,  # [..., B, periph_dim]
+        belief_summary: torch.Tensor,   # [..., B, belief_dim]
     ) -> torch.Tensor:
         """
         Returns:
-            [B, n_horizons]
+            [..., B, n_horizons]
+
+        Chấp nhận cả input không có chiều ensemble (gọi trực tiếp một
+        model, dùng ở smoke test / debug) lẫn input có sẵn chiều batch
+        (đường vmap chuẩn — vmap tự thêm/bỏ chiều được map, hàm forward
+        không cần biết gì về chiều E).
         """
         parts = [
             obs_i,
@@ -163,9 +214,55 @@ class LocalCounterfactualProxyNet(nn.Module):
         if self.use_belief_input:
             parts.append(belief_summary)
 
-        x = torch.cat(parts, dim=-1)  # [B, in_dim]
+        x = torch.cat(parts, dim=-1)  # [..., in_dim]
 
-        return self.net(x)  # [B, n_horizons]
+        return self.net(x)  # [..., n_horizons]
+
+
+# =============================================================================
+# Grad-clip riêng cho từng member (vector hoá theo chiều E)
+# =============================================================================
+
+def _clip_grad_norm_per_member(
+    stacked_params: Dict[str, torch.Tensor],
+    max_norm: float,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Clip gradient-norm ĐỘC LẬP cho từng ensemble member.
+
+    Nếu dùng `torch.nn.utils.clip_grad_norm_` trực tiếp trên list các tensor
+    đã stack, nó sẽ tính MỘT norm toàn cục qua cả chiều E lẫn chiều tham số
+    -> một member có gradient bùng nổ sẽ kéo tất cả member khác bị clip
+    theo, phá vỡ tính độc lập vốn là lý do ensemble tồn tại. Hàm này tính
+    norm riêng cho từng lát cắt E rồi scale riêng — không có vòng lặp Python
+    qua từng member, chỉ có một vòng lặp (nhỏ, cố định) qua các THAM SỐ
+    (weight/bias của từng layer), không phải qua agents/ensemble.
+
+    Returns:
+        [E] — norm gradient trước khi clip (để log/chẩn đoán nếu cần).
+    """
+    grads = [p.grad for p in stacked_params.values() if p.grad is not None]
+
+    if len(grads) == 0:
+        return torch.zeros(0)
+
+    E = int(grads[0].shape[0])
+    device = grads[0].device
+
+    sq_sum = torch.zeros(E, device=device, dtype=grads[0].dtype)
+
+    for g in grads:
+        sq_sum = sq_sum + g.reshape(E, -1).pow(2).sum(dim=1)
+
+    norm = torch.sqrt(sq_sum)                                    # [E]
+    coef = (float(max_norm) / (norm + eps)).clamp(max=1.0)       # [E]
+
+    for g in grads:
+        shape = [E] + [1] * (g.dim() - 1)
+        g.mul_(coef.view(*shape))
+
+    return norm
 
 
 # =============================================================================
@@ -174,57 +271,35 @@ class LocalCounterfactualProxyNet(nn.Module):
 
 class LocalCounterfactualProxyEnsemble:
     """
-    Ensemble proxy có dấu, doubly-robust, đa horizon.
+    Ensemble proxy có dấu, doubly-robust, đa horizon, chạy trên GPU dưới
+    dạng MỘT tensor có chiều ensemble (không phải n_ensemble model rời rạc
+    được lặp bằng Python).
 
     ---------------------------------------------------------------------
     BỐN CHẾ ĐỘ TÍNH EFFECT (effect_mode)
     ---------------------------------------------------------------------
-    Cả bốn đều tính được từ cùng một forward pass, nên chạy ablation gần
-    như miễn phí. Chọn mode nào tuỳ mục đích:
-
     "signed_aristocrat"  (MẶC ĐỊNH — dùng cho gán vai trò Thiện/Ác)
         w = f(s, a_j_obs) - E_{a' ~ pi_j}[ f(s, a') ]
-        Đây là aristocrat utility (Wolpert & Tumer 2002) áp lên NEIGHBOUR
-        thay vì lên chính mình như COMA (Foerster 2018).
-        w > 0: hành động thực của j TỐT cho i hơn mức trung bình của j -> j đang GIÚP
+        w > 0: hành động thực của j TỐT cho i hơn mức trung bình -> j GIÚP
         w < 0: j đang HẠI
-        Baseline lấy kỳ vọng theo TOÀN BỘ pi_j nên phương sai thấp hơn hẳn
-        so với việc bốc một hành động thay thế tuỳ tiện như v1.
 
     "signed_oracle_matched"  (dùng cho Exp3 calibration)
         w = mean_{a in candidates}[ f(s,a) ] - f(s, a_j_obs)
-        Khớp ĐÚNG công thức oracle trong env. Chỉ mode này mới so được
-        với compute_oracle_influence_from_current_state().
+        Khớp ĐÚNG công thức oracle trong env.
 
     "range"  (Pieroth ICML'24 style — baseline đối chứng)
         w = max_a f(s,a) - min_a f(s,a)   (luôn >= 0)
-        Chính là impact sample U^{j->i} của Pieroth. Dùng làm BASELINE:
-        nếu signed signature của ta phân vai tốt hơn range không dấu này
-        thì đó là bằng chứng trực tiếp cho novelty.
 
     "mean_abs"  (bản v1 — giữ để chạy ablation "trước/sau khi vá")
         w = mean_{a != a_obs} |f(s,a) - f(s,a_obs)|
 
     ---------------------------------------------------------------------
-    DOUBLY ROBUST — vì sao và công thức
+    DOUBLY ROBUST
     ---------------------------------------------------------------------
-    Ước lượng plug-in cho E[R | do(a_j = a)] là f_hat(s,a). Nếu f_hat lệch,
-    kết quả lệch. DR thêm một số hạng hiệu chỉnh dùng propensity:
-
         psi_DR(a) = f_hat(s,a) + (1{a_obs = a} / b_j(a|s)) * (R_obs - f_hat(s,a_obs))
 
-    Với baseline aristocrat, tổng theo pi_j có dạng đóng rất gọn:
-
-        w_DR = [f_hat(s,a_obs) - sum_a pi_j(a) f_hat(s,a)]        <- phần plug-in
-             + (R_obs - f_hat(s,a_obs)) * (1/b_j(a_obs) - 1)       <- phần hiệu chỉnh
-
-    Đọc bằng lời:
-      - f_hat hoàn hảo -> residual = 0 -> số hạng hiệu chỉnh biến mất -> plug-in đúng.
-      - f_hat lệch     -> residual != 0 -> hiệu chỉnh kéo về, với trọng số
-                          tỉ lệ nghịch propensity.
     Chỉ cần MỘT trong hai (outcome model HOẶC propensity) đúng là không chệch.
     Trong MARL ta biết chính xác propensity -> luôn có sẵn một cái đúng.
-
     Importance weight 1/b bị CLIP để tránh nổ phương sai khi b nhỏ.
     """
 
@@ -250,7 +325,6 @@ class LocalCounterfactualProxyEnsemble:
         device: str = "cpu",
         grad_clip: float = 1.0,
         eps: float = 1e-8,
-        # ---- mới ở v2 ----
         n_horizons: int = 3,
         effect_mode: str = "signed_aristocrat",
         use_doubly_robust: bool = True,
@@ -260,6 +334,7 @@ class LocalCounterfactualProxyEnsemble:
         candidate_actions: Optional[List[int]] = None,
         ensemble_dropout: float = 0.0,
         seed: int = 0,
+        use_vmap_ensemble: bool = True,
     ):
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
@@ -294,13 +369,13 @@ class LocalCounterfactualProxyEnsemble:
         )
 
         # ---------------------------------------------------------------
-        # [L3] ENSEMBLE ĐA DẠNG THẬT
+        # [L3] ENSEMBLE ĐA DẠNG THẬT, chạy như MỘT tensor có chiều E.
         # Ba nguồn đa dạng:
         #   1. Khởi tạo khác nhau (torch seed khác nhau mỗi member)
         #   2. Bootstrap mask khác nhau (mỗi member chỉ thấy 1 phần buffer)
-        #   3. Batch khác nhau (sample riêng cho từng member, không dùng chung)
+        #   3. Batch khác nhau (sample riêng cho từng member)
         # ---------------------------------------------------------------
-        self.models = []
+        self.models: List[LocalCounterfactualProxyNet] = []
 
         for k in range(self.n_ensemble):
             torch.manual_seed(int(seed) * 1000 + k)
@@ -319,14 +394,51 @@ class LocalCounterfactualProxyEnsemble:
                 ).to(self.device)
             )
 
-        self.optims = [
-            torch.optim.Adam(m.parameters(), lr=self.lr) for m in self.models
-        ]
+        self.use_vmap_ensemble = bool(use_vmap_ensemble) and _HAS_TORCH_FUNC
 
-        # RNG riêng cho từng member để bootstrap mask độc lập.
+        if self.use_vmap_ensemble:
+            self._setup_vmap_ensemble()
+        else:
+            # Fallback cho torch < 2.0 (không có torch.func): giữ hành vi
+            # kiểu vòng lặp cũ, đúng nhưng không tận dụng GPU triệt để.
+            self.optims = [
+                torch.optim.Adam(m.parameters(), lr=self.lr) for m in self.models
+            ]
+
+        # RNG riêng cho từng member để oversample có trọng số độc lập.
         self._member_rngs = [
             random.Random(int(seed) * 7919 + k) for k in range(self.n_ensemble)
         ]
+
+        # ---------------------------------------------------------------
+        # [BB1 — GPU_OPTIMIZATION_CONTRACT.md] Bootstrap mask CỐ ĐỊNH,
+        # KHÔNG rút lại ngẫu nhiên mỗi lần gọi.
+        #
+        # Nếu mỗi train_step() tự rút một pool con MỚI cho từng member (bản
+        # trước làm vậy để tránh quét toàn buffer bằng Python), thì về lâu
+        # dài mọi member đều đã "thấy" gần như toàn bộ buffer, chỉ khác
+        # nhau ở minibatch cụ thể tại mỗi bước — không còn sự khác biệt HỆ
+        # THỐNG giữa các member -> chúng hội tụ về gần cùng một hàm và
+        # sigma (Eq. 10) suy biến về 0, đúng lỗi của bản v1.
+        #
+        # Sửa: mỗi member có một permutation CỐ ĐỊNH (tính một lần ở đây,
+        # seed riêng theo member) đánh dấu ~bootstrap_ratio phần trăm VỊ TRÍ
+        # (rank trong buffer, không phải sample cụ thể — buffer là deque
+        # maxlen nên sample dịch chuyển qua vị trí theo thời gian, nhưng
+        # tập RANK mà một member luôn quan sát thì cố định) mà member đó
+        # được phép thấy. Member k luôn loại trừ đúng phần buffer đó, mọi
+        # lúc mọi nơi -> khác biệt hệ thống được duy trì, không phai theo
+        # thời gian.
+        # ---------------------------------------------------------------
+        self._member_pool_mask: List[np.ndarray] = []
+        keep_n = max(1, int(self.buffer_size * self.bootstrap_ratio))
+
+        for k in range(self.n_ensemble):
+            rng_k = np.random.RandomState(int(seed) * 7919 + k)
+            perm = rng_k.permutation(self.buffer_size)
+            mask = np.zeros(self.buffer_size, dtype=bool)
+            mask[perm[:keep_n]] = True
+            self._member_pool_mask.append(mask)
 
         self.buffer = deque(maxlen=self.buffer_size)
 
@@ -342,6 +454,88 @@ class LocalCounterfactualProxyEnsemble:
         self.latest_ensemble_disagreement = 0.0
         self.latest_dr_correction_magnitude = 0.0
         self.n_interventional_samples = 0
+
+        # [BB3 — GPU_OPTIMIZATION_CONTRACT.md] loss RIÊNG từng member, để
+        # test T3 so được "thang gradient member 0" giữa E=1 và E=4 mà
+        # không cần lục lại đồ thị autograd. None cho tới lần train đầu.
+        self.latest_loss_per_member: Optional[np.ndarray] = None
+
+    # =====================================================================
+    # Thiết lập đường vmap cho ensemble
+    # =====================================================================
+
+    def _setup_vmap_ensemble(self):
+        """
+        Gộp trọng số của n_ensemble model thành MỘT cây tensor có thêm
+        chiều đầu E, rồi định nghĩa 2 hàm forward vmap:
+
+          _vmap_forward_shared:
+              params/buffers có chiều E, DỮ LIỆU DÙNG CHUNG cho mọi member
+              (in_dims data = None -> broadcast). Dùng khi ta muốn ensemble
+              cùng đánh giá trên một batch — inference (_predict_all_actions),
+              holdout eval.
+
+          _vmap_forward_per_member:
+              params/buffers có chiều E, DỮ LIỆU CŨNG có chiều E riêng
+              (mỗi member một batch, cho bootstrap diversity thật). Dùng
+              khi train.
+
+        `self._base_model` chỉ đóng vai trò KIẾN TRÚC MẪU cho functional_call
+        — trọng số thật nằm hết trong self._stacked_params (yêu cầu grad).
+        self.models[k].parameters() sau bước này không còn là nguồn sự thật
+        (không ai đọc lại chúng ở nơi khác trong codebase, đã kiểm tra).
+        """
+        self._base_model = self.models[0]
+
+        stacked_params, stacked_buffers = stack_module_state(self.models)
+
+        self._stacked_params: Dict[str, torch.Tensor] = {
+            k: v.detach().clone().requires_grad_(True)
+            for k, v in stacked_params.items()
+        }
+        self._stacked_buffers: Dict[str, torch.Tensor] = dict(stacked_buffers)
+
+        self.optim = torch.optim.Adam(
+            list(self._stacked_params.values()), lr=self.lr
+        )
+
+        def _fmodel(params, buffers, obs_i, a_i_oh, a_j_oh, z, m, belief):
+            return functional_call(
+                self._base_model,
+                (params, buffers),
+                args=(),
+                kwargs=dict(
+                    obs_i=obs_i,
+                    action_i_onehot=a_i_oh,
+                    action_j_onehot=a_j_oh,
+                    z_core_excl_j=z,
+                    m_periph_excl_j=m,
+                    belief_summary=belief,
+                ),
+            )
+
+        # randomness="different": nếu sau này ensemble_dropout > 0, mỗi
+        # member phải rút mask dropout ĐỘC LẬP (đúng ý nghĩa ensemble).
+        # Mặc định vmap sẽ raise lỗi nếu gặp toán tử ngẫu nhiên mà không
+        # khai báo rõ randomness -> khai báo sẵn ở đây để không sập khi có
+        # người bật ensemble_dropout > 0 sau này.
+        self._vmap_forward_shared = vmap(
+            _fmodel, in_dims=(0, 0, None, None, None, None, None, None),
+            randomness="different",
+        )
+        self._vmap_forward_per_member = vmap(
+            _fmodel, in_dims=(0, 0, 0, 0, 0, 0, 0, 0),
+            randomness="different",
+        )
+
+    def _ensemble_train_mode(self, training: bool):
+        """Bật/tắt training mode (ảnh hưởng Dropout) cho kiến trúc mẫu.
+        Dùng chung một flag cho mọi member vì kiến trúc giống hệt nhau."""
+        if self.use_vmap_ensemble:
+            self._base_model.train(training)
+        else:
+            for m in self.models:
+                m.train(training)
 
     # =====================================================================
     # Helper tensor
@@ -410,7 +604,6 @@ class LocalCounterfactualProxyEnsemble:
         m_periph_excl_j,
         belief_summary,
         target_return_h,
-        # ---- mới ở v2, đều có default nên runner cũ vẫn chạy ----
         target_returns_multi=None,
         behaviour_prob_j=None,
         was_forced=False,
@@ -419,20 +612,19 @@ class LocalCounterfactualProxyEnsemble:
         """
         Thêm một mẫu supervised.
 
-        Args mới:
+        Args:
             target_returns_multi:
                 list/array length n_horizons = [R^(1), R^(2), ..., R^(H)].
-                Nếu None, sẽ broadcast target_return_h ra mọi horizon
-                (kém chính xác, chỉ để tương thích ngược — nên truyền vào).
+                Nếu None, broadcast target_return_h ra mọi horizon (kém
+                chính xác, chỉ để tương thích ngược — nên truyền vào).
             behaviour_prob_j:
                 b_j(a_j_obs | s) tại thời điểm thu thập — CẦN cho DR.
                 Nếu None, DR sẽ tự tắt cho mẫu này (fallback plug-in).
             was_forced:
-                True nếu hành động của j bị eps-forcing ép. Mẫu này là
-                CAN THIỆP THẬT, đáng giá hơn nhiều -> được oversample khi train.
+                True nếu hành động của j bị eps-forcing ép -> can thiệp
+                THẬT, đáng giá hơn -> được oversample khi train.
             state_key:
-                định danh ngữ cảnh (ví dụ zone id, hoặc hash vị trí thô).
-                Dùng để tính chiều "context-conditionality" của signature.
+                định danh ngữ cảnh (zone id / hash vị trí thô).
         """
         if target_returns_multi is None:
             multi = np.full(
@@ -473,6 +665,20 @@ class LocalCounterfactualProxyEnsemble:
 
         if bool(was_forced):
             self.n_interventional_samples += 1
+
+    def add_sample_batch(self, samples: List[dict]):
+        """
+        Thêm nhiều mẫu cùng lúc — giảm overhead gọi hàm khi runner đẩy cả
+        một trajectory (O(n_agents^2) mẫu mỗi timestep). Mỗi phần tử phải
+        có đúng các key mà add_sample nhận (dùng **s cho gọn ở call site).
+
+        Đây KHÔNG phải "đổi buffer sang tensor" — buffer vẫn là deque[dict]
+        vì drift_probe.py phụ thuộc trực tiếp vào định dạng đó. Cái được
+        loại bỏ ở đây là chi phí gọi hàm Python `add_sample(...)` riêng lẻ
+        n_agents^2 lần mỗi bước — thay bằng một vòng lặp append() rẻ.
+        """
+        for s in samples:
+            self.add_sample(**s)
 
     def get_buffer_size(self) -> int:
         return int(len(self.buffer))
@@ -522,49 +728,53 @@ class LocalCounterfactualProxyEnsemble:
             torch.tensor(target_multi, dtype=torch.float32, device=self.device),
         )
 
-    def _sample_for_member(self, member_idx: int, n: int, forced_boost: float = 3.0):
+    def _sample_for_member(self, buf_list: list, member_idx: int, n: int,
+                            forced_boost: float = 3.0):
         """
-        [L3] Sample RIÊNG cho từng ensemble member.
+        [L3] Sample RIÊNG cho từng ensemble member — KHÔNG quét toàn bộ
+        buffer bằng vòng lặp Python (bản cũ hash từng phần tử, O(buffer_size)
+        mỗi member mỗi train_step, tức O(n_ensemble * buffer_size) mỗi
+        train_step — với buffer 200k và 4 member là 800k lượt tính Python
+        thuần, KHÔNG liên quan gì tới GPU nhưng chiếm phần lớn wall-clock).
 
-        Hai cơ chế:
-          - bootstrap: mỗi member chỉ được thấy `bootstrap_ratio` phần buffer
-            (chọn theo hash ổn định của index để mask nhất quán qua các lần gọi)
-          - oversample mẫu can thiệp: mẫu was_forced=True là can thiệp THẬT
-            (đã cắt confounding) nên đáng giá hơn -> tăng xác suất được chọn.
+        [BB1] Pool con của mỗi member được rút từ `self._member_pool_mask
+        [member_idx]` — một permutation CỐ ĐỊNH tính một lần ở __init__,
+        KHÔNG rút lại ngẫu nhiên ở đây. Nếu rút ngẫu nhiên mỗi lần gọi, về
+        lâu dài mọi member "thấy" gần hết buffer và không còn khác biệt hệ
+        thống -> ensemble hội tụ về nhau, sigma (Eq. 10) suy biến về 0 —
+        đúng lỗi của bản v1 mà toàn bộ nhánh uncertainty-aware của paper
+        (LCB, selectivity, targeted-eps, bơm phồng) phụ thuộc vào việc
+        tránh được. Mask cố định giữ chi phí O(pool_size) (numpy, không
+        phải Python loop) NHƯNG vẫn đảm bảo member k luôn loại trừ đúng
+        một tập rank cố định của buffer, mọi lúc.
+
+        `buf_list` được truyền vào từ ngoài (list(self.buffer) một lần duy
+        nhất mỗi train_step, dùng chung cho mọi member) vì `deque` không
+        hỗ trợ random-access O(1).
         """
-        if len(self.buffer) == 0:
+        if len(buf_list) == 0:
             return []
 
         rng = self._member_rngs[member_idx]
-        buf = list(self.buffer)
 
-        # Bootstrap mask ổn định theo member: dùng hash của (member, vị trí).
-        keep_prob = self.bootstrap_ratio
-        weights = []
-        pool = []
+        mask = self._member_pool_mask[member_idx][: len(buf_list)]
+        pool_positions = np.nonzero(mask)[0]
 
-        for idx, s in enumerate(buf):
-            # Hash ổn định -> cùng một member luôn thấy cùng một tập con.
-            h = ((idx * 2654435761) ^ (member_idx * 40503)) & 0xFFFFFFFF
-            if (h / 0xFFFFFFFF) > keep_prob:
-                continue
+        if pool_positions.size == 0:
+            # Chỉ xảy ra khi buffer còn rất nhỏ (đầu training) và permutation
+            # tình cờ không rơi vào prefix ngắn đó -> fallback dùng cả
+            # buf_list hiện có, KHÔNG bao giờ trả rỗng.
+            pool_positions = np.arange(len(buf_list))
 
-            pool.append(s)
-            weights.append(forced_boost if s["was_forced"] else 1.0)
+        pool = [buf_list[int(i)] for i in pool_positions]
+        weights = [forced_boost if s["was_forced"] else 1.0 for s in pool]
 
-        if len(pool) == 0:
-            pool = buf
-            weights = [
-                forced_boost if s["was_forced"] else 1.0 for s in buf
-            ]
-
-        n = int(min(n, len(pool)))
-
-        if n <= 0:
-            return []
-
-        # random.choices lấy có hoàn lại, có trọng số -> đúng ý oversample.
-        return rng.choices(pool, weights=weights, k=n)
+        # random.choices lấy có hoàn lại, có trọng số -> luôn trả đúng n
+        # mẫu (kể cả khi pool nhỏ hơn n, ví dụ đầu training) -> mọi member
+        # luôn có cùng batch size -> stack được thành tensor [E, B, ...].
+        # Trọng số oversample cho was_forced=True (BB2) được giữ nguyên ở
+        # đây — đừng thay bằng random.sample/slicing thuần, sẽ mất oversample.
+        return rng.choices(pool, weights=weights, k=int(n))
 
     def train_step(
         self,
@@ -575,7 +785,10 @@ class LocalCounterfactualProxyEnsemble:
         """
         Train ensemble. Giữ nguyên chữ ký v1.
 
-        Khác v1 ở chỗ: mỗi member sample batch RIÊNG (xem _sample_for_member).
+        Khác trước ở chỗ: cả n_ensemble member forward/backward/update
+        trong MỘT lệnh vmap thay vì vòng lặp Python `for model in models`,
+        và mọi số liệu chẩn đoán được tích trên GPU rồi CHỈ đồng bộ về CPU
+        MỘT LẦN ở cuối hàm (thay vì mỗi bước mỗi member một lần `.item()`).
         """
         self.last_train_called = True
         self.last_train_batch_count = 0
@@ -595,25 +808,158 @@ class LocalCounterfactualProxyEnsemble:
             self.latest_loss = 0.0
             return 0.0
 
+        if not self.use_vmap_ensemble:
+            return self._train_step_fallback(n_steps, batch_size, holdout_size)
+
+        self._ensemble_train_mode(True)
+
+        E = self.n_ensemble
+        per_step_losses = []       # list of [E] tensors, sync một lần ở cuối
+        per_step_residuals = []    # list of [E] tensors
+
+        for _ in range(n_steps):
+            buf_list = list(self.buffer)  # một lần copy deque->list mỗi step
+
+            member_batches = [
+                self._sample_for_member(buf_list, k, batch_size)
+                for k in range(E)
+            ]
+
+            if any(len(b) == 0 for b in member_batches):
+                continue
+
+            obs_l, ai_l, aj_l, z_l, m_l, bl_l, tgt_l = [], [], [], [], [], [], []
+
+            for b in member_batches:
+                (obs_t, a_i_oh, a_j_oh, z_t, m_t, belief_t, target_multi_t) = (
+                    self._batch_to_tensors(b)
+                )
+                obs_l.append(obs_t)
+                ai_l.append(a_i_oh)
+                aj_l.append(a_j_oh)
+                z_l.append(z_t)
+                m_l.append(m_t)
+                bl_l.append(belief_t)
+                tgt_l.append(target_multi_t)
+
+            obs_e = torch.stack(obs_l, dim=0)    # [E, B, obs_dim]
+            ai_e = torch.stack(ai_l, dim=0)      # [E, B, A]
+            aj_e = torch.stack(aj_l, dim=0)      # [E, B, A]
+            z_e = torch.stack(z_l, dim=0)        # [E, B, core_dim]
+            m_e = torch.stack(m_l, dim=0)        # [E, B, periph_dim]
+            bel_e = torch.stack(bl_l, dim=0)     # [E, B, belief_dim]
+            tgt_e = torch.stack(tgt_l, dim=0)    # [E, B, H]
+
+            # MỘT lệnh vmap = n_ensemble forward pass chạy song song trên GPU.
+            preds = self._vmap_forward_per_member(
+                self._stacked_params, self._stacked_buffers,
+                obs_e, ai_e, aj_e, z_e, m_e, bel_e,
+            )  # [E, B, H]
+
+            per_member_loss = F.mse_loss(preds, tgt_e, reduction="none").mean(
+                dim=(1, 2)
+            )  # [E] — mỗi member có loss riêng, không trộn lẫn
+
+            loss = per_member_loss.sum()  # backward của tổng các thành phần
+            # ĐỘC LẬP <=> mỗi thành phần chỉ lan gradient về đúng member đó
+            # (vmap đảm bảo không có phép toán nào trộn chiều E).
+
+            self.optim.zero_grad(set_to_none=True)
+            loss.backward()
+            _clip_grad_norm_per_member(self._stacked_params, self.grad_clip)
+            self.optim.step()
+
+            per_step_losses.append(per_member_loss.detach())
+
+            with torch.no_grad():
+                res = torch.mean(
+                    torch.abs(preds[:, :, -1] - tgt_e[:, :, -1]), dim=1
+                )  # [E] — residual đo trên horizon cuối (khớp R^(H) của v1)
+            per_step_residuals.append(res)
+
+            self.last_train_batch_count += 1
+
+        # ---- holdout residual: batch chung, KHÔNG dùng để update ----------
+        # [H7] Residual phải đo trên dữ liệu không tham gia gradient, nếu
+        # không nó phản ánh chính sự thay đổi của mình chứ không phải
+        # structural shift.
+        holdout_residual_t = None
+
+        if holdout_size > 0 and len(self.buffer) > holdout_size:
+            ho_batch = random.sample(list(self.buffer), int(holdout_size))
+
+            (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target) = (
+                self._batch_to_tensors(ho_batch)
+            )
+
+            self._ensemble_train_mode(False)
+
+            with torch.no_grad():
+                stacked = self._vmap_forward_shared(
+                    self._stacked_params, self._stacked_buffers,
+                    ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b,
+                )  # [E, B, H] — MỘT lệnh vmap, dữ liệu dùng chung mọi member
+
+                pred_mean = stacked.mean(dim=0)  # [B, H]
+
+                holdout_residual_t = torch.mean(
+                    torch.abs(pred_mean[:, -1] - ho_target[:, -1])
+                )
+
+                # [L3] Chẩn đoán: ensemble có thật sự bất đồng không?
+                # Nếu số này ~ 0 thì ensemble đang giả, sigma vô nghĩa.
+                if stacked.shape[0] > 1:
+                    self.latest_ensemble_disagreement = float(
+                        torch.mean(torch.std(stacked, dim=0)).item()
+                    )  # 1 sync duy nhất cho cả holdout eval
+
+        if len(per_step_losses) == 0:
+            self.latest_loss = 0.0
+            self.latest_residual = 0.0
+            return 0.0
+
+        # ---- MỘT sync CPU<->GPU cho toàn bộ train_step() call --------------
+        # (bản cũ: n_steps * n_ensemble lần .item() cho loss + như vậy nữa
+        # cho residual; ở đây: 1 lần cho loss, 1 lần cho residual, bất kể
+        # n_steps/n_ensemble lớn cỡ nào.)
+        losses_stacked = torch.stack(per_step_losses)  # [n_steps_thật, E]
+        self.latest_loss = float(losses_stacked.mean().item())
+        # [BB3] Loss RIÊNG từng member (mean qua các step) — để test T3 xác
+        # nhận thang gradient của member 0 không đổi khi thêm member khác.
+        self.latest_loss_per_member = (
+            losses_stacked.mean(dim=0).detach().cpu().numpy()
+        )
+        self.latest_train_residual = float(
+            torch.stack(per_step_residuals).mean().item()
+        )
+
+        if holdout_residual_t is not None:
+            self.latest_holdout_residual = float(holdout_residual_t.item())
+            self.latest_residual = self.latest_holdout_residual
+        else:
+            self.latest_holdout_residual = self.latest_train_residual
+            self.latest_residual = self.latest_train_residual
+
+        return float(self.latest_loss)
+
+    # ---- fallback nếu torch < 2.0 (không có torch.func) -------------------
+    def _train_step_fallback(self, n_steps, batch_size, holdout_size):
+        """Đường vòng lặp Python cũ — chỉ dùng khi môi trường không có
+        torch.func (torch < 2.0). Đúng về mặt số học, không tối ưu GPU."""
         all_losses = []
         train_residuals = []
 
         for _ in range(n_steps):
+            buf_list = list(self.buffer)
             for k, (model, optim) in enumerate(zip(self.models, self.optims)):
-                batch = self._sample_for_member(k, batch_size)
+                batch = self._sample_for_member(buf_list, k, batch_size)
 
                 if len(batch) == 0:
                     continue
 
-                (
-                    obs_t,
-                    a_i_oh,
-                    a_j_oh,
-                    z_t,
-                    m_t,
-                    belief_t,
-                    target_multi_t,   # [B, n_horizons]
-                ) = self._batch_to_tensors(batch)
+                (obs_t, a_i_oh, a_j_oh, z_t, m_t, belief_t, target_multi_t) = (
+                    self._batch_to_tensors(batch)
+                )
 
                 model.train()
 
@@ -624,7 +970,7 @@ class LocalCounterfactualProxyEnsemble:
                     z_core_excl_j=z_t,
                     m_periph_excl_j=m_t,
                     belief_summary=belief_t,
-                )  # [B, n_horizons]
+                )
 
                 loss = F.mse_loss(pred, target_multi_t)
 
@@ -633,34 +979,21 @@ class LocalCounterfactualProxyEnsemble:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), self.grad_clip)
                 optim.step()
 
-                all_losses.append(float(loss.detach().cpu().item()))
+                all_losses.append(loss.detach())
 
-                # Residual đo trên horizon cuối (khớp R^(H) của v1).
                 with torch.no_grad():
-                    res = torch.mean(
-                        torch.abs(pred[:, -1] - target_multi_t[:, -1])
-                    )
-                    train_residuals.append(float(res.cpu().item()))
+                    res = torch.mean(torch.abs(pred[:, -1] - target_multi_t[:, -1]))
+                train_residuals.append(res)
 
             self.last_train_batch_count += 1
 
-        # ---- holdout residual: batch chung, KHÔNG dùng để update ----------
-        # [H7] Residual phải đo trên dữ liệu không tham gia gradient, nếu không
-        # nó phản ánh chính sự thay đổi của mình chứ không phải structural shift.
         holdout_residual = None
 
         if holdout_size > 0 and len(self.buffer) > holdout_size:
             ho_batch = random.sample(list(self.buffer), int(holdout_size))
-
-            (
-                ho_obs,
-                ho_ai,
-                ho_aj,
-                ho_z,
-                ho_m,
-                ho_b,
-                ho_target,
-            ) = self._batch_to_tensors(ho_batch)
+            (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target) = (
+                self._batch_to_tensors(ho_batch)
+            )
 
             with torch.no_grad():
                 preds = []
@@ -668,29 +1001,24 @@ class LocalCounterfactualProxyEnsemble:
                     model.eval()
                     preds.append(
                         model(
-                            obs_i=ho_obs,
-                            action_i_onehot=ho_ai,
-                            action_j_onehot=ho_aj,
-                            z_core_excl_j=ho_z,
-                            m_periph_excl_j=ho_m,
-                            belief_summary=ho_b,
+                            obs_i=ho_obs, action_i_onehot=ho_ai,
+                            action_j_onehot=ho_aj, z_core_excl_j=ho_z,
+                            m_periph_excl_j=ho_m, belief_summary=ho_b,
                         )
                     )
 
-                stacked = torch.stack(preds, dim=0)          # [E, B, n_horizons]
-                pred_mean = stacked.mean(dim=0)              # [B, n_horizons]
+                stacked = torch.stack(preds, dim=0)
+                pred_mean = stacked.mean(dim=0)
 
                 holdout_residual = float(
                     torch.mean(
                         torch.abs(pred_mean[:, -1] - ho_target[:, -1])
-                    ).cpu().item()
+                    ).item()
                 )
 
-                # [L3] Chẩn đoán: ensemble có thật sự bất đồng không?
-                # Nếu số này ~ 0 thì ensemble đang giả, sigma vô nghĩa.
                 if stacked.shape[0] > 1:
                     self.latest_ensemble_disagreement = float(
-                        torch.mean(torch.std(stacked, dim=0)).cpu().item()
+                        torch.mean(torch.std(stacked, dim=0)).item()
                     )
 
         if len(all_losses) == 0:
@@ -698,9 +1026,10 @@ class LocalCounterfactualProxyEnsemble:
             self.latest_residual = 0.0
             return 0.0
 
-        self.latest_loss = float(np.mean(all_losses))
+        self.latest_loss = float(torch.stack(all_losses).mean().item())
         self.latest_train_residual = (
-            float(np.mean(train_residuals)) if train_residuals else 0.0
+            float(torch.stack(train_residuals).mean().item())
+            if train_residuals else 0.0
         )
 
         if holdout_residual is not None:
@@ -725,18 +1054,17 @@ class LocalCounterfactualProxyEnsemble:
         belief,    # [B, belief_dim]
     ) -> torch.Tensor:
         """
-        Dự đoán return cho MỌI hành động khả dĩ của j, với mọi ensemble member.
+        Dự đoán return cho MỌI hành động khả dĩ của j, với mọi ensemble
+        member, trong ĐÚNG MỘT forward pass GPU.
 
-        Đây là tối ưu quan trọng: v1 gọi _predict_ensemble một lần cho mỗi
-        alternative action (tức action_dim lần forward). v2 gộp thành một
-        batch lớn -> chỉ 1 forward pass mỗi member.
+        Hai tầng gộp batch:
+          1. (đã có từ trước) Gộp mọi hành động thay thế của j vào một
+             batch lớn thay vì gọi forward action_dim lần.
+          2. (mới) Gộp luôn cả chiều ensemble bằng vmap thay vì lặp qua
+             từng model.
 
         Returns:
             [E, B, A, n_horizons]
-              E = số ensemble member
-              B = batch
-              A = action_dim
-              n_horizons = số horizon
         """
         obs_t = self._to_float_tensor(obs, self.obs_dim)        # [B, obs_dim]
         z_t = self._to_float_tensor(z, self.core_dim)           # [B, core_dim]
@@ -749,36 +1077,103 @@ class LocalCounterfactualProxyEnsemble:
         a_i_oh = self._one_hot(np.asarray(action_i).reshape(-1))  # [B, A]
 
         # Nhân bản mỗi sample A lần, mỗi bản gán một hành động khác của j.
-        # repeat_interleave: [B, D] -> [B*A, D] theo thứ tự
-        #   sample0-act0, sample0-act1, ..., sample0-act(A-1), sample1-act0, ...
         obs_rep = obs_t.repeat_interleave(A, dim=0)        # [B*A, obs_dim]
         z_rep = z_t.repeat_interleave(A, dim=0)            # [B*A, core_dim]
         m_rep = m_t.repeat_interleave(A, dim=0)            # [B*A, periph_dim]
         belief_rep = belief_t.repeat_interleave(A, dim=0)  # [B*A, belief_dim]
         a_i_rep = a_i_oh.repeat_interleave(A, dim=0)       # [B*A, A]
 
-        # a_j one-hot: lặp identity B lần -> [B*A, A]
         eye = torch.eye(A, dtype=torch.float32, device=self.device)  # [A, A]
         a_j_rep = eye.repeat(B, 1)                                    # [B*A, A]
 
-        outs = []
+        self._ensemble_train_mode(False)
 
         with torch.no_grad():
-            for model in self.models:
-                model.eval()
+            if self.use_vmap_ensemble:
+                preds = self._vmap_forward_shared(
+                    self._stacked_params, self._stacked_buffers,
+                    obs_rep, a_i_rep, a_j_rep, z_rep, m_rep, belief_rep,
+                )  # [E, B*A, n_horizons] — MỘT lệnh cho cả ensemble
+                out = preds.view(self.n_ensemble, B, A, self.n_horizons)
+            else:
+                out = self._predict_all_actions_loop(
+                    obs_rep, a_i_rep, a_j_rep, z_rep, m_rep, belief_rep, B, A,
+                )
 
-                pred = model(
-                    obs_i=obs_rep,
-                    action_i_onehot=a_i_rep,
-                    action_j_onehot=a_j_rep,
-                    z_core_excl_j=z_rep,
-                    m_periph_excl_j=m_rep,
-                    belief_summary=belief_rep,
-                )  # [B*A, n_horizons]
+        return out  # [E, B, A, n_horizons]
 
-                outs.append(pred.view(B, A, self.n_horizons))  # [B, A, n_horizons]
+    def _predict_all_actions_loop(
+        self, obs_rep, a_i_rep, a_j_rep, z_rep, m_rep, belief_rep, B, A,
+    ) -> torch.Tensor:
+        """Vòng lặp Python qua từng model — dùng làm fallback (torch<2.0)
+        VÀ làm bản tham chiếu cho test T1 (xem _predict_all_actions_reference).
+        Không dùng trong đường nóng khi use_vmap_ensemble=True."""
+        outs = []
+        for model in self.models:
+            model.eval()
+            pred = model(
+                obs_i=obs_rep, action_i_onehot=a_i_rep,
+                action_j_onehot=a_j_rep, z_core_excl_j=z_rep,
+                m_periph_excl_j=m_rep, belief_summary=belief_rep,
+            )
+            outs.append(pred.view(B, A, self.n_horizons))
+        return torch.stack(outs, dim=0)
 
-        return torch.stack(outs, dim=0)  # [E, B, A, n_horizons]
+    def _sync_stacked_to_models(self):
+        """Copy trọng số từ self._stacked_params (nguồn sự thật khi
+        use_vmap_ensemble=True) ngược lại vào self.models[k]. CHỈ dùng cho
+        test/debug (_predict_all_actions_reference) — không nằm trong
+        đường train/inference thật, chấp nhận vòng lặp Python ở đây."""
+        if not self.use_vmap_ensemble:
+            return
+        with torch.no_grad():
+            for k, model in enumerate(self.models):
+                sd = model.state_dict()
+                for name, p in self._stacked_params.items():
+                    if name in sd:
+                        sd[name].copy_(p[k])
+
+    def _predict_all_actions_reference(
+        self, obs, action_i, z, m, belief,
+    ) -> torch.Tensor:
+        """
+        [GPU_OPTIMIZATION_CONTRACT.md — quy tắc vàng ở Phần 3] Bản THAM
+        CHIẾU chậm (vòng lặp Python qua từng model, không vmap), đồng bộ
+        đúng trọng số hiện tại từ self._stacked_params. Dùng trong smoke
+        test để assert allclose với _predict_all_actions (đường vmap
+        nhanh) — đây là cách duy nhất bắt được lỗi kiểu BB4 (thứ tự
+        repeat_interleave/repeat/view bị đảo): cả hai đường đều cho số
+        thực "trông hợp lý", sai lệch chỉ lộ ra khi so hai bản với nhau.
+
+        KHÔNG dùng hàm này trong production — nó tồn tại chỉ để test.
+        """
+        self._sync_stacked_to_models()
+
+        obs_t = self._to_float_tensor(obs, self.obs_dim)
+        z_t = self._to_float_tensor(z, self.core_dim)
+        m_t = self._to_float_tensor(m, self.periph_dim)
+        belief_t = self._to_float_tensor(belief, self.belief_dim)
+
+        B = int(obs_t.shape[0])
+        A = int(self.action_dim)
+
+        a_i_oh = self._one_hot(np.asarray(action_i).reshape(-1))
+
+        obs_rep = obs_t.repeat_interleave(A, dim=0)
+        z_rep = z_t.repeat_interleave(A, dim=0)
+        m_rep = m_t.repeat_interleave(A, dim=0)
+        belief_rep = belief_t.repeat_interleave(A, dim=0)
+        a_i_rep = a_i_oh.repeat_interleave(A, dim=0)
+
+        eye = torch.eye(A, dtype=torch.float32, device=self.device)
+        a_j_rep = eye.repeat(B, 1)
+
+        with torch.no_grad():
+            out = self._predict_all_actions_loop(
+                obs_rep, a_i_rep, a_j_rep, z_rep, m_rep, belief_rep, B, A,
+            )
+
+        return out  # [E, B, A, n_horizons]
 
     # =====================================================================
     # Tính effect
@@ -794,7 +1189,8 @@ class LocalCounterfactualProxyEnsemble:
         mode: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Tính effect theo mode, có/không DR.
+        Tính effect theo mode, có/không DR. Toàn bộ đã vector hoá bằng
+        einsum/gather từ trước — giữ nguyên, chỉ dọn lại comment.
 
         Returns dict:
             effect:        [E, B]              effect ở horizon cuối
@@ -811,8 +1207,6 @@ class LocalCounterfactualProxyEnsemble:
             device=self.device,
         ).clamp(0, A - 1)  # [B]
 
-        # f(s, a_obs) cho mọi member, mọi horizon
-        # gather cần index shape khớp -> mở rộng thành [E, B, 1, H]
         idx_exp = (
             idx_obs.view(1, B, 1, 1).expand(E, B, 1, H)
         )  # [E, B, 1, H]
@@ -824,9 +1218,7 @@ class LocalCounterfactualProxyEnsemble:
 
         # ---------------------------------------------------------------
         if mode == "signed_aristocrat":
-            # baseline = E_{a ~ pi_j}[ f(s,a) ]
             if policy_probs_j is None:
-                # Không có pi_j -> dùng uniform (kém chính xác nhưng vẫn chạy)
                 w = torch.full(
                     (B, A), 1.0 / float(A), dtype=torch.float32, device=self.device
                 )
@@ -837,13 +1229,10 @@ class LocalCounterfactualProxyEnsemble:
                     device=self.device,
                 )  # [B, A]
 
-            # baseline: [E, B, H] = sum_a w[b,a] * preds[e,b,a,h]
             baseline = torch.einsum("ebah,ba->ebh", preds_all, w)
-
             effect_per_h = f_obs - baseline  # [E, B, H]
 
         elif mode == "signed_oracle_matched":
-            # Khớp công thức oracle: mean_{a in candidates} f(s,a) - f(s,a_obs)
             cand = torch.tensor(
                 [a for a in self.candidate_actions if 0 <= a < A],
                 dtype=torch.long,
@@ -859,17 +1248,15 @@ class LocalCounterfactualProxyEnsemble:
             effect_per_h = cand_mean - f_obs           # [E, B, H]
 
         elif mode == "range":
-            # Pieroth impact sample: max_a f - min_a f  (luôn >= 0)
             max_f = preds_all.max(dim=2).values        # [E, B, H]
             min_f = preds_all.min(dim=2).values        # [E, B, H]
             effect_per_h = max_f - min_f               # [E, B, H]
 
         elif mode == "mean_abs":
-            # Bản v1: mean_{a != a_obs} |f(a) - f(a_obs)|
             diff = torch.abs(preds_all - f_obs.unsqueeze(2))  # [E, B, A, H]
 
             mask = torch.ones(B, A, dtype=torch.float32, device=self.device)
-            mask.scatter_(1, idx_obs.view(B, 1), 0.0)          # [B, A], 0 tại a_obs
+            mask.scatter_(1, idx_obs.view(B, 1), 0.0)          # [B, A]
 
             denom = torch.clamp(mask.sum(dim=1), min=1.0)      # [B]
 
@@ -881,9 +1268,7 @@ class LocalCounterfactualProxyEnsemble:
             raise ValueError(f"mode không hợp lệ: {mode}")
 
         # ---------------------------------------------------------------
-        # DOUBLY ROBUST CORRECTION
-        # Chỉ áp cho các mode CÓ DẤU. Với "range" thì DR không có nghĩa
-        # (range không phải một kỳ vọng tuyến tính nên không có dạng DR đóng).
+        # DOUBLY ROBUST CORRECTION — chỉ áp cho mode có dấu.
         # ---------------------------------------------------------------
         apply_dr = (
             self.use_doubly_robust
@@ -905,10 +1290,8 @@ class LocalCounterfactualProxyEnsemble:
                 device=self.device,
             ).clamp(min=1.0 / self.iw_clip, max=1.0)  # [B]
 
-            # residual đo ở horizon cuối (R_obs là R^(H))
             residual = R_obs.view(1, B) - f_obs[:, :, -1]  # [E, B]
 
-            # trọng số hiệu chỉnh: (1/b - 1), clip để không nổ phương sai
             iw_minus_one = torch.clamp(
                 1.0 / b_obs - 1.0, min=0.0, max=self.iw_clip
             )  # [B]
@@ -916,11 +1299,8 @@ class LocalCounterfactualProxyEnsemble:
             correction = residual * iw_minus_one.view(1, B)  # [E, B]
 
             if mode == "signed_oracle_matched":
-                # ở mode này effect = baseline_cand - f_obs, tức f_obs mang dấu âm
                 correction = -correction
 
-            # Chỉ cộng vào horizon cuối (horizon khác không có observed target
-            # tương ứng ở đây -> giữ nguyên plug-in cho chúng).
             effect_per_h = effect_per_h.clone()
             effect_per_h[:, :, -1] = effect_per_h[:, :, -1] + correction
 
@@ -944,7 +1324,6 @@ class LocalCounterfactualProxyEnsemble:
         z_core_excl_j_batch,
         m_periph_excl_j_batch,
         belief_summary_batch,
-        # ---- optional, mới ở v2 ----
         policy_probs_j_batch=None,
         observed_returns_batch=None,
         behaviour_probs_obs_batch=None,
@@ -1013,12 +1392,11 @@ class LocalCounterfactualProxyEnsemble:
         a_i = np.asarray(action_i_batch, dtype=np.int64).reshape(-1)
         a_j = np.asarray(observed_action_j_batch, dtype=np.int64).reshape(-1)
 
-        # MỘT forward pass duy nhất cho mọi hành động thay thế.
+        # MỘT forward pass duy nhất (cả action thay thế lẫn cả ensemble).
         preds_all = self._predict_all_actions(
             obs=obs, action_i=a_i, z=z_arr, m=m_arr, belief=belief
         )  # [E, B, A, H]
 
-        # ---- effect theo mode chính ------------------------------------
         res = self._compute_effects(
             preds_all=preds_all,
             action_j_obs=a_j,
@@ -1043,8 +1421,6 @@ class LocalCounterfactualProxyEnsemble:
         mu_per_h = torch.mean(effect_per_h, dim=0)  # [B, H]
 
         # ---- LATENCY: trọng tâm horizon của |effect| --------------------
-        # latency = sum_h h * |e_h| / sum_h |e_h|
-        # Blocker (tức thì) -> gần 0. Relay (trễ) -> gần H-1.
         abs_h = torch.abs(mu_per_h)                              # [B, H]
         h_idx = torch.arange(
             self.n_horizons, dtype=torch.float32, device=self.device
@@ -1062,9 +1438,13 @@ class LocalCounterfactualProxyEnsemble:
         mu_range = torch.mean(res_range["effect"], dim=0)        # [B]
 
         self.latest_dr_correction_magnitude = float(
-            torch.mean(res["dr_correction"]).cpu().item()
+            torch.mean(res["dr_correction"]).item()
         )
 
+        # ---- MỘT lần .cpu().numpy() cho mỗi tensor output, ở biên API ----
+        # (đây là nơi bắt buộc phải rời GPU: influence_signature.py và
+        # belief_layer.py phía dưới vẫn nhận numpy, chưa được vector hoá
+        # trong đợt này — xem giải thích cuối README_INTEGRATION.md).
         to_np = lambda t: t.detach().cpu().numpy().astype(np.float32)
 
         return {
@@ -1117,10 +1497,9 @@ class LocalCounterfactualProxyEnsemble:
         dr_correction_magnitude:
             Đo mức độ reward model bị lệch. Lớn -> model sai nhiều,
             DR đang gánh. Nhỏ -> model tốt.
-            Vẽ theo thời gian là một hình đẹp cho paper.
 
         interventional_fraction:
-            Tỷ lệ mẫu đến từ eps-forcing (can thiệp thật). Reviewer sẽ hỏi.
+            Tỷ lệ mẫu đến từ eps-forcing (can thiệp thật).
         """
         n = max(1, len(self.buffer))
 
@@ -1137,8 +1516,5 @@ class LocalCounterfactualProxyEnsemble:
             "use_doubly_robust": bool(self.use_doubly_robust),
             "n_ensemble": int(self.n_ensemble),
             "n_horizons": int(self.n_horizons),
+            "use_vmap_ensemble": bool(self.use_vmap_ensemble),
         }
-
-
-# Alias để runner cũ import không gãy.
-LocalCounterfactualProxyEnsemble = LocalCounterfactualProxyEnsemble

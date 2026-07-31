@@ -517,10 +517,13 @@ class FinalCIGAMFRunner:
             probs = torch.softmax(logits, dim=-1)
             dist = torch.distributions.Categorical(probs=probs)
             sampled = dist.sample().detach().cpu().numpy()
+            # Một sync CPU<->GPU cho toàn bộ values thay vì gọi .item()
+            # từng agent một (bản cũ: n_agents lần đồng bộ mỗi bước).
+            values_np = values.detach().cpu().numpy()
 
         for ego in range(self.n_agents):
             actions[ego] = int(sampled[ego])
-            cache["value_cache"][ego] = float(values[ego].item())
+            cache["value_cache"][ego] = float(values_np[ego])
 
         return actions, cache
 
