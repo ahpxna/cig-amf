@@ -875,6 +875,10 @@ class FinalCIGAMFRunner:
         total_promoted = 0
         total_demoted = 0
 
+        # Ma trận ảnh hưởng có dấu [n_agents, n_agents], W[ego, j] = mu_ij.
+        # Dùng cho MatrixDriftDetector (cò súng thứ hai, độc lập với probe).
+        influence_matrix = np.zeros((self.n_agents, self.n_agents), dtype=np.float64)
+
         for ego in range(self.n_agents):
             obs_i = self.env.get_obs_of_ego(obs_all, ego)
             action_i = int(actions[ego])
@@ -916,6 +920,9 @@ class FinalCIGAMFRunner:
                 for k, j in enumerate(neighbor_ids)
             }
 
+            for k, j in enumerate(neighbor_ids):
+                influence_matrix[ego, j] = float(mu_arr[k])
+
             update_result = self.belief_modules[ego].update_batch(mu_sigma)
 
             if update_result is None:
@@ -929,7 +936,7 @@ class FinalCIGAMFRunner:
             total_promoted += len(promoted)
             total_demoted += len(demoted)
 
-        return int(total_promoted), int(total_demoted)
+        return int(total_promoted), int(total_demoted), influence_matrix
 
     def update_graph_modules(self, trajectory):
         """
@@ -964,21 +971,47 @@ class FinalCIGAMFRunner:
 
         promoted = 0
         demoted = 0
+        last_influence_matrix = None
 
         for idx in step_indices:
             step = trajectory[int(idx)]
             self.env.restore_state(step["env_snapshot_before_step"])
-            p_i, d_i = self._score_all_pairs_and_update_beliefs(
+            p_i, d_i, w_i = self._score_all_pairs_and_update_beliefs(
                 obs_all=step["obs_all"],
                 actions=step["actions"],
             )
             promoted += int(p_i)
             demoted += int(d_i)
+            last_influence_matrix = w_i
 
         self.env.restore_state(trajectory[-1]["env_snapshot_after_step"])
 
         residual = self.proxy.get_latest_residual()
-        triggered = int(self.scheduler.record_structural_residual(residual))
+
+        # ---- Hai cò súng độc lập cho evaluate_drift() (thay cho
+        # record_structural_residual() dùng residual tự nhiễm bẩn ở v1) ----
+
+        # Cò súng 1: probe đóng băng, bịt mắt, đọc trực tiếp proxy.buffer.
+        drift_info = self.drift.step(
+            episode=int(self.scheduler.episode),
+            buffer=self.proxy.buffer,
+            n_train_batches=self.cfg.get("drift_train_batches", 5),
+        )
+        probe_z = float(drift_info.get("z", 0.0) or 0.0)
+
+        # Cò súng 2: nhảy vọt trong ma trận ảnh hưởng có dấu.
+        matrix_z = 0.0
+        if last_influence_matrix is not None:
+            self.matdet.update(last_influence_matrix)
+            matrix_z = float(self.matdet.z_score())
+
+        fire_info = self.scheduler.evaluate_drift(
+            probe_z=probe_z,
+            matrix_z=matrix_z,
+            belief_modules=self.belief_modules,
+            drift_detector=self.drift,
+        )
+        triggered = int(fire_info["fired"])
 
         return {
             "proxy_loss": float(proxy_loss),
@@ -989,6 +1022,8 @@ class FinalCIGAMFRunner:
                 getattr(self.proxy, "get_latest_holdout_residual", lambda: residual)()
             ),
             "triggered": int(triggered),
+            "probe_z": float(probe_z),
+            "matrix_z": float(matrix_z),
             "promoted": int(promoted),
             "demoted": int(demoted),
         }
@@ -1194,11 +1229,15 @@ class FinalCIGAMFRunner:
                     float(graph_info.get("proxy_holdout_residual", 0.0))
                 )
                 sched_status = self.scheduler.get_status()
+                # v2 scheduler không còn EWMA/CUSUM nội bộ (đã thay bằng
+                # evaluate_drift() với probe_z/matrix_z) nên hai khoá này
+                # không còn trong get_status(); giữ cột lịch sử bằng z-score
+                # mới nhất để không phá format lưu trữ hiện có.
                 self.history["scheduler_residual_ewma"].append(
-                    float(sched_status.get("residual_ewma", 0.0) or 0.0)
+                    float(graph_info.get("probe_z", 0.0) or 0.0)
                 )
                 self.history["scheduler_cusum_score"].append(
-                    float(sched_status.get("cusum_score", 0.0))
+                    float(graph_info.get("matrix_z", 0.0) or 0.0)
                 )
                 self.history["scheduler_accel_remaining"].append(
                     int(sched_status.get("accel_remaining", 0))

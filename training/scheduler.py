@@ -12,6 +12,8 @@ Khác bản v1 ở ba chỗ:
 
 from typing import Dict, List, Optional
 
+import numpy as np
+
 
 class TwoTimescaleScheduler:
     """
@@ -66,6 +68,12 @@ class TwoTimescaleScheduler:
         self.trigger_count = 0
         self.last_trigger_episode = None
         self.trigger_log: List[Dict] = []
+
+        # Lịch sử residual thô, chỉ dùng cho wrapper tương thích ngược
+        # `record_structural_residual()` (API v1). Tách riêng khỏi mọi
+        # thứ dùng cho `evaluate_drift()` để không lẫn hai cơ chế.
+        self._residual_history: List[float] = []
+        self._residual_window = 20
 
     # ------------------------------------------------------------------
     # API v1
@@ -213,6 +221,55 @@ class TwoTimescaleScheduler:
         self.trigger_log.append(dict(out))
 
         return out
+
+    # ------------------------------------------------------------------
+    # Tương thích ngược API v1
+    # ------------------------------------------------------------------
+
+    def _residual_z_score(self, residual: float) -> float:
+        """Quy residual thô về z-score dựa trên cửa sổ gần đây (tự quản,
+        tách biệt khỏi DriftDetector/MatrixDriftDetector)."""
+        self._residual_history.append(float(residual))
+
+        if len(self._residual_history) > 500:
+            del self._residual_history[:-500]
+
+        h = self._residual_history
+
+        if len(h) < 5:
+            return 0.0
+
+        recent = np.asarray(h[-self._residual_window:], dtype=np.float64)
+        base = recent[:-1]
+
+        if base.size < 3:
+            return 0.0
+
+        mu, sd = float(np.mean(base)), float(np.std(base))
+
+        if sd < 1e-9:
+            return 0.0
+
+        return float((h[-1] - mu) / sd)
+
+    def record_structural_residual(self, residual: float) -> bool:
+        """
+        Wrapper tương thích ngược cho runner cũ (`final_runner.py`,
+        `baseline_runner.py`) vốn gọi API v1 với MỘT residual thô thay vì
+        hai z-score độc lập của `evaluate_drift()`.
+
+        Tự tính z-score nội bộ từ residual rồi coi đó là cò súng "probe";
+        không có cò súng "matrix" (matrix_z=0.0). Nếu runner có sẵn
+        DriftDetector/MatrixDriftDetector thật, nên gọi thẳng
+        `evaluate_drift()` thay vì hàm này.
+
+        Returns:
+            True nếu trigger bắn (tương đương `triggered` ở API v1).
+        """
+        z = self._residual_z_score(residual)
+        out = self.evaluate_drift(probe_z=z, matrix_z=0.0)
+
+        return bool(out["fired"])
 
     # ------------------------------------------------------------------
 

@@ -28,7 +28,7 @@ try:
         NoTwoTimescaleRunner,
     )
 except ModuleNotFoundError:
-    from baseline_runner import (
+    from runners.baseline_runner import (
         PureMeanFieldRunner,
         FullExplicitLocalRunner,
         NoBeliefRunner,
@@ -39,7 +39,7 @@ except ModuleNotFoundError:
 try:
     from runners.final_runner import FinalCIGAMFRunner
 except ModuleNotFoundError:
-    from final_runner import FinalCIGAMFRunner
+    from runners.final_runner import FinalCIGAMFRunner
 
 
 # ============================================================
@@ -55,7 +55,7 @@ try:
         plot_histories,
     )
 except ModuleNotFoundError:
-    from utils.io import (
+    from utils.io_utils import (
         ensure_dir,
         save_csv,
         save_history_csv,
@@ -70,7 +70,7 @@ try:
         recovery_latency,
     )
 except ModuleNotFoundError:
-    from utils.metric_utils import (
+    from utils.metrics import (
         oracle_calibration,
         oracle_core_f1_from_scores,
         recovery_latency,

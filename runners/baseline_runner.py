@@ -4,17 +4,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.structural_proxy  import LocalCounterfactualProxyEnsemble
-from models.belief_layer      import BayesLightBeliefState
-from models.peripheral_memory import PeripheralMultiMemory
+from models.structural_proxy import LocalCounterfactualProxyEnsemble
+from models.belief_layer import BayesLightBeliefState
 from models.core_behavior import PairRelationalModule
+from models.peripheral_memory import PeripheralMultiMemory
 from models.belief_summary import BeliefSummaryBuilder
 from models.policy_value import PolicyValueNet
 from training.scheduler import TwoTimescaleScheduler
 from training.replay_builder import MultiEgoReplayBuilder
-from models.influence_signature  import InfluenceSignatureTracker
-from models.intervention         import EpsilonForcedActionController
-from models.ego_conditioned_latent import EgoConditionedHeads
+
 
 class PureMeanFieldRunner:
     """
@@ -1000,30 +998,11 @@ class SharedAblationBase:
             )
 
     def _core_context_excluding(self, ego, exclude_j):
-        """[GPU_OPTIMIZATION_CONTRACT.md 2.1] sum-minus-one, cache theo ego
-        + core_set hiện tại — xem final_runner.py cho giải thích đầy đủ."""
         core_set = self.belief_modules[ego].get_core_set()
-        cache_key = (ego, frozenset(core_set))
-
-        if getattr(self, "_core_excl_cache_key", None) != cache_key:
-            self._core_excl_cache_key = cache_key
-            self._core_excl_cache = (
-                self.pair_rel_module.get_core_summary_excluding_all(ego, core_set)
-            )
-
-        if exclude_j in self._core_excl_cache:
-            return self._core_excl_cache[exclude_j]
-
         reduced = [x for x in core_set if x != exclude_j]
         return self.pair_rel_module.get_core_summary(ego, reduced)
 
     def _periph_context_excluding(self, ego, exclude_j):
-        """[GPU_OPTIMIZATION_CONTRACT.md 2.1] sum-minus-one qua
-        forward_excluding_all(), cache theo ego + peripheral_set hiện tại,
-        đồng bộ CPU một lần cho cả batch — xem final_runner.py cho giải
-        thích đầy đủ. Nhánh use_multi_memory=False dùng cơ chế single-slot
-        khác hẳn (single_periph_proj), không phải weighted-mean pooling
-        nên KHÔNG áp dụng thủ thuật này — giữ nguyên đường cũ."""
         if not self.use_multi_memory:
             return self._single_periph_summary_np_for_ego(
                 ego,
@@ -1031,53 +1010,17 @@ class SharedAblationBase:
             )
 
         belief_mod = self.belief_modules[ego]
-        periph_ids = sorted(list(belief_mod.get_peripheral_set()))
-        cache_key = (ego, tuple(periph_ids))
-
-        if getattr(self, "_periph_excl_cache_key", None) != cache_key:
-            self._periph_excl_cache_key = cache_key
-            if len(periph_ids) == 0:
-                self._periph_excl_cache = {}
-            else:
-                belief_state = belief_mod.get_state_dict()
-                inputs = self.periph_module.build_inputs(
-                    ego_id=ego,
-                    peripheral_ids=periph_ids,
-                    env=self.env,
-                    belief_state=belief_state,
-                    prev_core_set=belief_mod.prev_core_set,
-                )
-                raw = self.periph_module.forward_excluding_all(inputs, periph_ids)
-                if raw:
-                    ids_order = list(raw.keys())
-                    stacked = (
-                        torch.stack([raw[j] for j in ids_order], dim=0)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .astype(np.float32)
-                    )
-                    self._periph_excl_cache = {
-                        j: stacked[i] for i, j in enumerate(ids_order)
-                    }
-                else:
-                    self._periph_excl_cache = {}
-
-        if exclude_j in self._periph_excl_cache:
-            return self._periph_excl_cache[exclude_j]
-
-        # Fallback an toàn (không nên xảy ra) — đường chậm cũ.
-        periph_ids_reduced = sorted(
-            list(belief_mod.get_peripheral_set() - {exclude_j})
-        )
+        periph_ids = sorted(list(belief_mod.get_peripheral_set() - {exclude_j}))
         belief_state = belief_mod.get_state_dict()
+
         inputs = self.periph_module.build_inputs(
             ego_id=ego,
-            peripheral_ids=periph_ids_reduced,
+            peripheral_ids=periph_ids,
             env=self.env,
             belief_state=belief_state,
             prev_core_set=belief_mod.prev_core_set,
         )
+
         return self._periph_summary_np_from_inputs(inputs, ego=ego)
 
     def _select_actions_population(self, obs_all):
@@ -1152,12 +1095,10 @@ class SharedAblationBase:
             probs = torch.softmax(logits, dim=-1)
             dist = torch.distributions.Categorical(probs=probs)
             sampled = dist.sample().detach().cpu().numpy()
-            # Một sync CPU<->GPU cho toàn bộ values thay vì .item() từng agent.
-            values_np = values.detach().cpu().numpy()
 
         for ego in range(self.n_agents):
             actions[ego] = int(sampled[ego])
-            cache["value_cache"][ego] = float(values_np[ego])
+            cache["value_cache"][ego] = float(values[ego].item())
 
         return actions, cache
 
