@@ -220,7 +220,12 @@ class PureMeanFieldRunner:
             dist = torch.distributions.Categorical(probs=probs)
 
             logp = dist.log_prob(action_t)
-            adv = (ret_t - value).detach()
+            # [docs/CIG-AMF_training_debug_master.md mục 2.2(b)] advantage
+            # chuẩn hoá mean0/std1 trên batch n_agents mỗi timestep -- bản
+            # cũ dùng adv thô, gradient scale bám thẳng vào reward scale.
+            # ret_t (target critic) giữ nguyên thang gốc, không đổi.
+            adv_raw = (ret_t - value).detach()
+            adv = (adv_raw - adv_raw.mean()) / (adv_raw.std(unbiased=False) + 1e-8)
 
             policy_loss = -logp * adv
             value_loss = F.mse_loss(value, ret_t, reduction="none")
@@ -532,7 +537,12 @@ class FullExplicitLocalRunner:
             dist = torch.distributions.Categorical(probs=probs)
 
             logp = dist.log_prob(action_t)
-            adv = (ret_t - value).detach()
+            # [docs/CIG-AMF_training_debug_master.md mục 2.2(b)] advantage
+            # chuẩn hoá mean0/std1 trên batch n_agents mỗi timestep -- bản
+            # cũ dùng adv thô, gradient scale bám thẳng vào reward scale.
+            # ret_t (target critic) giữ nguyên thang gốc, không đổi.
+            adv_raw = (ret_t - value).detach()
+            adv = (adv_raw - adv_raw.mean()) / (adv_raw.std(unbiased=False) + 1e-8)
 
             policy_loss = -logp * adv
             value_loss = F.mse_loss(value, ret_t, reduction="none")
@@ -677,6 +687,16 @@ class SharedAblationBase:
             buffer_size=cfg.get("proxy_buffer_size", 200000),
             grad_clip=cfg.get("proxy_grad_clip", 1.0),
             device=device,
+            # ---- v2, default = giá trị gốc trong structural_proxy.py ->
+            # KHÔNG đổi hành vi nếu cfg không set ----
+            n_horizons=cfg.get("proxy_n_horizons", 3),
+            effect_mode=cfg.get("proxy_effect_mode", "signed_aristocrat"),
+            use_doubly_robust=cfg.get("proxy_use_doubly_robust", True),
+            iw_clip=cfg.get("proxy_iw_clip", 10.0),
+            bootstrap_ratio=cfg.get("proxy_bootstrap_ratio", 0.8),
+            use_belief_input=cfg.get("proxy_use_belief_input", False),
+            ensemble_dropout=cfg.get("proxy_ensemble_dropout", 0.0),
+            seed=cfg.get("seed", 0),
         )
 
         self.pair_rel_module = PairRelationalModule(
@@ -700,7 +720,9 @@ class SharedAblationBase:
             out_dim=self.periph_dim,
             mu_floor=cfg.get("periph_mu_floor", 0.02),
             beta_floor=cfg.get("periph_beta_floor", 0.05),
+            use_uniform_mix=cfg.get("periph_use_uniform_mix", True),
             uniform_mix=cfg.get("periph_uniform_mix", 0.25),
+            lb_coeff=cfg.get("periph_lb_coeff", 0.5),
         ).to(device)
 
         self.single_periph_proj = nn.Sequential(
@@ -744,9 +766,11 @@ class SharedAblationBase:
             alpha_slow_ratio=cfg["slow_ratio"],
             accel_factor=cfg["accel_factor"],
             accel_duration=cfg["accel_duration"],
-            ewma_alpha=cfg["ewma_alpha"],
-            cusum_threshold=cfg["cusum_threshold"],
-            cusum_drift=cfg["cusum_drift"],
+            z_threshold=cfg.get("z_threshold", 3.0),
+            require_both=cfg.get("require_both", False),
+            refractory=cfg.get("refractory", 10),
+            inflation_factor=cfg.get("inflation_factor", 2.5),
+            inflation_t_reset=cfg.get("inflation_t_reset", 1),
         )
 
         if not self.use_two_timescale:
@@ -814,6 +838,14 @@ class SharedAblationBase:
                 min_core_size=self.cfg.get("min_core_size", 1),
                 sigma_floor=self.cfg.get("sigma_floor", 0.0),
                 max_core_size=self.cfg.get("max_core_size", 4),
+                # ---- v2, default = giá trị "khuyến nghị" gốc trong
+                # belief_layer.py -> KHÔNG đổi hành vi nếu cfg không set ----
+                core_rule=self.cfg.get("belief_core_rule", "lcb"),
+                kappa=self.cfg.get("belief_kappa", 1.0),
+                alpha_decay=self.cfg.get("belief_alpha_decay", 0.7),
+                adaptive_k=self.cfg.get("belief_adaptive_k", False),
+                adaptive_k_min=self.cfg.get("belief_adaptive_k_min", 1),
+                signed_balance=self.cfg.get("belief_signed_balance", 0.5),
             )
         except TypeError:
             return BayesLightBeliefState(**common_kwargs)
@@ -1255,7 +1287,12 @@ class SharedAblationBase:
             ret_t = torch.tensor(returns_batch, dtype=torch.float32, device=self.device)
 
             logp = dist.log_prob(action_t)
-            adv = (ret_t - value).detach()
+            # [docs/CIG-AMF_training_debug_master.md mục 2.2(b)] advantage
+            # chuẩn hoá mean0/std1 trên batch n_agents mỗi timestep -- bản
+            # cũ dùng adv thô, gradient scale bám thẳng vào reward scale.
+            # ret_t (target critic) giữ nguyên thang gốc, không đổi.
+            adv_raw = (ret_t - value).detach()
+            adv = (adv_raw - adv_raw.mean()) / (adv_raw.std(unbiased=False) + 1e-8)
 
             policy_loss = -logp * adv
             value_loss = F.mse_loss(value, ret_t, reduction="none")
@@ -1612,13 +1649,13 @@ class SharedAblationBase:
                 )
                 sched_status = self.scheduler.get_status()
                 self.history["scheduler_residual_ewma"].append(
-                    float(sched_status["residual_ewma"] or 0.0)
+                    float(graph_info.get("probe_z", 0.0) or 0.0)
                 )
                 self.history["scheduler_cusum_score"].append(
-                    float(sched_status["cusum_score"])
+                    float(graph_info.get("matrix_z", 0.0) or 0.0)
                 )
                 self.history["scheduler_accel_remaining"].append(
-                    int(sched_status["accel_remaining"])
+                    int(sched_status.get("accel_remaining", 0))
                 )
                 self.history["proxy_loss"].append(float(graph_info["proxy_loss"]))
                 self.history["bc_loss"].append(float(bc_loss))

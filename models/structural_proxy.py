@@ -132,7 +132,7 @@ class LocalCounterfactualProxyNet(nn.Module):
         periph_dim: int,
         belief_dim: int,
         hidden: int = 160,
-        n_horizons: int = 3,
+        n_horizons: int = 8,
         use_belief_input: bool = False,
         dropout: float = 0.0,
     ):
@@ -325,7 +325,7 @@ class LocalCounterfactualProxyEnsemble:
         device: str = "cpu",
         grad_clip: float = 1.0,
         eps: float = 1e-8,
-        n_horizons: int = 3,
+        n_horizons: int = 8,
         effect_mode: str = "signed_aristocrat",
         use_doubly_robust: bool = True,
         iw_clip: float = 10.0,

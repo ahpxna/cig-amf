@@ -35,7 +35,11 @@ class MultiEgoReplayBuilder:
     - Stage 0 không train/update belief, nhưng phải collect proxy buffer.
     """
 
-    def __init__(self, discount=0.95, horizon=3):
+    def __init__(self, discount=0.95, horizon=8):
+        # P2 (Phần 2.2): H_causal >= max_latency + 2. Với 4 latency tier của
+        # Omni-Arena (blocker h=1, gatekeeper h=2-3, relay h=4-5,
+        # controller h=6+), H >= 8. Default bump 3 -> 8 (caller vẫn có thể
+        # truyền horizon= khác nếu cần).
         self.discount = float(discount)
         self.horizon = int(horizon)
 
@@ -71,6 +75,38 @@ class MultiEgoReplayBuilder:
 
                 row[ego] = float(val)
 
+            out.append(row)
+
+        return out
+
+    def build_h_step_returns_multi(self, trajectory, n_agents, n_horizons=None):
+        """
+        P2: bản multi-horizon của build_h_step_returns() -- trả về
+        R_i^(1), R_i^(2), ..., R_i^(n_horizons) cho mỗi (t, ego), tức
+        target_returns_multi thật (không phải broadcast một số) để nạp cho
+        structural_proxy_v2 (n_horizons=8 theo Phần 2.2).
+
+        R_i^(h)(t) = sum_{k=0}^{h-1} gamma^k * r_i(t+k)  (h = 1..n_horizons)
+
+        Return:
+            list length T. out[t][ego] = np.ndarray shape [n_horizons].
+        """
+        if n_horizons is None:
+            n_horizons = self.horizon
+
+        T = len(trajectory)
+        out = []
+
+        for t in range(T):
+            row = {}
+            for ego in range(int(n_agents)):
+                cum = 0.0
+                per_h = np.zeros((int(n_horizons),), dtype=np.float32)
+                for h in range(int(n_horizons)):
+                    if t + h < T:
+                        cum += (self.discount ** h) * float(trajectory[t + h]["rewards"][ego])
+                    per_h[h] = cum
+                row[ego] = per_h
             out.append(row)
 
         return out
@@ -124,6 +160,13 @@ class MultiEgoReplayBuilder:
 
         n_agents = int(env.n_agents)
         h_returns = self.build_h_step_returns(trajectory, n_agents)
+        # P2: target_returns_multi thật (n_horizons phần tử -- mặc định 8),
+        # lấy trực tiếp từ trajectory thay vì để add_sample() broadcast một
+        # số vô hướng ra mọi horizon (fallback cũ, kém chính xác hơn).
+        n_horizons_for_push = getattr(proxy_ensemble, "n_horizons", self.horizon)
+        h_returns_multi = self.build_h_step_returns_multi(
+            trajectory, n_agents, n_horizons=n_horizons_for_push
+        )
 
         pushed = 0
 
@@ -132,6 +175,14 @@ class MultiEgoReplayBuilder:
 
             obs_all = step["obs_all"]
             actions = step["actions"]
+
+            # [intervention.py — DR] forced_mask/behaviour_probs chỉ có ở
+            # final_runner.py (baseline_runner.py không dùng eps-forcing).
+            # .get() để KHÔNG crash với trajectory không có hai field này —
+            # proxy tự tắt DR về plug-in cho mẫu đó (behaviour_prob_j=None
+            # là fallback đã thiết kế sẵn trong add_sample).
+            forced_mask = step.get("forced_mask")
+            behaviour_probs = step.get("behaviour_probs")
 
             for ego in range(n_agents):
                 obs_i = env.get_obs_of_ego(obs_all, ego)
@@ -145,6 +196,21 @@ class MultiEgoReplayBuilder:
                     m_ex = step["periph_context_excluding"][ego][j]
                     belief_summary = step["belief_summary_cache"][ego]
                     target_h = h_returns[t][ego]
+                    target_multi = h_returns_multi[t][ego]
+
+                    was_forced = False
+                    behaviour_prob_j = None
+
+                    if forced_mask is not None:
+                        was_forced = bool(forced_mask[j])
+
+                    if behaviour_probs is not None:
+                        # b_j(a_j_obs | s) — propensity HIỆU DỤNG (đã tính
+                        # cả forcing), KHÔNG PHẢI policy_probs thô. Lấy nhầm
+                        # sẽ làm DR chệch có hệ thống một cách im lặng.
+                        behaviour_prob_j = float(
+                            behaviour_probs[j][int(actions[j])]
+                        )
 
                     proxy_ensemble.add_sample(
                         ego_id=ego,
@@ -156,6 +222,9 @@ class MultiEgoReplayBuilder:
                         m_periph_excl_j=m_ex,
                         belief_summary=belief_summary,
                         target_return_h=float(target_h),
+                        target_returns_multi=target_multi,
+                        behaviour_prob_j=behaviour_prob_j,
+                        was_forced=was_forced,
                     )
 
                     pushed += 1

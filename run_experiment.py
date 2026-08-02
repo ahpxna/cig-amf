@@ -141,9 +141,10 @@ def default_cfg():
         "slow_ratio": 0.15,
         "accel_factor": 4.0,
         "accel_duration": 8,
-        "ewma_alpha": 0.25,
-        "cusum_threshold": 0.005,
-        "cusum_drift": 0.0005,
+        # require_both/inflation_t_reset: xem TwoTimescaleScheduler, default
+        # gốc trong training/scheduler.py là False/1.
+        "require_both": False,
+        "inflation_t_reset": 1,
 
         "belief_lambda_0": 0.08,
         "belief_uncertainty_scale": 2.0,
@@ -154,13 +155,57 @@ def default_cfg():
         "min_core_size": 2,
         "max_core_size": 4,
         "sigma_floor": 0.08,
+        # ---- belief_layer v2, default = giá trị khuyến nghị gốc ----
+        "belief_core_rule": "lcb",
+        "belief_kappa": 1.0,
+        "belief_alpha_decay": 0.7,
+        "belief_adaptive_k": False,
+        "belief_adaptive_k_min": 1,
+        "belief_signed_balance": 0.5,
 
         "periph_mu_floor": 0.008,
         "periph_beta_floor": 0.03,
         "periph_uniform_mix": 0.35,
+        "periph_use_uniform_mix": True,
+        "periph_lb_coeff": 0.5,
         "belief_priority_mu_floor": 0.01,
         "shadow_loss_weight": 0.25,
         "graph_score_steps": 8,
+
+        # ---- structural_proxy v2, default = giá trị gốc trong
+        # structural_proxy.py ----
+        "proxy_n_horizons": 3,
+        "proxy_effect_mode": "signed_aristocrat",
+        "proxy_use_doubly_robust": True,
+        "proxy_iw_clip": 10.0,
+        "proxy_bootstrap_ratio": 0.8,
+        "proxy_use_belief_input": False,
+        "proxy_ensemble_dropout": 0.0,
+        "seed": 0,
+
+        # ---- final_runner.py: sig_tracker / forcer / heads / drift /
+        # matdet / recip, default = giá trị gốc đang hard-code trong
+        # runner (xem models/{influence_signature,intervention,
+        # ego_conditioned_latent,drift_probe,reciprocity}.py) ----
+        "sig_tracker_window": 30,
+
+        "eps": 0.03,
+        "forcer_max_forced_per_step": 2,
+        "forcer_anneal_to": 0.01,
+        "forcer_anneal_episodes": 60,
+
+        "heads_lr": 5e-4,
+        "heads_w_contrastive": 0.3,
+        "heads_w_influence": 1.0,
+
+        "drift_n_horizons": 3,
+        "drift_warmup_batches": 200,
+        "drift_recalibrate_after": 15,
+        "drift_train_batches": 5,
+
+        "matdet_window": 20,
+
+        "recip_min_causal_samples": 20,
     }
 
 

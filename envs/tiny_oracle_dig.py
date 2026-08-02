@@ -2,6 +2,27 @@ import copy
 import numpy as np
 
 
+class OracleInfluenceProfile(dict):
+    """
+    Hồ sơ ảnh hưởng can thiệp — P0(c).
+
+    Là dict với các key {signed, range, best, worst, per_action, base_return}
+    NHƯNG cũng hỗ trợ float(profile)/abs(profile) để tương thích ngược với
+    code cũ gọi compute_oracle_influence_from_current_state() và mong đợi
+    một số vô hướng (vd. run_experiment.py: `abs(float(score))`).
+
+    QUAN TRỌNG: __float__ trả về "signed" — CÓ DẤU, không phải abs. Bất kỳ
+    caller nào cần magnitude phải tự gọi abs() ở phía họ (như run_experiment
+    đã làm) — bản thân oracle không còn tự ý huỷ dấu nữa (P0a).
+    """
+
+    def __float__(self):
+        return float(self["signed"])
+
+    def __abs__(self):
+        return abs(float(self["signed"]))
+
+
 class TinyOracleDIG:
     """
     Tiny Oracle nhiều ego dùng cho calibration.
@@ -28,12 +49,22 @@ class TinyOracleDIG:
     ROLE_RELAY = "relay"
     ROLE_BLOCKER = "blocker"
 
-    def __init__(self, grid_size=8, max_steps=24, causal_horizon=3, seed=42):
+    # P0(d): các "purpose" nhiễu ngẫu nhiên mà step() có thể tiêu thụ.
+    # TinyOracleDIG hiện không có bước nào gọi rng trong step()/scripted_policy()
+    # (mọi động lực đều tất định), nên danh sách này rỗng — nhưng hạ tầng buffer
+    # vẫn được giữ để env con (vd. omni_arena) có thể tái sử dụng cùng cơ chế.
+    NOISE_PURPOSES = []
+
+    def __init__(self, grid_size=8, max_steps=24, causal_horizon=8, seed=42):
         self.grid_size = grid_size
         self.max_steps = max_steps
         self.causal_horizon = causal_horizon
         self.seed = seed
         self.rng = np.random.RandomState(seed)
+        # P0(d): common random numbers buffer, index theo (step, purpose).
+        # None => rng tiêu thụ bình thường (không có CRN).
+        self.noise_buffer = None
+        self._noise_call_counter = {}
 
         self.n_zones = 2
         self.n_agents = 8
@@ -177,6 +208,45 @@ class TinyOracleDIG:
 
     def _dist(self, a, b):
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    # ------------------------------------------------------------------
+    # P0(d): common random numbers
+    # ------------------------------------------------------------------
+
+    def set_noise_buffer(self, buffer):
+        """
+        buffer: dict {(step, purpose): value_or_list_of_values}.
+        Khi được set, _draw_noise() sẽ ưu tiên đọc từ đây thay vì gọi rng
+        trực tiếp, và được index theo (step, purpose) — KHÔNG theo thứ tự
+        gọi — nên base-branch và intervened-branch tiêu thụ đúng cùng
+        chuỗi nhiễu bất kể can thiệp có đổi số lần/không thứ tự gọi rng.
+        """
+        self.noise_buffer = buffer
+        self._noise_call_counter = {}
+
+    def clear_noise_buffer(self):
+        self.noise_buffer = None
+        self._noise_call_counter = {}
+
+    def _draw_noise(self, purpose):
+        """
+        Rút một số ngẫu nhiên cho "purpose" tại self.t hiện tại.
+        Nếu noise_buffer có sẵn entry cho (self.t, purpose), dùng nó (hỗ trợ
+        cả giá trị đơn lẫn list nếu purpose được gọi nhiều lần trong 1 step).
+        Ngược lại fallback về self.rng.rand() bình thường.
+        """
+        key = (self.t, purpose)
+
+        if self.noise_buffer is not None and key in self.noise_buffer:
+            val = self.noise_buffer[key]
+            if isinstance(val, (list, tuple, np.ndarray)):
+                idx = self._noise_call_counter.get(key, 0)
+                self._noise_call_counter[key] = idx + 1
+                idx = min(idx, len(val) - 1)
+                return float(val[idx])
+            return float(val)
+
+        return float(self.rng.rand())
 
     def scripted_policy(self, agent_id):
         role = self.agent_role[agent_id]
@@ -344,6 +414,21 @@ class TinyOracleDIG:
         if horizon is None:
             horizon = self.causal_horizon
 
+        # GUARD (P2<->P4 trap -- see omni_arena.py for the full rationale;
+        # kept here too since TinyOracleDIG shares this rollout mechanism
+        # and any subclass/future extension with episode-boundary events
+        # must not silently violate it). A forced-intervention rollout must
+        # not begin so late in the episode that its H-step window could run
+        # past the episode boundary. Real runtime assert, not a comment.
+        if forced is not None:
+            assert self.t + horizon <= self.max_steps, (
+                f"oracle forced-intervention rollout window crosses episode "
+                f"boundary: t={self.t} + horizon={horizon} > "
+                f"max_steps={self.max_steps}. Sample/restore a state earlier "
+                f"in the episode (t <= max_steps - horizon) before forcing "
+                f"an intervention rollout."
+            )
+
         snapshot = self.clone_state()
         gamma = 0.95
         total = np.zeros(self.n_agents, dtype=np.float32)
@@ -364,27 +449,109 @@ class TinyOracleDIG:
         self.restore_state(snapshot)
         return total
 
-    def compute_oracle_influence_from_current_state(self, ego_id, agent_j, intervention_action, horizon=None, n_trials=1):
+    def _make_crn_buffer(self, horizon, seed_rng):
+        """
+        P0(d): rút sẵn một buffer nhiễu cố định theo (step, purpose), dùng
+        chung một seed_rng riêng (KHÔNG phải self.rng, để không làm nhiễu
+        state rng chính của env). Nếu env không có NOISE_PURPOSES nào (như
+        TinyOracleDIG, vốn tất định), buffer sẽ rỗng và không có tác dụng —
+        vô hại.
+        """
+        buffer = {}
+        for step in range(horizon):
+            for purpose in self.NOISE_PURPOSES:
+                n_calls = self._noise_calls_per_step(purpose)
+                buffer[(step, purpose)] = [
+                    float(seed_rng.rand()) for _ in range(n_calls)
+                ]
+        return buffer
+
+    def _noise_calls_per_step(self, purpose):
+        # số lần purpose này có thể được gọi trong một step() — mặc định 1.
+        # Env con override nếu cần nhiều hơn (vd. 1 lần / zone).
+        return max(1, getattr(self, "n_zones", 1))
+
+    def compute_oracle_influence_from_current_state(
+        self,
+        ego_id,
+        agent_j,
+        intervention_action,
+        horizon=None,
+        n_trials=1,
+        forced_step=0,
+        candidate_actions=None,
+        crn_seed=None,
+    ):
+        """
+        P0 — oracle can thiệp đã sửa (4.1a-d):
+        (a) KHÔNG abs() — giữ dấu của (alt - base).
+        (b) forced_step có thể là bất kỳ bước nào trong {0..horizon-1}.
+        (c) Trả về hồ sơ nhiều hành động thay thế: signed / range / best /
+            worst / per_action, thay vì một số duy nhất.
+        (d) Common random numbers: base và mọi alt-branch tiêu thụ cùng một
+            buffer nhiễu rút sẵn theo (step, purpose) -> cho phép n_trials
+            nhỏ (1-2) mà vẫn triệt tiêu phương sai ngẫu nhiên không liên
+            quan tới can thiệp.
+
+        Return: dict với các key:
+            signed, range, best, worst, per_action (dict action->mean delta),
+            base_return
+        """
         if horizon is None:
             horizon = self.causal_horizon
 
+        if candidate_actions is None:
+            candidate_actions = list(range(self.N_ACTIONS))
+            if intervention_action not in candidate_actions:
+                candidate_actions.append(intervention_action)
+
         snapshot = self.clone_state()
-        deltas = []
 
-        for _ in range(n_trials):
-            self.restore_state(snapshot)
-            base = self.rollout_from_current_state(forced=None, horizon=horizon)
+        per_action_trials = {a: [] for a in candidate_actions}
+        base_trials = []
 
-            self.restore_state(snapshot)
-            alt = self.rollout_from_current_state(
-                forced=(agent_j, intervention_action, 0),
-                horizon=horizon,
+        for trial in range(n_trials):
+            crn_rng = np.random.RandomState(
+                ((crn_seed if crn_seed is not None else self.seed) * 9973 + trial)
             )
+            buffer = self._make_crn_buffer(horizon, crn_rng)
 
-            deltas.append(abs(float(alt[ego_id] - base[ego_id])))
+            self.restore_state(snapshot)
+            self.set_noise_buffer(buffer)
+            base = self.rollout_from_current_state(forced=None, horizon=horizon)
+            base_trials.append(float(base[ego_id]))
 
+            for a in candidate_actions:
+                self.restore_state(snapshot)
+                self.set_noise_buffer(buffer)
+                alt = self.rollout_from_current_state(
+                    forced=(agent_j, a, forced_step),
+                    horizon=horizon,
+                )
+                per_action_trials[a].append(float(alt[ego_id]))
+
+        self.clear_noise_buffer()
         self.restore_state(snapshot)
-        return float(np.mean(deltas))
+
+        base_mean = float(np.mean(base_trials))
+        per_action = {
+            a: float(np.mean(vals) - base_mean) for a, vals in per_action_trials.items()
+        }
+
+        deltas = np.array(list(per_action.values()), dtype=np.float64)
+        signed = float(np.mean(deltas))          # mean_a R(a) - R_base
+        rng_ = float(np.max(deltas) - np.min(deltas)) if len(deltas) > 0 else 0.0
+        best = float(np.max(deltas)) if len(deltas) > 0 else 0.0
+        worst = float(np.min(deltas)) if len(deltas) > 0 else 0.0
+
+        return OracleInfluenceProfile(
+            signed=signed,
+            range=rng_,
+            best=best,
+            worst=worst,
+            per_action=per_action,
+            base_return=base_mean,
+        )
 
     def sample_state_bank(self, n_states=24, burn_in=3):
         bank = []

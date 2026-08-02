@@ -96,6 +96,16 @@ class FinalCIGAMFRunner:
             buffer_size=cfg.get("proxy_buffer_size", 200000),
             grad_clip=cfg.get("proxy_grad_clip", 1.0),
             device=device,
+            # ---- v2, default = giá trị gốc trong structural_proxy.py ->
+            # KHÔNG đổi hành vi nếu cfg không set ----
+            n_horizons=cfg.get("proxy_n_horizons", 3),
+            effect_mode=cfg.get("proxy_effect_mode", "signed_aristocrat"),
+            use_doubly_robust=cfg.get("proxy_use_doubly_robust", True),
+            iw_clip=cfg.get("proxy_iw_clip", 10.0),
+            bootstrap_ratio=cfg.get("proxy_bootstrap_ratio", 0.8),
+            use_belief_input=cfg.get("proxy_use_belief_input", False),
+            ensemble_dropout=cfg.get("proxy_ensemble_dropout", 0.0),
+            seed=cfg.get("seed", 0),
         )
 
         self.pair_rel_module = PairRelationalModule(
@@ -117,11 +127,11 @@ class FinalCIGAMFRunner:
             num_slots=cfg["num_memory_slots"],
             memory_dim=cfg["periph_memory_dim"],
             out_dim=self.periph_dim,
-            mu_floor=0.05,             # Tăng sàn lên 5%
-            beta_floor=0.05,
-            use_uniform_mix=True,      # ÉP CỨNG BẬT MIX (Rất quan trọng!)
-            uniform_mix=0.3,           # Ép cứng 30% nhiễu
-            lb_coeff=0.5,              # ÉP CỨNG LỰC PHẠT (Gấp 10 lần mặc định)
+            mu_floor=cfg.get("periph_mu_floor", 0.02),
+            beta_floor=cfg.get("periph_beta_floor", 0.05),
+            use_uniform_mix=cfg.get("periph_use_uniform_mix", True),
+            uniform_mix=cfg.get("periph_uniform_mix", 0.25),
+            lb_coeff=cfg.get("periph_lb_coeff", 0.5),
         ).to(device)
 
         self.belief_summary_builder = BeliefSummaryBuilder(
@@ -149,21 +159,50 @@ class FinalCIGAMFRunner:
 
         self.scheduler = TwoTimescaleScheduler(
             k0_warmup=cfg["k0_warmup"],
+            alpha_fast=cfg.get("policy_lr", 1e-3),
+            alpha_slow_ratio=cfg.get("slow_ratio", 0.05),
+            accel_factor=cfg.get("accel_factor", 4.0),
+            accel_duration=cfg.get("accel_duration", 8),
             z_threshold=cfg.get("z_threshold", 3.0),
+            require_both=cfg.get("require_both", False),
             refractory=cfg.get("refractory", 10),
-            inflation_factor=cfg.get("inflation_factor", 2.5)
+            inflation_factor=cfg.get("inflation_factor", 2.5),
+            inflation_t_reset=cfg.get("inflation_t_reset", 1),
         )
-        self.sig_tracker = InfluenceSignatureTracker(n_agents=self.n_agents, window=30)
+        self.sig_tracker = InfluenceSignatureTracker(
+            n_agents=self.n_agents,
+            window=cfg.get("sig_tracker_window", 30),
+        )
         self.forcer = EpsilonForcedActionController(
-            n_agents=self.n_agents, action_dim=self.action_dim, eps=cfg.get("eps", 0.03),
-            max_forced_per_step=2, anneal_to=0.01, anneal_episodes=60,
-            rng=np.random.RandomState(cfg.get("seed", 0))
+            n_agents=self.n_agents,
+            action_dim=self.action_dim,
+            eps=cfg.get("eps", 0.03),
+            max_forced_per_step=cfg.get("forcer_max_forced_per_step", 2),
+            anneal_to=cfg.get("forcer_anneal_to", 0.01),
+            anneal_episodes=cfg.get("forcer_anneal_episodes", 60),
+            rng=np.random.RandomState(cfg.get("seed", 0)),
         )
-        self.heads = EgoConditionedHeads(latent_dim=self.pair_rel_module.hidden_dim, n_horizons=3).to(self.device)
-        self.drift = DriftDetector(obs_dim=self.obs_dim, action_dim=self.action_dim, n_horizons=3,
-                                   warmup_batches=200, recalibrate_after=15, seed=cfg.get("seed", 0), device=self.device)
-        self.matdet = MatrixDriftDetector(window=20)
-        self.recip = ReciprocityTracker(n_agents=self.n_agents, min_causal_samples=20)
+        self.heads = EgoConditionedHeads(
+            latent_dim=self.pair_rel_module.hidden_dim,
+            n_horizons=cfg.get("proxy_n_horizons", 3),
+        ).to(self.device)
+        self.heads_optim = torch.optim.Adam(
+            self.heads.parameters(), lr=cfg.get("heads_lr", cfg.get("core_lr", 5e-4))
+        )
+        self.drift = DriftDetector(
+            obs_dim=self.obs_dim,
+            action_dim=self.action_dim,
+            n_horizons=cfg.get("drift_n_horizons", 3),
+            warmup_batches=cfg.get("drift_warmup_batches", 200),
+            recalibrate_after=cfg.get("drift_recalibrate_after", 15),
+            seed=cfg.get("seed", 0),
+            device=self.device,
+        )
+        self.matdet = MatrixDriftDetector(window=cfg.get("matdet_window", 20))
+        self.recip = ReciprocityTracker(
+            n_agents=self.n_agents,
+            min_causal_samples=cfg.get("recip_min_causal_samples", 20),
+        )
 
         self.replay_builder = MultiEgoReplayBuilder(
             discount=cfg["discount"],
@@ -183,6 +222,14 @@ class FinalCIGAMFRunner:
                 min_core_size=cfg.get("min_core_size", 1),
                 max_core_size=cfg.get("max_core_size", 4),
                 sigma_floor=cfg.get("sigma_floor", 0.05),
+                # ---- v2, default = giá trị "khuyến nghị" gốc trong
+                # belief_layer.py -> KHÔNG đổi hành vi nếu cfg không set ----
+                core_rule=cfg.get("belief_core_rule", "lcb"),
+                kappa=cfg.get("belief_kappa", 1.0),
+                alpha_decay=cfg.get("belief_alpha_decay", 0.7),
+                adaptive_k=cfg.get("belief_adaptive_k", False),
+                adaptive_k_min=cfg.get("belief_adaptive_k_min", 1),
+                signed_balance=cfg.get("belief_signed_balance", 0.5),
             )
             for ego in range(self.n_agents)
         }
@@ -212,6 +259,15 @@ class FinalCIGAMFRunner:
             "proxy_loss": [],
             "bc_loss": [],
             "policy_loss": [],
+            # [debug doc mục 1.2 -- schema log mới, "0.2 Không bao giờ debug
+            # bằng số trung bình"] policy_loss cũ là actor+critic+entropy
+            # gộp làm một -- không tách được cái nào hỏng.
+            "actor_loss": [],
+            "critic_loss": [],
+            "entropy": [],
+            "grad_norm_preclip": [],
+            "adv_mean": [],
+            "adv_std": [],
             "triggered": [],
             "trigger_count": [],
             "stage": [],
@@ -590,10 +646,28 @@ class FinalCIGAMFRunner:
             # Một sync CPU<->GPU cho toàn bộ values thay vì gọi .item()
             # từng agent một (bản cũ: n_agents lần đồng bộ mỗi bước).
             values_np = values.detach().cpu().numpy()
+            probs_np = probs.detach().cpu().numpy()
+
+        # [EpsilonForcedActionController — intervention.py] PHẢI đứng SAU
+        # khi đã sample action, TRƯỚC khi actions được dùng để env.step().
+        # apply() sửa actions_list IN-PLACE tại vị trí bị ép, và trả về
+        # effective_probs = propensity hiệu dụng (mixture eps*uniform +
+        # (1-eps)*pi), KHÔNG PHẢI policy_probs thô — đây là behaviour
+        # probability đúng cần cho DR trong replay_builder/proxy. Lấy nhầm
+        # policy_probs (bỏ qua forcing) làm propensity sẽ khiến DR chệch có
+        # hệ thống một cách im lặng (không crash, không warning).
+        actions_list = [int(sampled[ego]) for ego in range(self.n_agents)]
+        forced_mask, effective_probs = self.forcer.apply(
+            actions=actions_list,
+            policy_probs=probs_np,
+        )
 
         for ego in range(self.n_agents):
-            actions[ego] = int(sampled[ego])
+            actions[ego] = int(actions_list[ego])
             cache["value_cache"][ego] = float(values_np[ego])
+
+        cache["forced_mask"] = forced_mask
+        cache["behaviour_probs"] = effective_probs
 
         return actions, cache
 
@@ -651,6 +725,7 @@ class FinalCIGAMFRunner:
         prev_actions = None
         prev_env_snapshot_before_step = None
         prev_h_snapshot = None
+        prev_forced_mask = None
 
         while not done:
             actions_dict, cache = self._select_actions_population(obs_all)
@@ -678,6 +753,8 @@ class FinalCIGAMFRunner:
                     "core_context_excluding": cache["core_context_excluding"],
                     "periph_context_excluding": cache["periph_context_excluding"],
                     "value_cache": cache["value_cache"],
+                    "forced_mask": cache["forced_mask"],
+                    "behaviour_probs": cache["behaviour_probs"],
                     "env_snapshot_before_step": env_snapshot_before_step,
                     "env_snapshot_after_step": env_snapshot_after_step,
                     "h_snapshot_before_latent_update": h_snapshot_before_latent_update,
@@ -702,6 +779,20 @@ class FinalCIGAMFRunner:
 
                 self.env.restore_state(env_snapshot_after_step)
 
+                # [ReciprocityTracker — reciprocity.py] Đúng thiết kế trong
+                # file: CÔNG CỤ CHẨN ĐOÁN, không cắm vào action selection.
+                # Dùng z_ij/s_ij tại t (cùng ngữ cảnh add_bc_transition vừa
+                # dùng) + a_j thật tại t+1 + cờ ego_was_forced tại t (a_i^t
+                # bị eps-forcing ép hay không -> a_i^t độc lập cơ học với
+                # mọi thứ khác, nên "biết a_i^t giúp đoán a_j^{t+1}" mới là
+                # nhân quả thật, không phải confounding từ cùng quan sát).
+                if prev_forced_mask is not None:
+                    self._record_reciprocity(
+                        prev_h_snapshot=prev_h_snapshot,
+                        actions_list=actions_list,
+                        prev_forced_mask=prev_forced_mask,
+                    )
+
             self.env.restore_state(env_snapshot_before_step)
 
             self.pair_rel_module.step_population(
@@ -716,22 +807,107 @@ class FinalCIGAMFRunner:
             prev_actions = list(actions_list)
             prev_env_snapshot_before_step = env_snapshot_before_step
             prev_h_snapshot = h_snapshot_before_latent_update
+            prev_forced_mask = cache["forced_mask"]
 
             obs_all = next_obs_all
 
         runtime = time.time() - t0
 
+        # [EpsilonForcedActionController] lịch trình anneal eps -> gọi
+        # đúng một lần sau mỗi episode (xem docstring step_episode()).
+        self.forcer.step_episode()
+
         return trajectory, ep_reward, runtime
+
+    def _record_reciprocity(self, prev_h_snapshot, actions_list, prev_forced_mask):
+        """
+        [reciprocity.py] Ghi nhận information gain g_ij (i -> j) cho MỌI
+        cặp có hướng, dùng CHÍNH bc_head/shadow_to_full đã có (không train
+        thêm gì ở đây, chỉ forward dưới no_grad để chẩn đoán). Batch một
+        lần duy nhất cho cả n_agents*(n_agents-1) cặp thay vì gọi bc_head
+        riêng từng cặp.
+        """
+        pairs = [
+            (ego, j)
+            for ego in range(self.n_agents)
+            for j in range(self.n_agents)
+            if j != ego
+        ]
+
+        if len(pairs) == 0:
+            return
+
+        z_list = []
+        s_list = []
+
+        for ego, j in pairs:
+            key = (int(ego), int(j))
+            z = (
+                prev_h_snapshot.get(key)
+                if prev_h_snapshot is not None
+                else None
+            )
+            if z is None:
+                z = self.pair_rel_module.get_pair_latent(ego, j)
+            z_list.append(np.asarray(z, dtype=np.float32).reshape(-1))
+            s_list.append(self.pair_rel_module.get_shadow_latent(ego, j))
+
+        z_t = torch.tensor(
+            np.stack(z_list, axis=0), dtype=torch.float32, device=self.device
+        )
+        s_t = torch.tensor(
+            np.stack(s_list, axis=0), dtype=torch.float32, device=self.device
+        )
+
+        with torch.no_grad():
+            logits_with_ego = self.pair_rel_module.bc_head(z_t)
+            logits_without_ego = self.pair_rel_module.bc_head(
+                self.pair_rel_module.shadow_to_full(s_t)
+            )
+
+        logits_with_np = logits_with_ego.detach().cpu().numpy()
+        logits_without_np = logits_without_ego.detach().cpu().numpy()
+
+        for k, (ego, j) in enumerate(pairs):
+            self.recip.record(
+                ego_id=ego,
+                neighbor_id=j,
+                logits_with_ego=logits_with_np[k],
+                logits_without_ego=logits_without_np[k],
+                true_next_action=int(actions_list[j]),
+                ego_was_forced=bool(prev_forced_mask[ego]),
+            )
 
     # ============================================================
     # Policy update
     # ============================================================
 
     def update_policy(self, trajectory):
+        """
+        [docs/CIG-AMF_training_debug_master.md mục 2.2(b)/2.2(c)] Hai sửa:
+
+        (b) Advantage KHÔNG chuẩn hoá -- bản cũ dùng thẳng
+            `adv = ret_t - value` làm hệ số nhân cho -logp, nên gradient
+            scale bám theo reward scale (biến động mạnh trên horizon dài).
+            Chuẩn hoá adv về mean 0 / std 1 TRÊN TỪNG BATCH timestep
+            (n_agents=24 mẫu mỗi t -- đủ lớn để ước lượng std thô, và
+            không cần forward pass thứ hai để chuẩn hoá toàn episode).
+            ret_t (target của critic) giữ NGUYÊN thang gốc -- chỉ adv dùng
+            cho actor mới bị chuẩn hoá.
+
+        (c)/1.2 policy_loss trước đây là MỘT số gộp actor+critic+entropy
+            -> không tách được actor hỏng hay critic hỏng. Giờ tách riêng
+            actor_loss/critic_loss/entropy/grad_norm_preclip, trả về dict
+            thay vì float trần, để log đúng schema mục 1.2 của debug doc.
+        """
         T = len(trajectory)
 
         if T == 0:
-            return 0.0
+            return {
+                "loss": 0.0, "actor_loss": 0.0, "critic_loss": 0.0,
+                "entropy": 0.0, "grad_norm_preclip": 0.0,
+                "adv_mean": 0.0, "adv_std": 0.0,
+            }
 
         returns = [[0.0 for _ in range(self.n_agents)] for _ in range(T)]
         R = np.zeros(self.n_agents, dtype=np.float32)
@@ -746,6 +922,11 @@ class FinalCIGAMFRunner:
                 returns[t][ego] = float(R[ego])
 
         total_loss = 0.0
+        total_actor_loss = 0.0
+        total_critic_loss = 0.0
+        total_entropy = 0.0
+        adv_mean_acc = []
+        adv_std_acc = []
         count = 0
 
         for t, step in enumerate(trajectory):
@@ -814,7 +995,12 @@ class FinalCIGAMFRunner:
             )
 
             logp = dist.log_prob(action_t)
-            adv = (ret_t - value).detach()
+            adv_raw = (ret_t - value).detach()
+
+            adv_mean_acc.append(float(adv_raw.mean().item()))
+            adv_std_acc.append(float(adv_raw.std(unbiased=False).item()))
+
+            adv = (adv_raw - adv_raw.mean()) / (adv_raw.std(unbiased=False) + 1e-8)
 
             policy_loss = -logp * adv
             value_loss = F.mse_loss(value, ret_t, reduction="none")
@@ -823,6 +1009,9 @@ class FinalCIGAMFRunner:
             loss_vec = policy_loss + 0.5 * value_loss - 0.01 * entropy
 
             total_loss = total_loss + loss_vec.sum()
+            total_actor_loss = total_actor_loss + policy_loss.sum()
+            total_critic_loss = total_critic_loss + value_loss.sum()
+            total_entropy = total_entropy + entropy.sum()
             count += self.n_agents
 
         self.policy_optim.zero_grad()
@@ -830,7 +1019,7 @@ class FinalCIGAMFRunner:
         loss = total_loss / max(1, count)
         loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(
+        grad_norm_preclip = torch.nn.utils.clip_grad_norm_(
             list(self.policy_value.parameters())
             + list(self.periph_module.parameters())
             + list(self.belief_summary_builder.parameters()),
@@ -839,7 +1028,15 @@ class FinalCIGAMFRunner:
 
         self.policy_optim.step()
 
-        return float(loss.item())
+        return {
+            "loss": float(loss.item()),
+            "actor_loss": float((total_actor_loss / max(1, count)).item()),
+            "critic_loss": float((total_critic_loss / max(1, count)).item()),
+            "entropy": float((total_entropy / max(1, count)).item()),
+            "grad_norm_preclip": float(grad_norm_preclip),
+            "adv_mean": float(np.mean(adv_mean_acc)) if adv_mean_acc else 0.0,
+            "adv_std": float(np.mean(adv_std_acc)) if adv_std_acc else 0.0,
+        }
 
     # ============================================================
     # Replay / proxy / graph / belief update
@@ -906,13 +1103,29 @@ class FinalCIGAMFRunner:
                 b_batch.append(belief_summary)
                 neighbor_ids.append(j)
 
-            mu_arr, sigma_arr = self.proxy.score_batch(
+            # score_batch_full thay vì score_batch: cùng mu/sigma, thêm
+            # latency/mu_per_h cần cho InfluenceSignatureTracker — không đổi
+            # input, không đổi giá trị mu/sigma trả về (score_batch chỉ là
+            # wrapper mỏng quanh score_batch_full, xem structural_proxy.py).
+            out = self.proxy.score_batch_full(
                 obs_i_batch=obs_i_batch,
                 action_i_batch=action_i_batch,
                 observed_action_j_batch=action_j_batch,
                 z_core_excl_j_batch=z_batch,
                 m_periph_excl_j_batch=m_batch,
                 belief_summary_batch=b_batch,
+            )
+            mu_arr, sigma_arr = out["mu"], out["sigma"]
+
+            # [InfluenceSignatureTracker — influence_signature.py] Trước đây
+            # tạo xong không ai gọi update() -> signature/get_role() luôn
+            # rỗng. context_key = zone hiện tại của j, dùng cho chiều
+            # context_std (ảnh hưởng có điều kiện theo tình huống hay không).
+            self.sig_tracker.update_from_proxy_output(
+                ego_id=ego,
+                neighbor_ids=neighbor_ids,
+                proxy_out=out,
+                context_keys=[int(self.env.agent_zone[j]) for j in neighbor_ids],
             )
 
             mu_sigma = {
@@ -1156,13 +1369,24 @@ class FinalCIGAMFRunner:
             pushed_proxy_samples = self.push_trajectory_to_proxy_buffer(trajectory)
 
             t_policy = time.time()
-            policy_loss = self.update_policy(trajectory)
+            policy_update_info = self.update_policy(trajectory)
+            policy_loss = policy_update_info["loss"]
             policy_runtime = time.time() - t_policy
 
             t_bc = time.time()
             bc_loss = self.pair_rel_module.train_bc(
                 n_steps=self.cfg["bc_train_steps"],
                 batch_size=self.cfg["bc_batch_size"],
+                # [ego_conditioned_latent.py] cắm E1/E2 vào CÙNG loss/backward
+                # của train_bc -> z_ij thật sự bị ép mang thông tin ego, xem
+                # docstring train_bc trong core_behavior.py.
+                heads=self.heads,
+                heads_optim=self.heads_optim,
+                w_contrastive=self.cfg.get("heads_w_contrastive", 0.3),
+                w_influence=self.cfg.get("heads_w_influence", 1.0),
+                w_target_fn=lambda ego_id, nb_id: self.belief_modules[
+                    ego_id
+                ].debiased_mu(nb_id),
             )
             bc_runtime = time.time() - t_bc
 
@@ -1245,6 +1469,27 @@ class FinalCIGAMFRunner:
                 self.history["proxy_loss"].append(float(graph_info["proxy_loss"]))
                 self.history["bc_loss"].append(float(bc_loss))
                 self.history["policy_loss"].append(float(policy_loss))
+                # [debug doc mục 1.2] actor/critic/entropy/grad_norm tách
+                # riêng -- KHÔNG gộp vào policy_loss nữa, để phân biệt được
+                # actor hỏng hay critic hỏng (mục 2.2c).
+                self.history["actor_loss"].append(
+                    float(policy_update_info["actor_loss"])
+                )
+                self.history["critic_loss"].append(
+                    float(policy_update_info["critic_loss"])
+                )
+                self.history["entropy"].append(
+                    float(policy_update_info["entropy"])
+                )
+                self.history["grad_norm_preclip"].append(
+                    float(policy_update_info["grad_norm_preclip"])
+                )
+                self.history["adv_mean"].append(
+                    float(policy_update_info["adv_mean"])
+                )
+                self.history["adv_std"].append(
+                    float(policy_update_info["adv_std"])
+                )
                 self.history["triggered"].append(int(graph_info["triggered"]))
                 self.history["trigger_count"].append(int(trigger_count_now))
                 self.history["stage"].append(int(stage_now))

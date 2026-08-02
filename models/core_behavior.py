@@ -860,7 +860,16 @@ class PairRelationalModule:
 
         return x_full_t, x_shadow_t, h_prev_t, s_prev_t, target_t
 
-    def train_bc(self, n_steps=1, batch_size=256):
+    def train_bc(
+        self,
+        n_steps=1,
+        batch_size=256,
+        heads=None,
+        heads_optim=None,
+        w_contrastive=0.3,
+        w_influence=1.0,
+        w_target_fn=None,
+    ):
         """
         Train auxiliary behavioural prediction objective.
 
@@ -884,8 +893,34 @@ class PairRelationalModule:
                 CE(logits_shadow, a_j^{t+1})
 
             total = full_loss + shadow_loss_weight * shadow_loss
+
+        [ego_conditioned_latent.py — vá pair-specificity, xem docstring
+        file đó] Nếu truyền `heads` (EgoConditionedHeads), cắm thêm:
+
+            total += w_influence * L_influence + w_contrastive * L_contrastive
+
+        vào CÙNG loss, backward CÙNG lượt với full_loss/shadow_loss. Đây là
+        điểm mấu chốt: L_influence/L_contrastive PHẢI tính trên `z_next`
+        (còn gradient, đầu ra sống của full_encoder ở batch này), KHÔNG
+        PHẢI trên `get_pair_latent()` (đã .detach()). Nếu dùng bản detach,
+        heads học ra thông tin sẵn có trong z nhưng full_encoder không hề
+        bị ép phải NHÉT thêm thông tin về ego vào z -- z_ij vẫn hội tụ về
+        global opponent model y như bug gốc, chỉ là heads "diễn" cho có.
+
+        ego_id/neighbor_id của batch lấy trực tiếp từ bc_buffer (đã có sẵn
+        từ add_bc_transition) -- KHÔNG gom theo ego khi gọi hàm này ở
+        runner, vì một batch bc_buffer tự nhiên trộn nhiều ego với nhau
+        (bc_buffer là buffer chung của mọi pair), nên neg_mask của
+        contrastive_loss (cùng j khác ego) tự nhiên không rỗng.
+
+        w_target_fn: callable(ego_id, neighbor_id) -> float, dùng làm nhãn
+        w_ij cho influence_loss. Không có nhãn causal riêng cho bc_buffer
+        nên dùng belief.debiased_mu(j) hiện tại của runner làm proxy nhãn
+        (đây chính là ước lượng w_ij tốt nhất đang có tại thời điểm gọi).
+        None = bỏ qua influence_loss (chỉ dùng contrastive).
         """
         self.last_bc_batch_count = 0
+        self.last_heads_loss = 0.0
 
         if len(self.bc_buffer) == 0:
             self.last_bc_loss = 0.0
@@ -933,7 +968,43 @@ class PairRelationalModule:
 
             loss = full_loss + self.shadow_loss_weight * shadow_loss
 
+            heads_loss_val = None
+            if heads is not None:
+                ego_ids_batch = [int(s["ego_id"]) for s in batch]
+                nb_ids_batch = [int(s["neighbor_id"]) for s in batch]
+
+                ego_t = torch.tensor(
+                    ego_ids_batch, dtype=torch.long, device=self.device
+                )
+                nb_t = torch.tensor(
+                    nb_ids_batch, dtype=torch.long, device=self.device
+                )
+
+                # [E2] dùng z_next CÒN GRADIENT -> ép full_encoder thật sự
+                # phải nhét thông tin ego vào z_ij (xem docstring hàm này).
+                con_loss = heads.contrastive_loss(z_next, ego_t, nb_t)
+
+                if w_target_fn is not None:
+                    w_vals = [
+                        float(w_target_fn(ego_ids_batch[k], nb_ids_batch[k]))
+                        for k in range(len(batch))
+                    ]
+                    w_t = torch.tensor(
+                        w_vals, dtype=torch.float32, device=self.device
+                    )
+                    inf_loss = heads.influence_loss(z_next, w_t)
+                else:
+                    inf_loss = torch.zeros(
+                        (), dtype=torch.float32, device=self.device
+                    )
+
+                heads_loss_val = w_influence * inf_loss + w_contrastive * con_loss
+                loss = loss + heads_loss_val
+
             self.optim.zero_grad()
+            if heads is not None and heads_optim is not None:
+                heads_optim.zero_grad()
+
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(
@@ -944,11 +1015,20 @@ class PairRelationalModule:
                 self.grad_clip,
             )
 
+            if heads is not None:
+                torch.nn.utils.clip_grad_norm_(heads.parameters(), self.grad_clip)
+
             self.optim.step()
+
+            if heads is not None and heads_optim is not None:
+                heads_optim.step()
 
             losses.append(float(loss.detach().cpu().item()))
             full_losses.append(float(full_loss.detach().cpu().item()))
             shadow_losses.append(float(shadow_loss.detach().cpu().item()))
+
+            if heads_loss_val is not None:
+                self.last_heads_loss = float(heads_loss_val.detach().cpu().item())
 
             self.last_bc_batch_count += 1
 
