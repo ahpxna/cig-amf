@@ -169,9 +169,9 @@ def default_cfg():
 
         "periph_mu_floor": 0.008,
         "periph_beta_floor": 0.03,
-        "periph_uniform_mix": 0.35,
+        "periph_uniform_mix": 0.4,
         "periph_use_uniform_mix": True,
-        "periph_lb_coeff": 0.5,
+        "periph_lb_coeff": 1,
         "belief_priority_mu_floor": 0.01,
         "shadow_loss_weight": 0.25,
         "graph_score_steps": 8,

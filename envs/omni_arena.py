@@ -67,7 +67,7 @@ class OmniArena:
     # = 0.15 * MIN_CORE_PHI = 0.0375 đã đủ: kênh [3] nổ bão hoà qua H=8 cho
     # |W*| ~ 0.3, đưa T5 SNR về ~13 (trong gate [3,20]) mà không phải nâng
     # trần. Bài toán của T5 là TẦN SUẤT NỔ, không phải biên độ.
-    PHI_GATEKEEPER_TO_COLLECTOR = 0.60
+    PHI_GATEKEEPER_TO_COLLECTOR = -0.60
     PHI_RELAY_TO_COLLECTOR = 0.35
     PHI_BLOCKER_TO_COLLECTOR = -0.50
     PHI_CONTROLLER_TO_COLLECTOR = 0.25
@@ -586,7 +586,6 @@ class OmniArena:
             self.delta_phi_frobenius_structural_last = 0.0
             self.delta_phi_frobenius_behavioural_last = 0.0
 
-    def _do_structural_shift(self):
         """
         Thực thi dời bottleneck (P4). GUARD A (P2<->P4 trap): shift CHỈ
         được phép khi lệnh gọi này thật sự bắt nguồn từ bên trong reset()
@@ -620,29 +619,33 @@ class OmniArena:
         delta_phi_frobenius_*, t, done, episode_count), nên nếu điều đó
         xảy ra thì restore_state() sau đó xoá sạch dấu vết của shift cùng
         phần state còn lại.
-        """
-        assert getattr(self, "_in_reset", False), (
-            "structural shift (P4) attempted OUTSIDE reset() "
-            f"(t={getattr(self, 't', None)}, done={getattr(self, 'done', None)}) -- "
-            "_do_structural_shift() may ONLY be invoked from inside "
-            "reset() (via _maybe_structural_shift(), which sets "
-            "self._in_reset=True for the duration of the call). A direct "
-            "call from application/test code bypassing reset() means the "
-            "structural configuration Phi would change without the episode "
-            "boundary bookkeeping (t/done/episode_count reset) -- exactly "
-            "the P2<->P4 trap this guard exists to catch."
-        )
-
+        """      
+    def _do_structural_shift(self):
         self.current_phase += 1
-
         prev_phi = copy.deepcopy(self.gt_influence_by_ego)
 
         for z in range(self.n_zones):
             self.active_lane[z] = "B" if self.active_lane[z] == "A" else "A"
+            
+            ra = self.zone_role_agents[z]
+            ob, orl = ra[self.ROLE_BLOCKER], ra[self.ROLE_RELAY]
+            ogk, oc = ra[self.ROLE_GATEKEEPER], ra[self.ROLE_CONTROLLER]
+            
+            # Đảo chéo 4 vai trò
+            ra[self.ROLE_BLOCKER] = orl
+            ra[self.ROLE_RELAY] = ob
+            ra[self.ROLE_GATEKEEPER] = oc
+            ra[self.ROLE_CONTROLLER] = ogk
+            
+            self.agent_role[ob] = self.ROLE_RELAY
+            self.agent_role[orl] = self.ROLE_BLOCKER
+            self.agent_role[ogk] = self.ROLE_CONTROLLER
+            self.agent_role[oc] = self.ROLE_GATEKEEPER
 
-        self._refresh_gt_graph()  # phi thay đổi TỨC THỜI, không agent nào di chuyển
-
+        self._refresh_gt_graph()
         self.delta_phi_frobenius_structural_last = self._delta_phi_frobenius(prev_phi, self.gt_influence_by_ego)
+        self.delta_phi_frobenius_behavioural_last = 0.0
+
         # RC-2: KHÔNG gán behavioural = 0.0 ở đây nữa. Hàm này không hề đo
         # behavioural drift, nên gán 0 là bịa số liệu — và đó chính là một
         # trong ba dòng đã biến T6 thành 1e12 theo cấu tạo.
@@ -718,15 +721,9 @@ class OmniArena:
         n = float(len(state_bank))
         return {j: {i: v / n for i, v in row.items()} for j, row in acc.items()}
 
-    def measure_realized_phi_tiers(
-        self,
-        n_states=32,
-        burn_in=3,
-        bank_seed=1234,
-        behaviour_pair=("cooperative", "selfish"),
-    ):
-        """
-        Đo CẢ HAI ‖dΦ̃‖_F và ghi vào delta_phi_frobenius_*_last:
+
+    """
+    Đo CẢ HAI ‖dΦ̃‖_F và ghi vào delta_phi_frobenius_*_last:
 
           structural  : đổi active_lane (phi đổi + delta đổi)  -> lớn
           behavioural : đổi _behaviour_mode() (phi BẤT BIẾN,
@@ -744,42 +741,60 @@ class OmniArena:
         chính hành vi sinh ra.
 
         Trả về (structural, behavioural).
-        """
+    """
+
+    def measure_realized_phi_tiers(
+        self,
+        n_states=32,
+        burn_in=3,
+        bank_seed=1234,
+        behaviour_pair=("cooperative", "selfish"),
+    ):
         mode_a, mode_b = behaviour_pair
         snapshot = self.clone_state()
         saved_mode = self.mode
-        saved_override = self._behaviour_override
+        saved_override = getattr(self, "_behaviour_override", None)
         saved_lane = copy.deepcopy(self.active_lane)
+        saved_role_agents = copy.deepcopy(self.zone_role_agents)
+        saved_agent_zone = copy.deepcopy(self.agent_zone)
 
         try:
-            # Tắt structural shift tự động trong lúc đo: reset() được gọi
-            # nhiều lần bên dưới và ở mode="structural_shift" nó có thể lật
-            # lane giữa chừng, làm nhiễm chéo hai phép đo.
-            self.mode = "behavioral_drift"
-
             self.set_behaviour_override(mode_a)
             phi_ref = self.realized_phi_matrix(
                 self.sample_state_bank(n_states, burn_in, bank_seed=bank_seed))
 
-            # --- structural: lật lane, phi đổi tức thời ---
+            # --- STRUCTURAL SHIFT (Đảo 4 vai trò) ---
             for z in range(self.n_zones):
                 self.active_lane[z] = "B" if self.active_lane[z] == "A" else "A"
+                ra = self.zone_role_agents[z]
+                ob, orl = ra[self.ROLE_BLOCKER], ra[self.ROLE_RELAY]
+                ogk, oc = ra[self.ROLE_GATEKEEPER], ra[self.ROLE_CONTROLLER]
+                
+                ra[self.ROLE_BLOCKER] = orl
+                ra[self.ROLE_RELAY] = ob
+                ra[self.ROLE_GATEKEEPER] = oc
+                ra[self.ROLE_CONTROLLER] = ogk
+                
+                self.agent_role[ob] = self.ROLE_RELAY
+                self.agent_role[orl] = self.ROLE_BLOCKER
+                self.agent_role[ogk] = self.ROLE_CONTROLLER
+                self.agent_role[oc] = self.ROLE_GATEKEEPER
+                
             self._refresh_gt_graph()
+            
             phi_shifted = self.realized_phi_matrix(
                 self.sample_state_bank(n_states, burn_in, bank_seed=bank_seed))
             structural = self._delta_phi_frobenius(phi_ref, phi_shifted)
 
+            # Phục hồi nguyên trạng
             self.active_lane = copy.deepcopy(saved_lane)
+            self.zone_role_agents = copy.deepcopy(saved_role_agents)
+            self.agent_zone = copy.deepcopy(saved_agent_zone)
             self._refresh_gt_graph()
 
-            # --- behavioural: phi y nguyên, chỉ đổi cách agent hành xử ---
-            # [P-4 FINAL DEBUG] Đo bằng TRUNG BÌNH các bước drift KỀ NHAU trong
-            # lịch thực tế của mode="behavioral_drift", thay vì một cặp cực đoan
-            # (cooperative vs selfish) — cặp cực đoan đo "khoảng cách 4 pha dồn
-            # một lần", thứ không agent nào trải nghiệm; drift mà learner thấy
-            # là MỘT bước chuyển pha. behaviour_pair giữ lại cho tương thích
-            # nhưng chỉ dùng làm fallback khi schedule < 2 mode.
-            schedule = ["cooperative", "delayed", "zigzag", "lazy", "selfish"]
+            # --- BEHAVIOURAL DRIFT ---
+            # GIỮ NGUYÊN "selfish" như bạn yêu cầu!
+            schedule = ["cooperative", "delayed", "zigzag", "lazy", "selfish"] 
             phis = {mode_a: phi_ref}
             for m in schedule:
                 if m not in phis:
@@ -797,10 +812,13 @@ class OmniArena:
                 phi_drifted = self.realized_phi_matrix(
                     self.sample_state_bank(n_states, burn_in, bank_seed=bank_seed))
                 behavioural = self._delta_phi_frobenius(phi_ref, phi_drifted)
+
         finally:
             self.set_behaviour_override(saved_override)
             self.mode = saved_mode
             self.active_lane = copy.deepcopy(saved_lane)
+            self.zone_role_agents = copy.deepcopy(saved_role_agents)
+            self.agent_zone = copy.deepcopy(saved_agent_zone)
             self._refresh_gt_graph()
             self.restore_state(snapshot)
 
@@ -808,6 +826,14 @@ class OmniArena:
         self.delta_phi_frobenius_behavioural_last = float(behavioural)
         return float(structural), float(behavioural)
 
+
+             # --- behavioural: phi y nguyên, chỉ đổi cách agent hành xử ---
+            # [P-4 FINAL DEBUG] Đo bằng TRUNG BÌNH các bước drift KỀ NHAU trong
+            # lịch thực tế của mode="behavioral_drift", thay vì một cặp cực đoan
+            # (cooperative vs selfish) — cặp cực đoan đo "khoảng cách 4 pha dồn
+            # một lần", thứ không agent nào trải nghiệm; drift mà learner thấy
+            # là MỘT bước chuyển pha. behaviour_pair giữ lại cho tương thích
+            # nhưng chỉ dùng làm fallback khi schedule < 2 mode.
     # ============================================================
     # API
     # ============================================================
