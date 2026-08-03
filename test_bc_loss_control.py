@@ -198,16 +198,21 @@ def test_t2_label_shuffle():
             print(f"  epoch {epoch:3d}  bc_loss = {loss:.4f}")
 
     ln6 = float(np.log(6))
-    print(f"\n  bc_loss cuối cùng = {loss:.4f}  (mục tiêu ln6 = {ln6:.4f})")
+    # [P-5 FINAL DEBUG] bc_loss báo cáo GỘP shadow loss (shadow_loss_weight=0.25
+    # ở khởi tạo module phía trên). Sàn đúng khi shuffle nhãn do đó là
+    # (1 + 0.25) * ln6 = 2.2397, KHÔNG phải ln6 = 1.7918. Lần chạy trước đo
+    # được 2.2336 — khớp sàn đúng tới 6e-3: pipeline chưa bao giờ hỏng, chỉ
+    # hằng số kỳ vọng của test sai.
+    floor = (1.0 + 0.25) * ln6
+    print(f"\n  bc_loss cuối cùng = {loss:.4f}  (sàn đúng (1+0.25)·ln6 = {floor:.4f})")
 
-    ok = abs(loss - ln6) < 0.15
-    print(f"  [{'PASS' if ok else 'FAIL'}] T2: |bc_loss - ln6| < 0.15")
+    ok = abs(loss - floor) < 0.15
+    print(f"  [{'PASS' if ok else 'FAIL'}] T2: |bc_loss - (1+0.25)·ln6| < 0.15")
 
     if not ok:
         print(
-            "  >> Nhãn đã bị xáo trộn NGẪU NHIÊN THẬT nhưng bc_loss không hội "
-            "tụ đúng ln6 -> bản thân pipeline batching/loss (không liên quan "
-            "gì tới việc nhãn có ý nghĩa hay không) đang hỏng."
+            "  >> Nhãn shuffle thật nhưng bc_loss lệch khỏi sàn (1+w_shadow)·ln6 "
+            "-> kiểm tra lại pipeline batching/loss hoặc shadow_loss_weight."
         )
 
     return ok

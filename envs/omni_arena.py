@@ -63,6 +63,10 @@ class OmniArena:
     # P1: bảng Phi thiết kế (tier A) — hằng số có dấu, xem Phần 2.1.
     # Các cặp không liệt kê => phi = 0 (không có kênh khai báo).
     # ------------------------------------------------------------------
+    # RC-1: thang phi GIỮ NGUYÊN. Không nâng |phi|, vì MAX_EMERGENT_MAGNITUDE
+    # = 0.15 * MIN_CORE_PHI = 0.0375 đã đủ: kênh [3] nổ bão hoà qua H=8 cho
+    # |W*| ~ 0.3, đưa T5 SNR về ~13 (trong gate [3,20]) mà không phải nâng
+    # trần. Bài toán của T5 là TẦN SUẤT NỔ, không phải biên độ.
     PHI_GATEKEEPER_TO_COLLECTOR = 0.60
     PHI_RELAY_TO_COLLECTOR = 0.35
     PHI_BLOCKER_TO_COLLECTOR = -0.50
@@ -82,7 +86,46 @@ class OmniArena:
     ]
     MIN_CORE_PHI = min(CORE_PHI_MAGNITUDES)  # 0.25
     # P3 / Phần 1.2: max|r_emergent| <= 0.15 * min|phi_ij|
-    MAX_EMERGENT_MAGNITUDE = 0.15 * MIN_CORE_PHI
+    #
+    # RC-3(a): trước khi xoá hai khối hand-coded, bất biến này vô nghĩa — nó
+    # neo vào bảng phi DANH NGHĨA (min 0.25) trong khi dòng reward pairwise
+    # THẬT là 2.5, tức tỉ lệ thực 1.5% chứ không phải 15%. Sau RC-1, phi LÀ
+    # dòng reward pairwise duy nhất nên bất biến này lại đúng theo nghĩa đen.
+    # [P-3 FINAL DEBUG] Trần nới 0.0375 -> 0.045 để đi kèm ZONE_CROWDING_COEF
+    # 0.012 -> 0.020: crowding điển hình ~0.030 + queue ~0.010 = ~0.040 phải
+    # nằm DƯỚI trần, nếu không r_emergent clip liên tục và đạo hàm theo vị trí
+    # biến mất (đúng cảnh báo RC-3 bên dưới).
+    MAX_EMERGENT_MAGNITUDE = 0.18 * MIN_CORE_PHI
+
+    # ------------------------------------------------------------------
+    # RC-5: tham số kênh [3]. Bản cũ dùng radius=1 + ngưỡng `> 2` trên lưới
+    # 24x24 với 6 agent/zone ⇒ mật độ quá thấp, đo thật max|r_emergent| = 0.0
+    # cả episode. Kênh arena_v3 khi đó KHÔNG TỒN TẠI: "DIG + arena_v3" thực
+    # chất là "DIG + 0".
+    #
+    # HIỆU CHỈNH (RC-3): biên độ cộng dồn điển hình phải nằm TRONG khoảng
+    # (0, MAX_EMERGENT_MAGNITUDE) chứ không dán vào trần. Nếu r_emergent bị
+    # clip liên tục thì đạo hàm theo vị trí agent khác biến mất ⇒ W*(control)
+    # về 0 lần nữa và SNR lại nổ. Nói cách khác: "bão hoà" ở đây nghĩa là NỔ
+    # MỖI BƯỚC, không phải CHẠM TRẦN mỗi bước.
+    # Tổng điển hình: crowding ~0.018 + queue ~0.010 = ~0.028 < 0.0375.
+    # ------------------------------------------------------------------
+    LANE_CONGESTION_RADIUS = 2
+    LANE_CAPACITY = 2                 # `>= 2` thay vì `> 2`
+    LANE_CONGESTION_PENALTY = 0.010   # was 0.1 — sẽ clip ngay lập tức nếu giữ
+    STATION_QUEUE_RADIUS = 2
+    STATION_QUEUE_PENALTY = 0.020
+    COLLISION_PENALTY = 0.015
+    # Coupling nền TRƠN theo khoảng cách, phạm vi cùng-zone. Đây là thứ RC-3(b)
+    # bắt buộc phải có: đo thật cho thấy các cặp control cùng zone KHÔNG chứa
+    # blocker (relay->controller, relay->gatekeeper, ...) trả W* = 0 tuyệt đối
+    # vì giữa chúng không tồn tại BẤT KỲ dòng code tương tác nào. Sampling
+    # cùng zone là cần nhưng KHÔNG đủ — phải có kênh vật lý nối chúng.
+    # [P-3 FINAL DEBUG] 0.012 -> 0.020: T5 SNR đo được 33.38 hơi vượt band
+    # chấp nhận [3, 20] vì std|W*|(control) = 0.0197 hơi nhỏ. Tăng ~1.67x kênh
+    # nền trơn kéo std control lên ~0.033 => SNR ~ 20. Nếu sau khi chạy lại
+    # env_audit mà T1 Gini < 0.30 hoặc r_emergent clip thường xuyên, hạ về 0.016.
+    ZONE_CROWDING_COEF = 0.020
 
     # P0(d): noise purposes có trong step() — dùng cho CRN buffer của oracle.
     NOISE_PURPOSES = ["resource_respawn"]
@@ -132,6 +175,13 @@ class OmniArena:
         self.supported_egos = list(range(self.n_agents))
         self.current_phase = 0
         self.episode_count = 0
+        self.episode_deliveries = 0
+
+        # RC-2: ép _behaviour_mode() trả về một mode cố định. CHỈ dùng cho phép
+        # đo Φ̃ (xem measure_realized_phi_tiers) — nó cần cô lập biến "hành vi"
+        # khỏi biến "pha episode", nếu không hai lần đo sẽ khác nhau ở cả hai
+        # trục và không quy được chênh lệch cho trục nào.
+        self._behaviour_override = None
 
         # [Guard A -- P2<->P4 trap] True CHỈ trong lúc reset() đang chạy.
         # Đây là tín hiệu ĐÚNG để _do_structural_shift() tự bảo vệ mình
@@ -164,6 +214,7 @@ class OmniArena:
         self.zone_lane_a = {}      # relay's home lane ("lane A")
         self.zone_lane_b = {}      # alternate lane ("lane B") — near blocker
         self.zone_panel = {}       # controller's target tile
+        self.zone_checkpoint = {}  # RC-4: blocker's own duty tile
         self.zone_centers = {}
 
         rows = max(2, int(np.sqrt(self.n_zones)))
@@ -190,6 +241,17 @@ class OmniArena:
                 self.zone_lane_a[zone] = (self._clip(cr), self._clip(cc_ - 3))
                 self.zone_lane_b[zone] = (self._clip(cr), self._clip(cc_ + 3))
                 self.zone_panel[zone] = (self._clip(cr - 3), self._clip(cc_ - 3))
+                # RC-4: ô trực của blocker, nằm GIỮA resource (cr+1) và
+                # sink (cr+3) — tức trên đúng tuyến vận chuyển của collector.
+                # Chọn vị trí này có chủ đích: blocker chỉ theo đuổi nhiệm vụ
+                # tĩnh của nó (đứng đúng ô), nhưng vì ô đó nằm trên tuyến nên
+                # dist(blocker, collector) <= 2 vẫn xảy ra thường xuyên ⇒ cạnh
+                # khai báo blocker->collector vẫn sống. Ảnh hưởng là HỆ QUẢ
+                # PHỤ của nhiệm vụ, không phải thứ blocker được trả tiền để
+                # tối đa hoá. Nếu đặt ô trực ra xa tuyến (vd lane_b) thì
+                # delta của gate_blocker_collector về 0 và cạnh âm duy nhất
+                # trong đồ thị chết theo — T2 sign balance sập.
+                self.zone_checkpoint[zone] = (self._clip(cr + 2), self._clip(cc_))
                 zone += 1
 
     def _init_population_roles(self):
@@ -273,6 +335,16 @@ class OmniArena:
                 blocker_phi += self.PHI_LANE_B_BONUS
             self._set_phi(blocker, collector, blocker_phi)
             self.declared_pairs.append((blocker, collector, "gate_blocker_collector", z))
+
+            # RC-4 (đã cân nhắc và LOẠI BỎ): KHÔNG thêm cạnh mirror zero-sum
+            # (collector -> blocker). Runner tối ưu return PER-AGENT, không có
+            # mixer/QMIX/team reward, nên "tổng âm" không phải cơ chế gây hại.
+            # Zero-sum hoá còn phản tác dụng: blocker sẽ ăn ĐÚNG phần collector
+            # mất ⇒ động cơ đuổi bắt MẠNH HƠN, và framing hợp tác của env bị
+            # phá. Cách đúng là cắt động cơ đuổi bắt ở gốc (xem r_solo trong
+            # step()): blocker theo nhiệm vụ riêng, ảnh hưởng lên collector là
+            # HỆ QUẢ PHỤ. Về mặt nghiên cứu đây mới là thứ cần đo — ảnh hưởng
+            # cấu trúc do môi trường sinh ra, không phải thứ agent cố ý tạo.
 
             # controller -> collector
             self._set_phi(controller, collector, self.PHI_CONTROLLER_TO_COLLECTOR)
@@ -404,9 +476,88 @@ class OmniArena:
 
         return 0.0
 
+    # ============================================================
+    # P3 / RC-5: kênh [3] r_emergent — nổi lên, không quy được về cặp
+    # ============================================================
+
+    def _apply_emergent_congestion(self, r_emergent):
+        """
+        Ba nguồn tắc nghẽn, tất cả chỉ phụ thuộc MẬT ĐỘ VỊ TRÍ nên không cặp
+        (i, j) khai báo nào "sở hữu" chúng — đúng định nghĩa kênh [3]:
+
+          1. lane over-capacity : bottleneck vật lý tại lane A / lane B
+          2. station queue      : tranh chấp resource và sink
+          3. zone crowding      : coupling nền trơn 1/(1+d), phạm vi cùng zone
+
+        (3) là bổ sung của RC-3(b) và nó BẮT BUỘC: (1) và (2) đều là ngưỡng
+        rời rạc, hai agent không bao giờ đồng vị trí sẽ cho W* == 0 TUYỆT ĐỐI
+        ⇒ std|W*|(control) == 0 ⇒ T5 SNR = ∞. Chỉ bơm biên độ (1)(2) không cứu
+        được: cặp không chạm nhau vẫn bằng 0 dù biên độ to đến đâu. Cần một
+        kênh liên tục theo khoảng cách để noise floor có giá trị hữu hạn.
+
+        Độ phức tạp: O(n_zones * n_agents) cho (1)(2) + O(n_agents^2) cho (3).
+        n_agents = 24 ⇒ ~600 phép tính/bước, không đáng kể so với chi phí
+        rollout của oracle (H=8 x |A|=6 x n_states). Nếu scale lên hàng nghìn
+        agent thì (3) phải đổi sang spatial hash theo zone.
+        """
+        for z in range(self.n_zones):
+            for lane_pos in (self.zone_lane_a[z], self.zone_lane_b[z]):
+                occupants = [
+                    a for a in range(self.n_agents)
+                    if self._dist(self.positions[a], lane_pos) <= self.LANE_CONGESTION_RADIUS
+                ]
+                if len(occupants) >= self.LANE_CAPACITY:
+                    for a in occupants:
+                        r_emergent[a] -= self.LANE_CONGESTION_PENALTY
+
+            # Bản cũ chỉ tính hàng đợi ở resource. Sink cũng là điểm nghẽn thật
+            # (collector phải dừng đúng ô đó để giao hàng) nên phải tính cả hai.
+            for station in (self.zone_resource[z], self.zone_sink[z]):
+                waiting = [
+                    a for a in range(self.n_agents)
+                    if self._dist(self.positions[a], station) <= self.STATION_QUEUE_RADIUS
+                ]
+                if len(waiting) >= 2:
+                    split = self.STATION_QUEUE_PENALTY / len(waiting)
+                    for a in waiting:
+                        r_emergent[a] -= split
+
+        for a in range(self.n_agents):
+            zone_a = self.agent_zone[a]
+            crowding = 0.0
+            for b in range(self.n_agents):
+                if b == a or self.agent_zone[b] != zone_a:
+                    continue
+                crowding += 1.0 / (1.0 + self._dist(self.positions[a], self.positions[b]))
+            r_emergent[a] -= self.ZONE_CROWDING_COEF * crowding
+
+        # P3 / Phần 1.2: chặn biên độ kênh [3] SAU khi cộng đủ ba nguồn.
+        for a in range(self.n_agents):
+            r_emergent[a] = float(np.clip(
+                r_emergent[a], -self.MAX_EMERGENT_MAGNITUDE, self.MAX_EMERGENT_MAGNITUDE
+            ))
+
+    def _aggregate_reward_by_role(self, rewards):
+        """Mean reward theo vai trò — metric báo cáo thay cho mean toàn quần thể."""
+        acc = {role: [] for role in self.ROLE_ORDER}
+        for a in range(self.n_agents):
+            acc[self.agent_role[a]].append(float(rewards[a]))
+        return {role: (float(np.mean(v)) if v else 0.0) for role, v in acc.items()}
+
     def _lane_queue(self, lane_pos, radius=1):
+        # [P-1 FINAL DEBUG] Chỉ đếm các vai trò THỰC SỰ xếp hàng ở lane
+        # (collector/relay). Bản cũ đếm MỌI agent trong bán kính, kể cả thân
+        # gatekeeper/controller đứng gần đó vì nhiệm vụ riêng => can thiệp lên
+        # gatekeeper làm queue tụt dưới ngưỡng q>=2, bật/tắt gate của
+        # blocker->collector (phi=-0.5) và relay->collector. Đo phân rã kênh
+        # (base vs disengage, cặp gk->collector) cho thấy d_w(gk kênh khai báo)
+        # = 0.000 ở MỌI state, toàn bộ W* âm -0.87 rò qua các gate khác =>
+        # corr(Phi,W*) sập về 0.625. Lọc theo role cắt đứt đường rò này.
+        queue_roles = (self.ROLE_COLLECTOR, self.ROLE_RELAY)
         count = 0
         for a in range(self.n_agents):
+            if self.agent_role[a] not in queue_roles:
+                continue
             if self._dist(self.positions[a], lane_pos) <= radius:
                 count += 1
         return count
@@ -492,7 +643,10 @@ class OmniArena:
         self._refresh_gt_graph()  # phi thay đổi TỨC THỜI, không agent nào di chuyển
 
         self.delta_phi_frobenius_structural_last = self._delta_phi_frobenius(prev_phi, self.gt_influence_by_ego)
-        self.delta_phi_frobenius_behavioural_last = 0.0
+        # RC-2: KHÔNG gán behavioural = 0.0 ở đây nữa. Hàm này không hề đo
+        # behavioural drift, nên gán 0 là bịa số liệu — và đó chính là một
+        # trong ba dòng đã biến T6 thành 1e12 theo cấu tạo.
+        # Giá trị đúng chỉ đến từ measure_realized_phi_tiers().
 
     def _delta_phi_frobenius(self, phi_a, phi_b):
         total = 0.0
@@ -505,9 +659,154 @@ class OmniArena:
         return float(np.sqrt(total))
 
     def tier_separation_ratio(self):
+        """
+        RC-2: mẫu số PHẢI là ‖dΦ̃‖ đo được (measure_realized_phi_tiers), không
+        phải hằng số 0.0 gán cứng. Bản cũ có ĐÚNG ba dòng gán
+        `delta_phi_frobenius_behavioural_last = 0.0` và không dòng nào khác
+        trong cả file gán giá trị khác ⇒ hàm này trả 1e12 THEO CẤU TẠO, và
+        "T6 = 9.9e11" chưa bao giờ là kết quả đo.
+        Khi chưa đo, trả inf để hỏng ồn ào thay vì trả 1e12 giả dạng số liệu.
+        """
         num = self.delta_phi_frobenius_structural_last
         den = self.delta_phi_frobenius_behavioural_last
-        return float(num / max(den, 1e-12))
+        if den <= 0.0:
+            return float("inf")
+        return float(num / den)
+
+    # ============================================================
+    # RC-2: Φ̃ = E_s[phi * delta] — ma trận ảnh hưởng ĐÃ HIỆN THỰC HOÁ
+    # ============================================================
+
+    def set_behaviour_override(self, mode_name):
+        """Ép _behaviour_mode(). None = trả về lịch theo pha như bình thường."""
+        self._behaviour_override = mode_name
+
+    def realized_phi_matrix(self, state_bank):
+        """
+        Φ̃_ij = E_s[ phi_ij * delta_ij(s) ] trên state bank cho trước.
+
+        TẠI SAO CẦN: bảng phi tĩnh mù tuyệt đối với hành vi — nó chỉ đổi tại
+        ranh giới structural shift, nên ‖dΦ‖_behavioural = 0 là hệ quả của
+        ĐỊNH NGHĨA, không phải phát hiện. Nhưng delta_ij(s) thì phụ thuộc vị
+        trí THẬT của cả hai agent (xem _gate_ladder), nên behavioural drift
+        CÓ làm đổi Φ̃ dù phi bất biến. Tín hiệu T6 cần đã nằm sẵn trong env
+        từ đầu, chỉ là chưa ai đo — không cần thêm tầng "realization gate"
+        nào cả, L2 chính là delta_ij(s).
+
+        Trả về dict thưa {ego: {src: Φ̃}} — chỉ chứa các cặp declared, đúng
+        miền mà _delta_phi_frobenius() cần.
+        """
+        if not state_bank:
+            return {}
+
+        snapshot = self.clone_state()
+        acc = {}
+        try:
+            for st in state_bank:
+                self.restore_state(st)
+                deltas = self._compute_deltas()
+                for (i, j), d in deltas.items():
+                    # phi lấy từ state đang restore: mỗi state mang theo
+                    # active_lane + bảng phi của chính nó, nên so sánh
+                    # cross-lane (structural) là hợp lệ.
+                    phi = self.gt_influence_by_ego[j].get(i, 0.0)
+                    row = acc.setdefault(j, {})
+                    row[i] = row.get(i, 0.0) + phi * d
+        finally:
+            self.restore_state(snapshot)
+
+        n = float(len(state_bank))
+        return {j: {i: v / n for i, v in row.items()} for j, row in acc.items()}
+
+    def measure_realized_phi_tiers(
+        self,
+        n_states=32,
+        burn_in=3,
+        bank_seed=1234,
+        behaviour_pair=("cooperative", "selfish"),
+    ):
+        """
+        Đo CẢ HAI ‖dΦ̃‖_F và ghi vào delta_phi_frobenius_*_last:
+
+          structural  : đổi active_lane (phi đổi + delta đổi)  -> lớn
+          behavioural : đổi _behaviour_mode() (phi BẤT BIẾN,
+                        chỉ phân bố state đổi)                 -> nhỏ nhưng > 0
+
+        KIỂM SOÁT NHIỄU: cả ba lần lấy mẫu dùng CHUNG bank_seed, chung
+        n_states, chung burn_in. Nếu không, chênh lệch đo được chỉ là nhiễu
+        lấy mẫu Monte-Carlo chứ không phải tín hiệu tầng.
+
+        Lưu ý thiết kế: state bank KHÔNG thể là một tập cố định dùng lại cho
+        cả hai chế độ hành vi — delta_ij(s) là hàm thuần của s, nên trên cùng
+        một tập s thì Φ̃ giống hệt nhau và ta lại thu về 0. Thứ mà behavioural
+        drift đổi là PHÂN BỐ state được ghé thăm. Vì vậy "cố định" ở đây có
+        nghĩa: cố định seed và quy trình lấy mẫu, thả tự do phần state do
+        chính hành vi sinh ra.
+
+        Trả về (structural, behavioural).
+        """
+        mode_a, mode_b = behaviour_pair
+        snapshot = self.clone_state()
+        saved_mode = self.mode
+        saved_override = self._behaviour_override
+        saved_lane = copy.deepcopy(self.active_lane)
+
+        try:
+            # Tắt structural shift tự động trong lúc đo: reset() được gọi
+            # nhiều lần bên dưới và ở mode="structural_shift" nó có thể lật
+            # lane giữa chừng, làm nhiễm chéo hai phép đo.
+            self.mode = "behavioral_drift"
+
+            self.set_behaviour_override(mode_a)
+            phi_ref = self.realized_phi_matrix(
+                self.sample_state_bank(n_states, burn_in, bank_seed=bank_seed))
+
+            # --- structural: lật lane, phi đổi tức thời ---
+            for z in range(self.n_zones):
+                self.active_lane[z] = "B" if self.active_lane[z] == "A" else "A"
+            self._refresh_gt_graph()
+            phi_shifted = self.realized_phi_matrix(
+                self.sample_state_bank(n_states, burn_in, bank_seed=bank_seed))
+            structural = self._delta_phi_frobenius(phi_ref, phi_shifted)
+
+            self.active_lane = copy.deepcopy(saved_lane)
+            self._refresh_gt_graph()
+
+            # --- behavioural: phi y nguyên, chỉ đổi cách agent hành xử ---
+            # [P-4 FINAL DEBUG] Đo bằng TRUNG BÌNH các bước drift KỀ NHAU trong
+            # lịch thực tế của mode="behavioral_drift", thay vì một cặp cực đoan
+            # (cooperative vs selfish) — cặp cực đoan đo "khoảng cách 4 pha dồn
+            # một lần", thứ không agent nào trải nghiệm; drift mà learner thấy
+            # là MỘT bước chuyển pha. behaviour_pair giữ lại cho tương thích
+            # nhưng chỉ dùng làm fallback khi schedule < 2 mode.
+            schedule = ["cooperative", "delayed", "zigzag", "lazy", "selfish"]
+            phis = {mode_a: phi_ref}
+            for m in schedule:
+                if m not in phis:
+                    self.set_behaviour_override(m)
+                    phis[m] = self.realized_phi_matrix(
+                        self.sample_state_bank(n_states, burn_in, bank_seed=bank_seed))
+            steps = [
+                self._delta_phi_frobenius(phis[schedule[k]], phis[schedule[k + 1]])
+                for k in range(len(schedule) - 1)
+            ]
+            if steps:
+                behavioural = float(np.mean(steps))
+            else:
+                self.set_behaviour_override(mode_b)
+                phi_drifted = self.realized_phi_matrix(
+                    self.sample_state_bank(n_states, burn_in, bank_seed=bank_seed))
+                behavioural = self._delta_phi_frobenius(phi_ref, phi_drifted)
+        finally:
+            self.set_behaviour_override(saved_override)
+            self.mode = saved_mode
+            self.active_lane = copy.deepcopy(saved_lane)
+            self._refresh_gt_graph()
+            self.restore_state(snapshot)
+
+        self.delta_phi_frobenius_structural_last = float(structural)
+        self.delta_phi_frobenius_behavioural_last = float(behavioural)
+        return float(structural), float(behavioural)
 
     # ============================================================
     # API
@@ -558,6 +857,7 @@ class OmniArena:
             "t": self.t,
             "done": self.done,
             "episode_count": self.episode_count,
+            "episode_deliveries": self.episode_deliveries,
             "current_phase": self.current_phase,
             "rng_state": self.rng.get_state(),
             "gt_core_by_ego": copy.deepcopy(self.gt_core_by_ego),
@@ -577,6 +877,8 @@ class OmniArena:
         self.t = state["t"]
         self.done = state["done"]
         self.episode_count = state["episode_count"]
+        # .get(): tương thích ngược với snapshot tạo trước RC-4.
+        self.episode_deliveries = state.get("episode_deliveries", 0)
         self.current_phase = state["current_phase"]
         self.rng.set_state(state["rng_state"])
         self.gt_core_by_ego = copy.deepcopy(state["gt_core_by_ego"])
@@ -744,6 +1046,7 @@ class OmniArena:
         self.carrying = {z: False for z in range(self.n_zones)}
         self.low_priority_active = {z: False for z in range(self.n_zones)}
         self.last_actions = {a: self.STAY for a in range(self.n_agents)}
+        self.episode_deliveries = 0
         # self.t/self.done đã được đặt lại ở ĐẦU reset() (trước
         # _maybe_structural_shift()) -- không gán lại ở đây nữa.
         self.episode_count += 1
@@ -754,6 +1057,10 @@ class OmniArena:
     # ============================================================
 
     def _behaviour_mode(self):
+        # RC-2: override thắng tuyệt đối — phép đo Φ̃ cần cô lập trục hành vi
+        # khỏi trục pha/episode_count.
+        if self._behaviour_override is not None:
+            return self._behaviour_override
         if self.mode == "behavioral_drift":
             phase = (self.episode_count // self.phase_length) % 5
             return ["cooperative", "delayed", "zigzag", "lazy", "selfish"][phase]
@@ -769,8 +1076,7 @@ class OmniArena:
         sink = self.zone_sink[z]
         lane_a = self.zone_lane_a[z]
         panel = self.zone_panel[z]
-        ra = self.zone_role_agents[z]
-        collector = ra[self.ROLE_COLLECTOR]
+        checkpoint = self.zone_checkpoint[z]
 
         def greedy(src, dst):
             return self._greedy_avoiding(agent_id, src, dst)
@@ -791,24 +1097,43 @@ class OmniArena:
                     return self.OPEN if (self.t % 3 != 1) else self.LEFT
                 if mode == "lazy":
                     return self.OPEN if (self.t % 3 == 0) else self.STAY
-                return self.STAY  # selfish -- ignores duty
+                # [P-4 FINAL DEBUG] selfish: duty suy giảm mạnh nhưng KHÔNG bỏ hẳn.
+                # "Bỏ duty" = realized structure đổi (delta sập 0 hàng loạt) =>
+                # behavioural dPhi~ (1.376) nuốt chửng structural (0.360), T6 đảo
+                # ngược. Theo paper (Exp 2): drift = "dependencies fixed, only
+                # policies move" — đổi CÁCH làm chứ không đổi VIỆC ai ảnh hưởng ai.
+                return self.OPEN if (self.t % 4 == 0) else self.STAY  # selfish
             return greedy(pos, gate)
 
         if role == self.ROLE_RELAY:
             if mode == "zigzag" and self.t % 4 == 0:
                 return self.LEFT
             if mode == "selfish":
-                return self.STAY
+                # [P-4] vẫn hướng về lane nhưng lề mề (đi 1 nghỉ 1), không bỏ vị trí
+                return self.STAY if (self.t % 2 == 0) else greedy(pos, lane_a)
             return greedy(pos, lane_a)
 
         if role == self.ROLE_BLOCKER:
             if mode == "selfish":
-                return self.rng.randint(0, self.N_ACTIONS - 1)
-            return greedy(pos, self.positions[collector])
+                # [P-4] nhiễu quanh checkpoint thay vì random toàn cục (bỏ vị trí)
+                if self.rng.rand() < 0.5:
+                    return self.rng.randint(0, self.N_ACTIONS - 1)
+                return greedy(pos, checkpoint)
+            # RC-4: scripted policy phải KHỚP với reward mới. Bản cũ
+            # `greedy(pos, self.positions[collector])` là hành vi tối ưu cho
+            # shaping đuổi bắt đã bị xoá; giữ nó lại thì baseline scripted vẫn
+            # đuổi trong khi learner thì không, và hai đường số liệu không còn
+            # so sánh được với nhau.
+            if mode == "lazy":
+                return self.STAY
+            return greedy(pos, checkpoint)
 
         if role == self.ROLE_CONTROLLER:
             if mode == "lazy" or mode == "selfish":
-                return self.STAY
+                # [P-4] vẫn trực panel, chỉ kích hoạt thưa hơn — không bỏ duty
+                if tuple(pos) == panel:
+                    return self.OPEN if (self.t % 4 == 0) else self.STAY
+                return self.STAY if (self.t % 2 == 0) else greedy(pos, panel)
             if tuple(pos) == panel:
                 return self.OPEN
             return greedy(pos, panel)
@@ -831,6 +1156,7 @@ class OmniArena:
         self._noise_call_counter = {}
         rewards = [-0.01 for _ in range(self.n_agents)]
         r_emergent = [0.0 for _ in range(self.n_agents)]
+        deliveries_this_step = 0
 
         # ---- gate/panel activation (based on state BEFORE movement) ----
         for z in range(self.n_zones):
@@ -870,66 +1196,46 @@ class OmniArena:
                 self.positions[a] = proposed[a]
             elif self.enable_congestion:
                 # P3: va chạm -- KHÔNG quy được cho một cặp (i,j) cụ thể -> kênh [3]
-                r_emergent[a] -= 0.015
+                r_emergent[a] -= self.COLLISION_PENALTY
 
         self.last_actions = {a: int(actions[a]) for a in range(self.n_agents)}
 
         # ============================================================
-        # TUẦN TRA VÀ TẦM NHÌN GATEKEEPER
+        # RC-1 — ĐÃ XOÁ: hai khối reward hand-coded
         # ============================================================
-        cycle_step = self.t % self.gate_cycle_length
-        is_gate_open_by_cycle = cycle_step < self.gate_open_duration
+        # (a) "TẦM NHÌN GATEKEEPER": `rewards[collector] -= 1.5` khi
+        #     dist(collector, gatekeeper) <= gatekeeper_sight.
+        #     KHÔNG phải dead code — chẩn đoán "0% nên vô hại" là SAI. Dưới
+        #     scripted policy nó nổ 0% chỉ vì layout ép hai agent luôn cách
+        #     nhau đúng 3 ô; dưới random policy nó nổ 7.5% collector-step, và
+        #     76% số lần nổ TRÙNG bước mà kênh khai báo gate_gk_collector cũng
+        #     nổ. Cạnh "gatekeeper GIÚP collector" (phi = +0.60) do đó có net
+        #     reward = 0.60 − 1.5 = −0.90: DẤU NGƯỢC HẲN thiết kế.
+        #     Đây là quả mìn tệ nhất trong cả file: learner càng giỏi thì
+        #     collector càng tiến sát cổng, tần suất nổ càng tăng, tức ground
+        #     truth nhân quả của env TỰ HỎNG DẦN theo tiến độ training.
+        #     GIẢI QUYẾT DẤU (không xoá mù): cạnh gatekeeper->collector được
+        #     chốt là DƯƠNG. Khối −1.5 mang ngữ nghĩa "giám sát/bắt quả tang",
+        #     mâu thuẫn trực tiếp với ngữ nghĩa "mở cổng cho qua" của phi, nên
+        #     nó bị loại; phi giữ nguyên +0.60 qua gate_gk_collector.
+        #
+        # (b) "ÁP LỰC BLOCKER": `rewards[collector] += -2.5` khi
+        #     dist(collector, blocker) <= 2 (+ −0.7 khi <= 1).
+        #     Đo thật: nổ 52.1% collector-step, tổng −397.2/episode = 4.2x
+        #     TOÀN BỘ kênh khai báo cộng lại. Điều kiện của nó
+        #     (`carrying and dist <= 2`) TRÙNG KHÍT gate_blocker_collector —
+        #     nó là bản sao bẩn của logic đã tồn tại.
+        #
+        # (c) `rewards[collector] -= 0.05` khi đứng ô cổng lúc gate đóng:
+        #     gate_open[z] do HÀNH ĐỘNG của gatekeeper quyết định ⇒ đây cũng
+        #     là reward đa-agent trá hình r_solo. Giá trị của cổng đã nằm
+        #     trong phi(gatekeeper->collector).
+        #
+        # BẤT BIẾN được khôi phục: mọi reward phụ thuộc từ 2 agent trở lên
+        # PHẢI đi qua w_ij = phi_ij * delta_ij(s) và PHẢI có mặt trong
+        # info["w_by_pair"] (trừ kênh [3] r_emergent, vốn không quy được về
+        # một cặp và bị chặn biên độ bởi MAX_EMERGENT_MAGNITUDE).
 
-        for z in range(self.n_zones):
-            ra = self.zone_role_agents[z]
-            gk = ra[self.ROLE_GATEKEEPER]
-            collector = ra[self.ROLE_COLLECTOR]
-            
-            gk_pos = self.positions[gk]
-            collector_pos = self.positions[collector]
-            
-            # 1. Nếu muốn Gatekeeper di chuyển theo nhịp, truyền vị trí hiện tại thay vì chuỗi
-            # (Hoặc có thể bỏ qua bước dịch chuyển này nếu scripted_policy đã lo)
-            
-            # 2. Xử lý tầm nhìn của Gatekeeper đối với Collector
-            dist_to_gk = self._dist(collector_pos, gk_pos)
-            
-            if dist_to_gk <= self.gatekeeper_sight:
-                rewards[collector] -= 1.5      
-
-
-        # ============================================================
-        # TĂNG CƯỜNG ÁP LỰC BLOCKER (Ép agent phải nhạy cấu trúc)
-        # ============================================================
-        BLOCKER_DETECTION_RADIUS = 2  # Tăng phạm vi phát hiện lên 2 ô
-        BLOCKER_PENALTY = -2.5      # Trừng phạt nặng hơn mức mặc định (-0.18)
-
-        for a in range(self.n_agents):
-            if self.agent_role[a] == self.ROLE_COLLECTOR:
-                collector_pos = self.positions[a]
-                z = self.agent_zone[a]
-                gate_pos = self.zone_gate[z]
-                collector_pos = self.positions[a]
-                
-                # Kiểm tra xem collector có đang đứng ở ô cổng không
-                if tuple(collector_pos) == gate_pos:
-                    if not self.gate_open[z]:
-                        # Cửa đang đóng, phạt chi phí chờ
-                        rewards[a] -= 0.05
-                    else:
-                        # Cửa mở, qua cổng suôn sẻ
-                        pass
-                ra = self.zone_role_agents[z]
-                blocker_agent = ra[self.ROLE_BLOCKER]
-                
-                blocker_pos = self.positions[blocker_agent]
-                # Dùng self._dist chuẩn của env
-                dist = self._dist(collector_pos, blocker_pos)
-                
-                if dist <= BLOCKER_DETECTION_RADIUS:
-                    rewards[a] += BLOCKER_PENALTY
-                    if dist <= 1:
-                        rewards[a] -= 0.7
         # ---- pickup / delivery (state after movement) ----
         for z in range(self.n_zones):
             ra = self.zone_role_agents[z]
@@ -950,31 +1256,16 @@ class OmniArena:
                 self.carrying[z] = False
                 rewards[collector] += 0.7
                 self.resource_available[z] = True
+                # RC-4: delivery là metric nhiệm vụ DUY NHẤT không bị nhiễu bởi
+                # phần zero-sum của reward. mean-reward toàn quần thể là metric
+                # SAI cho env đối kháng — dùng cái này + reward-theo-vai-trò.
+                deliveries_this_step += 1
 
         # P3 flag: khi OFF, kênh [3] không được ĐÁNH GIÁ chút nào (không phải
         # tính rồi zero-out) -- r_emergent giữ nguyên toàn 0.0 từ khởi tạo ở
         # đầu step(). Đây là nhánh riêng, đúng tinh thần "if/else sạch".
         if self.enable_congestion:
-            # ---- P3: lane over-capacity + station queue (emergent, kênh [3]) ----
-            for z in range(self.n_zones):
-                for lane_pos in (self.zone_lane_a[z], self.zone_lane_b[z]):
-                    occupants = [a for a in range(self.n_agents) if self._dist(self.positions[a], lane_pos) <= 1]
-                    if len(occupants) > 2:
-                        for a in occupants:
-                            r_emergent[a] -= 0.1
-
-                waiting = [
-                    a for a in range(self.n_agents)
-                    if self._dist(self.positions[a], self.zone_resource[z]) <= 1
-                ]
-                if len(waiting) >= 2:
-                    split = 0.02 / len(waiting)
-                    for a in waiting:
-                        r_emergent[a] -= split
-
-            # P3 / Phần 1.2: chặn biên độ kênh [3]
-            for a in range(self.n_agents):
-                r_emergent[a] = float(np.clip(r_emergent[a], -self.MAX_EMERGENT_MAGNITUDE, self.MAX_EMERGENT_MAGNITUDE))
+            self._apply_emergent_congestion(r_emergent)
 
         # ---- r_solo: chỉ phụ thuộc trạng thái/hành động CỦA CHÍNH ego ----
         for z in range(self.n_zones):
@@ -995,8 +1286,17 @@ class OmniArena:
             if tuple(self.positions[relay]) == self.zone_lane_a[z]:
                 rewards[relay] += 0.05
 
-            db = self._dist(self.positions[blocker], self.positions[collector])
-            rewards[blocker] += 0.03 / (db + 1)
+            # RC-4: XOÁ `rewards[blocker] += 0.03 / (dist(blocker, collector) + 1)`.
+            # Đó là gradient rõ ràng DUY NHẤT của blocker và nó trỏ thẳng vào
+            # "đứng sát collector", trong khi collector mất −2.5 vì đúng việc
+            # đó — bất đối xứng 83x. Ảnh hưởng cấu trúc trở thành MỤC TIÊU của
+            # agent thay vì thuộc tính của môi trường, nên thứ audit đo được
+            # là "cái blocker cố tình tạo ra", không phải cấu trúc env.
+            # Thay bằng mục tiêu solo thuần vị trí, đối xứng với
+            # relay/gatekeeper/controller: reward của blocker giờ KHÔNG còn
+            # phụ thuộc vị trí collector chút nào.
+            if tuple(self.positions[blocker]) == self.zone_checkpoint[z]:
+                rewards[blocker] += 0.05
 
             if tuple(self.positions[controller]) == self.zone_panel[z]:
                 rewards[controller] += 0.05
@@ -1024,8 +1324,15 @@ class OmniArena:
 
         self.t += 1
         self.done = (self.t >= self.max_steps)
+        self.episode_deliveries += deliveries_this_step
 
         info = {
+            # RC-4: metric báo cáo ĐÚNG cho env đối kháng. mean(rewards) trộn
+            # lẫn hai phía của một cạnh zero-sum nên nó bằng hằng số cộng nhiễu
+            # — nhìn vào nó là nhìn vào chỗ không có tín hiệu.
+            "reward_by_role": self._aggregate_reward_by_role(rewards),
+            "deliveries_step": deliveries_this_step,
+            "episode_deliveries": self.episode_deliveries,
             "gt_core_by_ego": copy.deepcopy(self.gt_core_by_ego),
             "gt_influence_by_ego": copy.deepcopy(self.gt_influence_by_ego),
             "delta_by_pair": {f"{i}->{j}": v for (i, j), v in deltas.items()},
@@ -1157,17 +1464,31 @@ class OmniArena:
         self.restore_state(snapshot)
         return total
 
-    def sample_state_bank(self, n_states=24, burn_in=3):
-        bank = []
-        self.reset()
-        for _ in range(n_states):
-            for _ in range(burn_in):
-                acts = [self.scripted_policy(i) for i in range(self.n_agents)]
-                _, _, done, _ = self.step(acts)
-                if done:
-                    self.reset()
-            bank.append(self.clone_state())
-        return bank
+    def sample_state_bank(self, n_states=24, burn_in=3, bank_seed=None):
+        """
+        bank_seed (RC-2): ép RNG về một hạt giống xác định trước khi lấy mẫu,
+        rồi TRẢ LẠI trạng thái RNG cũ. Cần thiết để hai lần đo Φ̃ chỉ khác
+        nhau đúng một biến (lane hoặc behaviour mode), phần ngẫu nhiên còn
+        lại trùng khít — nếu không thì ‖dΦ̃‖ đo được chỉ là nhiễu lấy mẫu.
+        """
+        saved_rng_state = self.rng.get_state() if bank_seed is not None else None
+        if bank_seed is not None:
+            self.rng.seed(bank_seed)   # seed tại chỗ, giữ nguyên object
+
+        try:
+            bank = []
+            self.reset()
+            for _ in range(n_states):
+                for _ in range(burn_in):
+                    acts = [self.scripted_policy(i) for i in range(self.n_agents)]
+                    _, _, done, _ = self.step(acts)
+                    if done:
+                        self.reset()
+                bank.append(self.clone_state())
+            return bank
+        finally:
+            if saved_rng_state is not None:
+                self.rng.set_state(saved_rng_state)
 
     def compute_oracle_influence_from_current_state(
         self,

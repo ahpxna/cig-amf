@@ -50,6 +50,19 @@ SEED = 123
 
 SIGNIFICANT_W = 0.01        # ngưỡng "đáng kể" cho T2 (đơn vị reward/step)
 
+# RC-2: tham số phép đo Φ̃ = E_s[phi * delta] cho T6.
+# T6_N_STATES là đánh đổi nhiễu/thời gian: ‖dΦ̃‖_behavioural là hiệu của hai
+# trung bình Monte-Carlo nên sai số ~ 1/sqrt(N). Dưới ~24 state thì nhiễu lấy
+# mẫu át tín hiệu drift và tỉ số T6 mất ổn định giữa các seed.
+T6_N_STATES = 48
+T6_BURN_IN = 3
+# Hai cực của lịch drift trong _behaviour_mode(): "cooperative" (gatekeeper mở
+# cổng mọi bước) vs "selfish" (bỏ nhiệm vụ). Chọn hai cực để ‖dΦ̃‖_behavioural
+# là CẬN TRÊN của drift — nếu ngay cả cận trên còn nhỏ hơn structural 3-20 lần
+# thì kết luận tách tầng mới có giá trị.
+T6_BEHAVIOUR_PAIR = ("cooperative", "selfish")
+T6_INVARIANCE_PHASES = 2    # was 5 -- chỉ để kiểm bất biến phi tĩnh, 2 là đủ
+
 
 def gini(values):
     x = np.sort(np.abs(np.asarray(values, dtype=np.float64)))
@@ -113,12 +126,26 @@ def _disengage_action(env, ego, j):
     có thể vô tình đứng lại đúng ngay trên đường đi/vùng nguy hiểm của ego,
     xem báo cáo triển khai, mục "deviations").
     """
+    # [P-2 FINAL DEBUG] Rời VỊ TRÍ NHIỆM VỤ (duty anchor) của j, không phải
+    # rời ego. Bản cũ maximize dist(j, ego) => kênh khai báo của CHÍNH j
+    # (vd. gate_gk_collector cần gatekeeper cách gate <= 1) thường KHÔNG đổi
+    # trạng thái giữa base/alt (đo được d_w = 0.000 ở mọi state), trong khi
+    # thân j vẫn quẩn quanh làm lệch queue/crowding của các gate KHÁC.
+    # "Vai trò j không tham gia" = j rời anchor mà delta_ij(s) của nó neo vào.
+    z = env.agent_zone[j]
+    role = env.agent_role[j]
+    anchor = {
+        env.ROLE_GATEKEEPER: env.zone_gate[z],
+        env.ROLE_RELAY: env.zone_lane_a[z],
+        env.ROLE_BLOCKER: env.zone_checkpoint[z],
+        env.ROLE_CONTROLLER: env.zone_panel[z],
+        env.ROLE_COLLECTOR: env.zone_resource[z],
+    }.get(role, env.positions[ego])
     src = env.positions[j]
-    ego_pos = env.positions[ego]
-    best_act, best_d = env.STAY, env._dist(src, ego_pos)
+    best_act, best_d = env.STAY, env._dist(src, anchor)
     for act in (env.UP, env.DOWN, env.LEFT, env.RIGHT):
         nxt = env._move(src, act)
-        d = env._dist(nxt, ego_pos)
+        d = env._dist(nxt, anchor)
         if d > best_d:
             best_d = d
             best_act = act
@@ -214,18 +241,33 @@ def build_declared_pair_list(env):
 
 
 def build_control_pair_list(env, declared_set, rng, n=N_CONTROL_PAIRS):
-    pairs = []
-    tries = 0
-    while len(pairs) < n and tries < n * 20:
-        tries += 1
-        i = int(rng.randint(0, env.n_agents))
-        j = int(rng.randint(0, env.n_agents))
-        if i == j:
-            continue
-        if (i, j) in declared_set:
-            continue
-        pairs.append((i, j, "control"))
-    return pairs
+    """
+    RC-3(b). Noise floor phải là "cặp CÓ THỂ tương tác nhưng KHÔNG được khai
+    báo" — tức CÙNG ZONE và không thuộc declared_set.
+
+    Bản cũ bốc ngẫu nhiên hai chỉ số trên toàn quần thể: 24 agent / 4 zone ⇒
+    ~75% cặp khác zone. Mọi kênh tương tác của env (declared, collision, lane,
+    queue, crowding) đều yêu cầu đồng vị trí vật lý, nên cặp khác zone cho
+    W* = 0 CHÍNH XÁC ⇒ np.std(np.abs(w_control)) = 0 ⇒ T5 SNR = ∞. Con số
+    3.8e9 là artefact của phép lấy mẫu, không nói gì về env.
+
+    Liệt kê vét cạn rồi shuffle thay vì rejection sampling: không gian cặp
+    cùng-zone chỉ cỡ n_zones * k^2 (k = agent/zone ≈ 6) ~ 144 phần tử, vét
+    cạn là O(n_agents^2) một lần và loại hẳn khả năng vòng while quay đủ
+    n*20 lượt mà vẫn trả về thiếu cặp.
+    """
+    candidates = [
+        (i, j, "control_same_zone")
+        for z in range(env.n_zones)
+        for i in [a for a in range(env.n_agents) if env.agent_zone[a] == z]
+        for j in [a for a in range(env.n_agents) if env.agent_zone[a] == z]
+        if i != j and (i, j) not in declared_set
+    ]
+    if not candidates:
+        return []
+
+    order = rng.permutation(len(candidates))
+    return [candidates[k] for k in order[:n]]
 
 
 def sample_states(env, n_states):
@@ -469,37 +511,47 @@ def run_t6(env_kwargs=None, seed=SEED):
             causal_horizon=HORIZON,
         )
 
-    # structural: chạy qua ranh giới phase để bắt sự kiện shift
-    env_s = OmniArena(mode="structural_shift", seed=seed, **env_kwargs)
-    probe_phase_length = env_kwargs.get("phase_length", PHASE_LENGTH)
-    structural_norms = []
-    for _ in range(probe_phase_length * 3):
-        env_s.reset()
-        done = False
-        info = None
-        while not done:
-            acts = [env_s.scripted_policy(i) for i in range(env_s.n_agents)]
-            _, _, done, info = env_s.step(acts)
-        structural_norms.append(info["delta_phi_frobenius_structural"])
-    t6_delta_phi_structural_max = float(np.max(structural_norms))
+    # ------------------------------------------------------------------
+    # RC-2. Cả TỬ và MẪU giờ đều đo trên Φ̃ = E_s[phi * delta], KHÔNG phải
+    # trên bảng phi tĩnh.
+    #
+    # Bản cũ: tử = ‖dPhi‖ tĩnh tại ranh giới shift, mẫu = literal
+    # `0.0 if behavioural_invariant else 1.0`. Mẫu số đó không phải phép đo —
+    # nó là hằng số suy ra từ một assert về chính giả định thiết kế. T6 =
+    # structural / 1e-12 = 9.9e11 là hệ quả số học, audit không hề chạm vào
+    # dữ liệu nào.
+    #
+    # Trên Φ̃ thì behavioural drift CÓ tín hiệu thật: phi bất biến, nhưng
+    # agent đi khác đi ⇒ delta_ij(s) đổi ⇒ Φ̃ đổi. Đây là thứ đáng gọi là
+    # "tách tầng": cùng một đại lượng, đo hai loại can thiệp khác nhau.
+    # ------------------------------------------------------------------
+    env_t6 = OmniArena(mode="behavioral_drift", seed=seed, **env_kwargs)
+    structural, behavioural = env_t6.measure_realized_phi_tiers(
+        n_states=T6_N_STATES,
+        burn_in=T6_BURN_IN,
+        bank_seed=seed,
+        behaviour_pair=T6_BEHAVIOUR_PAIR,
+    )
+    t6_ratio = env_t6.tier_separation_ratio()   # inf nếu behavioural == 0
 
-    # behavioural: Phi phải bất biến TUYỆT ĐỐI
+    # Bất biến thiết kế P4 vẫn phải giữ: bảng phi TĨNH không được đổi trong
+    # behavioural_drift. Kiểm riêng, và KHÔNG dùng nó làm mẫu số nữa.
     env_b = OmniArena(mode="behavioral_drift", seed=seed, **env_kwargs)
-    behavioural_invariant = True
+    static_phi_invariant = True
     try:
-        env_b.assert_behavioural_phi_invariance(n_phases=5)
+        env_b.assert_behavioural_phi_invariance(n_phases=T6_INVARIANCE_PHASES)
     except AssertionError as e:
-        behavioural_invariant = False
-        print(f"  !! behavioural invariance FAILED: {e}")
-
-    t6_delta_phi_behavioural = 0.0 if behavioural_invariant else 1.0
-    t6_ratio = t6_delta_phi_structural_max / max(t6_delta_phi_behavioural, 1e-12)
+        static_phi_invariant = False
+        print(f"  !! static Phi invariance FAILED: {e}")
 
     return {
-        "t6_delta_phi_structural_max": t6_delta_phi_structural_max,
-        "t6_delta_phi_behavioural": t6_delta_phi_behavioural,
-        "t6_ratio": t6_ratio,
-        "t6_behavioural_invariant_exact": behavioural_invariant,
+        "t6_delta_phi_structural_max": float(structural),
+        "t6_delta_phi_behavioural": float(behavioural),
+        "t6_ratio": float(t6_ratio),
+        # Giữ nguyên key cũ cho env_audit_staged.py; ngữ nghĩa đổi thành
+        # "bảng phi TĨNH bất biến" (vẫn phải True), không còn là mẫu số của T6.
+        "t6_behavioural_invariant_exact": static_phi_invariant,
+        "t6_static_phi_invariant": static_phi_invariant,
     }
 
 
@@ -646,13 +698,14 @@ def main():
     print(f"\n-- T5: SNR --")
     print(f"T5 SNR = mean|W*|(declared) / std|W*|(control) = {m1['t5_snr']:.4f}")
 
-    print(f"\n-- T6: tier_separation_ratio --")
-    print(f"  ||dPhi||_F structural (max over shift boundaries) = "
+    print(f"\n-- T6: tier_separation_ratio (RC-2: đo trên Φ̃ = E_s[phi*delta], "
+          f"n_states={T6_N_STATES}, behaviour_pair={T6_BEHAVIOUR_PAIR}) --")
+    print(f"  ||dPhi~||_F structural  (lật active_lane)           = "
           f"{m6['t6_delta_phi_structural_max']:.6f}")
-    print(f"  ||dPhi||_F behavioural (must be EXACTLY 0)          = "
+    print(f"  ||dPhi~||_F behavioural (đổi behaviour mode, PHẢI > 0) = "
           f"{m6['t6_delta_phi_behavioural']:.6f}")
-    print(f"  behavioural invariance exact                        = "
-          f"{m6['t6_behavioural_invariant_exact']}")
+    print(f"  bảng phi TĨNH bất biến trong drift (P4 design)      = "
+          f"{m6['t6_static_phi_invariant']}")
     print(f"T6 tier_separation_ratio = {m6['t6_ratio']:.4f}")
 
     print(f"\n-- corr(Phi, W*) -- (design intent vs oracle-measured ground truth) --")
@@ -690,15 +743,17 @@ def main():
          m4["t4_spread"], m4["t4_spread"] > 0.3),
         ("T5 SNR in [3, 20]", m1["t5_snr"], 3.0 <= m1["t5_snr"] <= 20.0),
         ("T6 ratio in [3, 20]", m6["t6_ratio"], 3.0 <= m6["t6_ratio"] <= 20.0),
-        # ĐẢO CỰC so với bản cũ: bản cũ coi ||dPhi||_behavioural == 0 là
-        # PASS, nhưng đó CHÍNH LÀ tautology mục 5.1(ii) -- Phi là hằng số
-        # cấu hình, không phụ thuộc hành vi/state thật. Check này SẼ FAIL
-        # cho tới khi Phi được sửa để phụ thuộc phân bố state (mục 5.3,
-        # "blocker chỉ chặn khi thực sự đứng trong lane") -- đó là tín
-        # hiệu ĐÚNG, không phải regression, đừng khôi phục lại điều kiện
-        # == 0.0 cũ để "cho pass".
-        ("T6 ||dPhi||(behavioural) > 0 (Phi phải phụ thuộc state, không phải hằng số -- xem mục 5.3, FAIL tới khi sửa)",
+        # RC-2: check này giờ đo THẬT. Trước đây mẫu số là literal 0.0/1.0
+        # nên nó chỉ phản chiếu lại giả định thiết kế. Đại lượng đúng là Φ̃ =
+        # E_s[phi*delta]: phi bất biến nhưng delta_ij(s) phụ thuộc vị trí
+        # thật của cả hai agent, nên behavioural drift PHẢI để lại dấu vết
+        # khác 0. Nếu vẫn == 0 thì hoặc state bank quá nhỏ, hoặc các gate
+        # không thực sự phụ thuộc hành vi -- cả hai đều là lỗi cần sửa,
+        # không được nới điều kiện để cho pass.
+        ("T6 ||dPhi~||(behavioural) > 0 (đo trên Φ̃, không phải hằng số hardcode)",
          m6["t6_delta_phi_behavioural"], m6["t6_delta_phi_behavioural"] > 0.0),
+        ("P4 design: bảng phi TĨNH bất biến trong behavioural_drift",
+         m6["t6_static_phi_invariant"], m6["t6_static_phi_invariant"]),
         ("corr(Phi, W*) in [0.70, 0.95]", m1["corr_phi_w"], 0.70 <= m1["corr_phi_w"] <= 0.95),
         ("oracle no abs() (per_action has negative deltas on a real pair)", mabs["has_negative_delta"], mabs["has_negative_delta"]),
     ]

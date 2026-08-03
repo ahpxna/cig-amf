@@ -120,7 +120,13 @@ def run_block(flags):
         "t4_spread": m4["t4_spread"],
         "t5_snr": m1["t5_snr"],
         "t6_ratio": m6["t6_ratio"],
-        "t6_behav_exact": m6["t6_delta_phi_behavioural"] == 0.0,
+        # RC-2: ĐẢO NGHĨA. Trường này từng hỏi "‖dPhi‖_behavioural có đúng
+        # bằng 0 không" -- điều kiện đó luôn True vì con số là literal
+        # hardcode, và nó chính là thứ khoá T6 ở 1e12. Giờ nó đo trên
+        # Φ̃ = E_s[phi*delta] và điều kiện PASS là KHÁC 0: behavioural drift
+        # phải để lại dấu vết đo được, chỉ là nhỏ hơn structural nhiều lần.
+        "t6_behav_exact": m6["t6_delta_phi_behavioural"] > 0.0,
+        "t6_static_phi_invariant": m6["t6_static_phi_invariant"],
         "corr_phi_w": m1["corr_phi_w"],
         "_raw": {"m1": m1, "m3": m3, "m4": m4, "m6": m6, "msign": msign, "mabs": mabs},
     }
@@ -182,8 +188,9 @@ def print_block_result(name, desc, flags, metrics, prev_metrics, prev_name):
         print(line)
 
     print(
-        f"  [T6 behavioural invariance exact (||dPhi||=0)] = "
-        f"{metrics['t6_behav_exact']}"
+        f"  [T6 ||dPhi~||(behavioural) > 0 (đo trên Φ̃)] = "
+        f"{metrics['t6_behav_exact']}   "
+        f"[phi tĩnh bất biến = {metrics['t6_static_phi_invariant']}]"
     )
     print(
         f"  [oracle no-abs() has_negative_delta] = "
@@ -270,8 +277,8 @@ def main():
         f"({'PASS (>3.0)' if c_m['t6_ratio'] > 3.0 else 'FAIL (<=3.0)'})"
     )
     print(
-        f"[Block C] ||dPhi||(behavioural) exactly 0: {c_m['t6_behav_exact']}  "
-        f"({'PASS' if c_m['t6_behav_exact'] else 'FAIL -- leak between modes, per blueprint Sec 3.3 this is a design bug'})"
+        f"[Block C] ||dPhi~||(behavioural) > 0: {c_m['t6_behav_exact']}  "
+        f"({'PASS' if c_m['t6_behav_exact'] else 'FAIL -- Φ̃ không phản ứng với behavioural drift: state bank quá nhỏ hoặc gate không phụ thuộc hành vi'})"
     )
 
     # ------------------------------------------------------------
@@ -293,7 +300,7 @@ def main():
             row += f"{fmt(v) + '(' + status + ')':>{col_w}s}"
         print(row)
 
-    row = f"  {'T6 behav==0 exact':22s}"
+    row = f"  {'T6 dPhi~behav > 0':22s}"
     for n in order:
         v = results[n][2]["t6_behav_exact"]
         row += f"{str(v):>{col_w}s}"

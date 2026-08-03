@@ -159,7 +159,11 @@ def default_cfg():
         "belief_core_rule": "lcb",
         "belief_kappa": 1.0,
         "belief_alpha_decay": 0.7,
-        "belief_adaptive_k": False,
+        # [P-6 FINAL DEBUG] Bật Eq (17) — adaptive core budget theo entropy.
+        # False = capacity allocation là hằng số => claim RQ3 (paper còn yêu
+        # cầu báo cáo "fraction of updates at which k_i binds at k_max")
+        # không thể kiểm chứng. Code đã có sẵn trong belief_layer.py:322-360.
+        "belief_adaptive_k": True,
         "belief_adaptive_k_min": 1,
         "belief_signed_balance": 0.5,
 

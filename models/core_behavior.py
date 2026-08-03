@@ -319,6 +319,15 @@ class PairRelationalModule:
             except Exception:
                 same_role = 0.0
 
+        # [P-8 FINAL DEBUG] Định danh HỢP LỆ: agent id chuẩn hóa (nhãn tùy ý,
+        # không mang thông tin cấu trúc). Feature thứ 7 chỉ có hiệu lực khi
+        # khởi tạo với rel_feat_dim=7; mặc định 6 sẽ truncate => no-op, không
+        # phá checkpoint/test cũ. TUYỆT ĐỐI KHÔNG thêm ROLE ID thật của
+        # neighbor: role là diagnostic ground truth của paper (Exp 4 chấm
+        # "recovered-role accuracy") — đưa vào input là rò rỉ nhãn, vô hiệu
+        # hóa claim H3/RQ3 và làm bẩn H1.
+        agent_id_norm = float(neighbor_id) / float(max(1, getattr(env, "n_agents", 1)))
+
         feats = [
             rel_row,
             rel_col,
@@ -326,6 +335,7 @@ class PairRelationalModule:
             same_zone,
             zone_diff,
             same_role,
+            agent_id_norm,
         ]
 
         if len(feats) < self.rel_feat_dim:

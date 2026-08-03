@@ -20,7 +20,13 @@ except ImportError:
 
 def run_step1():
     cfg = default_cfg()
-    
+    # [P-7 FINAL DEBUG] Bản cũ chạy 20 eps < k0_warmup=30 => TOÀN BỘ run nằm ở
+    # Stage 0: belief kẹt prior (mu=0, sigma=1), proxy chưa train, và theo đúng
+    # Eq (20)-(22) mọi neighbor bị dồn vào slot anomalous (sigma=1 > sigma_hi)
+    # => Usage Entropy 0.15 là HÀNH VI ĐÚNG lúc warm-up, không phải slot collapse.
+    # 4 chỉ số chẩn đoán chỉ có nghĩa khi đọc SAU khi sang Stage 1.
+    cfg["k0_warmup"] = 10
+
     print("Đang khởi tạo môi trường và mô hình Final-CIGAMF...")
     env = make_main_env(
         task_mode="behavioral_drift", 
@@ -32,8 +38,8 @@ def run_step1():
     
     runner = FinalCIGAMFRunner(env, cfg, device="cpu")
     
-    print("Đang chạy 20 episodes (Smoke test)... (Vui lòng đợi 1-2 phút)")
-    runner.run(n_episodes=20, eval_every=10)
+    print("Đang chạy 60 episodes (10 warm-up + 50 learned-stage)... (Vui lòng đợi ~5 phút)")
+    runner.run(n_episodes=60, eval_every=10)
     
     print("\n" + "="*60)
     print(" KẾT QUẢ BƯỚC 1 - 4 CHỈ SỐ CHẨN ĐOÁN CỦA BẢN V2:")
