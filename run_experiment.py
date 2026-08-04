@@ -167,11 +167,11 @@ def default_cfg():
         "belief_adaptive_k_min": 1,
         "belief_signed_balance": 0.5,
 
-        "periph_mu_floor": 0.008,
-        "periph_beta_floor": 0.03,
+        "periph_mu_floor": 0.015,
+        "periph_beta_floor": 0.05,
         "periph_uniform_mix": 0.4,
         "periph_use_uniform_mix": True,
-        "periph_lb_coeff": 1,
+        "periph_lb_coeff": 1.2,
         "belief_priority_mu_floor": 0.01,
         "shadow_loss_weight": 0.25,
         "graph_score_steps": 8,
@@ -199,7 +199,7 @@ def default_cfg():
         "forcer_anneal_episodes": 60,
 
         "heads_lr": 5e-4,
-        "heads_w_contrastive": 0.3,
+        "heads_w_contrastive": 1,
         "heads_w_influence": 1.0,
 
         "drift_n_horizons": 3,

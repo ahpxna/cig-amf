@@ -621,6 +621,10 @@ class OmniArena:
         phần state còn lại.
         """      
     def _do_structural_shift(self):
+        # --- BẮT ĐẦU PATCH - GUARD A ---
+        assert getattr(self, '_in_reset', False), \
+            "GUARD A (P2<->P4 trap): Cannot apply structural shift mid-episode. Call this only via reset()!"
+        # --- KẾT THÚC PATCH ---
         self.current_phase += 1
         prev_phi = copy.deepcopy(self.gt_influence_by_ego)
 

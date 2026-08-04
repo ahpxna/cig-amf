@@ -854,6 +854,12 @@ class LocalCounterfactualProxyEnsemble:
                 for k in range(E)
             ]
 
+            print(f"[TRAIN-DEBUG] batch_size={batch_size} " f"member_batch_lens={[len(b) for b in member_batches]}")
+
+            if any(len(b) == 0 for b in member_batches):
+                print("[TRAIN-DEBUG] SKIPPED — empty batch this step")
+                continue
+
             if any(len(b) == 0 for b in member_batches):
                 continue
 
@@ -904,6 +910,11 @@ class LocalCounterfactualProxyEnsemble:
                 res = torch.mean(
                     torch.abs(preds[:, :, -1] - tgt_e[:, :, -1]), dim=1
                 )  # [E] — residual đo trên horizon cuối (khớp R^(H) của v1)
+                forced_mask = torch.tensor([b["was_forced"] for b in member_batches[0]], device=preds.device)
+                if forced_mask.any():
+                    res_forced = torch.mean(torch.abs(preds[:, forced_mask, -1] - tgt_e[:, forced_mask, -1]))
+                    res_control = torch.mean(torch.abs(preds[:, ~forced_mask, -1] - tgt_e[:, ~forced_mask, -1])) if (~forced_mask).any() else torch.tensor(0.0)
+                    print(f"[RESIDUAL-SPLIT] forced_n={forced_mask.sum().item()} res_forced={res_forced.item():.4e} res_control={res_control.item():.4e}")
             per_step_residuals.append(res)
 
             self.last_train_batch_count += 1
@@ -943,8 +954,11 @@ class LocalCounterfactualProxyEnsemble:
                     )  # 1 sync duy nhất cho cả holdout eval
 
         if len(per_step_losses) == 0:
+            print("[TRAIN-DEBUG] ALL n_steps SKIPPED — per_step_losses rỗng")
             self.latest_loss = 0.0
             self.latest_residual = 0.0
+            self.latest_train_residual = 0.0
+            self.latest_holdout_residual = 0.0
             return 0.0
 
         # ---- MỘT sync CPU<->GPU cho toàn bộ train_step() call --------------

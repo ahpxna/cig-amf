@@ -525,9 +525,34 @@ class BayesLightBeliefState:
 
             # [B1] p_core — chỉ diagnostic, sigmoid trên LCB đã debias.
             mu_deb, sig_deb = self._debiased_arr(idx)
-            lcb = np.abs(mu_deb) - self.kappa * np.maximum(sig_deb, self.sigma_floor)
-            p = 1.0 / (1.0 + np.exp(-np.clip((lcb - self.tau) / max(self.tau, 1e-3), -60.0, 60.0)))
-            self._p_core_arr[idx] = p
+            # --- LCB / P COMPUTATION (rebuilt v3) ---
+            safe_sigma_ceiling = max(self.sigma_floor * 10.0, 0.1)
+            effective_sigma = np.clip(sig_deb, self.sigma_floor, safe_sigma_ceiling)
+
+            lcb = np.abs(mu_deb) - self.kappa * effective_sigma
+            normalized_lcb = (lcb - self.tau) / max(self.tau, 1e-4)
+            p = 1.0 / (1.0 + np.exp(-np.clip(normalized_lcb, -10.0, 10.0)))
+
+            print(f"[DEBUG] idx type={type(idx)}, idx.shape={getattr(idx,'shape',None)}, p.shape={p.shape}, _p_core_arr.shape={self._p_core_arr.shape}")
+
+
+            # Ghi debug KHÔNG điều kiện — hasattr từng khiến lần ghi đầu tiên luôn bị bỏ qua
+            self._last_lcb_debug = {
+                "mu_deb_mean": float(np.mean(np.abs(mu_deb))),
+                "penalty_mean": float(np.mean(self.kappa * effective_sigma)),
+                "lcb_mean": float(np.mean(lcb)),
+                "p_mean": float(np.mean(p)),
+            }
+
+            # QUAN TRỌNG: nếu mu_deb/sig_deb/p là MẢNG (vectorized theo neighbour), gán thẳng,
+            # đừng dùng [idx] trừ khi bạn CHẮC CHẮN đoạn này nằm trong vòng lặp có idx hợp lệ.
+            # Gán mảng an toàn tuyệt đối
+            if isinstance(idx, np.ndarray) and idx.dtype == bool:
+                # Nếu idx là boolean mask
+                self._p_core_arr[idx] = p[idx] if p.shape == idx.shape else p
+            else:
+                # Nếu idx là mảng chỉ số nguyên
+                np.put(self._p_core_arr, idx, p)
 
             # Đồng bộ dict view + history — bulk assignment/append, không
             # còn phép TÍNH nào ở đây (đã tính hết bằng numpy ở trên).

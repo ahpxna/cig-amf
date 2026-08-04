@@ -1167,7 +1167,7 @@ class FinalCIGAMFRunner:
                 "promoted": 0,
                 "demoted": 0,
             }
-
+        print(f"[GRAPH-DEBUG] should_update_graph={self.scheduler.should_update_graph()} " f"buffer_len={len(self.proxy.buffer)} n_steps_cfg={self.cfg['proxy_train_steps']}")
         proxy_loss = self.proxy.train_step(
             n_steps=self.cfg["proxy_train_steps"],
             batch_size=self.cfg["proxy_batch_size"],
@@ -1422,8 +1422,95 @@ class FinalCIGAMFRunner:
 
             stage_after_episode_step = int(self.scheduler.stage)
 
-            if stage_before_episode_step == 0 and stage_after_episode_step == 1:
+# --- BẮT ĐẦU PATCH RUNNER ---
+            import traceback
+
+            # 1. Khởi tạo bộ đếm và Hệ số nhân kiên trì (Persistent Multiplier)
+            self._calib_fail_count = getattr(self, '_calib_fail_count', 0)
+            self._consecutive_zero_max_p = getattr(self, '_consecutive_zero_max_p', 0)
+            self._kappa_multiplier = getattr(self, '_kappa_multiplier', 1.0) 
+
+            # 2. CẬP NHẬT CỜ REACTIVE
+            try:
+                current_max_p = max([float(np.max(b_mod._p_core_arr)) for b_mod in self.belief_modules.values() if hasattr(b_mod, '_p_core_arr')])
+            except:
+                current_max_p = 1.0
+
+            # BẮT BUỘC DÙNG 0.05. Nếu dưới 5% cơ hội vào Core, nghĩa là Core đã sập!
+            if current_max_p <= 0.05:
+                self._consecutive_zero_max_p += 1
+            else:
+                self._consecutive_zero_max_p = 0
+
+            # 3. Định nghĩa các điều kiện kích hoạt
+            is_stage_transition = (stage_before_episode_step == 0 and stage_after_episode_step == 1)
+            is_periodic_calib = (stage_after_episode_step == 1 and ep > 0 and (ep % 5 == 0 if ep <= 30 else ep % 25 == 0))
+            is_reactive_calib = (self._consecutive_zero_max_p >= 3)
+            
+            # CẬP NHẬT HỆ SỐ NHÂN (Ghi nhớ tình trạng bệnh)
+            if is_reactive_calib:
+                # Nếu đang sập: Chém đôi Kappa ngay lập tức, tối thiểu về 0.01
+                self._kappa_multiplier = max(0.01, self._kappa_multiplier * 0.5) 
+            elif is_periodic_calib and current_max_p > 0.1:
+                # Nếu định kỳ chạy mà mô hình đang khỏe (>10%): Phục hồi Kappa dần dần
+                self._kappa_multiplier = min(1.0, self._kappa_multiplier * 1.5)
+
+            if is_stage_transition:
                 self._reset_switch_counters_if_available()
+
+            # 4. Thực thi Calibration
+            if is_stage_transition or is_periodic_calib or is_reactive_calib:
+                calib_reason = "Stage Transition" if is_stage_transition else ("Periodic" if is_periodic_calib else "Reactive (max_p=0)")
+                print(f"\n[STEP 0 DIAGNOSTIC] --- Threshold Calibration Triggered at Ep {ep} | Reason: {calib_reason} ---")
+
+                try:
+                    calib = self.sig_tracker.auto_calibrate()
+                    sigma_hi = calib["sigma_hi"]
+                    tau_role = calib["tau_role"]
+                    print(f"   [VERIFY] sigma_hi={sigma_hi:.6f}  tau_role={tau_role:.6f}")
+
+                    if hasattr(self, 'periph_module'):
+                        self.periph_module.set_role_thresholds(tau_role, sigma_hi)
+
+                    modules_list = list(self.belief_modules.values()) if isinstance(self.belief_modules, dict) else list(self.belief_modules)
+
+                    _tau, _sig, _kap = 0.0, 0.0, 0.0
+                    for b_mod in modules_list:
+                        if not hasattr(b_mod, 'tau'):
+                            continue
+                        
+                        b_mod.tau = max(1e-4, tau_role * 0.5)
+                        b_mod.sigma_floor = max(1e-4, sigma_hi * 0.1)
+                        
+                        # Tính Kappa Gốc và NHÂN VỚI HỆ SỐ KIÊN TRÌ
+                        base_kappa = float(np.clip(tau_role / (sigma_hi + 1e-8), 0.05, 2.0))
+                        b_mod.kappa = base_kappa * self._kappa_multiplier
+                        
+                        _tau, _sig, _kap = b_mod.tau, b_mod.sigma_floor, b_mod.kappa
+
+                    print(f"   [SYNC] Param Update: tau={_tau:.5f}, sigma_floor={_sig:.5f}, kappa={_kap:.5f} (Multiplier: {self._kappa_multiplier:.3f})")
+
+                    target_mod = modules_list[0]
+                    dbg = getattr(target_mod, '_last_lcb_debug', None)
+                    if dbg:
+                        print(f"   [MATH CHECK] |mu_deb| mean={dbg.get('mu_deb_mean', float('nan')):.6f}"
+                              f" | Penalty mean={dbg.get('penalty_mean', float('nan')):.6f}"
+                              f" | p mean={dbg.get('p_mean', float('nan')):.4f}")
+
+                    try:
+                        sample_p = np.atleast_1d(target_mod._p_core_arr).flatten()[:5]
+                        print(f"   [SANITY] p_core_arr[0:5] hiện tại: {sample_p}")
+                    except Exception as sanity_e:
+                        pass
+
+                    self._calib_fail_count = 0
+                    if is_reactive_calib:
+                        self._consecutive_zero_max_p = 0
+
+                except Exception as e:
+                    self._calib_fail_count += 1
+                    print(f"   [ERROR] Calibration failed (Count: {self._calib_fail_count}/3): {e}")
+            # --- KẾT THÚC PATCH RUNNER ---
 
             if ep % int(eval_every) == 0:
                 self.history["episodes"].append(ep)
@@ -1520,8 +1607,8 @@ class FinalCIGAMFRunner:
                     f"pushed={pushed_proxy_samples} "
                     f"promoted={graph_info['promoted']} "
                     f"demoted={graph_info['demoted']} "
-                    f"proxy_train_res={graph_info.get('proxy_train_residual', 0.0):.5f} "
-                    f"proxy_holdout_res={graph_info.get('proxy_holdout_residual', 0.0):.5f} "
+                    f"proxy_train_res={graph_info.get('proxy_train_residual', 0.0):.3e} "
+                    f"proxy_holdout_res={graph_info.get('proxy_holdout_residual', 0.0):.3e} "
                     f"throughput={snapshot['throughput_agent_steps_per_sec']:.1f} "
                     f"throughput_total={snapshot['throughput_total_agent_steps_per_sec']:.1f}"
                 )

@@ -1,8 +1,9 @@
 import sys
 import numpy as np
-
+import torch
 # Lấy từ file run_experiment.py ở thư mục gốc
-from run_experiment import make_main_env, default_cfg
+
+from run_experiment import make_main_env, default_cfg, set_global_seed
 
 # Import runner đúng từ thư mục runners/ (theo hình bạn chụp)
 try:
@@ -26,6 +27,8 @@ def run_step1():
     # => Usage Entropy 0.15 là HÀNH VI ĐÚNG lúc warm-up, không phải slot collapse.
     # 4 chỉ số chẩn đoán chỉ có nghĩa khi đọc SAU khi sang Stage 1.
     cfg["k0_warmup"] = 10
+    set_global_seed(cfg["seed"])
+    print(f"[SEED-DEBUG] cfg_seed={cfg['seed']}")
 
     print("Đang khởi tạo môi trường và mô hình Final-CIGAMF...")
     env = make_main_env(
