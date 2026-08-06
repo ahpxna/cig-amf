@@ -200,7 +200,7 @@ def oracle_w_star_sustained(env, ego, j, horizon=HORIZON, crn_seed=SEED, n_force
     base_total = 0.0
     for t in range(horizon):
         acts = [env.scripted_policy(i) for i in range(env.n_agents)]
-        _, rew, done, _ = env.step(acts)
+        _, rew, done, _ = env.step(acts, return_obs=False, return_info=False)
         base_total += (gamma ** t) * float(rew[ego])
         if done:
             break
@@ -212,7 +212,7 @@ def oracle_w_star_sustained(env, ego, j, horizon=HORIZON, crn_seed=SEED, n_force
         acts = [env.scripted_policy(i) for i in range(env.n_agents)]
         if t < n_force_steps:
             acts[j] = _disengage_action(env, ego, j)
-        _, rew, done, _ = env.step(acts)
+        _, rew, done, _ = env.step(acts, return_obs=False, return_info=False)
         alt_total += (gamma ** t) * float(rew[ego])
         if done:
             break
@@ -370,7 +370,7 @@ def run_t3(env):
     for _ in range(N_STATES_T3):
         for _ in range(3):
             acts = [env.scripted_policy(k) for k in range(env.n_agents)]
-            _, _, done, info = env.step(acts)
+            _, _, done, info = env.step(acts, return_obs=False)
             if done:
                 env.reset()
         w_by_pair = info["w_by_pair"] if "w_by_pair" in info else {}
@@ -592,7 +592,7 @@ def oracle_no_abs_direct_check(env):
     env.reset()
     for _ in range(3):
         acts = [env.scripted_policy(i) for i in range(env.n_agents)]
-        env.step(acts)
+        env.step(acts, return_obs=False, return_info=False)
 
     profile = env.compute_oracle_influence_from_current_state(
         ego_id=collector, agent_j=blocker, intervention_action=env.STAY,

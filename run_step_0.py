@@ -9,7 +9,7 @@ def run_one(condition):
     # Dùng FullExplicitLocal làm thế thân cho oracle_core
     model_map = {
         "pure_mean_field": "PureMeanField",
-        "oracle_core": "FullExplicitLocal"
+        "explicit_local_learned": "FullExplicitLocal"
     }
     actual_model = model_map.get(condition, condition)
 
@@ -37,8 +37,8 @@ if __name__ == "__main__":
     # Truyền đúng 2 chữ mà diagnostics.py yêu cầu
     res = structure_sensitivity_test(
         run_fn=run_one,
-        conditions=("pure_mean_field", "oracle_core"),
-        n_seeds=3
+        conditions=("pure_mean_field", "explicit_local_learned"),
+        n_seeds=8
     )
 
     print("\n" + "="*50)

@@ -31,6 +31,9 @@ VARIANTS = [
 
 KEEP_KEYS = (
     "rank_correlation_mean", "spearman_mean", "sign_agreement_mean",
+    "signed_spearman_mean", "signed_mae_mean", "signed_bias_mean",
+    "signed_rmse_mean", "signed_p_value_mean",
+    "range_rank_correlation_mean",
     "bias_mean", "mae_mean", "pearson_mean", "n_states", "n_pairs",
 )
 

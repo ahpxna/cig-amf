@@ -310,6 +310,9 @@ class LocalCounterfactualProxyEnsemble:
         "range",
         "mean_abs",
     )
+    MODE_ALIASES = {
+        "unsigned_range": "range",
+    }
 
     def __init__(
         self,
@@ -352,6 +355,7 @@ class LocalCounterfactualProxyEnsemble:
 
         self.n_horizons = int(n_horizons)
 
+        effect_mode = self.MODE_ALIASES.get(str(effect_mode), str(effect_mode))
         if effect_mode not in self.MODES:
             raise ValueError(
                 f"effect_mode phải thuộc {self.MODES}, nhận '{effect_mode}'"

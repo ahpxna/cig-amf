@@ -1168,6 +1168,8 @@ class FinalCIGAMFRunner:
                 "demoted": 0,
             }
         print(f"[GRAPH-DEBUG] should_update_graph={self.scheduler.should_update_graph()} " f"buffer_len={len(self.proxy.buffer)} n_steps_cfg={self.cfg['proxy_train_steps']}")
+        st = self.scheduler.get_status()
+        print(f"[SCHED-DEBUG] episode={st['episode']} freq_used={self.scheduler._accel_freq() if self.scheduler.accel_remaining>0 else self.scheduler._base_freq()} " f"accel_remaining={st['accel_remaining']} trigger_count={st['trigger_count']} last_trigger_ep={st['last_trigger_episode']}")
         proxy_loss = self.proxy.train_step(
             n_steps=self.cfg["proxy_train_steps"],
             batch_size=self.cfg["proxy_batch_size"],
@@ -1224,6 +1226,9 @@ class FinalCIGAMFRunner:
             belief_modules=self.belief_modules,
             drift_detector=self.drift,
         )
+        if fire_info["fired"]:
+            print(f"[DRIFT-FIRE] ep={self.scheduler.episode} reason={fire_info['reason']} n_inflated={fire_info['n_inflated']} "
+                  f"probe_z={fire_info['probe_z']:.2f} matrix_z={fire_info['matrix_z']:.2f}")
         triggered = int(fire_info["fired"])
 
         return {

@@ -630,21 +630,6 @@ class OmniArena:
 
         for z in range(self.n_zones):
             self.active_lane[z] = "B" if self.active_lane[z] == "A" else "A"
-            
-            ra = self.zone_role_agents[z]
-            ob, orl = ra[self.ROLE_BLOCKER], ra[self.ROLE_RELAY]
-            ogk, oc = ra[self.ROLE_GATEKEEPER], ra[self.ROLE_CONTROLLER]
-            
-            # Đảo chéo 4 vai trò
-            ra[self.ROLE_BLOCKER] = orl
-            ra[self.ROLE_RELAY] = ob
-            ra[self.ROLE_GATEKEEPER] = oc
-            ra[self.ROLE_CONTROLLER] = ogk
-            
-            self.agent_role[ob] = self.ROLE_RELAY
-            self.agent_role[orl] = self.ROLE_BLOCKER
-            self.agent_role[ogk] = self.ROLE_CONTROLLER
-            self.agent_role[oc] = self.ROLE_GATEKEEPER
 
         self._refresh_gt_graph()
         self.delta_phi_frobenius_structural_last = self._delta_phi_frobenius(prev_phi, self.gt_influence_by_ego)
@@ -767,23 +752,10 @@ class OmniArena:
             phi_ref = self.realized_phi_matrix(
                 self.sample_state_bank(n_states, burn_in, bank_seed=bank_seed))
 
-            # --- STRUCTURAL SHIFT (Đảo 4 vai trò) ---
+            # --- STRUCTURAL SHIFT: relocate bottleneck only ---
             for z in range(self.n_zones):
                 self.active_lane[z] = "B" if self.active_lane[z] == "A" else "A"
-                ra = self.zone_role_agents[z]
-                ob, orl = ra[self.ROLE_BLOCKER], ra[self.ROLE_RELAY]
-                ogk, oc = ra[self.ROLE_GATEKEEPER], ra[self.ROLE_CONTROLLER]
-                
-                ra[self.ROLE_BLOCKER] = orl
-                ra[self.ROLE_RELAY] = ob
-                ra[self.ROLE_GATEKEEPER] = oc
-                ra[self.ROLE_CONTROLLER] = ogk
-                
-                self.agent_role[ob] = self.ROLE_RELAY
-                self.agent_role[orl] = self.ROLE_BLOCKER
-                self.agent_role[ogk] = self.ROLE_CONTROLLER
-                self.agent_role[oc] = self.ROLE_GATEKEEPER
-                
+
             self._refresh_gt_graph()
             
             phi_shifted = self.realized_phi_matrix(
@@ -1106,7 +1078,7 @@ class OmniArena:
         sink = self.zone_sink[z]
         lane_a = self.zone_lane_a[z]
         panel = self.zone_panel[z]
-        checkpoint = self.zone_checkpoint[z]
+        checkpoint = self.zone_lane_b[z] if self.active_lane[z] == "B" else self.zone_checkpoint[z]
 
         def greedy(src, dst):
             return self._greedy_avoiding(agent_id, src, dst)
@@ -1124,46 +1096,46 @@ class OmniArena:
                 if mode == "delayed":
                     return self.OPEN if (self.t % 2 == 0) else self.STAY
                 if mode == "zigzag":
-                    return self.OPEN if (self.t % 3 != 1) else self.LEFT
+                    return self.OPEN if (self.t % 3 != 1) else self.STAY
                 if mode == "lazy":
-                    return self.OPEN if (self.t % 3 == 0) else self.STAY
+                    return self.OPEN if (self.t % 3 != 1) else self.STAY
                 # [P-4 FINAL DEBUG] selfish: duty suy giảm mạnh nhưng KHÔNG bỏ hẳn.
                 # "Bỏ duty" = realized structure đổi (delta sập 0 hàng loạt) =>
                 # behavioural dPhi~ (1.376) nuốt chửng structural (0.360), T6 đảo
                 # ngược. Theo paper (Exp 2): drift = "dependencies fixed, only
                 # policies move" — đổi CÁCH làm chứ không đổi VIỆC ai ảnh hưởng ai.
-                return self.OPEN if (self.t % 4 == 0) else self.STAY  # selfish
+                return self.OPEN if (self.t % 2 == 0) else self.STAY  # selfish
             return greedy(pos, gate)
 
         if role == self.ROLE_RELAY:
             if mode == "zigzag" and self.t % 4 == 0:
-                return self.LEFT
+                return self.STAY
             if mode == "selfish":
                 # [P-4] vẫn hướng về lane nhưng lề mề (đi 1 nghỉ 1), không bỏ vị trí
-                return self.STAY if (self.t % 2 == 0) else greedy(pos, lane_a)
+                return self.STAY if (tuple(pos) == lane_a and self.t % 2 == 0) else greedy(pos, lane_a)
             return greedy(pos, lane_a)
 
         if role == self.ROLE_BLOCKER:
             if mode == "selfish":
-                # [P-4] nhiễu quanh checkpoint thay vì random toàn cục (bỏ vị trí)
-                if self.rng.rand() < 0.5:
-                    return self.rng.randint(0, self.N_ACTIONS - 1)
-                return greedy(pos, checkpoint)
+                # [P-4] chậm nhịp quanh duty anchor, không bỏ anchor.
+                return self.STAY if tuple(pos) == checkpoint else greedy(pos, checkpoint)
             # RC-4: scripted policy phải KHỚP với reward mới. Bản cũ
             # `greedy(pos, self.positions[collector])` là hành vi tối ưu cho
             # shaping đuổi bắt đã bị xoá; giữ nó lại thì baseline scripted vẫn
             # đuổi trong khi learner thì không, và hai đường số liệu không còn
             # so sánh được với nhau.
             if mode == "lazy":
-                return self.STAY
+                return self.STAY if tuple(pos) == checkpoint else greedy(pos, checkpoint)
             return greedy(pos, checkpoint)
 
         if role == self.ROLE_CONTROLLER:
             if mode == "lazy" or mode == "selfish":
                 # [P-4] vẫn trực panel, chỉ kích hoạt thưa hơn — không bỏ duty
                 if tuple(pos) == panel:
-                    return self.OPEN if (self.t % 4 == 0) else self.STAY
-                return self.STAY if (self.t % 2 == 0) else greedy(pos, panel)
+                    if mode == "lazy":
+                        return self.OPEN if (self.t % 2 == 0) else self.STAY
+                    return self.OPEN if (self.t % 3 == 0) else self.STAY
+                return greedy(pos, panel)
             if tuple(pos) == panel:
                 return self.OPEN
             return greedy(pos, panel)
@@ -1179,9 +1151,10 @@ class OmniArena:
     # Step
     # ============================================================
 
-    def step(self, actions):
+    def step(self, actions, return_obs=True, return_info=True):
         if self.done:
-            return self._get_obs_all(), [0.0] * self.n_agents, True, {}
+            obs = self._get_obs_all() if return_obs else None
+            return obs, [0.0] * self.n_agents, True, {}
 
         self._noise_call_counter = {}
         rewards = [-0.01 for _ in range(self.n_agents)]
@@ -1325,7 +1298,12 @@ class OmniArena:
             # Thay bằng mục tiêu solo thuần vị trí, đối xứng với
             # relay/gatekeeper/controller: reward của blocker giờ KHÔNG còn
             # phụ thuộc vị trí collector chút nào.
-            if tuple(self.positions[blocker]) == self.zone_checkpoint[z]:
+            blocker_duty = (
+                self.zone_lane_b[z]
+                if self.active_lane[z] == "B"
+                else self.zone_checkpoint[z]
+            )
+            if tuple(self.positions[blocker]) == blocker_duty:
                 rewards[blocker] += 0.05
 
             if tuple(self.positions[controller]) == self.zone_panel[z]:
@@ -1356,28 +1334,31 @@ class OmniArena:
         self.done = (self.t >= self.max_steps)
         self.episode_deliveries += deliveries_this_step
 
-        info = {
-            # RC-4: metric báo cáo ĐÚNG cho env đối kháng. mean(rewards) trộn
-            # lẫn hai phía của một cạnh zero-sum nên nó bằng hằng số cộng nhiễu
-            # — nhìn vào nó là nhìn vào chỗ không có tín hiệu.
-            "reward_by_role": self._aggregate_reward_by_role(rewards),
-            "deliveries_step": deliveries_this_step,
-            "episode_deliveries": self.episode_deliveries,
-            "gt_core_by_ego": copy.deepcopy(self.gt_core_by_ego),
-            "gt_influence_by_ego": copy.deepcopy(self.gt_influence_by_ego),
-            "delta_by_pair": {f"{i}->{j}": v for (i, j), v in deltas.items()},
-            "w_by_pair": {f"{i}->{j}": v for (i, j), v in w_by_pair.items()},
-            "r_emergent": list(r_emergent),
-            "active_lane": dict(self.active_lane),
-            "current_phase": self.current_phase,
-            "mode": self.mode,
-            "tier_separation_ratio": self.tier_separation_ratio(),
-            "delta_phi_frobenius_structural": self.delta_phi_frobenius_structural_last,
-            "delta_phi_frobenius_behavioural": self.delta_phi_frobenius_behavioural_last,
-            "evaluation_scope": "omni_arena_multi_ego",
-        }
+        info = {}
+        if return_info:
+            info = {
+                # RC-4: metric báo cáo ĐÚNG cho env đối kháng. mean(rewards) trộn
+                # lẫn hai phía của một cạnh zero-sum nên nó bằng hằng số cộng nhiễu
+                # — nhìn vào nó là nhìn vào chỗ không có tín hiệu.
+                "reward_by_role": self._aggregate_reward_by_role(rewards),
+                "deliveries_step": deliveries_this_step,
+                "episode_deliveries": self.episode_deliveries,
+                "gt_core_by_ego": copy.deepcopy(self.gt_core_by_ego),
+                "gt_influence_by_ego": copy.deepcopy(self.gt_influence_by_ego),
+                "delta_by_pair": {f"{i}->{j}": v for (i, j), v in deltas.items()},
+                "w_by_pair": {f"{i}->{j}": v for (i, j), v in w_by_pair.items()},
+                "r_emergent": list(r_emergent),
+                "active_lane": dict(self.active_lane),
+                "current_phase": self.current_phase,
+                "mode": self.mode,
+                "tier_separation_ratio": self.tier_separation_ratio(),
+                "delta_phi_frobenius_structural": self.delta_phi_frobenius_structural_last,
+                "delta_phi_frobenius_behavioural": self.delta_phi_frobenius_behavioural_last,
+                "evaluation_scope": "omni_arena_multi_ego",
+            }
 
-        return self._get_obs_all(), rewards, self.done, info
+        obs = self._get_obs_all() if return_obs else None
+        return obs, rewards, self.done, info
 
     # ============================================================
     # Observations
@@ -1487,7 +1468,7 @@ class OmniArena:
                 if local_t == forced_step:
                     acts[aid] = forced_action
 
-            _, rewards, done, _ = self.step(acts)
+            _, rewards, done, _ = self.step(acts, return_obs=False, return_info=False)
             total += (gamma ** local_t) * np.array(rewards, dtype=np.float32)
             local_t += 1
 
@@ -1511,7 +1492,7 @@ class OmniArena:
             for _ in range(n_states):
                 for _ in range(burn_in):
                     acts = [self.scripted_policy(i) for i in range(self.n_agents)]
-                    _, _, done, _ = self.step(acts)
+                    _, _, done, _ = self.step(acts, return_obs=False, return_info=False)
                     if done:
                         self.reset()
                 bank.append(self.clone_state())
@@ -1602,7 +1583,7 @@ class OmniArena:
             done = False
             while not done:
                 acts = [self.scripted_policy(i) for i in range(self.n_agents)]
-                _, _, done, _ = self.step(acts)
+                _, _, done, _ = self.step(acts, return_obs=False, return_info=False)
         phi1 = self.gt_influence_by_ego
         d = self._delta_phi_frobenius(phi0, phi1)
         assert d == 0.0, f"Phi bị đổi trong behavioural_drift! ||dPhi||_F = {d}"

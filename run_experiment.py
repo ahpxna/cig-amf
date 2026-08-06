@@ -68,12 +68,14 @@ try:
         oracle_calibration,
         oracle_core_f1_from_scores,
         recovery_latency,
+        safe_spearman,
     )
 except ModuleNotFoundError:
     from utils.metrics import (
         oracle_calibration,
         oracle_core_f1_from_scores,
         recovery_latency,
+        safe_spearman,
     )
 
 
@@ -1107,12 +1109,25 @@ def _call_oracle_influence(tiny_env, ego, j, action, horizon, discount):
     )
 
 
+def _oracle_profile_value(score, key, default=None):
+    if isinstance(score, dict):
+        if key in score:
+            return float(score[key])
+        if default is not None:
+            return float(default)
+    return float(score)
+
+
 def _compute_tiny_oracle_scores(tiny_env, state, ego, neighbor_ids, cfg, tiny_horizon):
-    oracle_scores = {}
+    signed_scores = {}
+    magnitude_scores = {}
+    range_scores = {}
     candidate_actions = _tiny_candidate_intervention_actions(tiny_env)
 
     for j in neighbor_ids:
-        vals = []
+        signed_vals = []
+        magnitude_vals = []
+        range_vals = []
 
         for action in candidate_actions:
             tiny_env.restore_state(state)
@@ -1126,13 +1141,65 @@ def _compute_tiny_oracle_scores(tiny_env, state, ego, neighbor_ids, cfg, tiny_ho
                 discount=float(cfg.get("discount", 0.95)),
             )
 
-            vals.append(abs(float(score)))
+            signed = _oracle_profile_value(score, "signed")
+            signed_vals.append(signed)
+            magnitude_vals.append(abs(signed))
+            range_vals.append(_oracle_profile_value(score, "range", default=abs(signed)))
 
-        oracle_scores[int(j)] = float(np.mean(vals)) if len(vals) > 0 else 0.0
+        signed_scores[int(j)] = (
+            float(np.mean(signed_vals)) if len(signed_vals) > 0 else 0.0
+        )
+        magnitude_scores[int(j)] = (
+            float(np.mean(magnitude_vals)) if len(magnitude_vals) > 0 else 0.0
+        )
+        range_scores[int(j)] = (
+            float(np.mean(range_vals)) if len(range_vals) > 0 else 0.0
+        )
 
     tiny_env.restore_state(state)
 
-    return oracle_scores
+    return {
+        "signed": signed_scores,
+        "magnitude": magnitude_scores,
+        "range": range_scores,
+    }
+
+
+def _signed_calibration(proxy_signed, oracle_signed, neighbor_ids):
+    ids = list(neighbor_ids)
+    if len(ids) == 0:
+        return {
+            "signed_bias": 0.0,
+            "signed_mae": 0.0,
+            "signed_rmse": 0.0,
+            "signed_spearman": 0.0,
+            "signed_p_value": 1.0,
+            "signed_constant_case": 1,
+            "sign_agreement": 0.0,
+        }
+
+    proxy = np.array([float(proxy_signed.get(j, 0.0)) for j in ids], dtype=np.float32)
+    oracle = np.array([float(oracle_signed.get(j, 0.0)) for j in ids], dtype=np.float32)
+
+    diff = proxy - oracle
+    rho, p_value, constant_case = safe_spearman(proxy, oracle)
+
+    nonzero = np.abs(oracle) > 1e-8
+    sign_agreement = (
+        float(np.mean(np.sign(proxy[nonzero]) == np.sign(oracle[nonzero])))
+        if np.any(nonzero)
+        else 0.0
+    )
+
+    return {
+        "signed_bias": float(np.mean(diff)),
+        "signed_mae": float(np.mean(np.abs(diff))),
+        "signed_rmse": float(np.sqrt(np.mean(diff ** 2))),
+        "signed_spearman": float(rho),
+        "signed_p_value": float(p_value),
+        "signed_constant_case": int(constant_case),
+        "sign_agreement": float(sign_agreement),
+    }
 
 
 def _tiny_train_cfg_from_base(cfg):
@@ -1283,13 +1350,15 @@ def _score_learned_proxy_for_state(runner, tiny_env, state, ego, neighbor_ids):
 
     obs_all = _get_obs_all_from_env(tiny_env)
 
-    if hasattr(tiny_env, "last_actions"):
-        current_actions = list(tiny_env.last_actions)
-    else:
+    if hasattr(tiny_env, "scripted_policy"):
         current_actions = [
             int(tiny_env.scripted_policy(a))
             for a in range(int(tiny_env.n_agents))
         ]
+    elif hasattr(tiny_env, "last_actions"):
+        current_actions = list(tiny_env.last_actions)
+    else:
+        current_actions = [0 for _ in range(int(tiny_env.n_agents))]
 
     belief_items = runner._build_belief_items_for_ego(int(ego))
     belief_summary = runner._belief_summary_np_from_items(belief_items)
@@ -1307,28 +1376,42 @@ def _score_learned_proxy_for_state(runner, tiny_env, state, ego, neighbor_ids):
     obs_i = tiny_env.get_obs_of_ego(obs_all, int(ego))
     action_i = int(current_actions[int(ego)])
 
-    learned_scores = {}
+    neighbor_ids = [int(j) for j in neighbor_ids]
+    learned_signed = {}
+    learned_magnitude = {}
+    learned_range = {}
     sigmas = {}
 
-    for j in neighbor_ids:
-        j = int(j)
-        action_j = int(current_actions[j])
+    old_effect_mode = getattr(runner.proxy, "effect_mode", None)
+    try:
+        runner.proxy.effect_mode = "signed_oracle_matched"
 
-        mu, sigma = runner.proxy.score_pair(
-            obs_i=obs_i,
-            action_i=action_i,
-            observed_action_j=action_j,
-            z_core_excl_j=z_excluding[j],
-            m_periph_excl_j=m_excluding[j],
-            belief_summary=belief_summary,
+        out = runner.proxy.score_batch_full(
+            obs_i_batch=[obs_i for _ in neighbor_ids],
+            action_i_batch=[action_i for _ in neighbor_ids],
+            observed_action_j_batch=[int(current_actions[j]) for j in neighbor_ids],
+            z_core_excl_j_batch=[z_excluding[j] for j in neighbor_ids],
+            m_periph_excl_j_batch=[m_excluding[j] for j in neighbor_ids],
+            belief_summary_batch=[belief_summary for _ in neighbor_ids],
         )
 
-        learned_scores[j] = float(abs(mu))
-        sigmas[j] = float(sigma)
+        for k, j in enumerate(neighbor_ids):
+            mu = float(out["mu"][k])
+            learned_signed[j] = mu
+            learned_magnitude[j] = abs(mu)
+            learned_range[j] = float(out["mu_range"][k])
+            sigmas[j] = float(out["sigma"][k])
+    finally:
+        if old_effect_mode is not None:
+            runner.proxy.effect_mode = old_effect_mode
 
     tiny_env.restore_state(state)
 
-    return learned_scores, sigmas
+    return {
+        "signed": learned_signed,
+        "magnitude": learned_magnitude,
+        "range": learned_range,
+    }, sigmas
 
 
 def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
@@ -1412,16 +1495,27 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
             )
 
             cal = oracle_calibration(
-                learned_scores=learned_scores,
-                oracle_scores=oracle_scores,
+                learned_scores=learned_scores["magnitude"],
+                oracle_scores=oracle_scores["magnitude"],
+                neighbor_ids=neighbor_ids,
+            )
+            signed_cal = _signed_calibration(
+                proxy_signed=learned_scores["signed"],
+                oracle_signed=oracle_scores["signed"],
+                neighbor_ids=neighbor_ids,
+            )
+
+            range_cal = oracle_calibration(
+                learned_scores=learned_scores["range"],
+                oracle_scores=oracle_scores["magnitude"],
                 neighbor_ids=neighbor_ids,
             )
 
             top_k = int(max(1, min(tiny_cfg.get("max_core_size", 4), len(neighbor_ids))))
 
             core_f1 = oracle_core_f1_from_scores(
-                learned_scores=learned_scores,
-                oracle_scores=oracle_scores,
+                learned_scores=learned_scores["magnitude"],
+                oracle_scores=oracle_scores["magnitude"],
                 neighbor_ids=neighbor_ids,
                 top_k=top_k,
             )
@@ -1434,6 +1528,10 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
                 "oracle_core_f1": float(core_f1),
             }
             aggregate_row.update(cal)
+            aggregate_row.update(signed_cal)
+            aggregate_row.update({
+                f"range_{k}": v for k, v in range_cal.items()
+            })
             aggregate_rows.append(aggregate_row)
 
             for j in neighbor_ids:
@@ -1443,9 +1541,14 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
                         "state_idx": int(state_idx),
                         "ego_id": int(ego),
                         "neighbor_id": int(j),
-                        "learned_score": float(learned_scores.get(j, 0.0)),
-                        "oracle_score": float(oracle_scores.get(j, 0.0)),
-                        "abs_error": float(abs(learned_scores.get(j, 0.0) - oracle_scores.get(j, 0.0))),
+                        "learned_score": float(learned_scores["magnitude"].get(j, 0.0)),
+                        "oracle_score": float(oracle_scores["magnitude"].get(j, 0.0)),
+                        "learned_signed": float(learned_scores["signed"].get(j, 0.0)),
+                        "oracle_signed": float(oracle_scores["signed"].get(j, 0.0)),
+                        "learned_range": float(learned_scores["range"].get(j, 0.0)),
+                        "oracle_range": float(oracle_scores["range"].get(j, 0.0)),
+                        "abs_error": float(abs(learned_scores["magnitude"].get(j, 0.0) - oracle_scores["magnitude"].get(j, 0.0))),
+                        "signed_error": float(learned_scores["signed"].get(j, 0.0) - oracle_scores["signed"].get(j, 0.0)),
                         "proxy_sigma": float(sigmas.get(j, 0.0)),
                     }
                 )
@@ -1481,6 +1584,14 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
         "p_value",
         "constant_case",
         "oracle_core_f1",
+        "signed_bias",
+        "signed_mae",
+        "signed_rmse",
+        "signed_spearman",
+        "signed_p_value",
+        "signed_constant_case",
+        "sign_agreement",
+        "range_rank_correlation",
     ]
 
     for key in numeric_keys:
@@ -1512,6 +1623,8 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
     print(f"state_ego_rows={summary['n_state_ego_rows']}")
     print(f"proxy_buffer_size={summary['proxy_buffer_size']}")
     print(f"rank_correlation_mean={summary.get('rank_correlation_mean', 0.0):.4f}")
+    print(f"signed_spearman_mean={summary.get('signed_spearman_mean', 0.0):.4f}")
+    print(f"sign_agreement_mean={summary.get('sign_agreement_mean', 0.0):.4f}")
     print(f"oracle_core_f1_mean={summary.get('oracle_core_f1_mean', 0.0):.4f}")
     print(f"mae_mean={summary.get('mae_mean', 0.0):.4f}")
     print(f"Saved tiny oracle results to: {out_dir}")

@@ -533,9 +533,6 @@ class BayesLightBeliefState:
             normalized_lcb = (lcb - self.tau) / max(self.tau, 1e-4)
             p = 1.0 / (1.0 + np.exp(-np.clip(normalized_lcb, -10.0, 10.0)))
 
-            print(f"[DEBUG] idx type={type(idx)}, idx.shape={getattr(idx,'shape',None)}, p.shape={p.shape}, _p_core_arr.shape={self._p_core_arr.shape}")
-
-
             # Ghi debug KHÔNG điều kiện — hasattr từng khiến lần ghi đầu tiên luôn bị bỏ qua
             self._last_lcb_debug = {
                 "mu_deb_mean": float(np.mean(np.abs(mu_deb))),

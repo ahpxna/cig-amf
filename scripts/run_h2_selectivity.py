@@ -86,12 +86,13 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root):
               f"f1={row['f1']:.3f} trig={trig}")
 
     # --- SR + recovery latency ---
-    dvals = np.array([d for _, d, _ in deltas if np.isfinite(d)])
-    struct_mask = []
-    for ep, d, _ in deltas:
-        near = any(0 <= ep - se <= 2 * eval_every for se in shift_eps)
-        struct_mask.append(near)
-    struct_mask = np.array(struct_mask[:len(dvals)])
+    finite_rows = [(ep, d) for ep, d, _ in deltas if np.isfinite(d)]
+    dvals = np.array([d for _, d in finite_rows], dtype=np.float64)
+    struct_mask = np.array(
+        [any(0 <= ep - se <= 2 * eval_every for se in shift_eps)
+         for ep, _ in finite_rows],
+        dtype=bool,
+    )
 
     d_struct = float(np.mean(dvals[struct_mask])) if struct_mask.any() else float("nan")
     d_behav = float(np.mean(dvals[~struct_mask])) if (~struct_mask).any() else float("nan")

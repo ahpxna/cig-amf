@@ -32,7 +32,7 @@ def run_step1():
 
     print("Đang khởi tạo môi trường và mô hình Final-CIGAMF...")
     env = make_main_env(
-        task_mode="behavioral_drift", 
+        task_mode="behavioral_drift",
         n_agents=24, 
         max_steps=30, 
         phase_length=40, 

@@ -24,7 +24,7 @@ import run_experiment as RE
 
 ABLATIONS = [
     ("Full-CIGAMF",  {}),
-    ("Scalar-Only",  {"proxy_effect_mode": "unsigned_range"}),
+    ("Scalar-Only",  {"proxy_effect_mode": "range"}),
     ("No-Semantic",  {"periph_use_uniform_mix": True, "periph_uniform_mix": 1.0}),
     ("No-AuxLoss",   {"periph_lb_coeff": 0.0}),
     ("Fixed-K",      {"belief_adaptive_k": False}),
