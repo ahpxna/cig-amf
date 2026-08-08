@@ -26,6 +26,8 @@ try:
         NoBeliefRunner,
         NoMultiMemoryRunner,
         NoTwoTimescaleRunner,
+        OracleCoreRunner,      # [FIX-O3]
+        RandomCoreRunner,      # [FIX-O3]
     )
 except ModuleNotFoundError:
     from runners.baseline_runner import (
@@ -34,7 +36,11 @@ except ModuleNotFoundError:
         NoBeliefRunner,
         NoMultiMemoryRunner,
         NoTwoTimescaleRunner,
+        OracleCoreRunner,      # [FIX-O3]
+        RandomCoreRunner,      # [FIX-O3]
     )
+
+from models.structural_proxy import build_pair_feat  # [FIX-X1]
 
 try:
     from runners.final_runner import FinalCIGAMFRunner
@@ -173,7 +179,19 @@ def default_cfg():
         "periph_beta_floor": 0.05,
         "periph_uniform_mix": 0.4,
         "periph_use_uniform_mix": True,
+        # [FIX-8b] HOÀN NGUYÊN 0.05 -> 1.2. Lập luận ở FIX-8 ("khôi phục độ
+        # mạnh hiệu dụng cũ") SAI: độ mạnh hiệu dụng cũ (1.2/24 = 0.05) chính
+        # là chế độ mà entropy ĐANG SỤP (0.15 trong log đầu tiên). Đo thật:
+        #     λ=1.2, aux đủ 24 ego  -> usage_entropy_ratio = 0.7758
+        #     λ=0.05, aux đủ 24 ego -> usage_entropy_ratio = 0.1430  (sụp)
+        # Reward cũng KHÔNG phải do aux: λ=0.05 cho reward ep50 = -0.897, tệ
+        # hơn cả λ=1.2 (-0.711) => nguyên nhân reward nằm ở policy learner,
+        # không phải L_aux. Việc còn lại của FIX-8 (tách aux khỏi cột
+        # policy_loss trong log) GIỮ NGUYÊN vì nó đúng độc lập.
         "periph_lb_coeff": 1.2,
+        # [FIX-2] phơi orth_coeff ra cfg để ablation No-AuxLoss tắt được CẢ
+        # hai thành phần của L_aux (Eq 27), không chỉ load-balancing.
+        "periph_orth_coeff": 1e-2,
         "belief_priority_mu_floor": 0.01,
         "shadow_loss_weight": 0.25,
         "graph_score_steps": 8,
@@ -186,6 +204,10 @@ def default_cfg():
         "proxy_iw_clip": 10.0,
         "proxy_bootstrap_ratio": 0.8,
         "proxy_use_belief_input": False,
+        # [FIX-X1] số chiều x_ij trong Eq (8). 5 = mặc định
+        # (drow, dcol, dist, same_zone, zone_diff). Đặt 0 để tái hiện cấu
+        # hình cũ (f_theta mù danh tính neighbour) làm ablation cho H1.
+        "proxy_pair_feat_dim": 5,
         "proxy_ensemble_dropout": 0.0,
         "seed": 0,
 
@@ -195,9 +217,26 @@ def default_cfg():
         # ego_conditioned_latent,drift_probe,reciprocity}.py) ----
         "sig_tracker_window": 30,
 
-        "eps": 0.03,
-        "forcer_max_forced_per_step": 2,
-        "forcer_anneal_to": 0.01,
+        # [EPS-ANNEAL] 0.03 -> 0.05: A1 cho thấy CHỈ eps=0.05 tách được khỏi
+        # nhiễu (Spearman +0.074, 8/8 seed, sống sót Bonferroni).
+        "eps": 0.05,
+        # [FIX-P1] 2 -> None. Cap làm xác suất ép THỰC TẾ (eps_eff ~ 0.0282)
+        # lệch khỏi eps ghi vào propensity (0.03) ~6% => DR mất tính không
+        # chệch và claim "b_j known exactly" sai. Với eps=0.03, n=24 thì
+        # E[#forced] = 0.72/bước nên cap gần như không bao giờ chạm — bỏ đi
+        # không mất gì. Xem cảnh báo trong intervention.py.
+        "forcer_max_forced_per_step": None,
+        # [EPS-ANNEAL] 0.01 -> 0.05 (tức KHÔNG anneal).
+        # Bằng chứng: min_head_frac suy giảm ĐƠN ĐIỆU theo episode
+        #     ep14: 0.099   ep28: 0.05   ep42: 0.026   ep56: 0.014
+        # đúng nhịp eps bị anneal 0.03 -> 0.01 trong 60 episode. forced_frac
+        # tụt theo (0.13 -> 0.02), và vì chặn dưới của min_head_frac là
+        # forced_frac/|A|, head của action hiếm lại đói dữ liệu về cuối run —
+        # tức chính giai đoạn ta cần ước lượng tốt nhất.
+        # eps-forcing là NGUỒN NHẬN DIỆN DUY NHẤT; anneal nó xuống là tự cắt
+        # nguồn. Chi phí (nhiễu hành vi) đã được paper cam kết "đo và báo cáo"
+        # chứ không phải giảm thiểu.
+        "forcer_anneal_to": 0.05,
         "forcer_anneal_episodes": 60,
 
         "heads_lr": 5e-4,
@@ -251,6 +290,32 @@ def smoke_cfg():
 # ============================================================
 
 MAIN_ENV_CLASS_NAMES = [
+    # ==================================================================
+    # [ENV-RESOLVE] BUG NGHIÊM TRỌNG NHẤT ĐÃ PHÁT HIỆN — đọc kỹ.
+    #
+    # Bảng này TRƯỚC ĐÂY để AdaptiveResourceFlowArena đứng đầu, nên
+    # make_main_env() luôn dựng envs/adaptive_resource_flow_arena_v3.py,
+    # KHÔNG PHẢI OmniArena. Hệ quả:
+    #
+    #   * run_step_1 / run_step_0 / run_h2 / run_h3 — mọi thứ đi qua
+    #     make_main_env — chạy trên arena_v3.
+    #   * env_audit.py / env_audit_staged.py import OmniArena TRỰC TIẾP nên
+    #     đo OmniArena. => audit và training NÓI VỀ HAI MÔI TRƯỜNG KHÁC NHAU
+    #     suốt toàn bộ dự án. Đó là lý do env_audit xanh mà reward không nhúc
+    #     nhích, và là lý do mọi chẩn đoán chéo giữa hai bên đều mâu thuẫn.
+    #   * TOÀN BỘ C1/C2/C3 (Frenet (s,d), Phi liên tục SGTP, zone asymmetry,
+    #     relay gate, Phi đo lại) nằm trong omni_arena.py => CHƯA TỪNG ảnh
+    #     hưởng một dòng training nào.
+    #
+    # BẰNG CHỨNG KHÔNG THỂ CHỐI: arena_v3.get_action_dim() trả về 13, còn
+    # OmniArena.N_ACTIONS = 6. Log [VERIFY-F1] in ra hist_action_forced có
+    # ĐÚNG 13 phần tử. Và min_head_frac quan sát 0.001-0.005 khớp chính xác
+    # chặn dưới forced_frac/13 ~ 0.006 — KHÔNG phải lỗi nhãn action như đã
+    # nghi, chỉ là |A| thật là 13 chứ không phải 6.
+    #
+    # OmniArena đã được xác nhận có đủ 7 method trong MAIN_REQUIRED_METHODS.
+    # ==================================================================
+    "OmniArena",
     "AdaptiveResourceFlowArena",
     "AdaptiveResourceFlowArenaV3",
     "ResourceFlowArena",
@@ -270,6 +335,7 @@ TINY_ENV_CLASS_NAMES = [
 ]
 
 MAIN_ENV_MODULE_CANDIDATES = [
+    "envs.omni_arena",          # [ENV-RESOLVE] xem ghi chú ở MAIN_ENV_CLASS_NAMES
     "envs.adaptive_resource_flow_arena_v3",
     "envs.adaptive_resource_flow_arena",
     "envs.resource_flow_arena",
@@ -586,10 +652,29 @@ def _validate_tiny_env(env):
 def make_main_env(task_mode, n_agents, max_steps, phase_length, seed):
     EnvCls = _resolve_main_env_class()
 
+    # ------------------------------------------------------------------
+    # [EXP5-ZONES] n_zones PHẢI scale theo N.
+    # omni_arena chỉ ràng buộc `assert n_agents >= 5 * n_zones` và n_zones là
+    # tham số constructor mặc định 4 — không có công thức nào suy n_zones từ
+    # n_agents. Hệ quả: sweep Experiment 5 với N in {8..96} luôn chạy trên
+    # ĐÚNG 4 zone, N=96 => 24 agent/zone trong đó chỉ 5 có vai trò còn 19 là
+    # ROLE_DRIFTER. Tức Exp5 đang đo "thêm drifter", KHÔNG phải "thêm cấu
+    # trúc" — patch phá-đối-xứng-zone không cứu được lỗi này.
+    # Giữ ~6 agent/zone: N=24 -> 4 zone, N=96 -> 16 zone. Vì zone_param_rng
+    # dùng cùng seed nên 4 zone đầu của N=96 TRÙNG draw với 4 zone của N=24
+    # => đọc được N=96 là "N=24 cộng 12 zone mới", không phải một hệ khác hẳn.
+    # grid_size cũng phải nở theo sqrt(n_zones), nếu không cell_h co lại và
+    # assert path_len trong _init_zone_layout sẽ bắn.
+    # ------------------------------------------------------------------
+    n_zones = max(1, int(n_agents) // 6)
+    grid_size = max(24, int(np.ceil(12 * np.sqrt(max(1, n_zones)))))
+
     kwargs = {
         "mode": task_mode,
         "task_mode": task_mode,
         "n_agents": int(n_agents),
+        "n_zones": int(n_zones),
+        "grid_size": int(grid_size),
         "num_agents": int(n_agents),
         "max_steps": int(max_steps),
         "episode_length": int(max_steps),
@@ -601,7 +686,18 @@ def make_main_env(task_mode, n_agents, max_steps, phase_length, seed):
         "resample_hidden_rules_each_reset": False,
     }
 
+    # [ENV-RESOLVE] In thẳng lớp env đang dùng. Bug ở trên tồn tại được lâu
+    # vì KHÔNG CÓ DÒNG NÀO nói mình đang chạy env gì.
+    print(f"[ENV-RESOLVE] main env = {EnvCls.__module__}.{EnvCls.__name__} "
+          f"(n_agents={n_agents}, n_zones={n_zones}, grid={grid_size})")
+
     env = _instantiate_with_fallbacks(EnvCls, kwargs)
+
+    try:
+        print(f"[ENV-RESOLVE] action_dim={env.get_action_dim()} "
+              f"obs_dim={env.get_obs_dim()}")
+    except Exception:
+        pass
 
     if hasattr(env, "set_mode"):
         try:
@@ -679,6 +775,16 @@ def make_runner(model_name, env, cfg, device):
         "NoBelief": "NoBelief",
         "NoMultiMemory": "NoMultiMemory",
         "NoTwoTimescale": "NoTwoTimescale",
+
+        # [FIX-O3] OracleCoreRunner/RandomCoreRunner ĐÃ tồn tại trong
+        # baseline_runner.py từ lâu nhưng KHÔNG có trong bảng alias này ->
+        # make_runner() không bao giờ dựng được chúng, nên run_step_0.py phải
+        # mượn FullExplicitLocal làm "thế thân" và gate Experiment 0 chưa từng
+        # được đo đúng. Đăng ký lại.
+        "OracleCore": "OracleCore",
+        "oracle_core": "OracleCore",
+        "RandomCore": "RandomCore",
+        "random_core": "RandomCore",
     }
 
     canonical = aliases.get(model_name, model_name)
@@ -700,6 +806,12 @@ def make_runner(model_name, env, cfg, device):
 
     if canonical == "NoTwoTimescale":
         return NoTwoTimescaleRunner(env, cfg, device=device)
+
+    if canonical == "OracleCore":
+        return OracleCoreRunner(env, cfg, device=device)
+
+    if canonical == "RandomCore":
+        return RandomCoreRunner(env, cfg, device=device)
 
     raise ValueError(f"Unknown model: {model_name}")
 
@@ -1280,9 +1392,21 @@ def _train_tiny_runner_for_proxy(tiny_env, tiny_cfg, args, device):
         if len(trajectory) > 0:
             last = trajectory[-1]
 
+            # Compute H-step returns for this trajectory so we can pass
+            # observed_returns into score_batch for possible DR correction.
+            try:
+                h_returns = runner.replay_builder.build_h_step_returns(trajectory, runner.n_agents)
+                observed_returns = h_returns[-1]
+            except Exception:
+                observed_returns = None
+
+            behaviour_probs = last.get("behaviour_probs") if isinstance(last, dict) else None
+
             runner._score_all_pairs_and_update_beliefs(
                 obs_all=last["obs_all"],
                 actions=last["actions"],
+                observed_returns=observed_returns,
+                behaviour_probs=behaviour_probs,
             )
 
     return runner
@@ -1393,6 +1517,17 @@ def _score_learned_proxy_for_state(runner, tiny_env, state, ego, neighbor_ids):
             z_core_excl_j_batch=[z_excluding[j] for j in neighbor_ids],
             m_periph_excl_j_batch=[m_excluding[j] for j in neighbor_ids],
             belief_summary_batch=[belief_summary for _ in neighbor_ids],
+            # [FIX-X1] Đường H1 calibration cũng PHẢI truyền x_ij, nếu không
+            # proxy raise (pair_feat_dim>0). Đây chính là đường đo Spearman
+            # vs oracle -- thiếu x_ij ở đây là thiếu ở đúng chỗ quan trọng nhất.
+            pair_feat_batch=[
+                build_pair_feat(
+                    tiny_env.positions, tiny_env.agent_zone,
+                    getattr(tiny_env, "grid_size", 1),
+                    getattr(tiny_env, "n_zones", 1), int(ego), int(j),
+                )
+                for j in neighbor_ids
+            ],
         )
 
         for k, j in enumerate(neighbor_ids):
@@ -1673,7 +1808,7 @@ def parse_args():
     parser.add_argument("--tiny_states", type=int, default=8)
     parser.add_argument("--tiny_burn_in", type=int, default=4)
     parser.add_argument("--tiny_horizon", type=int, default=3)
-    parser.add_argument("--tiny_proxy_train_episodes", type=int, default=8)
+    parser.add_argument("--tiny_proxy_train_episodes", type=int, default=40)
     parser.add_argument(
         "--with_tiny_calibration",
         action="store_true",

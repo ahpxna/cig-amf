@@ -272,35 +272,98 @@ def structure_sensitivity_test(
         Nếu structure_value lớn:
             -> Môi trường ổn, khoảng cách còn lại là do thuật toán.
     """
-    results = {c: [] for c in conditions}
+    # [FIX-5] run_fn nhận (condition, seed) nếu chấp nhận 2 tham số — bắt buộc
+    # để hai condition dùng CHUNG danh sách seed (paired comparison). Bản cũ
+    # chỉ nhận condition và caller tự bốc seed ngẫu nhiên => hai nhánh chạy
+    # trên seed khác nhau, chênh lệch đo được lẫn cả phương sai giữa seed.
+    import inspect
+    try:
+        takes_seed = len(inspect.signature(run_fn).parameters) >= 2
+    except (TypeError, ValueError):
+        takes_seed = False
 
+    seeds = list(range(int(n_seeds)))
+    results = {c: [] for c in conditions}
     for cond in conditions:
-        for _ in range(int(n_seeds)):
-            results[cond].append(float(run_fn(cond)))
+        for s in seeds:
+            results[cond].append(
+                float(run_fn(cond, s) if takes_seed else run_fn(cond))
+            )
 
     summary = {
         c: {
             "mean": float(np.mean(v)) if v else float("nan"),
             "std": float(np.std(v)) if v else float("nan"),
             "n": len(v),
+            "values": [float(x) for x in v],
         }
         for c, v in results.items()
     }
 
-    val = float("nan")
+    # [FIX-5] Bản cũ hard-code tên "oracle_core"; sau khi run_step_0.py đổi tên
+    # condition thành "explicit_local_learned" thì nhánh này KHÔNG BAO GIỜ chạy
+    # => structure_value = NaN, còn verdict vẫn in ra "CẢNH BÁO: sửa MÔI TRƯỜNG"
+    # một cách tự tin. Giờ lấy baseline = condition đầu, treatment = condition
+    # thứ hai, không phụ thuộc tên.
+    conds = list(conditions)
+    base_name = "pure_mean_field" if "pure_mean_field" in summary else conds[0]
+    treat_name = next((c for c in conds if c != base_name), None)
 
-    if "oracle_core" in summary and "pure_mean_field" in summary:
-        val = float(
-            summary["oracle_core"]["mean"] - summary["pure_mean_field"]["mean"]
+    val = float("nan")
+    ci_lo = ci_hi = float("nan")
+    significant = False
+    if treat_name is not None:
+        a = np.asarray(results[treat_name], dtype=float)
+        b = np.asarray(results[base_name], dtype=float)
+        if a.size and b.size:
+            val = float(a.mean() - b.mean())
+            # [FIX-5] Bootstrap CI: tài liệu debug yêu cầu rõ "in inconclusive
+            # khi CI chứa 0" thay vì phán quyết dứt khoát trên một điểm ước
+            # lượng nằm trong nhiễu.
+            rng = np.random.RandomState(12345)
+            diffs = [
+                rng.choice(a, a.size, replace=True).mean()
+                - rng.choice(b, b.size, replace=True).mean()
+                for _ in range(5000)
+            ]
+            ci_lo, ci_hi = (float(np.percentile(diffs, 2.5)),
+                            float(np.percentile(diffs, 97.5)))
+            significant = bool(ci_lo > 0.0 or ci_hi < 0.0)
+
+    if not np.isfinite(val):
+        verdict = "KHÔNG ĐO ĐƯỢC — thiếu condition hợp lệ."
+    elif not significant:
+        verdict = (
+            f"INCONCLUSIVE: CI95 = [{ci_lo:.3f}, {ci_hi:.3f}] CHỨA 0 — chưa đủ "
+            f"bằng chứng kết luận môi trường có/không nhạy cấu trúc. Tăng seed "
+            f"trước khi sửa môi trường."
+        )
+    elif val > 0:
+        verdict = (
+            f"Môi trường NHẠY cấu trúc (CI95 = [{ci_lo:.3f}, {ci_hi:.3f}]) — "
+            f"tiếp tục cải tiến thuật toán."
+        )
+    else:
+        verdict = (
+            f"CẢNH BÁO: treatment TỆ HƠN baseline có ý nghĩa "
+            f"(CI95 = [{ci_lo:.3f}, {ci_hi:.3f}])."
         )
 
     return {
         "per_condition": summary,
+        "baseline_condition": base_name,
+        "treatment_condition": treat_name,
         "structure_value": val,
-        "verdict": (
-            "Môi trường NHẠY cấu trúc — tiếp tục cải tiến thuật toán."
-            if np.isfinite(val) and val > 0.05
-            else "CẢNH BÁO: trần lợi ích quá thấp. Sửa MÔI TRƯỜNG trước."
+        "ci95": [ci_lo, ci_hi],
+        "significant": significant,
+        "verdict": verdict,
+        # Ghi rõ để không ai đọc nhầm lần nữa: đây KHÔNG phải oracle-core
+        # zero-cost của Experiment 0 trừ khi run_fn thực sự cung cấp nó.
+        "note": (
+            "structure_value chỉ đúng nghĩa Experiment 0 khi treatment là "
+            "oracle-core ZERO-COST (được cho sẵn core đúng, không huấn luyện). "
+            "Nếu treatment là một baseline PHẢI HỌC (vd. FullExplicitLocal) "
+            "thì đây là so sánh baseline-vs-baseline, không phải trần lợi ích."
         ),
     }
 

@@ -3,7 +3,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from models.structural_proxy import LocalCounterfactualProxyEnsemble
+from models.structural_proxy import (
+    LocalCounterfactualProxyEnsemble,
+    build_pair_feat,      # [FIX-X1]
+    PAIR_FEAT_DIM,
+)
 from models.belief_layer import BayesLightBeliefState
 from models.core_behavior import PairRelationalModule
 from models.peripheral_memory import PeripheralMultiMemory
@@ -106,6 +110,9 @@ class FinalCIGAMFRunner:
             use_belief_input=cfg.get("proxy_use_belief_input", False),
             ensemble_dropout=cfg.get("proxy_ensemble_dropout", 0.0),
             seed=cfg.get("seed", 0),
+            # [FIX-X1] x_ij (Eq 8). Đặt 0 để quay lại hành vi cũ (ablation
+            # "no-x_ij" — chính là cấu hình đã làm H1 thất bại ở 8 seed).
+            pair_feat_dim=cfg.get("proxy_pair_feat_dim", PAIR_FEAT_DIM),
         )
 
         self.pair_rel_module = PairRelationalModule(
@@ -132,6 +139,10 @@ class FinalCIGAMFRunner:
             use_uniform_mix=cfg.get("periph_use_uniform_mix", True),
             uniform_mix=cfg.get("periph_uniform_mix", 0.25),
             lb_coeff=cfg.get("periph_lb_coeff", 0.5),
+            # [FIX-2] orth_coeff trước đây KHÔNG đọc từ cfg -> luôn kẹt ở
+            # default 1e-2. Ablation "No-AuxLoss" (Eq 26-27) chỉ tắt được L_lb,
+            # còn L_orth vẫn chạy => ablation không cô lập đúng L_aux.
+            orth_coeff=cfg.get("periph_orth_coeff", 1e-2),
         ).to(device)
 
         self.belief_summary_builder = BeliefSummaryBuilder(
@@ -177,7 +188,9 @@ class FinalCIGAMFRunner:
             n_agents=self.n_agents,
             action_dim=self.action_dim,
             eps=cfg.get("eps", 0.03),
-            max_forced_per_step=cfg.get("forcer_max_forced_per_step", 2),
+            # [FIX-P1] default None: cap phá "b_j known exactly" (xem
+            # intervention.py) và gần như không bao giờ chạm ở eps=0.03/n=24.
+            max_forced_per_step=cfg.get("forcer_max_forced_per_step", None),
             anneal_to=cfg.get("forcer_anneal_to", 0.01),
             anneal_episodes=cfg.get("forcer_anneal_episodes", 60),
             rng=np.random.RandomState(cfg.get("seed", 0)),
@@ -241,6 +254,7 @@ class FinalCIGAMFRunner:
             "mean_reward": [],
             "reward_per_agent": [],
             "mean_f1": [],
+            "mean_f1_role": [],   # [F1-TOPK] chấm theo nhãn role (đối chứng)
             "mean_temporal_var": [],
             "mean_uncertainty": [],
             "mean_core_size": [],
@@ -439,7 +453,11 @@ class FinalCIGAMFRunner:
 
     def _periph_summary_tensor_from_inputs(self, inputs):
         return self.periph_module(inputs)
-
+    
+    def _periph_full_from_inputs(self, inputs):
+        """Bản đầy đủ — dùng trong training loop để aux_loss thực sự có gradient."""
+        return self.periph_module.forward_full(inputs)
+    
     def _periph_summary_np_from_inputs(self, inputs):
         with torch.no_grad():
             return (
@@ -565,6 +583,16 @@ class FinalCIGAMFRunner:
             "core_context_excluding": {},
             "periph_context_excluding": {},
             "value_cache": {},
+            # [FIX-X1] Ảnh chụp hình học TẠI timestep này, để replay_builder
+            # dựng x_ij đúng thời điểm mẫu được sinh ra. Không thể tính lại
+            # sau episode vì env.positions lúc đó đã là state cuối.
+            # Chi phí: 24 toạ độ + 24 zone id / timestep — không đáng kể.
+            "geom_snapshot": {
+                "positions": [list(self.env.positions[i]) for i in range(self.env.n_agents)],
+                "agent_zone": [int(z) for z in self.env.agent_zone],
+                "grid_size": int(getattr(self.env, "grid_size", 1)),
+                "n_zones": int(getattr(self.env, "n_zones", 1)),
+            },
         }
 
         obs_batch = []
@@ -657,10 +685,47 @@ class FinalCIGAMFRunner:
         # policy_probs (bỏ qua forcing) làm propensity sẽ khiến DR chệch có
         # hệ thống một cách im lặng (không crash, không warning).
         actions_list = [int(sampled[ego]) for ego in range(self.n_agents)]
+        _pre_forcing = list(actions_list)          # [VERIFY-F1]
         forced_mask, effective_probs = self.forcer.apply(
             actions=actions_list,
             policy_probs=probs_np,
         )
+
+        # ------------------------------------------------------------------
+        # [VERIFY-F1] Kiểm chứng forced action SỐNG SÓT tới trajectory.
+        #
+        # Lý do phải đo: min_head_frac quan sát được là 0.001-0.005, trong khi
+        # nếu forced action là uniform trên |A|=6 thì CHẶN DƯỚI LÝ THUYẾT là
+        # forced_frac/|A| ~ 0.013-0.033. Thấp hơn chặn dưới 15-30x là BẤT KHẢ
+        # THI nếu pipeline đúng => hoặc a_j ghi vào buffer là action TRƯỚC
+        # override, hoặc override xảy ra sau khi append.
+        #
+        # Đọc thứ tự code thì hiện tại có vẻ ĐÚNG (apply mutate in-place rồi
+        # actions_list mới được đóng gói). Nhưng "có vẻ đúng" không phải bằng
+        # chứng — đây là đúng loại lỗi mà đọc code không bắt được. Đo thật:
+        #   n_forced_seen      : số agent forcer báo đã ép
+        #   n_actually_changed : số agent action THỰC SỰ đổi so với pre-forcing
+        #   hist_forced        : phân bố action TRÊN CÁC AGENT BỊ ÉP
+        # Nếu forcing đúng thì hist_forced phải xấp xỉ uniform trên |A|.
+        # Nếu n_actually_changed == 0 trong khi n_forced_seen > 0 => bug.
+        # ------------------------------------------------------------------
+        try:
+            fidx = [k for k in range(self.n_agents) if bool(forced_mask[k])]
+            if fidx:
+                self._vf1_n_forced = getattr(self, "_vf1_n_forced", 0) + len(fidx)
+                self._vf1_n_changed = getattr(self, "_vf1_n_changed", 0) + sum(
+                    1 for k in fidx if actions_list[k] != _pre_forcing[k]
+                )
+                hist = getattr(self, "_vf1_hist", None)
+                if hist is None:
+                    hist = np.zeros(int(self.action_dim), dtype=np.int64)
+                for k in fidx:
+                    a = int(actions_list[k])
+                    if 0 <= a < hist.shape[0]:
+                        hist[a] += 1
+                self._vf1_hist = hist
+        except Exception:
+            pass
 
         for ego in range(self.n_agents):
             actions[ego] = int(actions_list[ego])
@@ -668,6 +733,10 @@ class FinalCIGAMFRunner:
 
         cache["forced_mask"] = forced_mask
         cache["behaviour_probs"] = effective_probs
+        # Save raw policy probabilities (π_j(a|s)) as well; useful for
+        # downstream diagnostics and for runners that expect policy_probs
+        # in the trajectory. Shape: [n_agents, A]
+        cache["policy_probs"] = probs_np
 
         return actions, cache
 
@@ -746,6 +815,8 @@ class FinalCIGAMFRunner:
                     "actions": list(actions_list),
                     "rewards": list(rewards),
                     "belief_items_cache": cache["belief_items_cache"],
+                    "behaviour_probs": cache.get("behaviour_probs"),
+                    "policy_probs": cache.get("policy_probs"),
                     "belief_summary_cache": cache["belief_summary_cache"],
                     "core_summary_cache": cache["core_summary_cache"],
                     "periph_inputs_cache": cache["periph_inputs_cache"],
@@ -753,8 +824,9 @@ class FinalCIGAMFRunner:
                     "core_context_excluding": cache["core_context_excluding"],
                     "periph_context_excluding": cache["periph_context_excluding"],
                     "value_cache": cache["value_cache"],
+                    "geom_snapshot": cache["geom_snapshot"],   # [FIX-X1]
                     "forced_mask": cache["forced_mask"],
-                    "behaviour_probs": cache["behaviour_probs"],
+                    
                     "env_snapshot_before_step": env_snapshot_before_step,
                     "env_snapshot_after_step": env_snapshot_after_step,
                     "h_snapshot_before_latent_update": h_snapshot_before_latent_update,
@@ -815,6 +887,26 @@ class FinalCIGAMFRunner:
 
         # [EpsilonForcedActionController] lịch trình anneal eps -> gọi
         # đúng một lần sau mỗi episode (xem docstring step_episode()).
+        # [VERIFY-F1] báo cáo mỗi episode — chỉ vài dòng, đủ để kết luận.
+        if getattr(self, "_vf1_n_forced", 0) > 0:
+            h = self._vf1_hist.astype(np.float64)
+            h = h / max(h.sum(), 1.0)
+            # LƯU Ý: forcer là TARGETED (eps per-agent khác nhau, smoke test
+            # §5 đo được tập trung 6.1x), nên "agent nào bị ép" KHÔNG đều.
+            # Nhưng "ép rồi thì chọn action nào" PHẢI đều trên |A| — chính
+            # phân bố này quyết định chặn dưới của min_head_frac.
+            print(
+                f"[VERIFY-F1] forced_seen={self._vf1_n_forced} "
+                f"actually_changed={self._vf1_n_changed} "
+                f"({100.0*self._vf1_n_changed/max(1,self._vf1_n_forced):.1f}%; "
+                f"kỳ vọng ~{100.0*(1-1.0/self.action_dim):.0f}% vì ép trùng "
+                f"action cũ với xác suất 1/|A|) "
+                f"hist_action_forced={np.round(h, 3).tolist()}"
+            )
+            self._vf1_n_forced = 0
+            self._vf1_n_changed = 0
+            self._vf1_hist = np.zeros(int(self.action_dim), dtype=np.int64)
+
         self.forcer.step_episode()
 
         return trajectory, ep_reward, runtime
@@ -922,6 +1014,7 @@ class FinalCIGAMFRunner:
                 returns[t][ego] = float(R[ego])
 
         total_loss = 0.0
+        total_periph_aux_loss = 0.0
         total_actor_loss = 0.0
         total_critic_loss = 0.0
         total_entropy = 0.0
@@ -951,11 +1044,24 @@ class FinalCIGAMFRunner:
                     )
                 )
 
-                periph_tensors.append(
-                    self._periph_summary_tensor_from_inputs(
-                        step["periph_inputs_cache"][ego]
-                    )
+                # [FIX-CRIT-1] Khối này TRƯỚC ĐÂY nằm NGOÀI vòng lặp ego (dedent
+                # một cấp), nên nó dùng biến `ego` rò rỉ = n_agents-1: chỉ tính
+                # M_i cho ĐÚNG MỘT ego cuối cùng, rồi PolicyValueNet.forward()
+                # âm thầm .expand(B,-1) tensor [1,D] đó ra cho cả 24 agent.
+                # Hậu quả (giải thích 3 triệu chứng đang treo):
+                #   1. Vi phạm Eq (25): M_i phải ego-specific, thực tế mọi agent
+                #      dùng chung peripheral memory của agent 23.
+                #   2. slot_usage_ema chỉ được cập nhật từ 1 ego mỗi timestep
+                #      => phân phối routing nghèo nàn => usage entropy thấp
+                #      (0.44 < 0.5) dù cơ chế semantic slot đã đúng.
+                #   3. aux_loss (Eq 26-27) chỉ bằng 1/24 độ lớn dự kiến và chỉ
+                #      từ một ego => ablation No-AuxLoss gần như không đổi kết
+                #      quả ("byte-identical" với Full-CIGAMF).
+                periph_out = self._periph_full_from_inputs(
+                    step["periph_inputs_cache"][ego]
                 )
+                periph_tensors.append(periph_out["memory"])
+                total_periph_aux_loss = total_periph_aux_loss + periph_out["aux_loss"]
 
             obs_t = torch.tensor(
                 np.stack(obs_batch),
@@ -1016,7 +1122,15 @@ class FinalCIGAMFRunner:
 
         self.policy_optim.zero_grad()
 
-        loss = total_loss / max(1, count)
+        # [FIX-8] Sau FIX-CRIT-1, aux_loss được cộng 24 lần/timestep thay vì 1
+        # => trọng số HIỆU DỤNG của L_aux tăng đúng 24x so với lúc λ_lb=1.2
+        # được tinh chỉnh. Bằng chứng: policy_loss log nhảy 0.19 -> 4.58 (~24x)
+        # và reward ep50 tụt xuống -0.711. Thang hiện tại mới là thang ĐÚNG
+        # (mean trên mỗi agent-step, khớp với total_loss), nên không sửa mẫu số
+        # mà phải hạ λ (xem periph_lb_coeff trong default_cfg).
+        aux_term = total_periph_aux_loss / max(1, count)
+        policy_term = total_loss / max(1, count)
+        loss = policy_term + aux_term
         loss.backward()
 
         grad_norm_preclip = torch.nn.utils.clip_grad_norm_(
@@ -1029,7 +1143,12 @@ class FinalCIGAMFRunner:
         self.policy_optim.step()
 
         return {
-            "loss": float(loss.item()),
+            # [FIX-8] "loss" trước đây GỘP cả aux -> cột policy_loss trong log
+            # bị aux nuốt (4.58 trong đó ~4.4 là aux). Vi phạm nguyên tắc 0.2
+            # của debug doc ("không debug bằng số gộp"). Tách hẳn ra.
+            "loss": float(policy_term.item()),
+            "aux_loss": float(aux_term.item()) if torch.is_tensor(aux_term) else float(aux_term),
+            "total_loss_with_aux": float(loss.item()),
             "actor_loss": float((total_actor_loss / max(1, count)).item()),
             "critic_loss": float((total_critic_loss / max(1, count)).item()),
             "entropy": float((total_entropy / max(1, count)).item()),
@@ -1059,7 +1178,7 @@ class FinalCIGAMFRunner:
 
         return int(pushed)
 
-    def _score_all_pairs_and_update_beliefs(self, obs_all, actions):
+    def _score_all_pairs_and_update_beliefs(self, obs_all, actions, observed_returns=None, behaviour_probs=None):
         """
         Score mọi directed pair (ego, j) và update Bayes-light belief.
 
@@ -1103,10 +1222,32 @@ class FinalCIGAMFRunner:
                 b_batch.append(belief_summary)
                 neighbor_ids.append(j)
 
-            # score_batch_full thay vì score_batch: cùng mu/sigma, thêm
-            # latency/mu_per_h cần cho InfluenceSignatureTracker — không đổi
-            # input, không đổi giá trị mu/sigma trả về (score_batch chỉ là
-            # wrapper mỏng quanh score_batch_full, xem structural_proxy.py).
+            # Prepare optional DR inputs: observed_returns and behaviour_probs
+            observed_returns_batch = None
+            behaviour_probs_obs_batch = None
+
+            if observed_returns is not None:
+                try:
+                    r = float(observed_returns.get(ego, observed_returns[ego]))
+                except Exception:
+                    try:
+                        r = float(observed_returns[ego])
+                    except Exception:
+                        r = None
+
+                if r is not None:
+                    observed_returns_batch = [r for _ in neighbor_ids]
+
+            if behaviour_probs is not None:
+                behaviour_probs_obs_batch = []
+                for j in neighbor_ids:
+                    try:
+                        bp = float(behaviour_probs[j][int(actions[j])])
+                    except Exception:
+                        bp = None
+                    behaviour_probs_obs_batch.append(bp)
+
+            # score_batch_full thêm các input DR nếu có, không đổi output khi absent
             out = self.proxy.score_batch_full(
                 obs_i_batch=obs_i_batch,
                 action_i_batch=action_i_batch,
@@ -1114,6 +1255,19 @@ class FinalCIGAMFRunner:
                 z_core_excl_j_batch=z_batch,
                 m_periph_excl_j_batch=m_batch,
                 belief_summary_batch=b_batch,
+                policy_probs_j_batch=None,
+                observed_returns_batch=observed_returns_batch,
+                behaviour_probs_obs_batch=behaviour_probs_obs_batch,
+                # [FIX-X1] x_ij dựng từ state HIỆN TẠI của env (score path
+                # chạy online), cùng hàm với push path -> không train/serve skew.
+                pair_feat_batch=[
+                    build_pair_feat(
+                        self.env.positions, self.env.agent_zone,
+                        getattr(self.env, "grid_size", 1),
+                        getattr(self.env, "n_zones", 1), ego, j,
+                    )
+                    for j in neighbor_ids
+                ],
             )
             mu_arr, sigma_arr = out["mu"], out["sigma"]
 
@@ -1184,6 +1338,13 @@ class FinalCIGAMFRunner:
             dtype=int,
         ).tolist()
 
+        # Pre-compute H-step returns for all timesteps so we can pass
+        # observed_returns into the proxy scoring call for DR correction.
+        try:
+            h_returns = self.replay_builder.build_h_step_returns(trajectory, self.n_agents)
+        except Exception:
+            h_returns = [None for _ in range(len(trajectory))]
+
         promoted = 0
         demoted = 0
         last_influence_matrix = None
@@ -1191,9 +1352,14 @@ class FinalCIGAMFRunner:
         for idx in step_indices:
             step = trajectory[int(idx)]
             self.env.restore_state(step["env_snapshot_before_step"])
+            observed_returns = h_returns[int(idx)] if h_returns is not None else None
+            behaviour_probs = step.get("behaviour_probs") if isinstance(step, dict) else None
+
             p_i, d_i, w_i = self._score_all_pairs_and_update_beliefs(
                 obs_all=step["obs_all"],
                 actions=step["actions"],
+                observed_returns=observed_returns,
+                behaviour_probs=behaviour_probs,
             )
             promoted += int(p_i)
             demoted += int(d_i)
@@ -1298,16 +1464,43 @@ class FinalCIGAMFRunner:
         core_switches = []
 
         diagnostic = last_info.get("diagnostic_core_by_ego", None)
+        f1s_role = []   # [F1-TOPK]
+
+        # ------------------------------------------------------------------
+        # [F1-TOPK] Ground truth cho Core F1 = TOP-K |Phi| ĐO ĐƯỢC, không phải
+        # nhãn vai trò tĩnh.
+        #
+        # gt_core_by_ego / diagnostic_core_by_ego là danh sách vai trò khai
+        # báo (collector -> {gatekeeper, relay, blocker, controller}). Sau khi
+        # Phi được ĐO từ công thức liên tục (xem _measure_phi_from_sgtp trong
+        # omni_arena), hai định nghĩa "core" đã tách hẳn nhau: belief chọn core
+        # theo |mu| còn thước đo lại chấm theo nhãn role. Kết quả f1 = 0.000
+        # SUỐT RUN là lỗi THƯỚC ĐO, không phải model.
+        #
+        # Báo cáo CẢ HAI: mean_f1 (vs top-k |Phi| đo được — thước đo chính) và
+        # mean_f1_role (vs nhãn role — giữ để có bằng chứng trong paper rằng
+        # nhãn role không còn là ground truth hợp lệ sau refactor Phi).
+        # ------------------------------------------------------------------
+        gt_influence = last_info.get("gt_influence_by_ego", None)
 
         for ego in range(self.n_agents):
             pred_core = self.belief_modules[ego].get_core_set()
 
-            if diagnostic is None:
-                gt_core = set()
-            else:
-                gt_core = diagnostic[ego]
+            gt_core_role = set() if diagnostic is None else set(diagnostic[ego])
+
+            gt_core = gt_core_role
+            if gt_influence is not None and ego in gt_influence:
+                row = gt_influence[ego]
+                if row:
+                    k = max(1, len(pred_core)) if pred_core else self.cfg.get(
+                        "seed_core_top_k", 3)
+                    gt_core = set(
+                        sorted(row, key=lambda j: abs(float(row[j])),
+                               reverse=True)[:int(k)]
+                    )
 
             f1s.append(self._core_f1(pred_core, gt_core))
+            f1s_role.append(self._core_f1(pred_core, gt_core_role))
             tvars.append(self.belief_modules[ego].get_temporal_variance())
             uncs.append(self.belief_modules[ego].get_mean_uncertainty())
             core_sizes.append(len(pred_core))
@@ -1336,6 +1529,7 @@ class FinalCIGAMFRunner:
             "mean_reward": float(np.mean(episode_reward)),
             "reward_per_agent": float(np.mean(episode_reward)),
             "mean_f1": float(np.mean(f1s)),
+            "mean_f1_role": float(np.mean(f1s_role)) if f1s_role else 0.0,
             "mean_temporal_var": float(np.mean(tvars)),
             "mean_uncertainty": float(np.mean(uncs)),
             "mean_core_size": float(np.mean(core_sizes)),
@@ -1470,12 +1664,36 @@ class FinalCIGAMFRunner:
 
                 try:
                     calib = self.sig_tracker.auto_calibrate()
-                    sigma_hi = calib["sigma_hi"]
                     tau_role = calib["tau_role"]
+
+                    all_sigma_bar = [
+                        float(v.get("sigma_bar", 0.0))
+                        for ego in range(self.n_agents)
+                        for v in self.belief_modules[ego].get_state_dict().values()
+                    ]
+                    if len(all_sigma_bar) >= 4:
+                        arr = np.asarray(all_sigma_bar)
+                        sigma_hi = float(np.percentile(arr, 80.0))
+                        sigma_p50 = float(np.percentile(arr, 50.0))
+                        sigma_p90 = float(np.percentile(arr, 90.0))
+                        sigma_iqr = float(np.percentile(arr, 75.0) - np.percentile(arr, 25.0))
+                    else:
+                        sigma_hi = calib["sigma_hi"]  # fallback, chưa đủ mẫu belief thật
+                        sigma_p50 = sigma_p90 = sigma_iqr = float("nan")
+                    g_anom_mean = float(getattr(self.periph_module, "g_anom_usage_ema", torch.zeros(1)).item())
+                    print(f"   [SLOT-DEBUG] sigma_p50={sigma_p50:.6f} sigma_p90={sigma_p90:.6f} "
+                          f"sigma_hi={sigma_hi:.6f} g_anom_mean={g_anom_mean:.4f}")
                     print(f"   [VERIFY] sigma_hi={sigma_hi:.6f}  tau_role={tau_role:.6f}")
 
                     if hasattr(self, 'periph_module'):
-                        self.periph_module.set_role_thresholds(tau_role, sigma_hi)
+                        # [B2.3] truyền CẢ sigma_iqr — trước đây bỏ trống nên
+                        # sigma_iqr_floor rơi về đúng sigma_hi và k_sg vẫn nổ.
+                        self.periph_module.set_role_thresholds(
+                            tau_role, sigma_hi,
+                            sigma_iqr=(
+                                sigma_iqr if np.isfinite(sigma_iqr) else None
+                            ),
+                        )
 
                     modules_list = list(self.belief_modules.values()) if isinstance(self.belief_modules, dict) else list(self.belief_modules)
 
@@ -1522,6 +1740,8 @@ class FinalCIGAMFRunner:
                 self.history["mean_reward"].append(snapshot["mean_reward"])
                 self.history["reward_per_agent"].append(snapshot["reward_per_agent"])
                 self.history["mean_f1"].append(snapshot["mean_f1"])
+                self.history["mean_f1_role"].append(
+                    snapshot.get("mean_f1_role", 0.0))
                 self.history["mean_temporal_var"].append(snapshot["mean_temporal_var"])
                 self.history["mean_uncertainty"].append(snapshot["mean_uncertainty"])
                 self.history["mean_core_size"].append(snapshot["mean_core_size"])
@@ -1599,6 +1819,7 @@ class FinalCIGAMFRunner:
                     f"stage={stage_now} "
                     f"reward={snapshot['mean_reward']:.3f} "
                     f"f1={snapshot['mean_f1']:.3f} "
+                    f"f1role={snapshot.get('mean_f1_role', 0.0):.3f} "
                     f"core={snapshot['mean_core_size']:.2f} "
                     f"switch={snapshot['mean_core_switches']:.2f} "
                     f"unc={snapshot['mean_uncertainty']:.5f} "

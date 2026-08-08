@@ -135,6 +135,7 @@ class LocalCounterfactualProxyNet(nn.Module):
         n_horizons: int = 8,
         use_belief_input: bool = False,
         dropout: float = 0.0,
+        pair_feat_dim: int = 0,
     ):
         super().__init__()
 
@@ -155,10 +156,28 @@ class LocalCounterfactualProxyNet(nn.Module):
         # ---------------------------------------------------------------
         self.use_belief_input = bool(use_belief_input)
 
+        # -------------------------------------------------------------------
+        # [FIX-X1] x_ij — HOÀN TẤT refactor Eq (7) -> Eq (8).
+        #
+        # Bản trước mới làm NỬA refactor: đã bỏ a_j khỏi input và chuyển sang
+        # multi-head output (đúng Eq 8), NHƯNG quên thêm x_ij vào input.
+        # Hậu quả định lượng: với ego i tại state s cố định, input chỉ phụ
+        # thuộc j qua Z_i^{-j} và M_i^{-j}. Với j NGOÀI core thì
+        # Z_i^{-j} = Z_i Y HỆT NHAU; còn M_i^{-j} là weighted-mean bỏ 1 trong
+        # ~20 item nên gần như không đổi. => ŵ_ij gần như HẰNG SỐ theo j =>
+        # không có thứ tự để xếp hạng => Spearman lang thang quanh 0 với dấu
+        # ngẫu nhiên. Khớp chính xác kết quả H1 8-seed (0.003, 0.138, -0.123,
+        # -0.027) mà bootstrap CI của MỌI biến thể đều chứa 0.
+        #
+        # pair_feat_dim = 0 giữ nguyên hành vi cũ (backward-compatible).
+        # -------------------------------------------------------------------
+        self.pair_feat_dim = int(pair_feat_dim)
+
         self.in_dim = (
             self.obs_dim
             + self.action_dim   # a_i one-hot
-            + self.action_dim   # a_j one-hot
+            # a_j KHÔNG còn ở input — xem multi-head output bên dưới
+            + self.pair_feat_dim   # x_ij (Eq 8)
             + self.core_dim
             + self.periph_dim
             + (self.belief_dim if self.use_belief_input else 0)
@@ -180,8 +199,8 @@ class LocalCounterfactualProxyNet(nn.Module):
         if dropout > 0.0:
             layers.append(nn.Dropout(float(dropout)))
 
-        # Output n_horizons thay vì 1.
-        layers.append(nn.Linear(self.hidden, self.n_horizons))
+        # Một "đầu" riêng cho MỖI hành động khả dĩ của j.
+        layers.append(nn.Linear(self.hidden, self.action_dim * self.n_horizons))
 
         self.net = nn.Sequential(*layers)
 
@@ -189,24 +208,33 @@ class LocalCounterfactualProxyNet(nn.Module):
         self,
         obs_i: torch.Tensor,            # [..., B, obs_dim]
         action_i_onehot: torch.Tensor,  # [..., B, action_dim]
-        action_j_onehot: torch.Tensor,  # [..., B, action_dim]
         z_core_excl_j: torch.Tensor,    # [..., B, core_dim]
         m_periph_excl_j: torch.Tensor,  # [..., B, periph_dim]
         belief_summary: torch.Tensor,   # [..., B, belief_dim]
+        pair_feat: torch.Tensor = None, # [..., B, pair_feat_dim] — x_ij (Eq 8)
     ) -> torch.Tensor:
         """
-        Returns:
-            [..., B, n_horizons]
-
-        Chấp nhận cả input không có chiều ensemble (gọi trực tiếp một
-        model, dùng ở smoke test / debug) lẫn input có sẵn chiều batch
-        (đường vmap chuẩn — vmap tự thêm/bỏ chiều được map, hàm forward
-        không cần biết gì về chiều E).
+        a_j KHÔNG còn là input. Mạng xuất dự đoán cho MỌI hành động của j
+        cùng lúc; a_j chỉ dùng để gather() ở nơi gọi (train_step / score_batch_full).
+        Returns: [..., B, action_dim, n_horizons]
         """
         parts = [
             obs_i,
             action_i_onehot,
-            action_j_onehot,
+        ]
+
+        # [FIX-X1] x_ij phải nằm NGAY SAU a_i, đúng thứ tự khai báo in_dim.
+        if self.pair_feat_dim > 0:
+            if pair_feat is None:
+                raise ValueError(
+                    "StructuralProxyNet được khởi tạo với pair_feat_dim="
+                    f"{self.pair_feat_dim} nhưng forward() không nhận pair_feat. "
+                    "Thiếu x_ij thì f_theta không phân biệt được neighbour j "
+                    "(xem FIX-X1) — không cho phép im lặng bỏ qua."
+                )
+            parts.append(pair_feat)
+
+        parts += [
             z_core_excl_j,
             m_periph_excl_j,
         ]
@@ -216,7 +244,8 @@ class LocalCounterfactualProxyNet(nn.Module):
 
         x = torch.cat(parts, dim=-1)  # [..., in_dim]
 
-        return self.net(x)  # [..., n_horizons]
+        out = self.net(x)  # [..., action_dim * n_horizons]
+        return out.view(*out.shape[:-1], self.action_dim, self.n_horizons)
 
 
 # =============================================================================
@@ -339,12 +368,15 @@ class LocalCounterfactualProxyEnsemble:
         seed: int = 0,
         use_vmap_ensemble: bool = True,
         compile_ensemble: bool = False,
+        pair_feat_dim: int = 0,
     ):
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
         self.core_dim = int(core_dim)
         self.periph_dim = int(periph_dim)
         self.belief_dim = int(belief_dim)
+        # [FIX-X1] x_ij (Eq 8). 0 = tắt, giữ hành vi cũ.
+        self.pair_feat_dim = int(pair_feat_dim)
         self.n_ensemble = int(n_ensemble)
         self.hidden = int(hidden)
         self.lr = float(lr)
@@ -364,6 +396,7 @@ class LocalCounterfactualProxyEnsemble:
 
         self.use_doubly_robust = bool(use_doubly_robust)
         self.iw_clip = float(iw_clip)
+        self.forced_boost = 4.0   # [FIX-HC3b] xem _sample_for_member
         self.bootstrap_ratio = float(np.clip(bootstrap_ratio, 0.1, 1.0))
         self.use_belief_input = bool(use_belief_input)
 
@@ -392,6 +425,7 @@ class LocalCounterfactualProxyEnsemble:
                     core_dim=self.core_dim,
                     periph_dim=self.periph_dim,
                     belief_dim=self.belief_dim,
+                    pair_feat_dim=self.pair_feat_dim,   # [FIX-X1]
                     hidden=self.hidden,
                     n_horizons=self.n_horizons,
                     use_belief_input=self.use_belief_input,
@@ -505,7 +539,7 @@ class LocalCounterfactualProxyEnsemble:
             list(self._stacked_params.values()), lr=self.lr
         )
 
-        def _fmodel(params, buffers, obs_i, a_i_oh, a_j_oh, z, m, belief):
+        def _fmodel(params, buffers, obs_i, a_i_oh, z, m, belief, pair_feat):
             return functional_call(
                 self._base_model,
                 (params, buffers),
@@ -513,10 +547,10 @@ class LocalCounterfactualProxyEnsemble:
                 kwargs=dict(
                     obs_i=obs_i,
                     action_i_onehot=a_i_oh,
-                    action_j_onehot=a_j_oh,
                     z_core_excl_j=z,
                     m_periph_excl_j=m,
                     belief_summary=belief,
+                    pair_feat=pair_feat,   # [FIX-X1]
                 ),
             )
 
@@ -525,6 +559,7 @@ class LocalCounterfactualProxyEnsemble:
         # Mặc định vmap sẽ raise lỗi nếu gặp toán tử ngẫu nhiên mà không
         # khai báo rõ randomness -> khai báo sẵn ở đây để không sập khi có
         # người bật ensemble_dropout > 0 sau này.
+        # [FIX-X1] thêm 1 in_dim cho pair_feat (tham số thứ 8 của _fmodel).
         self._vmap_forward_shared = vmap(
             _fmodel, in_dims=(0, 0, None, None, None, None, None, None),
             randomness="different",
@@ -637,6 +672,7 @@ class LocalCounterfactualProxyEnsemble:
         m_periph_excl_j,
         belief_summary,
         target_return_h,
+        pair_feat=None,
         target_returns_multi=None,
         behaviour_prob_j=None,
         was_forced=False,
@@ -684,6 +720,13 @@ class LocalCounterfactualProxyEnsemble:
             ),
             "belief_summary": self._normalise_vector(
                 belief_summary, self.belief_dim
+            ),
+            # [FIX-X1] x_ij; zeros nếu caller chưa truyền (chỉ hợp lệ khi
+            # pair_feat_dim == 0, ngược lại forward sẽ raise).
+            "pair_feat": (
+                np.zeros((self.pair_feat_dim,), dtype=np.float32)
+                if pair_feat is None
+                else self._normalise_vector(pair_feat, self.pair_feat_dim)
             ),
             "target_return_h": float(target_return_h),
             "target_returns_multi": multi,                      # [n_horizons]
@@ -747,6 +790,15 @@ class LocalCounterfactualProxyEnsemble:
         belief = np.stack(
             [b["belief_summary"] for b in batch], axis=0
         )                                                            # [B, belief_dim]
+        pair_feat = np.stack(
+            [b["pair_feat"] for b in batch], axis=0
+        )                                                       # [B, pair_feat_dim]
+        # [FIX-HC1] b_j(a_j|s) để cân trọng số loss theo nghịch propensity.
+        b_obs = np.asarray(
+            [(1.0 if b.get("behaviour_prob_j") is None
+              else float(b["behaviour_prob_j"])) for b in batch],
+            dtype=np.float32,
+        )                                                                # [B]
         target_multi = np.stack(
             [b["target_returns_multi"] for b in batch], axis=0
         )                                                            # [B, n_horizons]
@@ -754,15 +806,22 @@ class LocalCounterfactualProxyEnsemble:
         return (
             torch.tensor(obs, dtype=torch.float32, device=self.device),
             self._one_hot(action_i),
-            self._one_hot(action_j),
+            # a_j giờ là index thô [B] int64 — dùng để gather(), không vào forward
+            torch.tensor(action_j, dtype=torch.int64, device=self.device),
             torch.tensor(z, dtype=torch.float32, device=self.device),
             torch.tensor(m, dtype=torch.float32, device=self.device),
             torch.tensor(belief, dtype=torch.float32, device=self.device),
             torch.tensor(target_multi, dtype=torch.float32, device=self.device),
+            torch.tensor(pair_feat, dtype=torch.float32, device=self.device),
+            torch.tensor(b_obs, dtype=torch.float32, device=self.device),
         )
 
     def _sample_for_member(self, buf_list: list, member_idx: int, n: int,
-                            forced_boost: float = 3.0):
+                            forced_boost: float = None):
+        # [FIX-HC3b] 8.0 -> 4.0 (mặc định qua self.forced_boost).
+        # Hạ vì forced_boost đang KHUẾCH ĐẠI đúng nhóm mẫu mà VERIFY-F1 còn
+        # nghi ngờ sai nhãn (min_head_frac 0.001 thấp hơn chặn dưới lý thuyết
+        # forced_frac/|A| tới 15-30x). Chỉ nâng lại sau khi VERIFY-F1/F1b xanh.
         """
         [L3] Sample RIÊNG cho từng ensemble member — KHÔNG quét toàn bộ
         buffer bằng vòng lặp Python (bản cũ hash từng phần tử, O(buffer_size)
@@ -800,6 +859,8 @@ class LocalCounterfactualProxyEnsemble:
             pool_positions = np.arange(len(buf_list))
 
         pool = [buf_list[int(i)] for i in pool_positions]
+        if forced_boost is None:
+            forced_boost = float(getattr(self, "forced_boost", 4.0))
         weights = [forced_boost if s["was_forced"] else 1.0 for s in pool]
 
         # random.choices lấy có hoàn lại, có trọng số -> luôn trả đúng n
@@ -858,24 +919,28 @@ class LocalCounterfactualProxyEnsemble:
                 for k in range(E)
             ]
 
-            print(f"[TRAIN-DEBUG] batch_size={batch_size} " f"member_batch_lens={[len(b) for b in member_batches]}")
+#            print(f"[TRAIN-DEBUG] batch_size={batch_size} " f"member_batch_lens={[len(b) for b in member_batches]}")
 
             if any(len(b) == 0 for b in member_batches):
-                print("[TRAIN-DEBUG] SKIPPED — empty batch this step")
+#                print("[TRAIN-DEBUG] SKIPPED — empty batch this step")
                 continue
 
             if any(len(b) == 0 for b in member_batches):
                 continue
 
             obs_l, ai_l, aj_l, z_l, m_l, bl_l, tgt_l = [], [], [], [], [], [], []
+            pf_l = []   # [FIX-X1] x_ij per member
+            bobs_l = []  # [FIX-HC1] b_j(a_j|s) per member
 
             for b in member_batches:
-                (obs_t, a_i_oh, a_j_oh, z_t, m_t, belief_t, target_multi_t) = (
+                (obs_t, a_i_oh, a_j_idx, z_t, m_t, belief_t, target_multi_t,
+                 pf_t, bobs_t) = (
                     self._batch_to_tensors(b)
                 )
+                pf_l.append(pf_t); bobs_l.append(bobs_t)
                 obs_l.append(obs_t)
                 ai_l.append(a_i_oh)
-                aj_l.append(a_j_oh)
+                aj_l.append(a_j_idx)
                 z_l.append(z_t)
                 m_l.append(m_t)
                 bl_l.append(belief_t)
@@ -883,21 +948,52 @@ class LocalCounterfactualProxyEnsemble:
 
             obs_e = torch.stack(obs_l, dim=0)    # [E, B, obs_dim]
             ai_e = torch.stack(ai_l, dim=0)      # [E, B, A]
-            aj_e = torch.stack(aj_l, dim=0)      # [E, B, A]
+            aj_e = torch.stack(aj_l, dim=0)      # [E, B]
             z_e = torch.stack(z_l, dim=0)        # [E, B, core_dim]
             m_e = torch.stack(m_l, dim=0)        # [E, B, periph_dim]
             bel_e = torch.stack(bl_l, dim=0)     # [E, B, belief_dim]
             tgt_e = torch.stack(tgt_l, dim=0)    # [E, B, H]
+            pf_e = torch.stack(pf_l, dim=0)      # [E, B, pair_feat_dim]
+            bobs_e = torch.stack(bobs_l, dim=0)  # [E, B]
 
             # MỘT lệnh vmap = n_ensemble forward pass chạy song song trên GPU.
-            preds = self._vmap_forward_per_member(
+            preds_all = self._vmap_forward_per_member(
                 self._stacked_params, self._stacked_buffers,
-                obs_e, ai_e, aj_e, z_e, m_e, bel_e,
-            )  # [E, B, H]
+                obs_e, ai_e, z_e, m_e, bel_e, pf_e,   # [FIX-X1]
+            )  # [E, B, A, H]
 
-            per_member_loss = F.mse_loss(preds, tgt_e, reduction="none").mean(
-                dim=(1, 2)
-            )  # [E] — mỗi member có loss riêng, không trộn lẫn
+            E_, B_, A_, H_ = preds_all.shape
+            gather_idx = aj_e.view(E_, B_, 1, 1).expand(E_, B_, 1, H_)
+            preds = torch.gather(preds_all, dim=2, index=gather_idx).squeeze(2)  # [E, B, H]
+
+            # ----------------------------------------------------------------
+            # [FIX-HC1] HEAD COLLAPSE — nối eps-forcing vào LOSS HUẤN LUYỆN.
+            #
+            # Chuỗi nhân quả đã xác nhận bằng code (dòng gather ngay trên):
+            #   loss = MSE(gather(preds_all, a_j), target)
+            #     -> mỗi mẫu CHỈ 1 trong |A| head nhận gradient
+            #     -> head của action hiếm gần như đứng ở init
+            #     -> std_a f_theta(a) ~ nhiễu init
+            #     -> plug-in contrast f(a_j) - sum_a pi(a) f(a) ~ 0
+            #     -> mu ~ 0  (đo thật: mean_mu 0.117 vs W* ~1.5, lệch 13x)
+            #
+            # eps-forcing là cơ chế DUY NHẤT sinh phủ đều cho các head hiếm,
+            # nhưng trước đây mẫu forced chỉ được dùng cho DR correction (qua
+            # b_j ở score path), KHÔNG dùng để huấn luyện head. Đây đúng là
+            # "counterfactual sinh ra từ eps-forcing mà chưa được tiêu thụ".
+            #
+            # Trọng số 1/b_j (clip cùng c_iw): head của action hiếm nhận
+            # gradient tỉ lệ nghịch với độ hiếm. Chuẩn hoá về mean 1 để không
+            # đổi thang learning rate hiệu dụng.
+            # ----------------------------------------------------------------
+            iw = torch.clamp(
+                1.0 / torch.clamp(bobs_e, min=1.0 / self.iw_clip, max=1.0),
+                max=self.iw_clip,
+            )                                                    # [E, B]
+            iw = iw / torch.clamp(iw.mean(dim=1, keepdim=True), min=1e-8)
+
+            sq = F.mse_loss(preds, tgt_e, reduction="none").mean(dim=2)  # [E,B]
+            per_member_loss = (sq * iw).mean(dim=1)  # [E]
 
             loss = per_member_loss.sum()  # backward của tổng các thành phần
             # ĐỘC LẬP <=> mỗi thành phần chỉ lan gradient về đúng member đó
@@ -914,11 +1010,37 @@ class LocalCounterfactualProxyEnsemble:
                 res = torch.mean(
                     torch.abs(preds[:, :, -1] - tgt_e[:, :, -1]), dim=1
                 )  # [E] — residual đo trên horizon cuối (khớp R^(H) của v1)
-                forced_mask = torch.tensor([b["was_forced"] for b in member_batches[0]], device=preds.device)
-                if forced_mask.any():
-                    res_forced = torch.mean(torch.abs(preds[:, forced_mask, -1] - tgt_e[:, forced_mask, -1]))
-                    res_control = torch.mean(torch.abs(preds[:, ~forced_mask, -1] - tgt_e[:, ~forced_mask, -1])) if (~forced_mask).any() else torch.tensor(0.0)
-                    print(f"[RESIDUAL-SPLIT] forced_n={forced_mask.sum().item()} res_forced={res_forced.item():.4e} res_control={res_control.item():.4e}")
+                # [FIX-HC2] res_forced vs res_control ĐÃ HẾT GIÁ TRỊ CHẨN
+                # ĐOÁN sau refactor TARNet: a_j không còn là input, forced hay
+                # không chỉ đổi head nào được gather, không đổi độ khó dự đoán
+                # R_i^(H). Nên res_forced ~ res_control là TẤT YẾU, không phải
+                # bằng chứng model hỏng. Thay bằng head_spread — thứ đo trực
+                # tiếp việc mạng có phân biệt được trục action hay không.
+                fm = torch.tensor(
+                    [b["was_forced"] for b in member_batches[0]],
+                    device=preds.device,
+                )
+                hs = preds_all.std(dim=2)                    # [E, B, H]
+                hs_last = hs[:, :, -1].reshape(-1)
+                hs_p50 = torch.quantile(hs_last, 0.50)
+                hs_p90 = torch.quantile(hs_last, 0.90)
+                mu_scale = torch.mean(torch.abs(preds[:, :, -1])) + 1e-8
+                counts = torch.bincount(
+                    aj_e.reshape(-1), minlength=int(self.action_dim)
+                ).float()
+                min_head_frac = float(counts.min().item()) / max(
+                    1.0, float(aj_e.numel())
+                )
+                self.last_head_spread_p50 = float(hs_p50.item())
+                self.last_head_spread_ratio = float((hs_p50 / mu_scale).item())
+                self.last_min_head_frac = min_head_frac
+                self.last_forced_frac = float(fm.float().mean().item())
+                print(
+                    f"[HEAD-SPREAD] p50={hs_p50.item():.4e} p90={hs_p90.item():.4e} "
+                    f"p50/|mu|={self.last_head_spread_ratio:.3f} "
+                    f"(gate >0.10) min_head_frac={min_head_frac:.3f} "
+                    f"(gate >0.05) forced_frac={self.last_forced_frac:.3f}"
+                )
             per_step_residuals.append(res)
 
             self.last_train_batch_count += 1
@@ -932,18 +1054,22 @@ class LocalCounterfactualProxyEnsemble:
         if holdout_size > 0 and len(self.buffer) > holdout_size:
             ho_batch = random.sample(list(self.buffer), int(holdout_size))
 
-            (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target) = (
+            (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target, ho_pf,
+             _ho_bobs) = (
                 self._batch_to_tensors(ho_batch)
             )
 
             self._ensemble_train_mode(False)
 
             with torch.no_grad():
-                stacked = self._vmap_forward_shared(
+                stacked_all = self._vmap_forward_shared(
                     self._stacked_params, self._stacked_buffers,
-                    ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b,
-                )  # [E, B, H] — MỘT lệnh vmap, dữ liệu dùng chung mọi member
+                    ho_obs, ho_ai, ho_z, ho_m, ho_b, ho_pf,
+                )  # [E, B, A, H] — MỘT lệnh vmap, dữ liệu dùng chung mọi member
 
+                E_, B_, A_, H_ = stacked_all.shape
+                ho_idx = ho_aj.view(1, B_, 1, 1).expand(E_, B_, 1, H_)
+                stacked = torch.gather(stacked_all, dim=2, index=ho_idx).squeeze(2)  # [E, B, H]
                 pred_mean = stacked.mean(dim=0)  # [B, H]
 
                 holdout_residual_t = torch.mean(
@@ -1004,20 +1130,25 @@ class LocalCounterfactualProxyEnsemble:
                 if len(batch) == 0:
                     continue
 
-                (obs_t, a_i_oh, a_j_oh, z_t, m_t, belief_t, target_multi_t) = (
+                (obs_t, a_i_oh, a_j_idx, z_t, m_t, belief_t, target_multi_t,
+                 pf_t, _bobs_t) = (
                     self._batch_to_tensors(batch)
                 )
 
                 model.train()
 
-                pred = model(
+                pred_all = model(
                     obs_i=obs_t,
                     action_i_onehot=a_i_oh,
-                    action_j_onehot=a_j_oh,
                     z_core_excl_j=z_t,
                     m_periph_excl_j=m_t,
                     belief_summary=belief_t,
+                    pair_feat=pf_t,
                 )
+
+                B_, A_, H_ = pred_all.shape
+                idx = a_j_idx.view(B_, 1, 1).expand(B_, 1, H_)
+                pred = torch.gather(pred_all, dim=1, index=idx).squeeze(1)  # [B, H]
 
                 loss = F.mse_loss(pred, target_multi_t)
 
@@ -1038,7 +1169,8 @@ class LocalCounterfactualProxyEnsemble:
 
         if holdout_size > 0 and len(self.buffer) > holdout_size:
             ho_batch = random.sample(list(self.buffer), int(holdout_size))
-            (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target) = (
+            (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target, ho_pf,
+             _ho_bobs2) = (
                 self._batch_to_tensors(ho_batch)
             )
 
@@ -1046,22 +1178,21 @@ class LocalCounterfactualProxyEnsemble:
                 preds = []
                 for model in self.models:
                     model.eval()
-                    preds.append(
-                        model(
-                            obs_i=ho_obs, action_i_onehot=ho_ai,
-                            action_j_onehot=ho_aj, z_core_excl_j=ho_z,
-                            m_periph_excl_j=ho_m, belief_summary=ho_b,
-                        )
+                    pred_all = model(
+                        obs_i=ho_obs, action_i_onehot=ho_ai,
+                        z_core_excl_j=ho_z, m_periph_excl_j=ho_m,
+                        belief_summary=ho_b, pair_feat=ho_pf,
                     )
+                    B_, A_, H_ = pred_all.shape
+                    idx = ho_aj.view(B_, 1, 1).expand(B_, 1, H_)
+                    preds.append(torch.gather(pred_all, dim=1, index=idx).squeeze(1))
 
                 stacked = torch.stack(preds, dim=0)
                 pred_mean = stacked.mean(dim=0)
-
                 holdout_residual = float(
-                    torch.mean(
-                        torch.abs(pred_mean[:, -1] - ho_target[:, -1])
-                    ).item()
+                    torch.mean(torch.abs(pred_mean[:, -1] - ho_target[:, -1]))
                 )
+
 
                 if stacked.shape[0] > 1:
                     self.latest_ensemble_disagreement = float(
@@ -1099,6 +1230,7 @@ class LocalCounterfactualProxyEnsemble:
         z,         # [B, core_dim]
         m,         # [B, periph_dim]
         belief,    # [B, belief_dim]
+        pair_feat=None,   # [B, pair_feat_dim] — x_ij (FIX-X1)
     ) -> torch.Tensor:
         """
         Dự đoán return cho MỌI hành động khả dĩ của j, với mọi ensemble
@@ -1122,35 +1254,24 @@ class LocalCounterfactualProxyEnsemble:
         A = int(self.action_dim)
 
         a_i_oh = self._one_hot(np.asarray(action_i).reshape(-1))  # [B, A]
-
-        # Nhân bản mỗi sample A lần, mỗi bản gán một hành động khác của j.
-        obs_rep = obs_t.repeat_interleave(A, dim=0)        # [B*A, obs_dim]
-        z_rep = z_t.repeat_interleave(A, dim=0)            # [B*A, core_dim]
-        m_rep = m_t.repeat_interleave(A, dim=0)            # [B*A, periph_dim]
-        belief_rep = belief_t.repeat_interleave(A, dim=0)  # [B*A, belief_dim]
-        a_i_rep = a_i_oh.repeat_interleave(A, dim=0)       # [B*A, A]
-
-        eye = torch.eye(A, dtype=torch.float32, device=self.device)  # [A, A]
-        a_j_rep = eye.repeat(B, 1)                                    # [B*A, A]
+        pf_t = self._pair_feat_tensor(pair_feat, B)   # [FIX-X1]
 
         self._ensemble_train_mode(False)
 
         with torch.no_grad():
             if self.use_vmap_ensemble:
-                preds = self._vmap_forward_shared(
+                out = self._vmap_forward_shared(
                     self._stacked_params, self._stacked_buffers,
-                    obs_rep, a_i_rep, a_j_rep, z_rep, m_rep, belief_rep,
-                )  # [E, B*A, n_horizons] — MỘT lệnh cho cả ensemble
-                out = preds.view(self.n_ensemble, B, A, self.n_horizons)
+                    obs_t, a_i_oh, z_t, m_t, belief_t, pf_t,
+                )  # [E, B, A, n_horizons]
             else:
                 out = self._predict_all_actions_loop(
-                    obs_rep, a_i_rep, a_j_rep, z_rep, m_rep, belief_rep, B, A,
-                )
+                    obs_t, a_i_oh, z_t, m_t, belief_t, pf_t)
 
         return out  # [E, B, A, n_horizons]
 
     def _predict_all_actions_loop(
-        self, obs_rep, a_i_rep, a_j_rep, z_rep, m_rep, belief_rep, B, A,
+        self, obs, a_i_oh, z, m, belief, pair_feat=None,
     ) -> torch.Tensor:
         """Vòng lặp Python qua từng model — dùng làm fallback (torch<2.0)
         VÀ làm bản tham chiếu cho test T1 (xem _predict_all_actions_reference).
@@ -1159,11 +1280,11 @@ class LocalCounterfactualProxyEnsemble:
         for model in self.models:
             model.eval()
             pred = model(
-                obs_i=obs_rep, action_i_onehot=a_i_rep,
-                action_j_onehot=a_j_rep, z_core_excl_j=z_rep,
-                m_periph_excl_j=m_rep, belief_summary=belief_rep,
+                obs_i=obs, action_i_onehot=a_i_oh,
+                z_core_excl_j=z, m_periph_excl_j=m,
+                belief_summary=belief, pair_feat=pair_feat,
             )
-            outs.append(pred.view(B, A, self.n_horizons))
+            outs.append(pred)
         return torch.stack(outs, dim=0)
 
     def _sync_stacked_to_models(self):
@@ -1181,7 +1302,7 @@ class LocalCounterfactualProxyEnsemble:
                         sd[name].copy_(p[k])
 
     def _predict_all_actions_reference(
-        self, obs, action_i, z, m, belief,
+        self, obs, action_i, z, m, belief, pair_feat=None,
     ) -> torch.Tensor:
         """
         [GPU_OPTIMIZATION_CONTRACT.md — quy tắc vàng ở Phần 3] Bản THAM
@@ -1201,26 +1322,36 @@ class LocalCounterfactualProxyEnsemble:
         m_t = self._to_float_tensor(m, self.periph_dim)
         belief_t = self._to_float_tensor(belief, self.belief_dim)
 
-        B = int(obs_t.shape[0])
-        A = int(self.action_dim)
-
         a_i_oh = self._one_hot(np.asarray(action_i).reshape(-1))
-
-        obs_rep = obs_t.repeat_interleave(A, dim=0)
-        z_rep = z_t.repeat_interleave(A, dim=0)
-        m_rep = m_t.repeat_interleave(A, dim=0)
-        belief_rep = belief_t.repeat_interleave(A, dim=0)
-        a_i_rep = a_i_oh.repeat_interleave(A, dim=0)
-
-        eye = torch.eye(A, dtype=torch.float32, device=self.device)
-        a_j_rep = eye.repeat(B, 1)
+        pf_t = self._pair_feat_tensor(pair_feat, int(obs_t.shape[0]))
 
         with torch.no_grad():
             out = self._predict_all_actions_loop(
-                obs_rep, a_i_rep, a_j_rep, z_rep, m_rep, belief_rep, B, A,
-            )
+                obs_t, a_i_oh, z_t, m_t, belief_t, pf_t)
 
         return out  # [E, B, A, n_horizons]
+
+    def _pair_feat_tensor(self, pair_feat, B):
+        """[FIX-X1] Chuẩn hoá x_ij về [B, pair_feat_dim].
+
+        Trả None khi pair_feat_dim == 0 (chế độ tương thích ngược). Khi
+        pair_feat_dim > 0 mà caller không truyền, RAISE thay vì lặng lẽ
+        nhồi zeros — zeros nghĩa là 'mọi neighbour giống hệt nhau', đúng
+        cái bug FIX-X1 đang sửa, không được phép tái diễn âm thầm.
+        """
+        if self.pair_feat_dim <= 0:
+            return None
+        if pair_feat is None:
+            raise ValueError(
+                f"pair_feat_dim={self.pair_feat_dim} nhưng call site không "
+                "truyền x_ij. Xem FIX-X1."
+            )
+        arr = np.asarray(pair_feat, dtype=np.float32).reshape(B, -1)
+        if arr.shape[1] != self.pair_feat_dim:
+            raise ValueError(
+                f"x_ij phải có {self.pair_feat_dim} chiều, nhận {arr.shape[1]}"
+            )
+        return torch.tensor(arr, dtype=torch.float32, device=self.device)
 
     # =====================================================================
     # Tính effect
@@ -1348,6 +1479,15 @@ class LocalCounterfactualProxyEnsemble:
             if mode == "signed_oracle_matched":
                 correction = -correction
 
+            # [FIX-DR-H] DR correction (Eq 10) chỉ định nghĩa trên R^(H) nên
+            # chỉ áp cho horizon cuối — ĐÚNG theo paper. NHƯNG hệ quả là
+            # effect_per_h trở thành vector TRỘN estimator: h < H thuần
+            # plug-in, h = H đã hiệu chỉnh DR. Latency (Eq 19) lấy trọng tâm
+            # |ŵ^(h)| trên TẤT CẢ h, nên nó đang cộng táo với cam — thành phần
+            # thứ 6 của signature (Eq 18) không nhất quán về estimator.
+            # Giải pháp: giữ riêng bản plug-in thuần cho latency, còn mu/effect
+            # (đại lượng Eq 10 thực sự nói tới) vẫn dùng bản đã hiệu chỉnh.
+            effect_per_h_plugin = effect_per_h
             effect_per_h = effect_per_h.clone()
             effect_per_h[:, :, -1] = effect_per_h[:, :, -1] + correction
 
@@ -1355,7 +1495,11 @@ class LocalCounterfactualProxyEnsemble:
 
         return {
             "effect": effect_per_h[:, :, -1],   # [E, B]
-            "effect_per_h": effect_per_h,       # [E, B, H]
+            "effect_per_h": effect_per_h,       # [E, B, H]  (h=H đã có DR)
+            # [FIX-DR-H] nhất quán estimator trên MỌI horizon — dùng cho latency
+            "effect_per_h_plugin": (
+                effect_per_h_plugin if apply_dr else effect_per_h
+            ),
             "dr_correction": dr_correction,     # [B]
         }
 
@@ -1374,6 +1518,7 @@ class LocalCounterfactualProxyEnsemble:
         policy_probs_j_batch=None,
         observed_returns_batch=None,
         behaviour_probs_obs_batch=None,
+        pair_feat_batch=None,
     ):
         """
         GIỮ NGUYÊN chữ ký v1 -> runner cũ gọi được ngay.
@@ -1392,6 +1537,7 @@ class LocalCounterfactualProxyEnsemble:
             policy_probs_j_batch=policy_probs_j_batch,
             observed_returns_batch=observed_returns_batch,
             behaviour_probs_obs_batch=behaviour_probs_obs_batch,
+            pair_feat_batch=pair_feat_batch,
         )
 
         return out["mu"], out["sigma"]
@@ -1407,6 +1553,7 @@ class LocalCounterfactualProxyEnsemble:
         policy_probs_j_batch=None,
         observed_returns_batch=None,
         behaviour_probs_obs_batch=None,
+        pair_feat_batch=None,
     ) -> Dict[str, np.ndarray]:
         """
         Phiên bản đầy đủ — cung cấp mọi thứ influence_signature.py cần.
@@ -1414,8 +1561,7 @@ class LocalCounterfactualProxyEnsemble:
         Returns dict of np.ndarray:
             mu            [B]    effect trung bình qua ensemble (CÓ DẤU)
             sigma         [B]    std qua ensemble = bất định epistemic
-            mu_per_h      [B, H] effect theo từng horizon -> chiều LATENCY
-            latency       [B]    trọng tâm horizon của |effect|, trong [0, H-1]
+            mu_per_h      [B, H] effect thô theo từng horizon (diagnostic)
             mu_range      [B]    impact kiểu Pieroth (luôn >= 0) -> baseline
             dr_correction [B]    độ lớn hiệu chỉnh DR (chẩn đoán bias model)
         """
@@ -1427,7 +1573,6 @@ class LocalCounterfactualProxyEnsemble:
                 "mu": z,
                 "sigma": z,
                 "mu_per_h": np.zeros((0, self.n_horizons), dtype=np.float32),
-                "latency": z,
                 "mu_range": z,
                 "dr_correction": z,
             }
@@ -1441,7 +1586,8 @@ class LocalCounterfactualProxyEnsemble:
 
         # MỘT forward pass duy nhất (cả action thay thế lẫn cả ensemble).
         preds_all = self._predict_all_actions(
-            obs=obs, action_i=a_i, z=z_arr, m=m_arr, belief=belief
+            obs=obs, action_i=a_i, z=z_arr, m=m_arr, belief=belief,
+            pair_feat=pair_feat_batch,   # [FIX-X1]
         )  # [E, B, A, H]
 
         res = self._compute_effects(
@@ -1467,14 +1613,9 @@ class LocalCounterfactualProxyEnsemble:
 
         mu_per_h = torch.mean(effect_per_h, dim=0)  # [B, H]
 
-        # ---- LATENCY: trọng tâm horizon của |effect| --------------------
-        abs_h = torch.abs(mu_per_h)                              # [B, H]
-        h_idx = torch.arange(
-            self.n_horizons, dtype=torch.float32, device=self.device
-        ).view(1, -1)                                            # [1, H]
-
-        denom = torch.clamp(abs_h.sum(dim=1), min=self.eps)      # [B]
-        latency = (abs_h * h_idx).sum(dim=1) / denom             # [B]
+        # [SIG-5D] Khối LATENCY đã xoá — signature rút về R^5 (xem
+        # influence_signature.py). mu_per_h GIỮ LẠI làm diagnostic thô theo
+        # horizon; nó không mang tuyên bố "trọng tâm độ trễ" đang bị rút.
 
         # ---- mu_range: luôn tính, dùng làm baseline Pieroth -------------
         res_range = self._compute_effects(
@@ -1498,7 +1639,6 @@ class LocalCounterfactualProxyEnsemble:
             "mu": to_np(mu),
             "sigma": to_np(sigma),
             "mu_per_h": to_np(mu_per_h),
-            "latency": to_np(latency),
             "mu_range": to_np(mu_range),
             "dr_correction": to_np(res["dr_correction"]),
         }
@@ -1565,3 +1705,41 @@ class LocalCounterfactualProxyEnsemble:
             "n_horizons": int(self.n_horizons),
             "use_vmap_ensemble": bool(self.use_vmap_ensemble),
         }
+
+
+# =========================================================================
+# [FIX-X1] x_ij — pair feature cho Eq (8)
+# =========================================================================
+
+PAIR_FEAT_DIM = 5
+
+
+def build_pair_feat(positions, agent_zone, grid_size, n_zones, ego, j):
+    """x_ij = [drow/G, dcol/G, L1dist/G, same_zone, zone_diff/(n_zones-1)].
+
+    TẠI SAO CẦN (xem FIX-X1 trong LocalCounterfactualProxyNet.__init__):
+    trong omni_arena, w_ij(s) = phi_ij * delta_ij(s) mà delta_ij(s) là hàm
+    THUẦN của vị trí (mọi nhánh trong _gate_ladder đều là _dist(pos, anchor)).
+    Không có x_ij thì f_theta không có bất kỳ đầu vào nào phân biệt được j,
+    nên về mặt lý thuyết KHÔNG THỂ biểu diễn w_ij(s) — bất kể train bao lâu.
+
+    Dùng CHUNG một hàm cho cả push path (replay_builder) và score path
+    (final_runner): hai bên lệch định nghĩa x_ij sẽ gây train/serve skew,
+    một lỗi im lặng và rất khó bắt.
+    """
+    import numpy as _np
+
+    g = float(max(1, grid_size))
+    pi = positions[int(ego)]
+    pj = positions[int(j)]
+    drow = (float(pj[0]) - float(pi[0])) / g
+    dcol = (float(pj[1]) - float(pi[1])) / g
+    dist = (abs(float(pj[0]) - float(pi[0])) + abs(float(pj[1]) - float(pi[1]))) / g
+    zi = int(agent_zone[int(ego)])
+    zj = int(agent_zone[int(j)])
+    same_zone = 1.0 if zi == zj else 0.0
+    zone_diff = (zj - zi) / float(max(1, int(n_zones) - 1))
+
+    return _np.asarray(
+        [drow, dcol, dist, same_zone, zone_diff], dtype=_np.float32
+    )

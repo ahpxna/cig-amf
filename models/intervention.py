@@ -86,7 +86,7 @@ class EpsilonForcedActionController:
         n_agents: int,
         action_dim: int,
         eps: float = 0.03,
-        max_forced_per_step: Optional[int] = 2,
+        max_forced_per_step: Optional[int] = None,   # [FIX-P1] was 2
         anneal_to: Optional[float] = None,
         anneal_episodes: int = 60,
         rng: Optional[np.random.RandomState] = None,
@@ -97,7 +97,11 @@ class EpsilonForcedActionController:
         self.eps_initial = float(eps)
         self.eps = float(eps)
 
-        self.max_forced_per_step = max_forced_per_step
+        # [FIX-P1] None = không cap (mặc định mới). Ép về int nếu có giá trị
+        # để `cfg.get(..., 2)` trả về None từ config không bị hiểu nhầm.
+        self.max_forced_per_step = (
+            None if max_forced_per_step is None else int(max_forced_per_step)
+        )
         self.anneal_to = anneal_to
         self.anneal_episodes = int(max(1, anneal_episodes))
 
@@ -257,11 +261,42 @@ class EpsilonForcedActionController:
         draw = self.rng.rand(self.n_agents)         # [n_agents]
         forced_mask = draw < eps_vec                # [n_agents] bool
 
-        # Giới hạn số agent bị ép cùng lúc.
+        # ------------------------------------------------------------------
+        # [FIX-P1] Giới hạn số agent bị ép cùng lúc — PHÁ VỠ "propensity known
+        # exactly", claim trung tâm của paper (§B3: b_j "is known exactly,
+        # since pi_j is the learner's own network and eps is a chosen
+        # constant").
+        #
+        # Cap là một phép LỌC PHỤ THUỘC KẾT QUẢ BỐC THĂM của toàn quần thể:
+        # xác suất j thực sự bị ép không còn là eps_j nữa mà là
+        #     eps_eff_j = eps_j * P(j sống sót qua cap)
+        # trong đó P(...) phụ thuộc số agent khác cũng trúng ở bước đó.
+        # Với eps=0.03, n=24, cap=2: X ~ Bin(24, 0.03), P(X>2) ~ 3.8%, nên
+        # eps_eff ~ 0.0282 — propensity đang bị KHAI CAO ~6% một cách hệ
+        # thống, và DR chia sai đúng bằng tỉ lệ đó (mất tính không chệch).
+        #
+        # Cap gần như vô dụng ở chế độ mặc định: E[X] = 24*0.03 = 0.72 agent
+        # mỗi bước, tức cap=2 hầu như không bao giờ chạm. Nó trả giá bằng tính
+        # đúng đắn của claim để đổi lấy gần như không có gì.
+        #
+        # => Mặc định TẮT cap (max_forced_per_step=None). Nếu ai đó bật lại,
+        # cảnh báo một lần cho biết propensity ghi lại chỉ còn là xấp xỉ.
+        # ------------------------------------------------------------------
         if self.max_forced_per_step is not None:
             forced_ids = np.flatnonzero(forced_mask)
 
             if len(forced_ids) > int(self.max_forced_per_step):
+                if not getattr(self, "_cap_warned", False):
+                    print(
+                        "[eps-forcing][WARN] max_forced_per_step="
+                        f"{self.max_forced_per_step} vừa CẮT bớt số agent bị ép. "
+                        "Propensity ghi lại (eps danh nghĩa) giờ LỚN HƠN xác "
+                        "suất ép thực tế => DR chệch có hệ thống, và claim "
+                        "'b_j known exactly' của paper không còn đúng. "
+                        "Đặt forcer_max_forced_per_step=None để khôi phục."
+                    )
+                    self._cap_warned = True
+
                 keep = self.rng.choice(
                     forced_ids,
                     size=int(self.max_forced_per_step),

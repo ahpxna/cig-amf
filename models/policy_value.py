@@ -60,15 +60,37 @@ class PolicyValueNet(nn.Module):
         self.critic = nn.Linear(self.hidden, 1)
 
     def forward(self, obs, core_summary, peripheral_summary, belief_summary):
-        x = torch.cat(
-            [
-                obs,
-                core_summary,
-                peripheral_summary,
-                belief_summary,
-            ],
-            dim=-1,
-        )
+        # 1. Gom tất cả input vào 1 list
+        inputs = [
+            obs,
+            core_summary,
+            peripheral_summary,
+            belief_summary,
+        ]
+
+        # 2. Lấy số lượng batch/agents (ví dụ: B = 24) từ obs
+        B = obs.shape[0]
+
+        # 3. [FIX-CRIT-1b] Bản cũ .expand(B,-1) MỌI tensor có shape[0]==1 một
+        # cách âm thầm. Đó chính là thứ đã che giấu bug "peripheral memory của
+        # agent cuối bị nhân bản cho cả 24 agent" trong final_runner suốt nhiều
+        # lần debug: input sai shape không crash, chỉ lặng lẽ cho kết quả sai.
+        # Giữ lại expand cho trường hợp HỢP LỆ duy nhất (B == 1, gọi single-ego),
+        # còn lệch shape khi B > 1 thì phải nổ ngay tại chỗ.
+        names = ("obs", "core_summary", "peripheral_summary", "belief_summary")
+        expanded_inputs = []
+        for name, t in zip(names, inputs):
+            if t.dim() > 1 and t.shape[0] == 1 and B > 1:
+                raise ValueError(
+                    f"PolicyValueNet.forward: '{name}' có batch=1 trong khi "
+                    f"obs có batch={B}. Đây gần như luôn là lỗi wiring "
+                    f"(một summary bị tính cho 1 ego rồi dùng cho tất cả), "
+                    f"không phải broadcast hợp lệ."
+                )
+            expanded_inputs.append(t)
+
+        # 4. Cat lại an toàn
+        x = torch.cat(expanded_inputs, dim=-1)
 
         h = self.backbone(x)
 

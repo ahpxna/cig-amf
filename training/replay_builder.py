@@ -1,5 +1,7 @@
 import numpy as np
 
+from models.structural_proxy import build_pair_feat  # [FIX-X1]
+
 
 class MultiEgoReplayBuilder:
     """
@@ -192,6 +194,18 @@ class MultiEgoReplayBuilder:
                     if j == ego:
                         continue
 
+                    # [FIX-X1] x_ij tại ĐÚNG timestep t (ảnh chụp hình học
+                    # được runner lưu lúc thu thập; env.positions ở đây đã là
+                    # state cuối episode nên không dùng được).
+                    geom = step.get("geom_snapshot")
+                    if geom is None:
+                        pair_feat = None
+                    else:
+                        pair_feat = build_pair_feat(
+                            geom["positions"], geom["agent_zone"],
+                            geom["grid_size"], geom["n_zones"], ego, j,
+                        )
+
                     z_ex = step["core_context_excluding"][ego][j]
                     m_ex = step["periph_context_excluding"][ego][j]
                     belief_summary = step["belief_summary_cache"][ego]
@@ -212,6 +226,19 @@ class MultiEgoReplayBuilder:
                             behaviour_probs[j][int(actions[j])]
                         )
 
+                    # [VERIFY-F1b] Đo TẠI ĐIỂM GHI BUFFER: với các mẫu
+                    # was_forced=True, a_j phải phân bố ~uniform trên |A|.
+                    # Nếu ở runner hist_action_forced đều mà ở đây lệch =>
+                    # nhãn bị lệch giữa trajectory và buffer (đúng nghi vấn
+                    # "action_j lưu là action TRƯỚC override").
+                    if was_forced:
+                        _h = getattr(proxy_ensemble, "_vf1b_hist", None)
+                        if _h is None:
+                            _h = {}
+                            proxy_ensemble._vf1b_hist = _h
+                        _a = int(actions[j])
+                        _h[_a] = _h.get(_a, 0) + 1
+
                     proxy_ensemble.add_sample(
                         ego_id=ego,
                         neighbor_id=j,
@@ -225,6 +252,7 @@ class MultiEgoReplayBuilder:
                         target_returns_multi=target_multi,
                         behaviour_prob_j=behaviour_prob_j,
                         was_forced=was_forced,
+                        pair_feat=pair_feat,   # [FIX-X1]
                     )
 
                     pushed += 1

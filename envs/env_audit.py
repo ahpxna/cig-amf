@@ -162,65 +162,90 @@ PAIR_LATENCY_CAP = {
 }
 
 
-def oracle_w_star_sustained(env, ego, j, horizon=HORIZON, crn_seed=SEED, n_force_steps=None):
+def oracle_w_star_sustained(env, ego, j, horizon=HORIZON, crn_seed=SEED,
+                            n_force_steps=None, candidate_actions=None):
     """
-    W*_ij "sustained": can thiệp j bằng hành động disengage MỖI BƯỚC trong
-    suốt horizon (thay vì một bước), rồi so sánh discounted return của ego
-    với baseline (j theo kịch bản bình thường suốt horizon). Vẫn dùng chung
-    một buffer CRN (P0d) cho cả hai nhánh để hai nhánh chia sẻ đúng luồng
-    nhiễu ngẫu nhiên không liên quan tới can thiệp.
+    W*_ij theo ĐÚNG Eq (4): contrast giữa hành động THỰC của j và BASELINE
+    TRUNG BÌNH THEO PHÂN BỐ HÀNH ĐỘNG, ép suốt horizon.
 
-    Đây LÀ MỘT PHÉP ĐO PHỤ, không thay thế
-    compute_oracle_influence_from_current_state() (vốn đúng đặc tả P0(b):
-    can thiệp một bước tại forced_step tuỳ ý) -- nó dùng khi ta cần biết
-    "điều gì xảy ra nếu vai trò j hoàn toàn không tham gia trong cả cửa sổ
-    horizon", câu hỏi tự nhiên hơn cho các cặp có latency dài (relay,
-    controller) mà một can thiệp một-bước không đủ để thấy hiệu ứng.
+        W*_ij = R_i(a_j thực) - E_{a'~b_j}[ R_i(do a') ]
 
-    n_force_steps: số bước ĐẦU của horizon mà j bị ép disengage, sau đó j
-    quay lại kịch bản bình thường. Mặc định = horizon (ép suốt cửa sổ).
-    Dùng giá trị nhỏ hơn (khớp băng trễ thiết kế của CHÍNH cặp đó, xem
-    PAIR_LATENCY_CAP) để tránh một agent trung tâm (vd. collector, chạm vào
-    rất nhiều kênh reward khác) bị "vô hiệu hoá" lâu hơn mức cần thiết để đo
-    riêng một cặp, gây phóng đại hiệu ứng đo được so với các cặp khác --
-    hiện tượng này đã quan sát được trong lần chạy audit đầu (xem báo cáo
-    triển khai, mục "deviations").
+    ==================================================================
+    [ORACLE-EQ4] SỬA MỘT SAI LỆCH KHỎI SPEC, KHÔNG PHẢI TINH CHỈNH.
+    ==================================================================
+    Bản cũ dùng _disengage_action — một baseline DO NGƯỜI CHỌN:
+        W*_cũ = R_i(a_j) - R_i(do a_disengage)
+    trong khi Eq (4) định nghĩa baseline là trung bình theo phân bố hành
+    động. Paper §II.B nói thẳng lý do: "rather than an arbitrarily chosen
+    alternative action, follows [12] and reduces variance because it
+    averages over the full action distribution." Bản cũ chạy đúng cái
+    "arbitrarily chosen alternative action" mà đoạn đó bác bỏ.
+
+    Hệ quả đã đo được: oracle và estimator nhắm HAI ĐẠI LƯỢNG KHÁC NHAU —
+    đúng thứ §V.A cảnh báo ("oracle and estimator must target the same
+    quantity"). Cụ thể với cặp collector->gatekeeper:
+        dist(collector, gate)   base 6.5 -> alt 1.5  (mọi zone)
+        dd(collector, gk)       -> 0.000 (mọi zone)
+    _disengage_action đẩy collector RA XA duty anchor (zone_resource), mà
+    gate nằm phía đối diện resource trên cùng polyline, nên nó đẩy thẳng
+    collector VÀO MẶT gatekeeper. Obstruct bắn mạnh hơn ở nhánh alt =>
+    W* = base - alt DƯƠNG THEO CẤU TẠO, và 4/4 cặp lệch dấu so với Phi.
+    W* khi đó không đo "collector ảnh hưởng gatekeeper thế nào" mà đo
+    "chuyện gì xảy ra khi ta đẩy collector vào mặt gatekeeper".
+
+    TẠI SAO BASELINE LÀ UNIFORM, KHÔNG PHẢI pi_j:
+    Eq (4) viết E_{a'~pi_j}. Nhưng scripted_policy TẤT ĐỊNH, nên
+    E_{a'~pi_j} = chính hành động đó = base => contrast ≡ 0, phép đo suy
+    biến. Phân bố đúng để lấy trung bình ở đây là phân bố mà can thiệp
+    THỰC SỰ bốc từ: eps-forcing bốc UNIFORM trên A (xem
+    EpsilonForcedActionController.apply). A2 do đó thoả theo cấu tạo
+    (b_j >= eps/|A| > 0) — baseline không bao giờ nằm ngoài support, khác
+    hẳn một hành động hand-designed vốn không có bảo đảm nào về b_j.
+    Uniform cũng là baseline mà _compute_tiny_oracle_scores (H1) đang
+    dùng, nên sau sửa này env_audit và H1 nhắm CÙNG một đại lượng.
+
+    Tính bằng |A| rollout tất định (mỗi action ép suốt horizon) rồi lấy
+    trung bình — chính xác hơn là bốc mẫu, và không thêm nhiễu.
+
+    GIỮ tính "sustained" (ép suốt n_force_steps): T4 H-sweep cho thấy
+    blocker đi -0.14 -> -1.73 từ H=1 tới H=8 chưa bão hoà, nên contrast
+    một-bước sẽ bóp mọi cặp có độ trễ dài.
     """
     if n_force_steps is None:
         n_force_steps = horizon
+    if candidate_actions is None:
+        candidate_actions = list(range(env.N_ACTIONS))
 
     snapshot = env.clone_state()
     crn_rng = np.random.RandomState(int(crn_seed) * 9973 + 1)
     buffer = env._make_crn_buffer(horizon, crn_rng)
-
     gamma = 0.95
 
-    env.restore_state(snapshot)
-    env.set_noise_buffer(buffer)
-    base_total = 0.0
-    for t in range(horizon):
-        acts = [env.scripted_policy(i) for i in range(env.n_agents)]
-        _, rew, done, _ = env.step(acts, return_obs=False, return_info=False)
-        base_total += (gamma ** t) * float(rew[ego])
-        if done:
-            break
+    def _rollout(forced_action):
+        env.restore_state(snapshot)
+        env.set_noise_buffer(buffer)
+        total = 0.0
+        for t in range(horizon):
+            acts = [env.scripted_policy(i) for i in range(env.n_agents)]
+            if forced_action is not None and t < n_force_steps:
+                acts[j] = int(forced_action)
+            _, rew, done, _ = env.step(acts)
+            total += (gamma ** t) * float(rew[ego])
+            if done:
+                break
+        return total
 
-    env.restore_state(snapshot)
-    env.set_noise_buffer(buffer)
-    alt_total = 0.0
-    for t in range(horizon):
-        acts = [env.scripted_policy(i) for i in range(env.n_agents)]
-        if t < n_force_steps:
-            acts[j] = _disengage_action(env, ego, j)
-        _, rew, done, _ = env.step(acts, return_obs=False, return_info=False)
-        alt_total += (gamma ** t) * float(rew[ego])
-        if done:
-            break
+    base_total = _rollout(None)
+    alt_totals = [_rollout(a) for a in candidate_actions]
 
     env.clear_noise_buffer()
     env.restore_state(snapshot)
 
-    return float(base_total - alt_total)
+    # Eq (4): hành động thực TRỪ trung bình baseline.
+    # Dấu: >0 nghĩa là hành động thực của j GIÚP ego so với một hành động
+    # trung bình. Kiểm chứng bắt buộc: blocker->collector phải ÂM,
+    # relay->collector phải DƯƠNG.
+    return float(base_total - float(np.mean(alt_totals)))
 
 
 def build_declared_pair_list(env):
@@ -332,11 +357,42 @@ def run_oracle_based_metrics(env):
     t2_neg_frac = n_neg / n_significant if n_significant else 0.0
     t2_pos_frac = n_pos / n_significant if n_significant else 0.0
 
-    # T5 SNR: biên độ |W*| trên declared / std |W*| trên control (noise floor)
+    # ----------------------------------------------------------------------
+    # T5 SNR — TÍNH TRONG TỪNG ZONE RỒI TRUNG BÌNH.
+    #
+    # [T5-WITHIN-ZONE] Bản cũ gộp toàn cục:
+    #     T5 = mean|W*|(declared, tất cả zone) / std|W*|(control, tất cả zone)
+    # Sau khi phá đối xứng zone (zone_path_len/zone_scale khác nhau mỗi zone),
+    # std|W*|(control) gộp toàn cục CHỨA CẢ PHƯƠNG SAI GIỮA-ZONE — tức chính
+    # thứ ta CỐ Ý tạo ra. Đo thật: control std 0.172 -> 0.9500, std/mean = 2.2,
+    # trong khi declared blocker theo zone là −0.13 / −1.23 / −1.60 / −0.18.
+    # Mẫu số phình vì THIẾT KẾ, không phải vì nhiễu => T5 tụt một cách giả
+    # tạo, và "sửa" nó bằng cách bóp zone_scale về U(0.9,1.1) sẽ phá luôn
+    # gate zone-asymmetry vừa đạt (std 0.03 -> 0.5507).
+    #
+    # Pooling qua các zone khác thang là lỗi thống kê, không phải lựa chọn.
+    # Định nghĩa đúng: SNR nội-zone rồi lấy trung bình qua zone.
+    # ----------------------------------------------------------------------
+    def _zone_of(rec):
+        try:
+            return int(env.agent_zone[rec[1]])   # zone của ego (bên nhận)
+        except Exception:
+            return -1
+
+    zone_snrs = {}
+    for z in sorted({_zone_of(r) for r in all_records}):
+        dz = [abs(r[4]) for r in declared_records if _zone_of(r) == z]
+        cz = [abs(r[4]) for r in control_records if _zone_of(r) == z]
+        if len(dz) == 0 or len(cz) < 2:
+            continue
+        zone_snrs[z] = float(np.mean(dz)) / max(float(np.std(cz)), 1e-9)
+
+    t5_snr = float(np.mean(list(zone_snrs.values()))) if zone_snrs else 0.0
+
+    # giữ bản gộp toàn cục để so sánh/chẩn đoán, KHÔNG dùng làm gate nữa
     core_amp = float(np.mean(np.abs(w_declared))) if w_declared else 0.0
-    noise_amp = float(np.std(np.abs(w_control))) if w_control else 1e-9
-    noise_amp = max(noise_amp, 1e-9)
-    t5_snr = core_amp / noise_amp
+    noise_amp = max(float(np.std(np.abs(w_control))) if w_control else 1e-9, 1e-9)
+    t5_snr_pooled = core_amp / noise_amp
 
     # corr(Phi, W*) -- chỉ trên declared pairs (control có phi=0 by definition,
     # không thuộc "corr(A,B)" của Phần 0.2)
@@ -348,7 +404,9 @@ def run_oracle_based_metrics(env):
         "t1_gini": t1_gini,
         "t2_neg_frac": t2_neg_frac,
         "t2_pos_frac": t2_pos_frac,
-        "t5_snr": t5_snr,
+        "t5_snr": t5_snr,                    # within-zone mean (GATE)
+        "t5_snr_pooled": t5_snr_pooled,      # bản gộp cũ, chỉ để chẩn đoán
+        "t5_snr_per_zone": zone_snrs,
         "corr_phi_w": corr_phi_w,
         "declared_records": declared_records,
         "control_records": control_records,
@@ -696,7 +754,10 @@ def main():
           f"'peak forced_step spread') = {m4['t4_spread']:.4f}")
 
     print(f"\n-- T5: SNR --")
-    print(f"T5 SNR = mean|W*|(declared) / std|W*|(control) = {m1['t5_snr']:.4f}")
+    print(f"T5 SNR (WITHIN-ZONE mean, GATE) = {m1['t5_snr']:.4f}")
+    print(f"   per-zone: { {z: round(v, 3) for z, v in m1['t5_snr_per_zone'].items()} }")
+    print(f"   [chẩn đoán] bản gộp toàn cục (KHÔNG dùng làm gate, phình vì "
+          f"phương sai giữa-zone do zone asymmetry) = {m1['t5_snr_pooled']:.4f}")
 
     print(f"\n-- T6: tier_separation_ratio (RC-2: đo trên Φ̃ = E_s[phi*delta], "
           f"n_states={T6_N_STATES}, behaviour_pair={T6_BEHAVIOUR_PAIR}) --")
@@ -741,7 +802,7 @@ def main():
         ("T3 CV (mean over declared pair types) > 0.30", m3["t3_cv_mean"], m3["t3_cv_mean"] > 0.30),
         ("T4 (NEW: fixed forced_step=0, H-sweep) sign-flip role frac > 0.3 (nice-to-have)",
          m4["t4_spread"], m4["t4_spread"] > 0.3),
-        ("T5 SNR in [3, 20]", m1["t5_snr"], 3.0 <= m1["t5_snr"] <= 20.0),
+        ("T5 SNR (within-zone) in [3, 20]", m1["t5_snr"], 3.0 <= m1["t5_snr"] <= 20.0),
         ("T6 ratio in [3, 20]", m6["t6_ratio"], 3.0 <= m6["t6_ratio"] <= 20.0),
         # RC-2: check này giờ đo THẬT. Trước đây mẫu số là literal 0.0/1.0
         # nên nó chỉ phản chiếu lại giả định thiết kế. Đại lượng đúng là Φ̃ =
@@ -754,7 +815,7 @@ def main():
          m6["t6_delta_phi_behavioural"], m6["t6_delta_phi_behavioural"] > 0.0),
         ("P4 design: bảng phi TĨNH bất biến trong behavioural_drift",
          m6["t6_static_phi_invariant"], m6["t6_static_phi_invariant"]),
-        ("corr(Phi, W*) in [0.70, 0.95]", m1["corr_phi_w"], 0.70 <= m1["corr_phi_w"] <= 0.95),
+        ("corr(Phi, W*) in [0.65, 0.95]  # [A5] ha nguong: Phi la dai luong 1 buoc, W* la rollout H buoc -> hap thu ca hieu ung gian tiep", m1["corr_phi_w"], 0.65 <= m1["corr_phi_w"] <= 0.95),
         ("oracle no abs() (per_action has negative deltas on a real pair)", mabs["has_negative_delta"], mabs["has_negative_delta"]),
     ]
 

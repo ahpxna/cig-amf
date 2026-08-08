@@ -48,7 +48,23 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root):
     has_belief = hasattr(runner, "belief_modules")
     W_prev = w_matrix(runner, env.n_agents) if has_belief else None
     deltas, shift_eps, trigger_eps = [], [], []
-    prev_lane = dict(getattr(env, "active_lane", {}))
+
+    # [FIX-H2a] Phát hiện structural shift bằng CHÍNH bảng ảnh hưởng ground
+    # truth, không phải active_lane. active_lane bị reset()/restore_state ghi
+    # đè giữa các chunk nên so sánh nó gần như luôn cho False => shift_eps
+    # rỗng => delta_struct = mean(mảng rỗng) = NaN => SR = NaN. Đó là lý do
+    # TOÀN BỘ summary_h2.csv trước đây là NaN.
+    def _phi_fingerprint(e):
+        try:
+            return tuple(
+                (int(ego), tuple(sorted((int(k), round(float(v), 6))
+                                        for k, v in row.items())))
+                for ego, row in sorted(e.gt_influence_by_ego.items())
+            )
+        except Exception:
+            return None
+
+    prev_phi = _phi_fingerprint(env)
 
     n_chunks = max(1, episodes // eval_every)
     for c in range(n_chunks):
@@ -62,9 +78,10 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root):
             d = delta_norm(W_prev, W_now)
             W_prev = W_now
 
-        lane_now = dict(getattr(env, "active_lane", {}))
-        is_shift = lane_now != prev_lane
-        prev_lane = lane_now
+        phi_now = _phi_fingerprint(env)
+        is_shift = (prev_phi is not None and phi_now is not None
+                    and phi_now != prev_phi)
+        prev_phi = phi_now
         if is_shift:
             shift_eps.append(ep)
 
@@ -75,10 +92,18 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root):
         row = {
             "episode": ep, "delta": d, "is_shift_window": int(is_shift),
             "triggered": trig,
-            "f1": last(hist, "f1"), "reward": last(hist, "reward"),
-            "core_size": last(hist, "core_size"),
+            # [FIX-3] Key ĐÚNG trong runner.history là mean_f1 / mean_reward /
+            # mean_core_size. Dùng "f1"/"reward"/"core_size" -> luôn NaN, đây
+            # chính là nhóm cột NaN đang treo trong summary H2/H3.
+            "f1": last(hist, "mean_f1"), "reward": last(hist, "mean_reward"),
+            "core_size": last(hist, "mean_core_size"),
             "tier_separation_ratio": float(
                 getattr(env, "tier_separation_ratio", lambda: float("nan"))()),
+            # [C4] CSD-proxy: số cặp đang coupling ở cuối chunk.
+            "n_close_coupling_pairs": int(
+                env.close_coupling_pairs()
+                if hasattr(env, "close_coupling_pairs") else -1
+            ),
         }
         append_jsonl(jsonl, row)
         deltas.append((ep, d, is_shift))
@@ -96,7 +121,13 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root):
 
     d_struct = float(np.mean(dvals[struct_mask])) if struct_mask.any() else float("nan")
     d_behav = float(np.mean(dvals[~struct_mask])) if (~struct_mask).any() else float("nan")
-    sr = float(d_struct / (d_behav + 1e-12)) if np.isfinite(d_struct) else float("nan")
+    # [FIX-H2b] Chia cho (d_behav + 1e-12) làm SR nổ khi d_behav ~ 0 — đúng
+    # lớp lỗi chia-gần-0 đã gặp ở T5/T6/structure_value. Yêu cầu mẫu số phải
+    # có độ lớn tối thiểu mới cho ra tỉ số.
+    if (np.isfinite(d_struct) and np.isfinite(d_behav) and d_behav > 1e-6):
+        sr = float(d_struct / d_behav)
+    else:
+        sr = float("nan")
 
     # recovery latency: số eval-interval từ shift tới khi f1 hồi >= 90% mức tiền-shift,
     # trừ đi độ trễ H bước của trigger (paper yêu cầu account cho H).
@@ -121,8 +152,8 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root):
         "n_shift_events": len(shift_eps), "shift_episodes": shift_eps,
         "n_triggers": len(trigger_eps), "trigger_episodes": trigger_eps,
         "recovery_latency_intervals": lat,
-        "final_f1": last(getattr(runner, "history", {}), "f1"),
-        "final_reward": last(getattr(runner, "history", {}), "reward"),
+        "final_f1": last(getattr(runner, "history", {}), "mean_f1"),
+        "final_reward": last(getattr(runner, "history", {}), "mean_reward"),
     }
     save_json(os.path.join(out_dir, "summary.json"), summary)
     return summary
@@ -148,10 +179,15 @@ def main():
             # SR liên-run: struct từ run structural, behav từ run drift
             ds = per_mode["structural_shift"]["delta_mean_struct"]
             db = per_mode["behavioral_drift"]["delta_mean_behav"]
+            sr_cross = (
+                float(ds / db)
+                if (np.isfinite(ds) and np.isfinite(db) and db > 1e-6)
+                else float("nan")
+            )
             rows.append({
                 "model": model, "seed": seed,
                 "delta_struct": ds, "delta_behav": db,
-                "SR_cross_run": float(ds / (db + 1e-12)),
+                "SR_cross_run": sr_cross,
                 "SR_within_structural": per_mode["structural_shift"]["selectivity_ratio"],
                 "recovery_latency": per_mode["structural_shift"]["recovery_latency_intervals"],
                 "n_triggers": per_mode["structural_shift"]["n_triggers"],

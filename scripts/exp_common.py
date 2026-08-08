@@ -51,9 +51,23 @@ def w_matrix(runner, n_agents):
     return W
 
 
-def delta_norm(W_prev, W_new, eps=1e-8):
-    """Eq (33): ||W(t)-W(t-1)||_F / (||W(t-1)||_F + eps)."""
-    return float(np.linalg.norm(W_new - W_prev) / (np.linalg.norm(W_prev) + eps))
+def delta_norm(W_prev, W_new, eps=1e-8, min_ref=1e-3):
+    """Eq (33): ||W(t)-W(t-1)||_F / (||W(t-1)||_F + eps).
+
+    [FIX-9] Trong warm-up, belief còn ở prior μ=0 nên ||W(t-1)||_F ≈ 0 và
+    mẫu số tụt về eps=1e-8 => Δ nổ lên hàng TRIỆU (log H2 thật:
+    delta_behav = 9.08e6). Đó không phải "belief biến động mạnh" mà là
+    chia-cho-gần-0 — đúng lớp lỗi đã gặp ở T5/T6/structure_value.
+
+    Trả NaN khi ma trận tham chiếu chưa có nội dung (||W_prev|| < min_ref):
+    Δ ở điểm đó KHÔNG xác định được, và NaN sẽ bị loại khỏi thống kê thay vì
+    kéo lệch trung bình. Paper (§D, Eq 33) cũng nói rõ mục đích chuẩn hoá là
+    làm đại lượng KHÔNG THỨ NGUYÊN — nó chỉ có nghĩa khi có thang để chuẩn hoá.
+    """
+    ref = float(np.linalg.norm(W_prev))
+    if ref < min_ref:
+        return float("nan")
+    return float(np.linalg.norm(W_new - W_prev) / (ref + eps))
 
 
 def mean_over_egos(runner, method, key=None):

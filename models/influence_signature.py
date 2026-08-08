@@ -35,7 +35,6 @@ SÁU CHIỀU CỦA SIGNATURE
   2. sigma           — bất định epistemic (từ ensemble disagreement)
   3. temporal_std    — biến động theo THỜI GIAN (hành vi j có ổn định không)
   4. context_std     — biến động theo NGỮ CẢNH (ảnh hưởng có điều kiện không)
-  5. latency         — trọng tâm horizon của |effect|, trong [0, H-1]
 
 Chiều 3 và 4 khác nhau về bản chất và đây là chỗ dễ nhầm:
   - temporal_std cao = "hôm nay nó ảnh hưởng mạnh, mai lại yếu" -> KHÔNG ỔN ĐỊNH
@@ -75,7 +74,14 @@ import numpy as np
 
 
 # Số chiều của signature
-SIGNATURE_DIM = 6
+# [SIG-5D] 6 -> 5: bỏ latency.
+# Bằng chứng thực nghiệm buộc phải bỏ: T4 H-sweep trên H in {1,2,3,5,8} cho
+# thấy 3/4 vai trò khai báo KHÔNG đổi dấu và đều bão hoà ở H=2 => sign-flip
+# role fraction = 0.25 < ngưỡng 0.30. Bốn vai trò có CÙNG một profile độ trễ,
+# tức arena không sinh ra latency ladder tách được. Giữ chiều thứ 6 là mô tả
+# một thứ không đo được. Multi-horizon head GIỮ NGUYÊN (nó vẫn nuôi v_tim và
+# DR); chỉ thành phần signature bị rút. Xem Limitations trong paper.
+SIGNATURE_DIM = 5
 
 # Tên chiều — dùng khi vẽ heatmap centroid cho paper
 SIGNATURE_NAMES = (
@@ -84,7 +90,6 @@ SIGNATURE_NAMES = (
     "sigma",
     "temporal_std",
     "context_std",
-    "latency",
 )
 
 # Nhãn vai trò
@@ -110,7 +115,6 @@ class InfluenceSignatureTracker:
             neighbor_id=j,
             signed_mu=out["mu"][b],
             sigma=out["sigma"][b],
-            latency=out["latency"][b],
             context_key=env.agent_zone[ego],   # hoặc bất kỳ id ngữ cảnh nào
         )
 
@@ -151,7 +155,6 @@ class InfluenceSignatureTracker:
         # history[(i,j)] = deque các quan sát signed_mu gần nhất
         self._mu_hist: Dict[Tuple[int, int], deque] = {}
         self._sigma_hist: Dict[Tuple[int, int], deque] = {}
-        self._latency_hist: Dict[Tuple[int, int], deque] = {}
 
         # context_mu[(i,j)][ctx] = deque các mu quan sát trong ngữ cảnh ctx
         self._context_mu: Dict[Tuple[int, int], Dict] = {}
@@ -168,7 +171,6 @@ class InfluenceSignatureTracker:
         neighbor_id: int,
         signed_mu: float,
         sigma: float,
-        latency: float = 0.0,
         context_key=None,
     ):
         """
@@ -185,13 +187,11 @@ class InfluenceSignatureTracker:
         if key not in self._mu_hist:
             self._mu_hist[key] = deque(maxlen=self.window)
             self._sigma_hist[key] = deque(maxlen=self.window)
-            self._latency_hist[key] = deque(maxlen=self.window)
             self._context_mu[key] = {}
             self._n_obs[key] = 0
 
         self._mu_hist[key].append(float(signed_mu))
         self._sigma_hist[key].append(float(sigma))
-        self._latency_hist[key].append(float(latency))
         self._n_obs[key] += 1
 
         if context_key is not None:
@@ -214,12 +214,12 @@ class InfluenceSignatureTracker:
 
         Args:
             neighbor_ids: list[int] length B — thứ tự khớp với batch của proxy
-            proxy_out:    dict từ score_batch_full, cần các khoá mu/sigma/latency
+            proxy_out:    dict từ score_batch_full, cần các khoá mu/sigma
             context_keys: list length B hoặc None
         """
         mu = np.asarray(proxy_out["mu"]).reshape(-1)            # [B]
         sigma = np.asarray(proxy_out["sigma"]).reshape(-1)      # [B]
-        latency = np.asarray(
+        _unused_latency = np.asarray(
             proxy_out.get("latency", np.zeros_like(mu))
         ).reshape(-1)                                            # [B]
 
@@ -229,7 +229,6 @@ class InfluenceSignatureTracker:
                 neighbor_id=int(j),
                 signed_mu=float(mu[b]),
                 sigma=float(sigma[b]),
-                latency=float(latency[b]),
                 context_key=(
                     None if context_keys is None else context_keys[b]
                 ),
@@ -242,14 +241,13 @@ class InfluenceSignatureTracker:
     def get_signature(self, ego_id: int, neighbor_id: int) -> np.ndarray:
         """
         Returns:
-            np.ndarray float32 shape [6] = SIGNATURE_DIM
+            np.ndarray float32 shape [5] = SIGNATURE_DIM
 
             [0] signed_mu     trung bình có dấu
             [1] abs_mu        |trung bình|
             [2] sigma         bất định trung bình
             [3] temporal_std  std của mu theo thời gian
             [4] context_std   std của mu-trung-bình-theo-ngữ-cảnh giữa các ngữ cảnh
-            [5] latency       trọng tâm horizon trung bình
         """
         key = (int(ego_id), int(neighbor_id))
 
@@ -258,7 +256,6 @@ class InfluenceSignatureTracker:
 
         mus = np.asarray(self._mu_hist[key], dtype=np.float64)          # [T]
         sigmas = np.asarray(self._sigma_hist[key], dtype=np.float64)    # [T]
-        lats = np.asarray(self._latency_hist[key], dtype=np.float64)    # [T]
 
         signed_mu = float(np.mean(mus))
 
@@ -301,10 +298,9 @@ class InfluenceSignatureTracker:
             else 0.0
         )
 
-        latency = float(np.mean(lats))
 
         return np.array(
-            [signed_mu, abs_mu, sigma, temporal_std, context_std, latency],
+            [signed_mu, abs_mu, sigma, temporal_std, context_std],
             dtype=np.float32,
         )
 
@@ -319,7 +315,7 @@ class InfluenceSignatureTracker:
             np.ndarray float32 shape [len(neighbor_ids), SIGNATURE_DIM]
 
         normalise=True: z-score theo từng CỘT (chiều). Cần cho k-means vì
-        latency có thang [0, H-1] còn signed_mu có thang ~[-1, 1].
+        các chiều có thang khác nhau (abs_mu >= 0, signed_mu ~[-1,1]).
         """
         if normalise is None:
             normalise = self.normalise

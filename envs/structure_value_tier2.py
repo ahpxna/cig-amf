@@ -14,7 +14,7 @@ if root_dir not in sys.path:
 
 # --- 2. IMPORT CÁC MODULE TỪ ROOT ---
 from models.diagnostics import bootstrap_ci, compare_two_methods
-from runners.baseline_runner import PureMeanFieldRunner
+from runners.baseline_runner import PureMeanFieldRunner, OracleCoreRunner, RandomCoreRunner
 from runners.final_runner import FinalCIGAMFRunner
 
 # Môi trường nằm cùng thư mục envs
@@ -72,9 +72,10 @@ def train_and_eval(config, seed, n_episodes, hidden, lr, batch_size, k_core):
         runner = PureMeanFieldRunner(env, cfg)
     elif config == "cig_amf":
         runner = FinalCIGAMFRunner(env, cfg)
-    elif config in ["random_core", "oracle_core"]:
-        print(f"Warning: Chưa implement {config} cụ thể, tạm dùng FinalCIGAMFRunner")
-        runner = FinalCIGAMFRunner(env, cfg)
+    elif config == "oracle_core":
+        runner = OracleCoreRunner(env, cfg)
+    elif config == "random_core":
+        runner = RandomCoreRunner(env, cfg)
     else:
         raise ValueError(f"Cấu hình không hợp lệ: {config}")
 
@@ -108,8 +109,10 @@ if __name__ == "__main__":
     structure_value = R["oracle_core"] - R["pure_mf"]
     learning_range  = R["oracle_core"] - R["random_core"]
 
-    sv_norm = structure_value / max(1e-12, learning_range)
-    rho     = (R["cig_amf"] - R["pure_mf"]) / max(1e-12, structure_value)
+    denom = learning_range if abs(learning_range) > 1e-9 else float("nan")
+    sv_norm = structure_value / denom
+    rho_denom = structure_value if abs(structure_value) > 1e-9 else float("nan")
+    rho = (R["cig_amf"] - R["pure_mf"]) / rho_denom
 
     print(f"\nstructure_value (thô)      = {structure_value:.4f}")
     print(f"structure_value (chuẩn hoá)= {sv_norm:.3f}")

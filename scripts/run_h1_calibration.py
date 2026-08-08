@@ -9,7 +9,8 @@ Chạy tiny-oracle calibration (run_experiment.run_tiny_task) trên ma trận c�
 Output: results/h1/<variant>_seed<S>/tiny_oracle_summary.json (+ CSV per-pair)
         results/h1/summary_h1.csv
 
-Chạy:  python scripts/run_h1_calibration.py --seeds 0 1 2
+Default seeds: 0 1 2 3 4 5 6 7
+Chạy:  python scripts/run_h1_calibration.py --seeds 0 1 2 3 4 5 6 7
 """
 import argparse
 import csv
@@ -27,6 +28,12 @@ VARIANTS = [
     ("dr_eps000", {"proxy_use_doubly_robust": True, "eps": 0.0}),
     ("dr_eps001", {"proxy_use_doubly_robust": True, "eps": 0.01}),
     ("dr_eps005", {"proxy_use_doubly_robust": True, "eps": 0.05}),
+    # [A1 spec] Chỉ eps=0.05 tách khỏi nhiễu (Spearman +0.074, 99% CI
+    # [+0.042,+0.109], 8/8 seed dương, sống sót Bonferroni). Đó là bằng chứng
+    # ĐẦU TIÊN ủng hộ H1 "bias giảm theo eps" -> phải quét tiếp lên cao để lấy
+    # ĐỘ DỐC, chính là figure của Experiment 1.
+    ("dr_eps008", {"proxy_use_doubly_robust": True, "eps": 0.08}),
+    ("dr_eps012", {"proxy_use_doubly_robust": True, "eps": 0.12}),
 ]
 
 KEEP_KEYS = (
@@ -40,7 +47,13 @@ KEEP_KEYS = (
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
+    ap.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=[0, 1, 2, 3, 4, 5, 6, 7],
+        help="Seed list for H1 calibration; default is 8 seeds 0..7",
+    )
     ap.add_argument("--device", type=str, default="cpu")
     args_cli = ap.parse_args()
 

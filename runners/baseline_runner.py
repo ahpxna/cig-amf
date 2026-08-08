@@ -4,7 +4,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.structural_proxy import LocalCounterfactualProxyEnsemble
+from models.structural_proxy import (
+    LocalCounterfactualProxyEnsemble,
+    build_pair_feat,   # [FIX-X1]
+    PAIR_FEAT_DIM,
+)
 from models.belief_layer import BayesLightBeliefState
 from models.core_behavior import PairRelationalModule
 from models.peripheral_memory import PeripheralMultiMemory
@@ -296,7 +300,280 @@ class PureMeanFieldRunner:
 
         return self.history
 
+class OracleCoreRunner:
+    """
+    Oracle-core baseline cho Experiment 0 (Structure Value gate).
+    Core được CHO SẴN bởi oracle (top-k |W*| thật, qua
+    env.compute_oracle_influence_from_current_state — đúng hàm đã dùng ở
+    structure_value_tier0.py/tier1.py), KHÔNG học từ dữ liệu — "zero-cost"
+    đúng nghĩa paper: không tốn chi phí NHẬN DIỆN cấu trúc, chứ không phải
+    zero-cost huấn luyện policy (policy vẫn học RL, chỉ khác input: one-hot
+    hành động của core thật thay vì mean-field/random).
 
+    core_refresh_every: làm mới core mỗi N bước thay vì mỗi bước, vì rollout
+    oracle cho mọi cặp mỗi bước quá đắt. Xấp xỉ có chủ đích — nêu rõ khi báo
+    cáo kết quả, không phải oracle tức thời lý tưởng.
+    """
+
+    _log_tag = "OracleCore"
+
+    def __init__(self, env, cfg, device="cpu"):
+        self.env = env
+        self.cfg = dict(cfg)
+        self.device = device
+
+        self.n_agents = int(env.n_agents)
+        self.obs_dim = int(env.get_obs_dim())
+        self.action_dim = int(env.get_action_dim())
+        self.k_core = int(cfg.get("seed_core_top_k", 3))
+
+        self.hidden = int(cfg.get("policy_hidden", 160))
+        self.discount = float(cfg.get("discount", 0.95))
+        self.oracle_horizon = int(cfg.get("causal_horizon", 8))
+        self.oracle_n_trials = int(cfg.get("oracle_n_trials", 1))
+        self.core_refresh_every = int(cfg.get("core_refresh_every", 5))
+
+        in_dim = self.obs_dim + self.k_core * self.action_dim
+
+        self.policy_value = nn.Sequential(
+            nn.Linear(in_dim, self.hidden), nn.ReLU(),
+            nn.Linear(self.hidden, self.hidden), nn.ReLU(),
+        ).to(device)
+        self.actor = nn.Linear(self.hidden, self.action_dim).to(device)
+        self.critic = nn.Linear(self.hidden, 1).to(device)
+
+        self.optim = torch.optim.Adam(
+            list(self.policy_value.parameters())
+            + list(self.actor.parameters())
+            + list(self.critic.parameters()),
+            lr=float(cfg.get("policy_lr", 1e-3)),
+        )
+
+        self._cached_core = {ego: [] for ego in range(self.n_agents)}
+        self._steps_since_refresh = 10 ** 9  # ép làm mới ngay lần gọi đầu
+
+        self.history = {
+            "episodes": [], "mean_reward": [], "reward_per_agent": [],
+            "policy_loss": [], "runtime": [], "throughput_agent_steps_per_sec": [],
+            "episode_runtime_total": [], "throughput_total_agent_steps_per_sec": [],
+            "stage": [], "mean_f1": [], "mean_temporal_var": [], "mean_uncertainty": [],
+            "mean_core_size": [], "mean_core_switches": [], "proxy_loss": [],
+            "bc_loss": [], "triggered": [], "trigger_count": [], "proxy_buffer_size": [],
+            "pushed_proxy_samples": [], "promoted": [], "demoted": [],
+            "mean_mu": [], "max_p": [],
+        }
+
+    def _refresh_core_if_needed(self):
+        """Oracle thật (|W*|) — override ở RandomCoreRunner cho baseline ngẫu nhiên."""
+        if self._steps_since_refresh < self.core_refresh_every:
+            self._steps_since_refresh += 1
+            return
+
+        # [FIX-O1] Bản cũ lặp (ego, j): 24 x 23 = 552 lượt oracle rollout MỖI
+        # lần refresh, ~6-7 refresh/episode => chạy cả đêm không xong.
+        # Chỉ cần lặp theo j: một lần can thiệp lên j cho ra W* của MỌI ego
+        # cùng lúc, vì env.step() trả về reward VECTOR. Giảm đúng 24x, KHÔNG
+        # xấp xỉ, KHÔNG mất chính xác — chỉ là dùng lại thông tin đã có.
+        #
+        # [FIX-O2] Bản cũ nuốt lỗi bằng `except Exception: infl[j] = 0.0`.
+        # Ở cuối episode, guard B (self.t + horizon <= max_steps) NÉM assert
+        # cho MỌI cặp => toàn bộ infl = 0 => sorted() trả về 3 agent đầu theo
+        # thứ tự dict, tức "oracle" âm thầm biến thành baseline câm mà không
+        # có một dòng cảnh báo nào. Giờ: bỏ qua refresh (giữ core cũ) và đếm
+        # số lần hỏng để báo cáo.
+        saved = self.env.clone_state()
+        infl_matrix = np.zeros((self.n_agents, self.n_agents), dtype=np.float64)
+        n_failed = 0
+
+        for j in range(self.n_agents):
+            try:
+                profile = self.env.compute_oracle_influence_all_egos_from_current_state(
+                    agent_j=j, intervention_action=self.env.STAY,
+                    horizon=self.oracle_horizon, n_trials=self.oracle_n_trials,
+                )
+                for ego in range(self.n_agents):
+                    if ego != j:
+                        infl_matrix[ego, j] = abs(float(profile[ego]))
+            except AssertionError:
+                # guard P2<->P4: rollout vượt ranh giới episode/shift
+                n_failed += 1
+            except Exception as e:
+                n_failed += 1
+                if not getattr(self, "_oracle_warned", False):
+                    print(f"[OracleCore][WARN] oracle rollout lỗi ({type(e).__name__}: {e}) "
+                          f"-- giữ core cũ, KHÔNG coi ảnh hưởng = 0.")
+                    self._oracle_warned = True
+            finally:
+                self.env.restore_state(saved)
+
+        self.env.restore_state(saved)
+        self._oracle_failed_refreshes = getattr(self, "_oracle_failed_refreshes", 0)
+
+        if n_failed >= self.n_agents:
+            # Không đo được gì cả -> GIỮ NGUYÊN core cũ thay vì gán rác.
+            self._oracle_failed_refreshes += 1
+            self._steps_since_refresh = 0
+            return
+
+        for ego in range(self.n_agents):
+            infl = {j: infl_matrix[ego, j] for j in range(self.n_agents) if j != ego}
+            self._cached_core[ego] = sorted(
+                infl, key=infl.get, reverse=True
+            )[: self.k_core]
+
+        self._steps_since_refresh = 0
+
+    def _core_context(self, actions_list, ego):
+        vec = np.zeros(self.k_core * self.action_dim, dtype=np.float32)
+        for idx, j in enumerate(self._cached_core.get(ego, [])):
+            a = int(actions_list[j])
+            if 0 <= a < self.action_dim:
+                vec[idx * self.action_dim + a] = 1.0
+        return vec
+
+    def _forward(self, obs_t, core_t):
+        h = self.policy_value(torch.cat([obs_t, core_t], dim=-1))
+        return self.actor(h), self.critic(h).squeeze(-1)
+
+    def _select_actions_population(self, obs_all):
+        self._refresh_core_if_needed()
+        last_actions = getattr(self.env, "last_actions", [0] * self.n_agents)
+
+        obs_batch, core_batch = [], []
+        for ego in range(self.n_agents):
+            obs_batch.append(self.env.get_obs_of_ego(obs_all, ego))
+            core_batch.append(self._core_context(last_actions, ego))
+
+        obs_t = torch.tensor(np.stack(obs_batch), dtype=torch.float32, device=self.device)
+        core_t = torch.tensor(np.stack(core_batch), dtype=torch.float32, device=self.device)
+
+        with torch.no_grad():
+            logits, values = self._forward(obs_t, core_t)
+            dist = torch.distributions.Categorical(probs=torch.softmax(logits, dim=-1))
+            sampled = dist.sample().detach().cpu().numpy()
+
+        return [int(a) for a in sampled], values.detach().cpu().numpy().astype(np.float32), core_batch
+
+    def collect_episode(self):
+        obs_all = self.env.reset()
+        self._steps_since_refresh = 10 ** 9  # làm mới core ngay đầu episode
+        done, trajectory = False, []
+        ep_reward = np.zeros(self.n_agents, dtype=np.float32)
+        t0 = time.time()
+
+        while not done:
+            actions, values_np, core_batch = self._select_actions_population(obs_all)
+            next_obs_all, rewards, done, info = self.env.step(actions)
+            rewards = np.array(rewards, dtype=np.float32)
+            ep_reward += rewards
+            trajectory.append({
+                "obs_all": [x.copy() for x in obs_all],
+                "core_context": [x.copy() for x in core_batch],
+                "actions": list(actions), "rewards": list(rewards), "values": list(values_np),
+            })
+            obs_all = next_obs_all
+
+        return trajectory, ep_reward, time.time() - t0
+
+    def update_policy(self, trajectory):
+        T = len(trajectory)
+        if T == 0:
+            return 0.0
+
+        returns = [[0.0] * self.n_agents for _ in range(T)]
+        R = np.zeros(self.n_agents, dtype=np.float32)
+        for t in reversed(range(T)):
+            R = np.array(trajectory[t]["rewards"], dtype=np.float32) + self.discount * R
+            for ego in range(self.n_agents):
+                returns[t][ego] = float(R[ego])
+
+        total_loss, count = 0.0, 0
+        for t, step in enumerate(trajectory):
+            obs_batch, core_batch, actions_batch, returns_batch = [], [], [], []
+            for ego in range(self.n_agents):
+                obs_batch.append(self.env.get_obs_of_ego(step["obs_all"], ego))
+                core_batch.append(step["core_context"][ego])
+                actions_batch.append(int(step["actions"][ego]))
+                returns_batch.append(float(returns[t][ego]))
+
+            obs_t = torch.tensor(np.stack(obs_batch), dtype=torch.float32, device=self.device)
+            core_t = torch.tensor(np.stack(core_batch), dtype=torch.float32, device=self.device)
+            action_t = torch.tensor(actions_batch, dtype=torch.long, device=self.device)
+            ret_t = torch.tensor(returns_batch, dtype=torch.float32, device=self.device)
+
+            logits, value = self._forward(obs_t, core_t)
+            dist = torch.distributions.Categorical(probs=torch.softmax(logits, dim=-1))
+            logp = dist.log_prob(action_t)
+            adv_raw = (ret_t - value).detach()
+            adv = (adv_raw - adv_raw.mean()) / (adv_raw.std(unbiased=False) + 1e-8)
+
+            policy_loss = -logp * adv
+            value_loss = F.mse_loss(value, ret_t, reduction="none")
+            entropy = dist.entropy()
+            total_loss = total_loss + (policy_loss + 0.5 * value_loss - 0.01 * entropy).sum()
+            count += self.n_agents
+
+        self.optim.zero_grad()
+        loss = total_loss / max(1, count)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(self.policy_value.parameters()) + list(self.actor.parameters())
+            + list(self.critic.parameters()), 0.5,
+        )
+        self.optim.step()
+        return float(loss.item())
+
+    def run(self, n_episodes=100, eval_every=10):
+        for ep in range(int(n_episodes)):
+            trajectory, episode_reward, runtime = self.collect_episode()
+            policy_loss = self.update_policy(trajectory)
+            agent_steps = float(self.n_agents * len(trajectory))
+            throughput = agent_steps / max(float(runtime), 1e-9)
+            mean_reward = float(np.mean(episode_reward))
+
+            if ep % int(eval_every) == 0:
+                h = self.history
+                h["episodes"].append(ep); h["mean_reward"].append(mean_reward)
+                h["reward_per_agent"].append(mean_reward); h["policy_loss"].append(float(policy_loss))
+                h["runtime"].append(float(runtime)); h["throughput_agent_steps_per_sec"].append(float(throughput))
+                h["episode_runtime_total"].append(float(runtime))
+                h["throughput_total_agent_steps_per_sec"].append(float(throughput))
+                h["stage"].append(0); h["mean_f1"].append(0.0); h["mean_temporal_var"].append(0.0)
+                h["mean_uncertainty"].append(0.0); h["mean_core_size"].append(float(self.k_core))
+                h["mean_core_switches"].append(0.0); h["proxy_loss"].append(0.0); h["bc_loss"].append(0.0)
+                h["triggered"].append(0); h["trigger_count"].append(0); h["proxy_buffer_size"].append(0)
+                h["pushed_proxy_samples"].append(0); h["promoted"].append(0); h["demoted"].append(0)
+                h["mean_mu"].append(0.0); h["max_p"].append(0.0)
+
+                print(f"[{self._log_tag} ep {ep:04d}] reward={mean_reward:.3f} "
+                      f"policy_loss={policy_loss:.4f} throughput={throughput:.1f}")
+
+        return self.history
+
+
+class RandomCoreRunner(OracleCoreRunner):
+    """
+    Control cho Experiment 0. Kiến trúc/kích thước input GIỐNG HỆT
+    OracleCoreRunner (cùng k_core*action_dim) — khác biệt DUY NHẤT là core
+    chọn NGẪU NHIÊN thay vì theo |W*| thật. Đây chính là cái
+    learning_range = R[oracle] - R[random] trong structure_value_tier2.py cần.
+    """
+
+    _log_tag = "RandomCore"
+
+    def __init__(self, env, cfg, device="cpu"):
+        super().__init__(env, cfg, device=device)
+        self._rng = np.random.RandomState(int(cfg.get("seed", 0)))
+
+    def _refresh_core_if_needed(self):
+        if self._steps_since_refresh < self.core_refresh_every:
+            self._steps_since_refresh += 1
+            return
+        for ego in range(self.n_agents):
+            others = [j for j in range(self.n_agents) if j != ego]
+            self._rng.shuffle(others)
+            self._cached_core[ego] = others[: self.k_core]
+        self._steps_since_refresh = 0
 class FullExplicitLocalRunner:
     """
     Full Explicit Local baseline.
@@ -682,6 +959,7 @@ class SharedAblationBase:
             core_dim=self.core_dim,
             periph_dim=self.periph_dim,
             belief_dim=self.belief_dim,
+            pair_feat_dim=cfg.get("proxy_pair_feat_dim", PAIR_FEAT_DIM),  # [FIX-X1]
             n_ensemble=cfg["n_ensemble"],
             lr=cfg["proxy_lr"],
             buffer_size=cfg.get("proxy_buffer_size", 200000),
@@ -1067,6 +1345,14 @@ class SharedAblationBase:
             "core_context_excluding": {},
             "periph_context_excluding": {},
             "value_cache": {},
+            # [FIX-X1] giống final_runner: ảnh chụp hình học tại timestep này
+            # để replay_builder dựng x_ij đúng thời điểm.
+            "geom_snapshot": {
+                "positions": [list(p) for p in self.env.positions],
+                "agent_zone": [int(z) for z in self.env.agent_zone],
+                "grid_size": int(getattr(self.env, "grid_size", 1)),
+                "n_zones": int(getattr(self.env, "n_zones", 1)),
+            },
         }
 
         obs_batch = []
@@ -1179,6 +1465,7 @@ class SharedAblationBase:
                     "core_context_excluding": cache["core_context_excluding"],
                     "periph_context_excluding": cache["periph_context_excluding"],
                     "value_cache": cache["value_cache"],
+                    "geom_snapshot": cache["geom_snapshot"],   # [FIX-X1]
                     "env_snapshot_before_step": env_snapshot_before_step,
                     "env_snapshot_after_step": env_snapshot_after_step,
                     "h_snapshot_before_latent_update": h_snapshot_before_latent_update,
@@ -1328,7 +1615,7 @@ class SharedAblationBase:
 
         return int(pushed)
 
-    def _score_all_pairs_and_update_beliefs(self, obs_all, actions):
+    def _score_all_pairs_and_update_beliefs(self, obs_all, actions, observed_returns=None, behaviour_probs=None):
         if not self.use_belief:
             return 0, 0
 
@@ -1362,6 +1649,34 @@ class SharedAblationBase:
                 b_batch.append(belief_summary)
                 neighbor_ids.append(j)
 
+            # Build optional DR inputs when available: observed_returns for ego
+            # and behaviour probability of observed neighbour action.
+            observed_returns_batch = None
+            behaviour_probs_obs_batch = None
+
+            if observed_returns is not None:
+                try:
+                    # observed_returns may be dict-like mapping ego->value
+                    r = float(observed_returns.get(ego, observed_returns[ego]))
+                except Exception:
+                    try:
+                        r = float(observed_returns[ego])
+                    except Exception:
+                        r = None
+
+                if r is not None:
+                    observed_returns_batch = [r for _ in neighbor_ids]
+
+            if behaviour_probs is not None:
+                # behaviour_probs expected to be a matrix-like [n_agents, A]
+                behaviour_probs_obs_batch = []
+                for j in neighbor_ids:
+                    try:
+                        bp = float(behaviour_probs[j][int(actions[j])])
+                    except Exception:
+                        bp = None
+                    behaviour_probs_obs_batch.append(bp)
+
             mu_arr, sigma_arr = self.proxy.score_batch(
                 obs_i_batch=obs_i_batch,
                 action_i_batch=action_i_batch,
@@ -1369,6 +1684,20 @@ class SharedAblationBase:
                 z_core_excl_j_batch=z_batch,
                 m_periph_excl_j_batch=m_batch,
                 belief_summary_batch=b_batch,
+                policy_probs_j_batch=None,
+                observed_returns_batch=observed_returns_batch,
+                behaviour_probs_obs_batch=behaviour_probs_obs_batch,
+                # [FIX-X1] ablation runners phải dùng CÙNG conditioning set
+                # với Final-CIGAMF, nếu không so sánh sẽ lẫn cả hiệu ứng của
+                # x_ij vào hiệu ứng của cơ chế bị cắt.
+                pair_feat_batch=[
+                    build_pair_feat(
+                        self.env.positions, self.env.agent_zone,
+                        getattr(self.env, "grid_size", 1),
+                        getattr(self.env, "n_zones", 1), ego, j,
+                    )
+                    for j in neighbor_ids
+                ],
             )
 
             mu_sigma = {
@@ -1428,13 +1757,23 @@ class SharedAblationBase:
 
         promoted = 0
         demoted = 0
+        # Precompute H-step returns so we can pass observed_returns for DR.
+        try:
+            h_returns = self.replay_builder.build_h_step_returns(trajectory, self.n_agents)
+        except Exception:
+            h_returns = [None for _ in range(len(trajectory))]
 
         for idx in step_indices:
             step = trajectory[int(idx)]
             self.env.restore_state(step["env_snapshot_before_step"])
+            observed_returns = h_returns[int(idx)] if h_returns is not None else None
+            behaviour_probs = step.get("behaviour_probs") if isinstance(step, dict) else None
+
             p_i, d_i = self._score_all_pairs_and_update_beliefs(
                 obs_all=step["obs_all"],
                 actions=step["actions"],
+                observed_returns=observed_returns,
+                behaviour_probs=behaviour_probs,
             )
             promoted += int(p_i)
             demoted += int(d_i)

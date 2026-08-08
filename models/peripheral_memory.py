@@ -170,6 +170,14 @@ class PeripheralMultiMemory(nn.Module):
         self.tau_role = float(tau_role)
         self.sigma_hi = float(sigma_hi)
         self.role_sharpness = float(role_sharpness)
+        self.sigma_iqr_floor = float(sigma_hi)
+
+        self.register_buffer(
+            "slot_memory_ema",
+            torch.zeros(self.num_slots, self.memory_dim),
+        )
+        self.register_buffer("g_anom_usage_ema", torch.zeros(1))
+        self.g_anom_ema_alpha = 0.05
 
         self.lb_coeff = float(lb_coeff)
         self.orth_coeff = float(orth_coeff)
@@ -233,6 +241,10 @@ class PeripheralMultiMemory(nn.Module):
         )
         self.usage_ema_alpha = 0.05
 
+        self.register_buffer(
+            "slot_memory_ema",
+            torch.zeros(self.num_slots, self.memory_dim),
+        )
     # =====================================================================
     # Helper
     # =====================================================================
@@ -288,7 +300,7 @@ class PeripheralMultiMemory(nn.Module):
     # [T1] GÁN SLOT NGỮ NGHĨA (mềm, có gradient)
     # =====================================================================
 
-    def _semantic_slot_probs(self, items: torch.Tensor) -> torch.Tensor:
+    def _semantic_slot_probs(self, items: torch.Tensor) -> torch.Tensor:        
         """
         Gán mềm mỗi peripheral item vào 4 vai trò từ chữ ký ảnh hưởng.
 
@@ -307,14 +319,39 @@ class PeripheralMultiMemory(nn.Module):
         Thứ tự ưu tiên: Dị biệt xét TRƯỚC. Nếu chưa hiểu rõ thằng này thì
         gán nó vào Thiện hay Ác đều là võ đoán.
         """
-        mu = items[:, 1]                       # [N]  CÓ DẤU
+        mu = items[:, 1]                   
+        # [N]  CÓ DẤU
         sigma = torch.clamp(items[:, 2], min=0.0)  # [N]
 
         # Độ dốc PHẢI chuẩn hoá theo ngưỡng, nếu không thì tại mu=0 hàm
         # sigmoid chưa kịp bão hoà và "Trung tính" bị thua "Thiện"/"Ác".
         # (Lỗi này đã bị bắt trong unit test — xem influence_signature.py.)
         k_mu = self.role_sharpness / max(self.tau_role, 1e-8)
-        k_sg = self.role_sharpness / max(self.sigma_hi, 1e-8)
+        # [B2.3] Thang của g_anom PHẢI theo ĐỘ TÁN của phân bố sigma, không
+        # theo NGƯỠNG. Lập luận "dimensionless, divided by the threshold it
+        # acts on" của paper chỉ đúng khi biến và ngưỡng cùng thang — với mu
+        # thì đúng (tau_role là percentile của |mu|), với sigma thì KHÔNG:
+        # sigma_hi co lại theo t (belief hội tụ) trong khi sigma đầu vào lại
+        # bị fix ensemble đẩy lên 16x, nên k_sg = rho/sigma_hi nổ và g_anom
+        # bão hoà về 1 => mọi neighbour dồn vào slot anomalous => entropy sụp.
+        # Dùng IQR làm mẫu số (có sàn) giữ độ dốc ổn định theo thời gian.
+        k_sg_denom = max(
+            float(getattr(self, "sigma_iqr_floor", self.sigma_hi)),
+            float(self.sigma_hi) * 0.25,
+            1e-3,
+        )
+        # [B2.3b] CHẶN TRÊN cho độ dốc. Bản chỉ-đổi-mẫu-số đã lật suy biến
+        # sang phía ngược lại: g_anom_mean 0.0000 (ep15) / 0.0213 (ep50), tức
+        # slot "anomalous" gần như KHÔNG BAO GIỜ được dùng, kèm Hit Max Rate
+        # gấp đôi (0.1429 -> 0.2857) và entropy tụt 0.7949 -> 0.7143.
+        # "Mọi thứ đều anomalous" và "không gì anomalous" đều là suy biến,
+        # chỉ khác hướng.
+        # Với sigma_hi = percentile-80, kỳ vọng ĐÚNG là g_anom_mean ~ 0.2:
+        # khoảng 20% số cặp nằm trên ngưỡng. Sigmoid chỉ đạt được điều đó khi
+        # độ dốc HỮU HẠN — k_sg -> vô cùng biến gate thành hàm bậc thang và
+        # đẩy mọi giá trị về 0 hoặc 1. Chặn ở 12: với |sigma - sigma_hi| ~
+        # 0.05 điển hình thì sigmoid(±0.6) ~ 0.35/0.65, tức gate vẫn MỀM.
+        k_sg = float(np.clip(self.role_sharpness / k_sg_denom, 1.0, 12.0))
 
         g_anom = torch.sigmoid(k_sg * (sigma - self.sigma_hi))  # [N]
         g_sure = 1.0 - g_anom                                   # [N]
@@ -334,6 +371,11 @@ class PeripheralMultiMemory(nn.Module):
         probs[:, ROLE_ANOMALOUS] = g_anom
 
         row_sum = torch.clamp(probs.sum(dim=1, keepdim=True), min=self.eps)  # [N,1]
+
+        with torch.no_grad():
+            self.g_anom_usage_ema.mul_(1.0 - self.g_anom_ema_alpha).add_(
+                self.g_anom_ema_alpha * g_anom.mean()
+            )
 
         return probs / row_sum  # [N, 4]
 
@@ -543,6 +585,9 @@ class PeripheralMultiMemory(nn.Module):
             self.slot_usage_ema.mul_(1.0 - self.usage_ema_alpha).add_(
                 self.usage_ema_alpha * usage
             )
+            self.slot_memory_ema.mul_(1.0 - self.usage_ema_alpha).add_(
+                self.usage_ema_alpha * memories.detach()
+            )
 
         flat = memories.reshape(1, -1)                # [1, K*memory_dim]
         memory_out = self.out_proj(flat).squeeze(0)   # [out_dim]
@@ -746,9 +791,18 @@ class PeripheralMultiMemory(nn.Module):
             name = ("beneficial", "harmful", "neutral", "anomalous")[q]
             out[f"usage_{name}"] = float(usage[q])
 
+        mem = self.slot_memory_ema.detach().cpu().numpy()  # [K, memory_dim]
+        if K >= 2 and np.linalg.norm(mem, axis=1).min() > 1e-8:
+            normed = mem / np.clip(np.linalg.norm(mem, axis=1, keepdims=True), 1e-8, None)
+            gram = normed @ normed.T
+            off_mask = ~np.eye(K, dtype=bool)
+            out["mean_offdiag_cosine"] = float(np.mean(np.abs(gram[off_mask])))
+        else:
+            out["mean_offdiag_cosine"] = float("nan")  # chưa đủ dữ liệu để đo (slot còn rỗng)
+        out["g_anom_mean"] = float(self.g_anom_usage_ema.item())
         return out
 
-    def set_role_thresholds(self, tau_role: float, sigma_hi: float):
+    def set_role_thresholds(self, tau_role: float, sigma_hi: float, sigma_iqr: float = None):
         """
         Cập nhật ngưỡng sau khi gọi tracker.auto_calibrate().
 
@@ -759,6 +813,7 @@ class PeripheralMultiMemory(nn.Module):
         """
         self.tau_role = float(tau_role)
         self.sigma_hi = float(sigma_hi)
+        self.sigma_iqr_floor = float(sigma_iqr) if sigma_iqr is not None else float(sigma_hi)
 
 
 # =========================================================================

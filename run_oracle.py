@@ -45,12 +45,26 @@ if __name__ == "__main__":
     print(f"Độ phân tán ảnh hưởng (norm_by_std)    : {norm_std:.4f}")
     print("-" * 65)
     
-    if frac_changed > 0.05:
-        verdict = "PASS: Môi trường TỐT. Trí tuệ Oracle thay đổi hẳn hành động so với Mù (> 5%). Đã sẵn sàng cho CIG-AMF!"
+    # [FIX-7] Bản cũ phán "PASS ... Đã sẵn sàng cho CIG-AMF!" CHỈ dựa vào
+    # frac_action_changed > 0.05. Đó là tiêu chí YẾU HƠN gate Experiment 0 của
+    # paper: biết cấu trúc có ĐỔI hành động không, chứ không phải khoảng cách
+    # REGRET/reward có đáng kể không. Phải thoả CẢ HAI (đổi hành động + hối
+    # tiếc chuẩn hoá đủ lớn) mới được coi là qua gate.
+    ok_changed = frac_changed > 0.05
+    ok_regret = (norm_std == norm_std) and norm_std > 0.05   # loại NaN
+    if ok_changed and ok_regret:
+        verdict = ("PASS: qua gate Experiment 0 — cấu trúc vừa đổi hành động "
+                   f"({frac_changed:.1%}) vừa có hối tiếc chuẩn hoá đáng kể "
+                   f"({norm_std:.3f}).")
+    elif ok_changed and not ok_regret:
+        verdict = ("CHƯA QUA GATE: hành động có đổi nhưng hối tiếc chuẩn hoá "
+                   f"{norm_std:.3f} <= 0.05 — biết cấu trúc gần như vô ích về "
+                   "mặt giá trị. KHÔNG được coi đây là 'sẵn sàng cho CIG-AMF'.")
     elif frac_changed > 0.0:
-        verdict = "CẢNH BÁO NHẸ: Cấu trúc có tác động, nhưng quá yếu (< 5%). Hãy tăng hình phạt va chạm trong envs."
+        verdict = ("CẢNH BÁO: cấu trúc có tác động nhưng quá yếu (< 5% số lần "
+                   "đổi hành động).")
     else:
-        verdict = "FAIL: Mù hay Oracle cũng ra hành động hệt nhau. Structure Value = 0. Cần sửa môi trường."
+        verdict = "FAIL: Mù hay Oracle cũng ra hành động hệt nhau."
         
     print("Phán quyết (Verdict):", verdict)
     print("="*65)

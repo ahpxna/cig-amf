@@ -26,7 +26,9 @@ ABLATIONS = [
     ("Full-CIGAMF",  {}),
     ("Scalar-Only",  {"proxy_effect_mode": "range"}),
     ("No-Semantic",  {"periph_use_uniform_mix": True, "periph_uniform_mix": 1.0}),
-    ("No-AuxLoss",   {"periph_lb_coeff": 0.0}),
+    # [FIX-2] tắt CẢ hai thành phần của L_aux (Eq 26 lb + Eq 27 orth); bản cũ
+    # chỉ tắt lb nên ablation gần như trùng khít Full-CIGAMF.
+    ("No-AuxLoss",   {"periph_lb_coeff": 0.0, "periph_orth_coeff": 0.0}),
     ("Fixed-K",      {"belief_adaptive_k": False}),
 ]
 
@@ -68,7 +70,7 @@ def run_variant(name, cfg_over, seed, episodes, eval_every, device, out_root):
             "slot_cos_offdiag": float(diag.get("mean_offdiag_cosine",
                                     diag.get("offdiag_cosine", float("nan")))),
             "hit_max_rate": mean_over_egos(runner, "get_saturation_stats", "hit_max_rate"),
-            "mean_core_size": last(hist, "core_size"),
+            "mean_core_size": last(hist, "mean_core_size"),
             "mean_reward": last(hist, "mean_reward"),
             "f1": last(hist, "f1"),
             "throughput": last(hist, "throughput_agent_steps_per_sec"),
@@ -94,10 +96,16 @@ def run_variant(name, cfg_over, seed, episodes, eval_every, device, out_root):
         "slot_cos_offdiag": m(cos_off),
         "hit_max_rate": m(hitmax),
         "mean_core_size": m(ks),
-        "frac_k_at_kmax": float(np.mean([1.0 for v in ks if np.isfinite(v)
-                                         and v >= kmax - 1e-6]) if ks else 0.0),
+        # [FIX-4] Bản cũ dùng list-comprehension CÓ FILTER -> mọi phần tử còn
+        # lại đều = 1.0 nên mean luôn bằng 1.0 (hoặc NaN khi rỗng): chỉ số này
+        # chưa bao giờ đo được gì. Phải là indicator trên TOÀN BỘ mẫu.
+        "frac_k_at_kmax": (
+            float(np.mean([1.0 if v >= kmax - 1e-6 else 0.0
+                           for v in ks if np.isfinite(v)]))
+            if any(np.isfinite(v) for v in ks) else float("nan")
+        ),
         "mean_reward": m(rewards),
-        "final_f1": last(getattr(runner, "history", {}), "f1"),
+        "final_f1": last(getattr(runner, "history", {}), "mean_f1"),
     }
     summary.update({f"cfg_{k}": v for k, v in cfg_over.items()})
     save_json(os.path.join(out_dir, "summary.json"), summary)
