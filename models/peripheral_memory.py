@@ -1,71 +1,84 @@
 """
-peripheral_memory_v2.py — Peripheral multi-memory, bản vá slot collapse.
+peripheral_memory_v2.py — Peripheral multi-memory with a slot-collapse fix.
 
 =============================================================================
-CHẨN ĐOÁN NULL RESULT CỦA BẢN v1
+DIAGNOSIS OF THE V1 NULL RESULT
 =============================================================================
-Bảng kết quả trong paper:
-    NoMultiMemory (BỎ multi-memory)  Core F1 = 0.251 / 0.259, throughput 241.8
-    Final CIG-AMF (CÓ multi-memory)  Core F1 = 0.244 / 0.262, throughput  74.7
+The paper's result table reports:
+    NoMultiMemory (WITHOUT multi-memory)  Core F1 = 0.251 / 0.259, throughput 241.8
+    Final CIG-AMF (WITH multi-memory)      Core F1 = 0.244 / 0.262, throughput  74.7
 
-Bỏ module chính đi thì NGANG BẰNG mà NHANH GẤP 3.2 LẦN. Tức module đang
-chiếm ~70% chi phí tính toán mà không mang lại gì.
+Removing the main module produced equivalent performance while running 3.2
+TIMES FASTER. The module therefore consumed approximately 70% of the
+computation without providing a measurable benefit.
 
-NGUYÊN NHÂN — SLOT COLLAPSE. Nhìn code v1:
+ROOT CAUSE — SLOT COLLAPSE. The v1 code was:
 
-    slot_logits = self.slot_router(enc_in)      # không ai giao việc
+    slot_logits = self.slot_router(enc_in)      # no task assigned to any slot
     slot_probs  = F.softmax(slot_logits, dim=-1)
 
-Không có BẤT KỲ tín hiệu huấn luyện nào nói "ngăn 1 chứa loại này, ngăn 2
-chứa loại kia". Mạng chỉ được bảo "chia kiểu gì cũng được, miễn reward tốt".
-Mà reward thì xa xôi, nhiễu, gradient truyền về tận lớp gán-ngăn cực kỳ yếu.
+No training signal specified that one slot should contain one type of item and
+another slot should contain a different type. The network was only told that
+any partition was acceptable as long as reward improved. Reward is delayed
+and noisy, so the gradient reaching the slot-assignment layer was extremely
+weak.
 
-Khi không ai giao việc, mạng tìm đường dễ nhất. Hai kịch bản sụp:
-  (a) Sụp ĐỒNG PHỤC: softmax gán mọi item vào 4 ngăn với trọng số ~đều
-      (mỗi ngăn ~25%) -> cả 4 ngăn chứa cùng hỗn hợp -> mỗi ngăn ~ trung bình
-      toàn bộ -> concat 4 ngăn = 4 bản photocopy của single mean.
-      Bốn nồi lẩu nhưng CÙNG MỘT VỊ.
-  (b) Sụp ĐỘC QUYỀN: một ngăn hút hết, ba ngăn còn lại rỗng -> cũng ~ mean.
+Without an assigned task, the network selected the easiest solution. Two
+collapse modes were possible:
+  (a) UNIFORM COLLAPSE: softmax assigned every item to all four slots with
+      approximately equal weights (about 25% per slot). All four slots then
+      contained the same mixture, each slot approximated the global mean, and
+      concatenating four slots produced four copies of a single mean. Four
+      containers were present, but all contained the same representation.
+  (b) MONOPOLY COLLAPSE: one slot absorbed everything and the other three
+      remained empty, again reducing the representation to approximately one
+      mean.
 
-v1 còn có `uniform_mix = 0.25` trộn thêm uniform memory vào — điều này
-LÀM TỆ THÊM kịch bản (a): nó chủ động kéo mọi slot về gần trung bình chung.
+v1 also used `uniform_mix = 0.25` to mix a uniform memory into the slots. This
+MADE mode (a) WORSE by actively pulling every slot toward the common mean.
 
 =============================================================================
-BA LỚP THUỐC CHỮA (dùng đồng thời)
+THREE CORRECTION LAYERS, USED TOGETHER
 =============================================================================
 
-[T1] GIAO VIỆC CHO NGĂN — slot ngữ nghĩa.
-     Thay vì để softmax tự bơi, mỗi ngăn được ĐỊNH NGHĨA TRƯỚC bằng vai trò
-     chức năng suy từ chữ ký ảnh hưởng nhân quả:
-        ngăn 0 "Thiện"     : mu > 0, mạnh, chắc chắn
-        ngăn 1 "Ác"        : mu < 0, mạnh, chắc chắn
-        ngăn 2 "Trung tính": |mu| ~ 0
-        ngăn 3 "Dị biệt"   : sigma cao — chưa hiểu được, "bọn làm mình sợ"
-     Gán MỀM bằng sigmoid nên gradient vẫn chảy.
+[T1] ASSIGN TASKS TO SLOTS — semantic slots.
+     Instead of leaving softmax unconstrained, each slot has a predefined
+     functional role inferred from its causal influence signature:
+        slot 0, "Beneficial": mu > 0, strong, and certain
+        slot 1, "Harmful"   : mu < 0, strong, and certain
+        slot 2, "Neutral"   : |mu| approximately 0
+        slot 3, "Anomalous" : high sigma — not yet understood, representing
+                               agents whose effects remain uncertain
+     Assignment is soft through sigmoid gates, so gradients still flow.
 
-     Ưu điểm so với k-means: ý nghĩa ngăn CỐ ĐỊNH qua thời gian. K-means
-     phải re-cluster định kỳ và ý nghĩa cụm đổi mỗi lần -> policy học lại
-     từ đầu -> thêm một nguồn non-stationarity, đúng thứ paper đang diệt.
+     Compared with k-means, semantic slot meanings remain FIXED over time.
+     K-means would require periodic reclustering, and cluster meanings could
+     change after every reclustering. The policy would then have to relearn
+     their interpretation, introducing another source of non-stationarity —
+     exactly the phenomenon the paper is intended to address.
 
-     Ngăn "Dị biệt" đáng chú ý: nó biến sigma từ một tham số điều khiển
-     thành MỘT CHIỀU NGỮ NGHĨA. Hầu hết phương pháp coi uncertainty là thứ
-     cần GIẢM; ở đây nó là THUỘC TÍNH ĐỂ PHÂN LOẠI.
+     The "Anomalous" slot is particularly important: it turns sigma from a
+     control parameter into a SEMANTIC DIMENSION. Most methods treat
+     uncertainty only as something to reduce; here it is an attribute used
+     for classification.
 
-[T2] CHỐNG SỤP ĐỘC QUYỀN — load-balancing loss (Switch Transformer).
-        L_lb = alpha * K * sum_q  f_q * P_q
-     f_q = tỷ lệ item được định tuyến vào ngăn q
-     P_q = xác suất định tuyến trung bình router gán cho ngăn q
-     Cả hai bằng 1/K khi cân bằng; tích nhỏ nhất khi đều.
-     Gradient tỉ lệ mức quá tải -> vòng phản hồi tự sửa.
-     Fedus et al. quét alpha từ 1e-1 đến 1e-5, khuyến nghị 1e-2.
+[T2] PREVENT MONOPOLY COLLAPSE — load-balancing loss (Switch Transformer).
+        L_lb = alpha * K * sum_q f_q * P_q
+     f_q is the fraction of items routed to slot q.
+     P_q is the mean routing probability assigned to slot q by the router.
+     Both equal 1/K under perfect balance, where their product is minimized.
+     The gradient scales with overload, creating a self-correcting feedback
+     loop. Fedus et al. swept alpha from 1e-1 to 1e-5 and recommended 1e-2.
 
-[T3] CHỐNG SỤP ĐỒNG PHỤC — orthogonality loss.
+[T3] PREVENT UNIFORM-CONTENT COLLAPSE — orthogonality loss.
         L_orth = mean_{q != r} cosine_similarity(m_q, m_r)^2
-     Phạt khi vector của các ngăn quá giống nhau. Đây chính là "chống 4 nồi
-     cùng một vị". Load-balancing KHÔNG chữa được kịch bản (a) vì phân bổ
-     có thể rất đều mà nội dung vẫn giống hệt nhau — nên cần cả hai.
+     This penalizes slot vectors that are too similar. It directly prevents
+     four slots from carrying the same content. Load balancing cannot correct
+     mode (a), because routing can be perfectly even while slot contents remain
+     identical; both losses are therefore necessary.
 
-     (Bổ sung tuỳ chọn: MI regularizer kiểu ROMA, xem slot_specialisation_loss)
+     An optional ROMA-style mutual-information regularizer is also available;
+     see slot_specialisation_loss.
 =============================================================================
 """
 
@@ -87,16 +100,15 @@ from models.influence_signature import (
 
 class PeripheralMultiMemory(nn.Module):
     """
-    Peripheral encoder với slot ngữ nghĩa + slot tự do.
+    Peripheral encoder with semantic and free slots.
 
-    Kiến trúc LAI:
-        - N_SEMANTIC_ROLES = 4 slot CỐ ĐỊNH theo vai trò (Thiện/Ác/Trung tính/Dị biệt)
-        - n_free_slots slot TỰ DO học bằng router (bắt cái mà 4 luật bỏ sót)
-    Tổng số slot = 4 + n_free_slots.
+    Hybrid architecture: four fixed beneficial/harmful/neutral/anomalous
+    semantic slots plus n_free_slots learned by the router to capture residual
+    structure. Total slots equal 4+n_free_slots.
 
-    item format (GIỮ NGUYÊN 9 chiều như v1 để runner không phải sửa):
+    Item format retains v1's nine dimensions for runner compatibility:
         0: action_j
-        1: mu_bar        <- GIỜ CÓ DẤU (v1 luôn >= 0)
+        1: mu_bar        <- now signed; v1 was always nonnegative
         2: sigma_bar
         3: p_core
         4: in_prev_core
@@ -109,21 +121,21 @@ class PeripheralMultiMemory(nn.Module):
         periph_items: np/tensor [N_p, 9]
     Output:
         forward()      -> [out_dim]
-        forward_full() -> dict gồm memory + các loss phụ trợ
+        forward_full() returns memory and auxiliary losses.
 
     Args:
         n_free_slots:
-            số slot tự do ngoài 4 slot ngữ nghĩa. 0 = chỉ dùng slot ngữ nghĩa.
+            Free slots beyond the four semantic slots; zero means semantic only.
         lb_coeff:
-            hệ số load-balancing loss. Fedus et al. khuyến nghị 1e-2.
+            Load-balancing coefficient; Fedus et al. recommend 1e-2.
         orth_coeff:
-            hệ số orthogonality loss.
+            Orthogonality-loss coefficient.
         role_sharpness:
-            độ dốc sigmoid khi gán mềm. Lớn -> gần gán cứng.
+            Sigmoid slope for soft assignment; larger approaches hard assignment.
         use_uniform_mix:
-            v1 trộn uniform memory (mặc định 0.25) — điều này KÉO MỌI SLOT
-            VỀ GẦN TRUNG BÌNH CHUNG, tức chủ động gây sụp đồng phục.
-            v2 mặc định TẮT. Bật lại chỉ để chạy ablation "trước khi vá".
+            v1 uniform-memory mixing, default 0.25, pulled every slot toward a
+            common mean and induced uniform collapse. v2 disables it by
+            default; enable only for the before-correction ablation.
     """
 
     def __init__(
@@ -134,14 +146,14 @@ class PeripheralMultiMemory(nn.Module):
         item_hidden: int = 48,
         item_dim: int = 9,
         n_free_slots: int = 2,
-        # ---- ngưỡng vai trò (nên lấy từ tracker.auto_calibrate()) ----
+        # Role thresholds should come from tracker.auto_calibrate().
         tau_role: float = 0.05,
         sigma_hi: float = 0.5,
         role_sharpness: float = 3.0,
-        # ---- hệ số regulariser ----
+        # Regularization coefficients.
         lb_coeff: float = 0.5,
         orth_coeff: float = 1e-2,
-        # ---- tương thích ngược ----
+        # Backward compatibility.
         num_slots: Optional[int] = None,
         use_uniform_mix: bool = True,
         uniform_mix: float = 0.25,
@@ -160,7 +172,7 @@ class PeripheralMultiMemory(nn.Module):
         self.n_semantic_slots = int(N_SEMANTIC_ROLES)
         self.n_free_slots = int(max(0, n_free_slots))
 
-        # `num_slots` của v1 nếu được truyền vào thì hiểu là TỔNG số slot.
+        # Interpret legacy num_slots as the total slot count.
         if num_slots is not None:
             total = int(num_slots)
             self.n_free_slots = int(max(0, total - self.n_semantic_slots))
@@ -188,7 +200,7 @@ class PeripheralMultiMemory(nn.Module):
         self.beta_floor = float(beta_floor)
         self.eps = float(eps)
 
-        # action one-hot + phần còn lại của item
+        # Action one-hot plus the remaining item fields.
         self.non_action_dim = self.item_dim - 1
         self.encoder_in_dim = self.action_dim + self.non_action_dim
 
@@ -200,22 +212,19 @@ class PeripheralMultiMemory(nn.Module):
         )
 
         # ---------------------------------------------------------------
-        # Router CHỈ phụ trách slot tự do. Slot ngữ nghĩa gán bằng luật.
+        # The router controls only free slots; rules assign semantic slots.
         #
-        # ROUTER ĐƯỢC ĐIỀU KIỆN HOÁ THEO NHÓM NGỮ NGHĨA — thiết kế này đã
-        # được kiểm chứng bằng thực nghiệm trên dữ liệu tổng hợp 4 vai trò
+        # Condition the router on semantic group. Synthetic four-role data
+        # empirically validated this design:
         # (blocker / relay / consumer / inert):
-        #     k-means TOÀN CỤC trên signature   : purity 0.767
-        #     ngữ nghĩa + k-means TRONG TỪNG NHÓM: purity 0.967
-        # Lý do: chuẩn hoá toàn cục bị chi phối bởi các vai trò ảnh hưởng
-        # MẠNH (blocker, relay), khiến các vai trò YẾU (consumer vs inert)
-        # bị nén sát vào nhau và không tách được. Khi phân nhóm theo dấu
-        # trước rồi mới tách trong nhóm, việc tách blocker/consumer trong
-        # nhóm "Ác" đạt purity 1.000.
+        #     global signature k-means: 0.767 purity
+        #     semantic grouping plus within-group k-means: 0.967 purity
+        # Global normalization is dominated by strong blocker/relay roles and
+        # compresses weak consumer/inert roles. Sign grouping first yielded
+        # 1.000 purity for blocker/consumer separation in the harmful group.
         #
-        # Cách hiện thực hoá mà vẫn giữ tính khả vi: nối sem_probs vào input
-        # của router, để router biết item thuộc nhóm nào và chuyên môn hoá
-        # theo nhóm — thay vì phải phân nhóm cứng rồi chạy k-means rời rạc.
+        # Concatenate sem_probs to router input for differentiable within-group
+        # specialization instead of hard grouping followed by discrete k-means.
         # ---------------------------------------------------------------
         if self.n_free_slots > 0:
             self.router_in_dim = self.encoder_in_dim + self.n_semantic_slots
@@ -234,7 +243,7 @@ class PeripheralMultiMemory(nn.Module):
             nn.ReLU(),
         )
 
-        # Chẩn đoán slot usage — số PHẢI báo cáo để chứng minh hết collapse.
+        # Slot-usage diagnostics required to demonstrate collapse removal.
         self.register_buffer(
             "slot_usage_ema",
             torch.full((self.num_slots,), 1.0 / float(self.num_slots)),
@@ -297,60 +306,54 @@ class PeripheralMultiMemory(nn.Module):
         return torch.cat([action_oh, rest], dim=-1)    # [N, action_dim+8]
 
     # =====================================================================
-    # [T1] GÁN SLOT NGỮ NGHĨA (mềm, có gradient)
+    # [T1] Differentiable soft semantic-slot assignment.
     # =====================================================================
 
     def _semantic_slot_probs(self, items: torch.Tensor) -> torch.Tensor:        
         """
-        Gán mềm mỗi peripheral item vào 4 vai trò từ chữ ký ảnh hưởng.
+        Soft-assign each peripheral item to four influence-signature roles.
 
-        items: [N, 9]  (cột 1 = mu_bar CÓ DẤU, cột 2 = sigma_bar)
+        items: [N,9], with signed mu_bar in column 1 and sigma_bar in column 2.
 
         Returns:
-            [N, 4] — mỗi hàng tổng ~1
+            [N,4], with each row summing to approximately one.
 
-        Cấu trúc cổng (khớp với soft_role_assignment trong influence_signature.py):
-            g_anom = sigmoid(k*(sigma - sigma_hi))       chưa hiểu được
+        Gate structure matching influence_signature.soft_role_assignment:
+            g_anom = sigmoid(k*(sigma-sigma_hi))         unresolved
             g_sure = 1 - g_anom
-            g_pos  = sigmoid(k*(mu - tau))               đủ dương -> Thiện
-            g_neg  = sigmoid(k*(-mu - tau))              đủ âm    -> Ác
-            g_neu  = clamp(1 - g_pos - g_neg, 0, 1)      quanh 0  -> Trung tính
+            g_pos  = sigmoid(k*(mu-tau))                 beneficial
+            g_neg  = sigmoid(k*(-mu-tau))                harmful
+            g_neu  = clamp(1-g_pos-g_neg,0,1)            neutral
 
-        Thứ tự ưu tiên: Dị biệt xét TRƯỚC. Nếu chưa hiểu rõ thằng này thì
-        gán nó vào Thiện hay Ác đều là võ đoán.
+        Anomalous takes priority because assigning an uncertain item as
+        beneficial or harmful would be arbitrary.
         """
         mu = items[:, 1]                   
-        # [N]  CÓ DẤU
+        # [N], signed.
         sigma = torch.clamp(items[:, 2], min=0.0)  # [N]
 
-        # Độ dốc PHẢI chuẩn hoá theo ngưỡng, nếu không thì tại mu=0 hàm
-        # sigmoid chưa kịp bão hoà và "Trung tính" bị thua "Thiện"/"Ác".
-        # (Lỗi này đã bị bắt trong unit test — xem influence_signature.py.)
+        # Normalize slope by threshold. Otherwise at mu=0 sigmoid has not
+        # saturated and neutral loses to beneficial/harmful. A unit test in
+        # influence_signature.py exposed this defect.
         k_mu = self.role_sharpness / max(self.tau_role, 1e-8)
-        # [B2.3] Thang của g_anom PHẢI theo ĐỘ TÁN của phân bố sigma, không
-        # theo NGƯỠNG. Lập luận "dimensionless, divided by the threshold it
-        # acts on" của paper chỉ đúng khi biến và ngưỡng cùng thang — với mu
-        # thì đúng (tau_role là percentile của |mu|), với sigma thì KHÔNG:
-        # sigma_hi co lại theo t (belief hội tụ) trong khi sigma đầu vào lại
-        # bị fix ensemble đẩy lên 16x, nên k_sg = rho/sigma_hi nổ và g_anom
-        # bão hoà về 1 => mọi neighbour dồn vào slot anomalous => entropy sụp.
-        # Dùng IQR làm mẫu số (có sàn) giữ độ dốc ổn định theo thời gian.
+        # [B2.3] Scale g_anom by sigma-distribution dispersion rather than its
+        # threshold. Threshold normalization is valid for mu because tau_role
+        # is a |mu| percentile, but sigma_hi shrinks as beliefs converge while
+        # the ensemble fix raised input sigma 16x. rho/sigma_hi then exploded,
+        # saturated g_anom at one, routed every neighbour as anomalous, and
+        # collapsed entropy. A floored IQR denominator stabilizes slope.
         k_sg_denom = max(
             float(getattr(self, "sigma_iqr_floor", self.sigma_hi)),
             float(self.sigma_hi) * 0.25,
             1e-3,
         )
-        # [B2.3b] CHẶN TRÊN cho độ dốc. Bản chỉ-đổi-mẫu-số đã lật suy biến
-        # sang phía ngược lại: g_anom_mean 0.0000 (ep15) / 0.0213 (ep50), tức
-        # slot "anomalous" gần như KHÔNG BAO GIỜ được dùng, kèm Hit Max Rate
-        # gấp đôi (0.1429 -> 0.2857) và entropy tụt 0.7949 -> 0.7143.
-        # "Mọi thứ đều anomalous" và "không gì anomalous" đều là suy biến,
-        # chỉ khác hướng.
-        # Với sigma_hi = percentile-80, kỳ vọng ĐÚNG là g_anom_mean ~ 0.2:
-        # khoảng 20% số cặp nằm trên ngưỡng. Sigmoid chỉ đạt được điều đó khi
-        # độ dốc HỮU HẠN — k_sg -> vô cùng biến gate thành hàm bậc thang và
-        # đẩy mọi giá trị về 0 hoặc 1. Chặn ở 12: với |sigma - sigma_hi| ~
-        # 0.05 điển hình thì sigmoid(±0.6) ~ 0.35/0.65, tức gate vẫn MỀM.
+        # [B2.3b] Cap the slope. Changing only the denominator reversed the
+        # degeneracy: g_anom_mean was 0.0000 at ep15 and 0.0213 at ep50,
+        # anomalous was almost unused, Hit Max Rate doubled 0.1429->0.2857,
+        # and entropy fell 0.7949->0.7143. Both all-anomalous and none-anomalous
+        # are degenerate. With sigma_hi at percentile 80, expected mean is
+        # about 0.2. A finite cap of 12 keeps typical +/-0.05 differences at
+        # sigmoid(+/-0.6)=0.35/0.65 and therefore retains a soft gate.
         k_sg = float(np.clip(self.role_sharpness / k_sg_denom, 1.0, 12.0))
 
         g_anom = torch.sigmoid(k_sg * (sigma - self.sigma_hi))  # [N]
@@ -381,17 +384,17 @@ class PeripheralMultiMemory(nn.Module):
 
     def _importance_beta(self, items: torch.Tensor) -> torch.Tensor:
         """
-        Trọng số tin cậy khi pooling trong mỗi slot.
+        Confidence weight for within-slot pooling.
 
-        v1 dùng |mu| ở tử -> item ảnh hưởng mạnh được ưu tiên. GIỮ NGUYÊN
-        tinh thần đó, nhưng lấy trị tuyệt đối Ở ĐÂY (không phải trong
-        estimator), vì tới bước này ta đã dùng xong DẤU để chọn slot.
+        Preserve v1's prioritization of strong effects via |mu|, but apply the
+        absolute value here after sign has already selected the slot, not in
+        the estimator.
 
         beta = (beta_floor + p_core) * (|mu| + mu_floor) * 1/(1+sigma)
 
         Returns: [N]
         """
-        mu = items[:, 1]                             # [N] có dấu
+        mu = items[:, 1]                             # [N], signed.
         sigma = torch.clamp(items[:, 2], min=0.0)    # [N]
         p_core = torch.clamp(items[:, 3], min=0.0, max=1.0)  # [N]
 
@@ -406,7 +409,7 @@ class PeripheralMultiMemory(nn.Module):
         return torch.clamp(beta, min=self.eps)
 
     # =====================================================================
-    # [T2][T3] Các loss phụ trợ
+    # [T2][T3] Auxiliary losses.
     # =====================================================================
 
     def _load_balancing_loss(self, slot_probs: torch.Tensor) -> torch.Tensor:
@@ -417,12 +420,10 @@ class PeripheralMultiMemory(nn.Module):
 
         slot_probs: [N, K]
 
-        f_q: tỷ lệ item mà ngăn q là ngăn ĐƯỢC CHỌN (argmax) — đây là đại
-             lượng rời rạc nên không có gradient, dùng như hệ số.
-        P_q: xác suất định tuyến TRUNG BÌNH — đây là chỗ gradient chảy qua.
+        f_q is the discrete argmax routing fraction and acts as a coefficient;
+        P_q is mean routing probability and carries gradients.
 
-        Khi cân bằng hoàn hảo: f_q = P_q = 1/K -> L = K * K * (1/K^2) = 1.
-        Càng mất cân bằng L càng lớn.
+        Perfect balance gives f_q=P_q=1/K and L=1. Imbalance increases L.
 
         Returns: scalar
         """
@@ -431,31 +432,29 @@ class PeripheralMultiMemory(nn.Module):
         if N == 0:
             return torch.zeros((), dtype=torch.float32, device=slot_probs.device)
 
-        # f_q: one-hot của argmax rồi lấy trung bình. Không cần gradient.
+        # f_q is the mean argmax one-hot and needs no gradient.
         with torch.no_grad():
             hard = F.one_hot(
                 slot_probs.argmax(dim=1), num_classes=K
             ).to(dtype=torch.float32)  # [N, K]
             f = hard.mean(dim=0)       # [K]
 
-        P = slot_probs.mean(dim=0)     # [K]  <- gradient chảy qua đây
+        P = slot_probs.mean(dim=0)     # [K], gradient path.
 
         return float(K) * torch.sum(f * P)
 
     def _orthogonality_loss(self, memories: torch.Tensor) -> torch.Tensor:
         """
-        [T3] Phạt khi các slot vector quá giống nhau — chống "4 nồi cùng vị".
+        [T3] Penalize overly similar slot vectors to prevent uniform content.
 
         memories: [K, memory_dim]
 
         L = mean over q != r of  cos(m_q, m_r)^2
 
-        Bình phương cosine chứ không phải cosine thuần: ta muốn phạt cả
-        giống hệt (cos=1) lẫn đối nhau hoàn toàn (cos=-1)? KHÔNG — đối nhau
-        là ổn (chúng phân biệt được). Nhưng dùng bình phương giúp loss luôn
-        không âm và phạt mạnh khi |cos| gần 1. Với slot ngữ nghĩa Thiện/Ác,
-        ta KỲ VỌNG chúng đối nhau, nên có tuỳ chọn dùng abs thay vì square
-        nếu muốn cho phép đối cực (xem allow_antipodal).
+        Squared cosine is nonnegative and penalizes both identical and
+        antipodal vectors. Antipodal beneficial/harmful semantics may be valid,
+        so allow_antipodal provides an alternative when opposites should not
+        be penalized.
 
         Returns: scalar
         """
@@ -467,7 +466,7 @@ class PeripheralMultiMemory(nn.Module):
         normed = F.normalize(memories, p=2, dim=1, eps=self.eps)  # [K, D]
         gram = normed @ normed.t()                                 # [K, K]
 
-        # Lấy phần ngoài đường chéo
+        # Select off-diagonal entries.
         mask = ~torch.eye(K, dtype=torch.bool, device=memories.device)  # [K, K]
         off_diag = gram[mask]                                            # [K*(K-1)]
 
@@ -479,23 +478,23 @@ class PeripheralMultiMemory(nn.Module):
 
     def forward_full(self, periph_items) -> Dict[str, torch.Tensor]:
         """
-        Forward đầy đủ, trả cả memory lẫn các loss phụ trợ.
+        Full forward pass returning memory and all auxiliary losses.
 
         Returns dict:
-            memory:      [out_dim]           — cắm vào policy
+            memory:      [out_dim]           — supplied to the policy
             lb_loss:     scalar              — load balancing
             orth_loss:   scalar              — orthogonality
             aux_loss:    scalar              — lb_coeff*lb + orth_coeff*orth
-            slot_probs:  [N, K]              — để chẩn đoán
-            slot_usage:  [K]                 — tỷ lệ dùng mỗi ngăn
-            memories:    [K, memory_dim]     — vector từng ngăn
+            slot_probs:  [N, K]              — diagnostics
+            slot_usage:  [K]                 — usage fraction per slot
+            memories:    [K, memory_dim]     — vector for each slot
         """
         items = self._normalise_inputs(periph_items)  # [N, 9]
         device = self._device()
 
         zero = torch.zeros((), dtype=torch.float32, device=device)
 
-        # ---- rỗng ------------------------------------------------------
+        # Empty input.
         if items.shape[0] == 0:
             x = torch.zeros(
                 1, self.num_slots * self.memory_dim,
@@ -523,15 +522,15 @@ class PeripheralMultiMemory(nn.Module):
         enc_in = self._prepare_encoder_input(items)   # [N, action_dim+8]
         h = self.item_encoder(enc_in)                 # [N, memory_dim]
 
-        # ---- [T1] slot ngữ nghĩa ---------------------------------------
+        # [T1] Semantic slots.
         sem_probs = self._semantic_slot_probs(items)  # [N, 4]
 
-        # ---- slot tự do (ĐIỀU KIỆN HOÁ THEO NHÓM NGỮ NGHĨA) -------------
+        # Free slots conditioned on semantic group.
         if self.n_free_slots > 0:
-            # Nối sem_probs vào input: router biết item thuộc nhóm nào
-            # -> học được cấu trúc TRONG từng nhóm (blocker vs consumer),
-            # thay vì phải tách chúng trong không gian toàn cục nơi chúng
-            # bị nén sát nhau. Xem ghi chú ở __init__ về kết quả thực nghiệm.
+            # Concatenate sem_probs so the router knows the item's group and
+            # learns within-group structure such as blocker versus consumer,
+            # rather than separating weak roles compressed in global space.
+            # See the empirical results documented in __init__.
             router_in = torch.cat(
                 [enc_in, sem_probs.detach()], dim=-1
             )  # [N, encoder_in_dim + 4]
@@ -539,15 +538,15 @@ class PeripheralMultiMemory(nn.Module):
             free_logits = self.slot_router(router_in)             # [N, n_free]
             free_probs = F.softmax(free_logits, dim=-1)           # [N, n_free]
 
-            # Trộn: mỗi item chia đôi khối lượng giữa phần ngữ nghĩa và
-            # phần tự do. 0.5/0.5 là mặc định trung tính.
+            # Split each item's mass between semantic and free components;
+            # 0.5/0.5 is the neutral default.
             slot_probs = torch.cat(
                 [0.5 * sem_probs, 0.5 * free_probs], dim=1
             )  # [N, K]
         else:
             slot_probs = sem_probs  # [N, 4]
 
-        # ---- pooling từng slot ------------------------------------------
+        # Pool within each slot.
         beta = self._importance_beta(items)           # [N]
 
         # weighted[n, q] = slot_probs[n,q] * beta[n]
@@ -561,9 +560,9 @@ class PeripheralMultiMemory(nn.Module):
 
         memories = num / den                          # [K, memory_dim]
 
-        # ---- uniform mix (v1) — mặc định TẮT ----------------------------
-        # Bật lại chỉ để chạy ablation. Nó chủ động kéo mọi slot về gần
-        # trung bình chung, tức GÂY sụp đồng phục.
+        # v1 uniform mix, disabled by default. Enable only for ablation: it
+        # actively pulls every slot toward the global mean and CAUSES uniform
+        # collapse.
         if self.use_uniform_mix:
             num_u = slot_probs.t() @ h                              # [K, D]
             den_u = torch.clamp(
@@ -574,12 +573,12 @@ class PeripheralMultiMemory(nn.Module):
             mix = float(np.clip(self.uniform_mix, 0.0, 1.0))
             memories = (1.0 - mix) * memories + mix * uniform_mem
 
-        # ---- loss phụ trợ ------------------------------------------------
+        # Auxiliary losses.
         lb_loss = self._load_balancing_loss(slot_probs)
         orth_loss = self._orthogonality_loss(memories)
         aux_loss = self.lb_coeff * lb_loss + self.orth_coeff * orth_loss
 
-        # ---- chẩn đoán usage --------------------------------------------
+        # Usage diagnostics.
         with torch.no_grad():
             usage = slot_probs.mean(dim=0)  # [K]
             self.slot_usage_ema.mul_(1.0 - self.usage_ema_alpha).add_(
@@ -604,31 +603,32 @@ class PeripheralMultiMemory(nn.Module):
 
     def forward_excluding_all(self, periph_items, item_ids) -> Dict[int, torch.Tensor]:
         """
-        [GPU_OPTIMIZATION_CONTRACT.md mục 2.1] M_i^{-j} cho MỌI j trong tập
-        peripheral hiện tại của một ego, CÙNG LÚC, bằng thủ thuật sum-trừ-một
-        — thay vì gọi forward_full() riêng cho từng exclusion (bản cũ:
-        build_inputs + forward đầy đủ N lần mỗi ego, tức chạy lại
-        item_encoder/slot_router cho gần hết tập N-1 lần nữa mỗi lần).
+        [GPU_OPTIMIZATION_CONTRACT.md section 2.1] Compute M_i^{-j}
+        simultaneously for every j in one ego's current peripheral set using
+        sum-minus-one. The old path called forward_full separately for each
+        exclusion: build_inputs plus a full forward N times per ego, rerunning
+        item_encoder/slot_router on almost the entire set each time.
 
-        CHỈ ĐÚNG VỚI POOLING KIỂU WEIGHTED-SUM (Eq. 25 — mean pooling có
-        trọng số, permutation-invariant kiểu Deep Sets), vì mỗi item đóng
-        góp qua h[n]/slot_probs[n]/beta[n] ĐỘC LẬP, không có chuẩn hoá chéo
-        item nào trước bước pooling (đã kiểm: item_encoder/semantic gate/
-        free-slot router đều là MLP áp per-item, không có BatchNorm/attention
-        giữa các item). Nếu sau này đổi pooling sang attention hoặc max
-        (paper nhắc Set Transformer là biến thể tương lai), hàm này SAI —
-        phải quay lại forward_full() riêng từng exclusion.
+        This is VALID ONLY FOR WEIGHTED-SUM POOLING. Eq. 25 is a weighted mean,
+        permutation-invariant in the Deep Sets style. Each item contributes
+        independently through h[n], slot_probs[n], and beta[n], with no
+        cross-item normalization before pooling. item_encoder, semantic gates,
+        and the free-slot router were verified to be per-item MLPs without
+        cross-item BatchNorm or attention. If pooling later changes to
+        attention or max, including the paper's proposed Set Transformer
+        variant, this method is wrong and must revert to a separate
+        forward_full call for every exclusion.
 
-        KHÔNG dùng hàm này để train (không tính lb_loss/orth_loss) — chỉ
-        phục vụ dựng context M_i^{-j} làm input cho proxy. Huấn luyện
-        periph_module vẫn qua forward_full() trên tập ĐẦY ĐỦ.
+        Do not use this method for training because it does not compute
+        lb_loss/orth_loss. It only constructs M_i^{-j} proxy context. Train the
+        peripheral module with forward_full() on the complete set.
 
         Args:
-            periph_items: [N, item_dim] — toàn bộ tập peripheral hiện tại.
-            item_ids: list[int] độ dài N, id neighbour tương ứng từng hàng.
+            periph_items: [N,item_dim], the complete current peripheral set.
+            item_ids: N neighbour IDs corresponding to the rows.
 
         Returns:
-            {item_id: memory_out [out_dim]} cho mọi id trong item_ids.
+            {item_id: memory_out [out_dim]} for every item ID.
         """
         items = self._normalise_inputs(periph_items)
         N = items.shape[0]
@@ -654,11 +654,11 @@ class PeripheralMultiMemory(nn.Module):
             beta = self._importance_beta(items)          # [N]
             weighted = slot_probs * beta.unsqueeze(1)     # [N, K]
 
-            num = weighted.t() @ h                         # [K, D]  tổng ĐẦY ĐỦ
+            num = weighted.t() @ h                         # [K,D], complete sum.
             den = weighted.sum(dim=0)                       # [K]
 
-            # Đóng góp riêng từng item vào từng slot -> [N, K, D], vector
-            # hoá qua chiều N thay vì vòng lặp Python.
+            # Each item's per-slot contribution is [N,K,D], vectorized over N
+            # instead of a Python loop.
             contrib = weighted.unsqueeze(2) * h.unsqueeze(1)   # [N, K, D]
             num_excl = num.unsqueeze(0) - contrib               # [N, K, D]
             den_excl = torch.clamp(
@@ -686,13 +686,13 @@ class PeripheralMultiMemory(nn.Module):
 
     def forward(self, periph_items) -> torch.Tensor:
         """
-        GIỮ NGUYÊN chữ ký v1 — trả đúng [out_dim].
-        Runner cũ gọi được ngay; muốn dùng aux_loss thì gọi forward_full().
+        Preserve the v1 signature and exact [out_dim] return. Legacy runners
+        work unchanged; call forward_full() when auxiliary loss is required.
         """
         return self.forward_full(periph_items)["memory"]
 
     # =====================================================================
-    # build_inputs — giữ nguyên chữ ký v1
+    # build_inputs preserves the v1 signature.
     # =====================================================================
 
     def build_inputs(
@@ -704,10 +704,11 @@ class PeripheralMultiMemory(nn.Module):
         prev_core_set=None,
     ) -> np.ndarray:
         """
-        Dựng ma trận item cho một ego-agent.
+        Build the item matrix for one ego agent.
 
-        KHÁC v1 DUY NHẤT MỘT CHỖ: mu_bar giờ CÓ DẤU (v1 luôn >= 0 vì proxy
-        đã lấy abs). Đây là thứ khiến slot ngữ nghĩa Thiện/Ác hoạt động được.
+        The only difference from v1 is that mu_bar is now SIGNED. v1 was always
+        nonnegative because the proxy applied abs. Sign enables the
+        beneficial/harmful semantic slots.
 
         Returns:
             np.ndarray float32 [len(peripheral_ids), 9]
@@ -738,7 +739,7 @@ class PeripheralMultiMemory(nn.Module):
 
             rows.append([
                 float(action_j),
-                float(b["mu_bar"]),      # CÓ DẤU
+                float(b["mu_bar"]),      # Signed.
                 float(b["sigma_bar"]),
                 float(b["p_core"]),
                 float(j in prev_core_set),
@@ -751,23 +752,23 @@ class PeripheralMultiMemory(nn.Module):
         return np.asarray(rows, dtype=np.float32)
 
     # =====================================================================
-    # Chẩn đoán
+    # Diagnostics.
     # =====================================================================
 
     def get_slot_diagnostics(self) -> Dict[str, float]:
         """
-        BẰNG CHỨNG CHỐNG COLLAPSE — phải đưa vào paper.
+        Anti-collapse evidence that must be included in the paper.
 
         usage_entropy_ratio:
-            entropy của phân bố usage / log(K).
-            ~1.0 = dùng đều cả K ngăn (tốt)
-            ~0.0 = một ngăn hút hết (sụp độc quyền)
-            LƯU Ý: chỉ số này CAO KHÔNG đủ để kết luận không collapse — sụp
-            ĐỒNG PHỤC cho entropy = 1.0 hoàn hảo mà vẫn vô dụng. Phải xem
-            kèm orthogonality (vẽ heatmap centroid).
+            Usage-distribution entropy divided by log(K). Approximately 1.0
+            means even use of all K slots; approximately 0.0 means monopoly
+            collapse. High entropy alone does not establish absence of
+            collapse: uniform-content collapse has perfect entropy 1.0 while
+            remaining useless. Report orthogonality too, using a centroid
+            heatmap.
 
         max_usage / min_usage:
-            nếu min_usage ~ 0 thì có ngăn chết.
+            min_usage near zero indicates a dead slot.
         """
         usage = self.slot_usage_ema.detach().cpu().numpy()  # [K]
         K = int(usage.shape[0])
@@ -798,18 +799,18 @@ class PeripheralMultiMemory(nn.Module):
             off_mask = ~np.eye(K, dtype=bool)
             out["mean_offdiag_cosine"] = float(np.mean(np.abs(gram[off_mask])))
         else:
-            out["mean_offdiag_cosine"] = float("nan")  # chưa đủ dữ liệu để đo (slot còn rỗng)
+            out["mean_offdiag_cosine"] = float("nan")  # Insufficient data; slots remain empty.
         out["g_anom_mean"] = float(self.g_anom_usage_ema.item())
         return out
 
     def set_role_thresholds(self, tau_role: float, sigma_hi: float, sigma_iqr: float = None):
         """
-        Cập nhật ngưỡng sau khi gọi tracker.auto_calibrate().
+        Update thresholds after tracker.auto_calibrate().
 
-        QUAN TRỌNG: thang của mu phụ thuộc hoàn toàn vào thang reward của
-        môi trường. Cắm cứng tau_role có thể khiến TẤT CẢ neighbour rơi vào
-        Trung tính (reward nhỏ) hoặc KHÔNG AI vào Trung tính (reward lớn) —
-        cả hai đều làm slot ngữ nghĩa vô dụng.
+        IMPORTANT: mu scale depends entirely on environment reward scale. A
+        hard-coded tau_role can make every neighbour neutral under small
+        rewards or no neighbour neutral under large rewards. Both outcomes
+        make semantic slots useless.
         """
         self.tau_role = float(tau_role)
         self.sigma_hi = float(sigma_hi)
@@ -817,7 +818,7 @@ class PeripheralMultiMemory(nn.Module):
 
 
 # =========================================================================
-# MI regularizer kiểu ROMA (tuỳ chọn, thay cho orthogonality)
+# Optional ROMA-style MI regularizer as an orthogonality alternative.
 # =========================================================================
 
 def slot_specialisation_loss(
@@ -825,29 +826,27 @@ def slot_specialisation_loss(
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Regulariser chuyên môn hoá kiểu ROMA, dạng thông tin tương hỗ.
+    ROMA-style mutual-information specialization regularizer.
 
         I(slot; item) = H(E_n[p(slot|n)]) - E_n[H(p(slot|n))]
 
-    Ý nghĩa hai số hạng:
-      - H(trung bình): entropy của phân bố usage tổng. CAO là tốt
-        -> dùng đều mọi ngăn (chống sụp độc quyền).
-      - E[H]: entropy trung bình của từng gán. THẤP là tốt
-        -> mỗi item được gán DỨT KHOÁT vào một ngăn, không nhoè
-        (chống sụp đồng phục).
+    H(mean) is entropy of aggregate usage. High values evenly use all slots and
+    prevent monopoly collapse. E[H] is the mean entropy of individual
+    assignments. Low values assign each item decisively rather than diffusely
+    and prevent uniform-content collapse.
 
-    Tối đa hoá I <=> tối thiểu hoá -I. Hàm này trả về -I để dùng làm loss.
+    Maximizing I is equivalent to minimizing -I; this function returns -I as loss.
 
-    Đây là chỗ mượn từ ROMA (Wang et al. ICML 2020): họ dùng MI để ép
-    role <-> trajectory. Ta ép slot <-> influence signature. Khác NGUỒN
-    TÍN HIỆU (interventional vs observational), nên là mượn-có-cải-tiến
-    chứ không phải bê nguyên xi.
+    ROMA (Wang et al., ICML 2020) uses MI to bind role and trajectory. This
+    method binds slot and influence signature. Its interventional signal differs
+    from ROMA's observational signal, making this an adapted use rather than a
+    direct copy.
 
     Args:
         slot_probs: [N, K]
 
     Returns:
-        scalar (= -I, càng nhỏ càng chuyên môn hoá tốt)
+        Scalar -I; lower values indicate stronger specialization.
     """
     if slot_probs.shape[0] == 0:
         return torch.zeros((), dtype=torch.float32, device=slot_probs.device)
@@ -864,5 +863,5 @@ def slot_specialisation_loss(
     return -mutual_info
 
 
-# Alias tương thích ngược.
+# Backward-compatible alias.
 PeripheralMultiMemory = PeripheralMultiMemory

@@ -1,115 +1,114 @@
-"""
-reciprocity.py — Đo chiều NGƯỢC: tôi có ảnh hưởng nó không?
+"""reciprocity.py — Measure the reverse direction of causal influence.
 
 =============================================================================
-Ý TƯỞNG
+IDEA
 =============================================================================
-Toàn bộ phần còn lại của CIG-AMF đo MỘT chiều:
+The rest of CIG-AMF measures one direction:
 
-    w_ij  :  j -> i     "nó ảnh hưởng tôi bao nhiêu"
+    w_ij  :  j -> i     influence of j on ego i
 
-File này đo chiều còn lại:
+This module measures the reverse direction:
 
-    g_ij  :  i -> j     "tôi ảnh hưởng nó bao nhiêu"
+    g_ij  :  i -> j     influence of ego i on j
 
-Cách đo, nói bằng lời: huấn luyện HAI mô hình cùng dự đoán hành động kế
-tiếp của j.
-    Mô hình A -- CHỈ nhìn j          (dùng shadow state s_ij)
-    Mô hình B -- nhìn CẢ j VÀ tôi    (dùng pair latent z_ij)
+The estimator trains TWO models to predict j's next action:
+    Model A — observes only j              (shadow state s_ij)
+    Model B — observes j and ego i         (pair latent z_ij)
 
-Nếu B đoán giỏi hơn A, nghĩa là biết về tôi giúp đoán được j
-  -> j ĐANG PHẢN ỨNG VỚI TÔI.
-Nếu hai mô hình ngang nhau -> j hoàn toàn phớt lờ tôi.
+If B predicts better than A, information about ego i improves prediction of j,
+indicating that j REACTS TO i. Equal performance indicates that j ignores i.
 
-Hiệu số chính là information gain (lượng thông tin thu được):
+The performance difference is the information gain:
 
-    g_ij = CE(mô hình A) - CE(mô hình B)     [nats]
+    g_ij = CE(model A) - CE(model B)     [nats]
 
-CE là cross-entropy, tức "độ ngỡ ngàng trung bình khi thấy hành động thật".
-g_ij > 0 nghĩa là biết thêm về tôi làm giảm sự ngỡ ngàng.
+CE is cross-entropy, or average surprise under the true action. g_ij > 0 means
+conditioning on ego i reduces surprise.
 
 =============================================================================
-HẠ TẦNG ĐÃ CÓ SẴN — ĐÂY LÀ LÝ DO NÓ RẺ
+INFRASTRUCTURE IS ALREADY AVAILABLE — THIS IS WHY IT IS CHEAP
 =============================================================================
-    z_ij  cập nhật từ (z_prev, o_i, a_i, o_j, a_j, xi)  <- CÓ ego
-    s_ij  cập nhật từ (s_prev,        o_j, a_j, xi)     <- KHÔNG ego
+    z_ij  is updated from (z_prev, o_i, a_i, o_j, a_j, xi)  <- with ego
+    s_ij  is updated from (s_prev,        o_j, a_j, xi)     <- without ego
 
-Hai biểu diễn này đã tồn tại trong CIG-AMF vì lý do khác (shadow dùng để
-warm-start khi promote). Chúng vô tình tạo thành đúng cặp đối chứng cần
-thiết. Ta chỉ phải thêm MỘT đầu tuyến tính trên shadow. Khoảng 40 dòng.
-
-=============================================================================
-VẤN ĐỀ CONFOUNDING VÀ CÁCH GIẢI
-=============================================================================
-Bản quan sát thuần bị nhiễu nặng: nếu i và j đứng cạnh nhau, o_i và o_j
-nhìn thấy CÙNG một thứ. Mô hình B đoán giỏi hơn không phải vì j phản ứng
-với i, mà vì o_i vô tình chứa thông tin về hoàn cảnh chung.
-
-Đây đúng là cái bẫy correlation-vs-causation mà cả bài đang chống.
-
-CÁCH GIẢI, và nó gần như MIỄN PHÍ: chỉ tính trên những bước mà hành động
-của CHÍNH EGO i bị eps-forcing ép ngẫu nhiên (F_i = 1). Ở những bước đó,
-a_i độc lập với mọi thứ khác theo đúng nghĩa cơ học. Nếu a_i vẫn giúp đoán
-được a_j^{t+1}, thì đó BẮT BUỘC là nhân quả.
-
-Ta đã ép mọi agent sẵn rồi, nên chỉ cần lọc theo cờ F_i.
+These representations already exist for other reasons: the shadow state
+warm-starts a pair latent after promotion. Together, they form the exact
+control pair required by this diagnostic. Only ONE additional linear head on
+the shadow state is needed, approximately 40 lines of implementation.
 
 =============================================================================
-Ô 2x2 — ĐÂY MỚI LÀ ĐÓNG GÓP KHÁI NIỆM
+CONFOUNDING ISSUE AND SOLUTION
 =============================================================================
-Ghép hai chiều lại được bốn loại quan hệ:
+Purely observational data are heavily confounded. When i and j are adjacent,
+o_i and o_j observe the same context. Model B can outperform A because o_i
+contains information about that shared context, not because j reacts to i.
 
-                     |  i->j THẤP (nó kệ tôi)  |  i->j CAO (nó để ý tôi)
+This is the same correlation-versus-causation trap addressed by the paper.
+
+The nearly cost-free solution is to compute the statistic only on steps where
+ego i is forced to take a random action (F_i = 1). On those steps, a_i is
+mechanically independent of all other variables. Any remaining predictive
+value for a_j^{t+1} is therefore causal.
+
+Epsilon forcing already covers all agents; the estimator only needs to filter
+by the F_i flag.
+
+=============================================================================
+2x2 MATRIX — THIS IS THE CONCEPTUAL CONTRIBUTION
+=============================================================================
+Combining the two dimensions gives four types of relationships:
+
+                     |  i->j LOW (j ignores i)     |  i->j HIGH (j reacts to i)
     -----------------|-------------------------|--------------------------
-    j->i THẤP        |  vô can                 |  KẺ BÁM ĐUÔI
-    (tôi kệ nó)      |                         |  (nhìn tôi mà không hại tôi)
+    j->i LOW        |  neutral                 |  STALKER
+    (j weakly affects i)|                      |  (reacts without harming i)
     -----------------|-------------------------|--------------------------
-    j->i CAO         |  VẬT CẢN VÔ TRI         |  CẶP GHÉP CHIẾN LƯỢC  (!)
-    (nó ảnh hưởng tôi)|  (chắn đường, không    |  (hai bên cùng đọc bài nhau)
-                     |   biết tôi tồn tại)     |
+    j->i HIGH       |  INERT OBJECT           |  STRATEGIC PAIR  (!)
+    (j affects i)   |  (blocks without reacting)|
 
-Ô dưới-phải là nơi non-stationarity thật sự sinh ra: hai agent liên tục
-thích nghi với nhau, tạo thành vòng lặp đuổi nhau mà sách giáo khoa MARL
-gọi là "cyclic dynamics". Nếu đo được ô này, ta chỉ đích danh được các cặp
-CHỊU TRÁCH NHIỆM cho sự phi dừng -- điều chưa ai làm.
+The bottom-right cell is where genuine non-stationarity arises: two agents
+continually adapt to each other and form the chasing loop described as cyclic
+dynamics in standard MARL. Measuring this cell directly identifies pairs
+responsible for non-stationarity, a capability absent from prior work.
 
-Ô dưới-trái quan trọng theo cách khác: vật cản vô tri thì chỉ cần TRÁNH,
-không cần mô hình hoá hành vi -- vì nó không phản ứng với ta. Ngược lại,
-cặp ghép chiến lược thì bắt buộc phải mô hình hoá kỹ.
-
-=============================================================================
-LIÊN HỆ VỚI JAQUES (2019)
-=============================================================================
-Social influence của Jaques đo đúng chiều i->j nhưng trên HÀNH ĐỘNG và
-bằng KL quan sát, rồi dùng làm intrinsic reward. Ở đây:
-    - chiều i->j: gần giống họ, nhưng đo bằng can thiệp thật (F_i=1)
-    - chiều j->i: trên RETURN của ego, thứ họ không đo
-    - mục đích: phân loại quan hệ, không phải thưởng
-Nói cách khác, ta thu hồi đại lượng của Jaques như MỘT TRỤC trong hồ sơ
-hai chiều. Đây là cách định vị rất sạch so với tổ tiên gần nhất.
+The bottom-left cell matters differently. Inert objects need only be avoided;
+their behaviour need not be modelled because they do not react to ego.
+Strategic pairs, by contrast, require careful behavioural modelling.
 
 =============================================================================
-ĐÁNH GIÁ THẲNG THẮN VỀ MỨC ĐỘ HỨA HẸN
+LINK TO JAQUES (2019)
 =============================================================================
-ĐIỂM MẠNH
-  + rẻ thật (hạ tầng có sẵn, ~40 dòng)
-  + bản nhân quả gần như miễn phí nhờ eps-forcing đã có
-  + tạo ra một hình 2x2 mới, gắn thẳng vào luận đề trung tâm của bài
-  + định vị sạch so với Jaques
+Jaques social influence measures the i->j direction over ACTIONS through an
+observational KL term, then uses it as intrinsic reward. Here:
+    - i->j is similar but measured through a real intervention (F_i=1);
+    - j->i is measured on ego return, which Jaques does not measure; and
+    - the objective is relationship classification rather than reward shaping.
+The Jaques quantity is therefore recovered as ONE AXIS of a two-dimensional
+profile, providing a clean distinction from the closest predecessor.
 
-RỦI RO
-  - trong môi trường resource-flow hợp tác, có thể ĐA SỐ cặp rơi vào ô
-    "vật cản vô tri", ô ghép chiến lược rỗng -> hình đẹp nhưng vô nghĩa
-  - mẫu mỏng: cần F_i = 1, mà eps chỉ 3% -> mỗi cặp rất ít mẫu nhân quả
-  - chưa rõ policy DÙNG con số này để làm gì
+=============================================================================
+HONEST ASSESSMENT OF PROMISE LEVEL
+=============================================================================
+STRENGTHS
+  + really cheap (infrastructure already exists, ~40 lines)
+  + causal measurement is almost free thanks to eps-forcing already in place
+  + creates a new 2x2 matrix, directly tied to the paper's central thesis
+  + clean positioning compared to Jaques
 
-KẾT LUẬN
-  Triển khai như CÔNG CỤ CHẨN ĐOÁN trước, KHÔNG cắm vào vòng lặp quyết
-  định. Vẽ hình 2x2. Chỉ khi hình đó cho thấy cấu trúc thật thì mới đưa
-  vào core selection ở bài sau. Cách này lấy được phần lợi (hình mới, định
-  vị mới) mà không đánh cược cả bài vào một giả thuyết chưa kiểm chứng.
+RISKS
+  - in cooperative resource-flow environments, most pairs may fall into the
+    "inert object" cell, the strategic pair cell may be empty -> beautiful but meaningless
+  - thin sample: need F_i = 1, but eps is only 3% -> very few causal samples per pair
+  - unclear how the policy uses this number
 
-  Vì thế mặc định `use_in_signature=False`.
+CONCLUSION
+  Implement this as a diagnostic first and DO NOT connect it to the decision
+  loop. Plot the 2x2 matrix. Introduce the signal into core selection only if
+  the matrix demonstrates real structure in a subsequent study. This retains
+  the diagnostic and positioning value without making the current paper depend
+  on an untested hypothesis.
+
+  Hence, default `use_in_signature=False`.
 =============================================================================
 """
 
@@ -123,16 +122,16 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     _HAS_TORCH = True
-except ImportError:  # cho phép import file này khi chưa cài torch
+except ImportError:  # allow importing this file without torch
     _HAS_TORCH = False
     nn = object
 
 
-# Nhãn của bốn ô
-QUAD_IRRELEVANT = 0     # vô can
-QUAD_FOLLOWER = 1       # kẻ bám đuôi
-QUAD_OBSTACLE = 2       # vật cản vô tri
-QUAD_STRATEGIC = 3      # cặp ghép chiến lược
+# labels of the four cells
+QUAD_IRRELEVANT = 0     # neutral
+QUAD_FOLLOWER = 1       # stalker
+QUAD_OBSTACLE = 2       # inert object
+QUAD_STRATEGIC = 3      # strategic pair
 
 QUAD_NAMES = ("irrelevant", "follower", "obstacle", "strategic")
 QUAD_NAMES_VI = ("vô can", "bám đuôi", "vật cản vô tri", "ghép chiến lược")
@@ -141,13 +140,11 @@ QUAD_NAMES_VI = ("vô can", "bám đuôi", "vật cản vô tri", "ghép chiến
 if _HAS_TORCH:
 
     class EgoFreeActionHead(nn.Module):
-        """
-        Mô hình A: dự đoán a_j^{t+1} CHỈ từ shadow state (không có ego).
+        """Model A: predicts a_j^{t+1} ONLY from shadow state (without ego).
 
-        Cố ý giữ cùng dung lượng với đầu dự đoán trên z_ij, nếu không thì
-        hiệu số cross-entropy sẽ phản ánh chênh lệch dung lượng mạng chứ
-        không phản ánh lượng thông tin về ego. Đây là chi tiết dễ bỏ sót
-        nhưng làm hỏng toàn bộ phép đo.
+        Keep exactly the same capacity as the head predicting from z_ij.
+        Otherwise, the cross-entropy difference reflects model capacity rather
+        than information about ego, invalidating the complete measurement.
         """
 
         def __init__(self, shadow_dim: int, action_dim: int, hidden: int = 64):
@@ -165,11 +162,10 @@ if _HAS_TORCH:
 
 
 class ReciprocityTracker:
-    """
-    Theo dõi information gain hai chiều cho từng cặp có hướng.
+    """Track information gain in both directions for each directed pair.
 
-    Cách dùng trong runner (sau khi đã có z_ij và s_ij của bước t, và
-    đã biết hành động thật a_j ở bước t+1):
+    Usage in runner (after having z_ij and s_ij of step t, and
+    knowing the true action a_j at step t+1):
 
         rec.record(
             ego_id=i, neighbor_id=j,
@@ -179,15 +175,13 @@ class ReciprocityTracker:
             ego_was_forced=bool(forced_mask_prev[i]),
         )
 
-    Rồi lấy kết quả:
+    Then take the result:
         g = rec.get_gain(i, j, causal_only=True)
         quad = rec.get_quadrant(i, j, w_ij=belief.debiased_mu(j))
 
     Args:
-        window: số quan sát gần nhất giữ cho mỗi cặp.
-        min_causal_samples: dưới ngưỡng này thì bản nhân quả coi như chưa
-            đủ tin cậy và trả về NaN thay vì một con số bịa.
-    """
+        window: number of recent observations to keep for each pair.
+        min_causal_samples: below this threshold, causal measurement is considered unreliable and returns NaN instead of a fabricated number."""
 
     def __init__(
         self,
@@ -201,18 +195,17 @@ class ReciprocityTracker:
         self.min_causal_samples = int(min_causal_samples)
         self.eps = float(eps)
 
-        # ce[(i,j)] = deque các (ce_without, ce_with, was_forced)
+        # ce[(i,j)] = deque of (ce_without, ce_with, was_forced)
         self._ce: Dict[Tuple[int, int], deque] = {}
 
     # ------------------------------------------------------------------
 
     @staticmethod
     def _cross_entropy(logits: np.ndarray, target: int) -> float:
-        """
-        CE của một mẫu, tính ổn định số học (log-sum-exp).
+        """CE of a sample, computed in a numerically stable way (log-sum-exp).
 
-        Đây là "độ ngỡ ngàng": mô hình gán xác suất càng thấp cho hành động
-        thật thì CE càng cao.
+        This is predictive surprise: CE increases as the probability assigned
+        to the true action decreases.
         """
         z = np.asarray(logits, dtype=np.float64).reshape(-1)
         z = z - np.max(z)
@@ -230,7 +223,7 @@ class ReciprocityTracker:
         true_next_action: int,
         ego_was_forced: bool = False,
     ):
-        """Ghi nhận một quan sát cho cặp (i, j)."""
+        """Record an observation for the pair (i, j)."""
         key = (int(ego_id), int(neighbor_id))
 
         if key not in self._ce:
@@ -257,20 +250,20 @@ class ReciprocityTracker:
         neighbor_id: int,
         causal_only: bool = True,
     ) -> float:
-        """
-        Information gain g_ij = CE_without - CE_with, đơn vị nats.
+        """Information gain g_ij = CE_without - CE_with, unit nats.
 
         Args:
             causal_only:
-                True  -> CHỈ dùng các bước mà hành động của ego bị ép ngẫu
-                         nhiên. Ở đó a_i độc lập với mọi thứ, nên mọi khả
-                         năng dự đoán đều là nhân quả. Trả NaN nếu chưa đủ
-                         mẫu (thà không biết còn hơn biết sai).
-                False -> dùng tất cả. Rẻ và luôn có số, nhưng DÍNH
-                         CONFOUNDING: o_i và o_j nhìn cùng một thế giới.
+                True uses ONLY steps where ego's action was forced. On those
+                steps, a_i is independent of other variables, making the
+                predictive signal causal. Insufficient samples return NaN
+                instead of a fabricated estimate.
+                False uses every step. This is inexpensive and nearly always
+                produces a number, but is CONFOUNDED because o_i and o_j
+                observe the same world.
 
         Returns:
-            float (có thể là NaN nếu causal_only và thiếu mẫu)
+            A float, possibly NaN when causal_only has insufficient samples.
         """
         key = (int(ego_id), int(neighbor_id))
         rows = self._ce.get(key)
@@ -309,24 +302,24 @@ class ReciprocityTracker:
         tau_g: float = 0.02,
         causal_only: bool = True,
     ) -> int:
-        """
-        Xếp cặp (i, j) vào một trong bốn ô.
+        """Place the pair (i, j) into one of the four cells.
 
         Args:
-            w_ij: ảnh hưởng j->i (lấy từ belief.debiased_mu(j)).
-            tau_w, tau_g: ngưỡng cho hai trục. Nên đặt bằng phân vị của
-                phân phối quan sát được, không cắm cứng (xem calibrate).
+            w_ij: Influence j->i from belief.debiased_mu(j).
+            tau_w, tau_g: Thresholds for the two axes. Derive these from the
+                observed-data distribution rather than hard-coding them; see
+                calibrate().
 
         Returns:
-            int trong {0,1,2,3}, hoặc -1 nếu chưa đủ dữ liệu nhân quả.
+            Integer in {0, 1, 2, 3}, or -1 for insufficient causal data.
         """
         g = self.get_gain(ego_id, neighbor_id, causal_only=causal_only)
 
         if not np.isfinite(g):
             return -1
 
-        strong_in = abs(float(w_ij)) > float(tau_w)   # nó ảnh hưởng tôi
-        strong_out = float(g) > float(tau_g)          # tôi ảnh hưởng nó
+        strong_in = abs(float(w_ij)) > float(tau_w)   # j influences i.
+        strong_out = float(g) > float(tau_g)          # i influences j.
 
         if strong_in and strong_out:
             return QUAD_STRATEGIC
@@ -344,13 +337,11 @@ class ReciprocityTracker:
         percentile: float = 70.0,
         causal_only: bool = True,
     ) -> Dict[str, float]:
-        """
-        Đặt ngưỡng tau_g theo phân vị của chính dữ liệu quan sát được.
+        """Set the threshold tau_g based on the distribution of the observed data.
 
-        Cần thiết vì thang của information gain phụ thuộc entropy của không
-        gian hành động: với 5 hành động, gain tối đa là log(5) ~ 1.61 nats.
-        Cắm cứng 0.02 có thể đúng ở môi trường này và sai hoàn toàn ở
-        môi trường khác.
+        This is necessary because information-gain scale depends on action-space
+        entropy. With five actions, maximum gain is log(5) ~ 1.61 nats.
+        A hard-coded 0.02 may be appropriate here and entirely wrong elsewhere.
         """
         vals = []
 
@@ -380,17 +371,18 @@ class ReciprocityTracker:
         tau_g: float = 0.02,
         causal_only: bool = True,
     ) -> Dict:
-        """
-        Quét toàn bộ cặp, đếm số lượng mỗi ô, và trả về dữ liệu để vẽ.
+        """Scan all pairs, count each cell, and return data for plotting.
 
-        HÌNH CHO PAPER: scatter với trục x = w_ij (j->i) và trục y = g_ij
-        (i->j), chia bốn góc phần tư bằng hai đường tau. Nếu các điểm tụ
-        thành cụm rõ ở nhiều ô -> có cấu trúc thật, đáng đưa vào cơ chế.
-        Nếu tất cả dồn vào một ô -> ý tưởng không cho thêm thông tin gì,
-        và nên nói thẳng như vậy trong Discussion.
+        PAPER FIGURE: scatter plot with x-axis w_ij (j->i) and y-axis g_ij
+        (i->j), divided into four quadrants by the two thresholds. Clear
+        clustering into multiple cells demonstrates real structure worth
+        incorporating into the mechanism. Concentration in one cell means the
+        diagnostic adds no information and should be reported directly in the
+        Discussion.
 
         Returns:
-            dict gồm counts, points (để vẽ), và tỷ lệ mẫu đủ tin cậy.
+            Dictionary containing counts, plot points, and reliable-sample
+            coverage.
         """
         counts = {name: 0 for name in QUAD_NAMES}
         counts["insufficient_data"] = 0

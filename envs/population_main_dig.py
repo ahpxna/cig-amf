@@ -3,21 +3,19 @@ import numpy as np
 
 
 class PopulationMainDIG:
-    """
-    Dynamic Influence Gridworld toàn population, nhiều ego thật.
+    """Dynamic Influence Gridworld with full population, multiple ego agents.
 
-    Vai trò:
-    - collector: tác tử thu reward chính trong zone của nó
-    - gatekeeper: mở cổng
-    - relay: hỗ trợ gián tiếp
-    - blocker: cản trở collector
-    - drifter: gây nhiễu nhẹ
+Roles:
+- collector: agent that collects reward within its zone
+- gatekeeper: opens the gate
+- relay: provides indirect support
+- blocker: hinders the collector
+- drifter: causes mild disturbance
 
-    Mỗi ego đều có:
-    - reward riêng
-    - core thật riêng
-    - influence thật riêng
-    """
+Each ego has:
+- private reward
+- private core
+- private influence"""
 
     UP = 0
     DOWN = 1
@@ -214,13 +212,13 @@ class PopulationMainDIG:
         if self.episode_count > 0 and self.episode_count % self.phase_length == 0:
             self.current_phase += 1
 
-            # đổi gatekeeper giữa các zone
+            # switch gatekeeper between zones
             for z in range(self.n_zones):
                 nxt = (z + 1) % self.n_zones
                 self.zone_role_agents[z][self.ROLE_GATEKEEPER], self.zone_role_agents[nxt][self.ROLE_GATEKEEPER] = \
                     self.zone_role_agents[nxt][self.ROLE_GATEKEEPER], self.zone_role_agents[z][self.ROLE_GATEKEEPER]
 
-            # đồng bộ lại role + zone
+            # sync role + zone
             for z in range(self.n_zones):
                 for role_name, aid in self.zone_role_agents[z].items():
                     self.agent_role[aid] = role_name

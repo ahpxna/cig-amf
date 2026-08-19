@@ -1,39 +1,44 @@
 """
-intervention.py — ε-forced action controller cho CIG-AMF v2.
+intervention.py — ε-forced action controller for CIG-AMF v2.
 
 =============================================================================
-VÌ SAO CÓ FILE NÀY
+WHY THIS FILE EXISTS
 =============================================================================
-Bản v1 định nghĩa w_ij bằng do-operator (Eq. 3-4 trong paper) nhưng ước lượng
-nó bằng một reward model thuần quan sát (Eq. 7). Vấn đề: a_j KHÔNG hề ngẫu
-nhiên — nó tương quan với s, a_i, và hành động của mọi neighbour khác. Nên
-hiệu hai lần dự đoán của model có thể chỉ là correlation đội lốt causation,
-và paper buộc phải viết câu tự thú "không claim w_hat = w".
+Version 1 defines w_ij with the do-operator (Equations 3–4 in the paper), but
+estimates it with a purely observational reward model (Equation 7). The
+problem is that a_j is NOT randomized: it is correlated with s, a_i, and the
+actions of every other neighbour. The difference between two model
+predictions can therefore be correlation disguised as causation, forcing the
+paper to concede that it does not claim w_hat = w.
 
-File này sửa tận gốc: với xác suất epsilon, ta ÉP agent j chọn hành động
-ngẫu nhiên đều thay vì theo policy. Khi a_j được randomize thật, mọi đường
-confounding bị CẮT ĐỨT VỀ MẶT CƠ HỌC — đó đúng nghĩa do(a_j), không phải
-xấp xỉ. Đây là randomized controlled trial mà y học phải tốn triệu đô, còn
-ta làm miễn phí vì ta sở hữu simulator.
+This file fixes the problem at its source. With probability epsilon, agent j
+is FORCED to choose a uniformly random action instead of following its policy.
+Once a_j is genuinely randomized, every confounding path is cut
+MECHANICALLY. This is a literal do(a_j), not an approximation: the equivalent
+of a randomized controlled trial that would cost millions in medicine, but is
+free here because the simulator is under experimental control.
 
 =============================================================================
-HỆ QUẢ QUAN TRỌNG: PROPENSITY TRỞ NÊN CHÍNH XÁC
+IMPORTANT CONSEQUENCE: PROPENSITY IS EXACT
 =============================================================================
-Behaviour policy hiệu dụng của agent j tại bước t là một hỗn hợp:
+The effective behaviour policy of agent j at step t is the mixture
 
-    b_j(a | s) = eps * (1/|A|)  +  (1 - eps) * pi_j(a | s)      nếu j đang bị ép
-    b_j(a | s) = pi_j(a | s)                                     nếu j không bị ép
+    b_j(a | s) = eps * (1/|A|) + (1 - eps) * pi_j(a | s)  if j is forced
+    b_j(a | s) = pi_j(a | s)                              otherwise.
 
-Ta BIẾT CHÍNH XÁC b_j (vì ta tự train pi_j và tự chọn eps). Trong off-policy
-evaluation, propensity thường phải ước lượng và đó là nguồn sai số chính.
-Ở đây nó exact → doubly-robust estimator (structural_proxy_v2.py) chỉ cần
-"một trong hai mô hình đúng" và ta ĐÃ CÓ SẴN một cái đúng tuyệt đối.
+b_j is KNOWN EXACTLY because pi_j is the learner's own network and eps is a
+chosen constant. Propensity normally has to be estimated in off-policy
+evaluation and is a major source of error. Here it is exact, so the doubly
+robust estimator in structural_proxy_v2.py needs only one of its two models
+to be correct, and one of them is already correct by construction.
 
-Ngoài ra eps-forcing đảm bảo luôn giả định POSITIVITY / OVERLAP:
-    b_j(a | s) >= eps / |A| > 0  cho mọi a
-Không có nó, hành động phản thực a'_j mà j không bao giờ làm sẽ khiến model
-phải ngoại suy vào vùng không có dữ liệu → ước lượng vô nghĩa. Bản v1 KHÔNG
-nêu giả định này ở đâu cả.
+Epsilon forcing also guarantees the POSITIVITY/OVERLAP assumption:
+
+    b_j(a | s) >= eps / |A| > 0  for every a.
+
+Without this guarantee, a counterfactual action a'_j that j never takes would
+force the model to extrapolate into a region with no data, making the estimate
+meaningless. Version 1 did not state this assumption anywhere.
 =============================================================================
 """
 
@@ -44,41 +49,43 @@ import numpy as np
 
 class EpsilonForcedActionController:
     """
-    Quản lý việc ép hành động ngẫu nhiên rải rác trong lúc training.
+    Manage sparse random action forcing during training.
 
-    Cách dùng trong runner (thay cho chỗ đang sample action từ policy):
+    Runner usage, replacing the current policy-action sampling site:
 
         forced_mask, effective_probs = controller.apply(
-            actions=actions,             # list[int] length n_agents, từ policy
-            policy_probs=policy_probs,   # np [n_agents, action_dim], từ softmax logits
+            actions=actions,             # policy actions, list[int], length n_agents
+            policy_probs=policy_probs,   # np [n_agents, action_dim], softmax probabilities
         )
-        # actions đã được sửa in-place tại các vị trí bị ép
+        # Forced positions in actions have been modified in place.
         obs, rew, done, info = env.step(actions)
 
-    Rồi khi push replay:
+    When pushing the transition to replay:
         step["forced_mask"]     = forced_mask       # np bool [n_agents]
         step["behaviour_probs"] = effective_probs   # np [n_agents, action_dim]
 
     Args:
         n_agents:
-            số agent trong population.
+            Number of agents in the population.
         action_dim:
-            kích thước không gian hành động rời rạc.
+            Size of the discrete action space.
         eps:
-            xác suất mỗi agent bị ép ở mỗi bước. 0.02-0.05 là hợp lý:
-            đủ để tích luỹ mẫu can thiệp, đủ nhỏ để không phá reward.
+            Per-step forcing probability for each agent. Values in 0.02–0.05
+            accumulate enough intervention samples while remaining small
+            enough not to destroy reward.
         max_forced_per_step:
-            trần số agent bị ép cùng lúc. Ép nhiều agent một lúc làm
-            nhiễu lẫn nhau và khó quy trách nhiệm, nên giới hạn.
-            None = không giới hạn.
+            Maximum number of agents forced at once. Simultaneously forcing
+            many agents causes mutual interference and complicates credit
+            assignment, so this can be capped. None means no cap.
         anneal_to:
-            nếu khác None, eps sẽ giảm tuyến tính từ eps xuống anneal_to
-            theo anneal_episodes. Dùng khi muốn can thiệp mạnh lúc đầu
-            (proxy cần dữ liệu) rồi nhẹ dần (bảo vệ reward cuối).
+            If not None, linearly reduce eps to anneal_to over
+            anneal_episodes. This supports stronger early intervention, when
+            the proxy needs data, followed by lighter intervention to protect
+            final reward.
         anneal_episodes:
-            số episode để anneal.
+            Number of episodes over which to anneal.
         rng:
-            np.random.RandomState để tái lập được theo seed.
+            Seedable np.random.RandomState for reproducibility.
     """
 
     def __init__(
@@ -97,8 +104,8 @@ class EpsilonForcedActionController:
         self.eps_initial = float(eps)
         self.eps = float(eps)
 
-        # [FIX-P1] None = không cap (mặc định mới). Ép về int nếu có giá trị
-        # để `cfg.get(..., 2)` trả về None từ config không bị hiểu nhầm.
+        # [FIX-P1] None means no cap and is the new default. Cast non-None
+        # values to int so a None returned by `cfg.get(..., 2)` is preserved.
         self.max_forced_per_step = (
             None if max_forced_per_step is None else int(max_forced_per_step)
         )
@@ -109,19 +116,19 @@ class EpsilonForcedActionController:
 
         self.episode = 0
 
-        # eps riêng cho từng agent (None = dùng eps chung cho tất cả)
+        # Per-agent eps; None uses the common eps for all agents.
         self._eps_per_agent = None
 
-        # Thống kê để báo cáo trong paper (reviewer sẽ hỏi "eps làm mất bao nhiêu reward")
+        # Paper-reporting statistics, including the reward cost of epsilon.
         self.total_steps = 0
         self.total_forced = 0
 
     # ------------------------------------------------------------------
-    # Lịch trình eps
+    # Epsilon schedule
     # ------------------------------------------------------------------
 
     def step_episode(self):
-        """Gọi một lần sau mỗi episode để cập nhật lịch trình anneal."""
+        """Call once after each episode to update the annealing schedule."""
         self.episode += 1
 
         if self.anneal_to is None:
@@ -136,11 +143,11 @@ class EpsilonForcedActionController:
         return float(self.eps)
 
     # ------------------------------------------------------------------
-    # Áp dụng can thiệp
+    # Apply interventions
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
-    # NHẮM MỤC TIÊU CAN THIỆP THEO BẤT ĐỊNH
+    # UNCERTAINTY-TARGETED INTERVENTIONS
     # ------------------------------------------------------------------
 
     def set_priority(
@@ -149,41 +156,47 @@ class EpsilonForcedActionController:
         floor_ratio: float = 0.34,
     ):
         """
-        Phân bổ ngân sách can thiệp theo mức "chưa hiểu" của từng agent.
+        Allocate the intervention budget according to how poorly each agent
+        is understood.
 
-        VÌ SAO CẦN
+        MOTIVATION
         ----------
-        Ta đang trả 3% reward để mua dữ liệu nhân quả. Nếu rải đều, phần lớn
-        3% đó rơi vào những cặp đã hiểu rõ từ lâu — tiền tiêu mà không mua
-        thêm được thông tin gì.
+        The system pays 3% of reward to acquire causal data. Under a uniform
+        allocation, most of that 3% is spent on pairs that are already well
+        understood, consuming budget without purchasing new information.
 
-        Ví dụ: bạn có 3 phiếu hỏi ý kiến chuyên gia. Đem hỏi 3 câu bạn đã
-        biết đáp án thì phí. Hỏi đúng 3 câu đang mơ hồ nhất mới đáng.
+        An equivalent example is having three expert-consultation vouchers.
+        Spending them on three questions whose answers are already known is
+        wasteful; they should be spent on the three most ambiguous questions.
 
-        Ở đây "đang mơ hồ nhất" = epistemic uncertainty cao = ensemble đang
-        bất đồng về agent đó.
+        Here, "most ambiguous" means high epistemic uncertainty: the ensemble
+        disagrees most strongly about that agent.
 
-        RÀNG BUỘC KHÔNG ĐƯỢC VI PHẠM
+        NON-NEGOTIABLE CONSTRAINT
+        -------------------------
+        Every agent MUST retain a forcing probability greater than zero. If
+        an agent is never forced, overlap assumption A2 fails for that agent
+        and all related causal estimates lose their foundation. `floor_ratio`
+        therefore guarantees each agent at least that fraction of the mean
+        intervention budget.
+
+        CAUSAL VALIDITY IS PRESERVED
         ----------------------------
-        Mọi agent PHẢI giữ xác suất bị ép > 0. Nếu một agent không bao giờ
-        được ép, giả định overlap (A2) sụp với agent đó, và mọi ước lượng
-        nhân quả liên quan tới nó mất căn cứ. Vì thế có `floor_ratio`: mỗi
-        agent luôn giữ ít nhất `floor_ratio` phần ngân sách trung bình.
+        The choice of WHOM to force may depend on anything, including history
+        and uncertainty, without invalidating causality, provided that:
 
-        TÍNH HỢP LỆ NHÂN QUẢ VẪN GIỮ NGUYÊN
-        -----------------------------------
-        Việc CHỌN AI để ép có thể phụ thuộc vào bất cứ thứ gì (kể cả lịch sử,
-        bất định...) mà không phá tính nhân quả, MIỄN LÀ:
-          (a) hành động sau khi đã quyết định ép vẫn bốc ngẫu nhiên đều,
-              độc lập với trạng thái  -> giữ nguyên do(a_j)
-          (b) xác suất ép của từng agent được GHI LẠI và đưa vào propensity
-              -> DR vẫn đúng
-        Cả hai đều được bảo đảm bên dưới: eps_per_agent được ghi vào
-        effective_probs trả về.
+          (a) after the target is selected, its action remains uniformly
+              random and state-independent, preserving do(a_j); and
+          (b) each agent's forcing probability is RECORDED and included in
+              the propensity, preserving the validity of the DR estimator.
+
+        Both conditions are enforced below: eps_per_agent is incorporated
+        into the returned effective_probs.
 
         Args:
-            scores: np [n_agents], càng cao càng ưu tiên ép. None = tắt.
-            floor_ratio: sàn ngân sách, trong (0, 1].
+            scores: np [n_agents]; higher values receive higher forcing
+                priority. None disables targeting.
+            floor_ratio: Budget floor in (0, 1].
         """
         if scores is None:
             self._eps_per_agent = None
@@ -193,7 +206,7 @@ class EpsilonForcedActionController:
 
         if s.shape[0] != self.n_agents:
             raise ValueError(
-                f"scores phải có length {self.n_agents}, nhận {s.shape[0]}"
+                f"scores must have length {self.n_agents}; received {s.shape[0]}"
             )
 
         s = np.clip(s, 0.0, None)
@@ -203,12 +216,12 @@ class EpsilonForcedActionController:
             self._eps_per_agent = None
             return
 
-        # Chuẩn hoá thành trọng số trung bình 1.0, rồi trộn với sàn.
+        # Normalize to weights with mean 1.0, then mix in the floor.
         w = s / (total / self.n_agents)
         fr = float(np.clip(floor_ratio, 1e-3, 1.0))
         w = fr + (1.0 - fr) * w
 
-        # Giữ NGÂN SÁCH TỔNG không đổi: mean(eps_j) = eps.
+        # Keep the TOTAL BUDGET unchanged: mean(eps_j) = eps.
         w = w / float(np.mean(w))
 
         eps_j = np.clip(self.eps * w, 0.0, 1.0)
@@ -216,7 +229,7 @@ class EpsilonForcedActionController:
         self._eps_per_agent = eps_j.astype(np.float64)
 
     def get_eps_per_agent(self) -> np.ndarray:
-        """np [n_agents] — xác suất ép hiện tại của từng agent."""
+        """Return the current forcing probability of every agent."""
         if getattr(self, "_eps_per_agent", None) is None:
             return np.full(self.n_agents, self.eps, dtype=np.float64)
 
@@ -228,59 +241,64 @@ class EpsilonForcedActionController:
         policy_probs: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Ép ngẫu nhiên một số agent, và trả về propensity hiệu dụng.
+        Randomly force a subset of agents and return effective propensities.
 
         Args:
             actions:
-                list[int] length n_agents. Hành động đã sample từ policy.
-                SẼ BỊ SỬA IN-PLACE tại các vị trí bị ép.
+                Policy-sampled actions as list[int] of length n_agents.
+                Forced positions WILL BE MODIFIED IN PLACE.
             policy_probs:
                 np.ndarray shape [n_agents, action_dim].
-                pi_j(a | s) cho mọi agent, mọi hành động.
+                pi_j(a | s) for every agent and every action.
 
         Returns:
             forced_mask:
-                np.ndarray bool shape [n_agents]. True = agent này bị ép.
+                Boolean array of shape [n_agents]. True means the agent was
+                forced.
             effective_probs:
                 np.ndarray float32 shape [n_agents, action_dim].
-                b_j(a | s) — behaviour policy hiệu dụng, dùng cho DR estimator.
+                b_j(a | s), the effective behaviour policy used by the DR
+                estimator.
         """
         probs = np.asarray(policy_probs, dtype=np.float32)
 
         if probs.shape != (self.n_agents, self.action_dim):
             raise ValueError(
-                f"policy_probs phải có shape [{self.n_agents}, {self.action_dim}], "
-                f"nhận được {probs.shape}"
+                f"policy_probs must have shape [{self.n_agents}, {self.action_dim}]; "
+                f"received {probs.shape}"
             )
 
-        # ---- 1. Quyết định agent nào bị ép -------------------------------
-        # eps_vec: [n_agents] — bằng nhau nếu không set_priority,
-        # khác nhau nếu đang nhắm mục tiêu theo bất định.
+        # ---- 1. Decide which agents are forced ---------------------------
+        # eps_vec is uniform unless set_priority enables uncertainty-based
+        # targeting, in which case its entries differ by agent.
         eps_vec = self.get_eps_per_agent()          # [n_agents]
 
         draw = self.rng.rand(self.n_agents)         # [n_agents]
         forced_mask = draw < eps_vec                # [n_agents] bool
 
         # ------------------------------------------------------------------
-        # [FIX-P1] Giới hạn số agent bị ép cùng lúc — PHÁ VỠ "propensity known
-        # exactly", claim trung tâm của paper (§B3: b_j "is known exactly,
+        # [FIX-P1] Capping the number of simultaneously forced agents BREAKS
+        # the paper's central "propensity known exactly" claim (§B3: b_j "is known exactly,
         # since pi_j is the learner's own network and eps is a chosen
         # constant").
         #
-        # Cap là một phép LỌC PHỤ THUỘC KẾT QUẢ BỐC THĂM của toàn quần thể:
-        # xác suất j thực sự bị ép không còn là eps_j nữa mà là
-        #     eps_eff_j = eps_j * P(j sống sót qua cap)
-        # trong đó P(...) phụ thuộc số agent khác cũng trúng ở bước đó.
-        # Với eps=0.03, n=24, cap=2: X ~ Bin(24, 0.03), P(X>2) ~ 3.8%, nên
-        # eps_eff ~ 0.0282 — propensity đang bị KHAI CAO ~6% một cách hệ
-        # thống, và DR chia sai đúng bằng tỉ lệ đó (mất tính không chệch).
+        # The cap is a FILTER THAT DEPENDS ON THE OUTCOME of the population's
+        # complete random draw. The probability that j is actually forced is
+        # no longer eps_j, but
+        #     eps_eff_j = eps_j * P(j survives the cap),
+        # where P(...) depends on how many other agents were also selected at
+        # that step. With eps=0.03, n=24, and cap=2, X ~ Bin(24, 0.03) and
+        # P(X>2) ~ 3.8%, so eps_eff ~ 0.0282. Recorded propensity is therefore
+        # systematically overstated by ~6%, and DR divides by exactly the
+        # wrong factor, losing unbiasedness.
         #
-        # Cap gần như vô dụng ở chế độ mặc định: E[X] = 24*0.03 = 0.72 agent
-        # mỗi bước, tức cap=2 hầu như không bao giờ chạm. Nó trả giá bằng tính
-        # đúng đắn của claim để đổi lấy gần như không có gì.
+        # The cap is almost useless under the default regime:
+        # E[X] = 24*0.03 = 0.72 agents per step, so cap=2 is almost never hit.
+        # It sacrifices the validity of the claim for almost no benefit.
         #
-        # => Mặc định TẮT cap (max_forced_per_step=None). Nếu ai đó bật lại,
-        # cảnh báo một lần cho biết propensity ghi lại chỉ còn là xấp xỉ.
+        # Therefore the cap is disabled by default
+        # (max_forced_per_step=None). If it is re-enabled, warn once that the
+        # recorded propensity is only approximate.
         # ------------------------------------------------------------------
         if self.max_forced_per_step is not None:
             forced_ids = np.flatnonzero(forced_mask)
@@ -289,11 +307,11 @@ class EpsilonForcedActionController:
                 if not getattr(self, "_cap_warned", False):
                     print(
                         "[eps-forcing][WARN] max_forced_per_step="
-                        f"{self.max_forced_per_step} vừa CẮT bớt số agent bị ép. "
-                        "Propensity ghi lại (eps danh nghĩa) giờ LỚN HƠN xác "
-                        "suất ép thực tế => DR chệch có hệ thống, và claim "
-                        "'b_j known exactly' của paper không còn đúng. "
-                        "Đặt forcer_max_forced_per_step=None để khôi phục."
+                        f"{self.max_forced_per_step} truncated the selected agents. "
+                        "Recorded nominal-eps propensity now EXCEEDS the actual "
+                        "forcing probability, systematically biasing DR and "
+                        "invalidating the paper's 'b_j known exactly' claim. "
+                        "Set forcer_max_forced_per_step=None to restore validity."
                     )
                     self._cap_warned = True
 
@@ -305,49 +323,50 @@ class EpsilonForcedActionController:
                 forced_mask = np.zeros(self.n_agents, dtype=bool)
                 forced_mask[keep] = True
 
-        # ---- 2. Ép hành động ngẫu nhiên đều ------------------------------
+        # ---- 2. Force uniformly random actions ---------------------------
         for j in np.flatnonzero(forced_mask):
             actions[int(j)] = int(self.rng.randint(0, self.action_dim))
 
-        # ---- 3. Tính propensity hiệu dụng --------------------------------
-        # Với agent KHÔNG bị ép:  b = pi
-        # Với agent BỊ ép:        b = eps * uniform + (1-eps) * pi
+        # ---- 3. Compute effective propensities ---------------------------
+        # For an UNFORCED agent: b = pi
+        # For a FORCED agent:   b = eps * uniform + (1-eps) * pi
         #
-        # Lưu ý tinh tế: ta dùng công thức mixture cho agent bị ép chứ không
-        # phải uniform thuần. Lý do: từ góc nhìn của estimator, quá trình sinh
-        # dữ liệu là "với xác suất eps thì uniform, ngược lại thì pi" — đó là
-        # marginal distribution của hành động, và đó mới là propensity đúng
-        # để chia trong importance weighting.
+        # Subtle point: use the mixture formula for a forced agent, not the
+        # pure uniform distribution. From the estimator's perspective, the
+        # data-generating process is "uniform with probability eps, otherwise
+        # pi." Its marginal action distribution is the correct propensity for
+        # importance weighting.
         uniform = np.full(
             (self.n_agents, self.action_dim),
             1.0 / float(self.action_dim),
             dtype=np.float32,
         )  # [n_agents, action_dim]
 
-        # Mỗi agent có eps riêng -> propensity riêng. Ghi lại đúng eps đã
-        # dùng, nếu không DR sẽ chia sai và mất tính không chệch.
+        # Each agent has its own eps and hence its own propensity. Record the
+        # eps actually used; otherwise DR divides by the wrong quantity and
+        # loses unbiasedness.
         e = eps_vec.reshape(-1, 1).astype(np.float32)   # [n_agents, 1]
 
         effective_probs = (
             e * uniform + (1.0 - e) * probs
         ).astype(np.float32)  # [n_agents, action_dim]
 
-        # Chuẩn hoá lại phòng sai số dấu phẩy động.
+        # Renormalize to guard against floating-point error.
         row_sum = np.sum(effective_probs, axis=1, keepdims=True)  # [n_agents, 1]
         effective_probs = effective_probs / np.clip(row_sum, 1e-8, None)
 
-        # ---- 4. Thống kê --------------------------------------------------
+        # ---- 4. Statistics ------------------------------------------------
         self.total_steps += self.n_agents
         self.total_forced += int(np.sum(forced_mask))
 
         return forced_mask, effective_probs
 
     # ------------------------------------------------------------------
-    # Báo cáo
+    # Reporting
     # ------------------------------------------------------------------
 
     def get_stats(self) -> Dict[str, float]:
-        """Số liệu để đưa vào bảng trong paper."""
+        """Return statistics for inclusion in the paper's result tables."""
         rate = (
             float(self.total_forced) / float(self.total_steps)
             if self.total_steps > 0
@@ -371,25 +390,26 @@ class EpsilonForcedActionController:
 
 class OracleInterventionSampler:
     """
-    Wrapper quanh clone/restore của env để lấy w_ij NHÂN QUẢ THẬT.
+    Wrap environment clone/restore operations to obtain truly causal w_ij.
 
-    Env đã có sẵn:
+    The environment already provides:
         clone_state(), restore_state(state),
         rollout_from_current_state(forced={j: action}, horizon, discount)
 
-    Dùng cho hai việc:
-      (1) Exp3 tiny-oracle calibration — so proxy với ground truth.
-      (2) Sinh một lượng nhỏ mẫu can thiệp CHUẨN XÁC để anchor proxy
-          (khác eps-forcing ở chỗ: cái này giữ nguyên trạng thái, đổi đúng
-          1 hành động, so sánh trực tiếp — tức tầng 3 counterfactual thật).
+    This supports two uses:
+      (1) Exp3 tiny-oracle calibration, comparing the proxy with ground truth.
+      (2) Generating a small number of EXACT intervention samples to anchor
+          the proxy. Unlike epsilon forcing, this procedure holds the state
+          fixed, changes exactly one action, and compares the outcomes
+          directly: a genuine level-3 counterfactual.
 
-    CẢNH BÁO ĐỘ KHỚP ESTIMAND (lỗi trong bản v1):
-        Bản v1 để proxy tính  mean_a |f(a) - f(a_obs)|   (LUÔN >= 0)
-        còn oracle tính        mean_a  (R(a) - R_base)    (CÓ DẤU)
-        Hai đại lượng này KHÔNG THỂ khớp nhau. Một neighbour có ảnh hưởng
-        đối xứng (giúp ở action này, hại ở action kia) cho oracle ~ 0 nhưng
-        proxy ~ lớn. Đó là lý do Exp3 không bao giờ ra kết quả tốt.
-        Class này expose CẢ HAI dạng để so đúng cặp với nhau.
+    ESTIMAND-ALIGNMENT WARNING (a version-1 defect):
+        Version 1 computes  mean_a |f(a) - f(a_obs)|  in the proxy (ALWAYS >= 0)
+        but computes         mean_a  (R(a) - R_base)   in the oracle (SIGNED).
+        These quantities CANNOT agree. A neighbour with symmetric influence,
+        helping under one action and harming under another, yields oracle ~ 0
+        but a large proxy value. This is why Exp3 could never produce a good
+        result. This class exposes BOTH forms so like estimands can be compared.
     """
 
     def __init__(
@@ -411,12 +431,14 @@ class OracleInterventionSampler:
         candidate_actions: Optional[List[int]] = None,
     ) -> float:
         """
-        w_ij CÓ DẤU (khớp với 'signed_oracle_matched' của proxy v2).
+        Return signed w_ij, aligned with proxy v2's `signed_oracle_matched`.
 
             w = mean_a [ R_i(do(a_j = a)) ] - R_i(baseline)
 
-        w > 0: ép j làm khác đi thì i TỐT hơn  -> j hiện đang cản i
-        w < 0: ép j làm khác đi thì i TỆ hơn   -> j hiện đang giúp i
+        w > 0: forcing j to act differently makes i BETTER off, so j is
+               currently obstructing i.
+        w < 0: forcing j to act differently makes i WORSE off, so j is
+               currently helping i.
 
         Returns:
             float
@@ -443,14 +465,14 @@ class OracleInterventionSampler:
         candidate_actions: List[int],
     ) -> float:
         """
-        Impact kiểu Pieroth (ICML 2024), Definition 5.1:
+        Pieroth-style impact (ICML 2024), Definition 5.1:
 
             U^{j->i} = max_a R_i(do(a_j=a)) - min_a R_i(do(a_j=a))
 
-        Luôn >= 0. Đây là BASELINE ĐỐI CHỨNG quan trọng: nếu signature CÓ DẤU
-        của ta phân loại vai trò tốt hơn đại lượng range KHÔNG DẤU này, đó là
-        bằng chứng trực tiếp cho novelty (Pieroth chủ động tránh counterfactual
-        và không có dấu).
+        This quantity is always >= 0. It is an important CONTROL BASELINE: if
+        the signed signature classifies roles better than this unsigned range,
+        that is direct evidence for novelty because Pieroth deliberately
+        avoids counterfactuals and does not retain a sign.
 
         Returns:
             float >= 0
@@ -487,16 +509,16 @@ class OracleInterventionSampler:
         candidate_actions: List[int],
     ) -> Dict[str, float]:
         """
-        Trả về ground-truth profile đầy đủ cho một cặp — dùng làm nhãn
-        chuẩn khi đánh giá influence signature.
+        Return the complete ground-truth profile for one pair, used as the
+        reference label when evaluating an influence signature.
 
         Returns:
-            dict với các khoá:
-                signed   : mean_a R(a) - R_base            (có dấu)
+            Dictionary with the following keys:
+                signed   : mean_a R(a) - R_base            (signed)
                 range    : max_a R(a) - min_a R(a)         (Pieroth-style, >=0)
-                best     : max_a R(a) - R_base             (j có thể giúp i tối đa bao nhiêu)
-                worst    : min_a R(a) - R_base             (j có thể hại i tối đa bao nhiêu)
-                spread   : std_a R(a)                      (độ phân tán theo hành động)
+                best     : max_a R(a) - R_base             (maximum help j can provide i)
+                worst    : min_a R(a) - R_base             (maximum harm j can cause i)
+                spread   : std_a R(a)                      (dispersion across actions)
         """
         saved = self.env.clone_state()
 

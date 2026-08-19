@@ -149,8 +149,8 @@ def default_cfg():
         "slow_ratio": 0.15,
         "accel_factor": 4.0,
         "accel_duration": 8,
-        # require_both/inflation_t_reset: xem TwoTimescaleScheduler, default
-        # gốc trong training/scheduler.py là False/1.
+        # See TwoTimescaleScheduler for require_both/inflation_t_reset. The
+        # original defaults in training/scheduler.py are False and 1.
         "require_both": False,
         "inflation_t_reset": 1,
 
@@ -163,14 +163,15 @@ def default_cfg():
         "min_core_size": 2,
         "max_core_size": 4,
         "sigma_floor": 0.08,
-        # ---- belief_layer v2, default = giá trị khuyến nghị gốc ----
+        # belief_layer v2: retain the original recommended defaults.
         "belief_core_rule": "lcb",
         "belief_kappa": 1.0,
         "belief_alpha_decay": 0.7,
-        # [P-6 FINAL DEBUG] Bật Eq (17) — adaptive core budget theo entropy.
-        # False = capacity allocation là hằng số => claim RQ3 (paper còn yêu
-        # cầu báo cáo "fraction of updates at which k_i binds at k_max")
-        # không thể kiểm chứng. Code đã có sẵn trong belief_layer.py:322-360.
+        # [P-6 FINAL DEBUG] Enable Equation 17: an entropy-adaptive core budget.
+        # False makes capacity allocation constant, leaving the RQ3 claim
+        # untestable. The paper also requires reporting the "fraction of updates
+        # at which k_i binds at k_max." The implementation already exists in
+        # belief_layer.py:322–360.
         "belief_adaptive_k": True,
         "belief_adaptive_k_min": 1,
         "belief_signed_balance": 0.5,
@@ -179,63 +180,67 @@ def default_cfg():
         "periph_beta_floor": 0.05,
         "periph_uniform_mix": 0.4,
         "periph_use_uniform_mix": True,
-        # [FIX-8b] HOÀN NGUYÊN 0.05 -> 1.2. Lập luận ở FIX-8 ("khôi phục độ
-        # mạnh hiệu dụng cũ") SAI: độ mạnh hiệu dụng cũ (1.2/24 = 0.05) chính
-        # là chế độ mà entropy ĐANG SỤP (0.15 trong log đầu tiên). Đo thật:
-        #     λ=1.2, aux đủ 24 ego  -> usage_entropy_ratio = 0.7758
-        #     λ=0.05, aux đủ 24 ego -> usage_entropy_ratio = 0.1430  (sụp)
-        # Reward cũng KHÔNG phải do aux: λ=0.05 cho reward ep50 = -0.897, tệ
-        # hơn cả λ=1.2 (-0.711) => nguyên nhân reward nằm ở policy learner,
-        # không phải L_aux. Việc còn lại của FIX-8 (tách aux khỏi cột
-        # policy_loss trong log) GIỮ NGUYÊN vì nó đúng độc lập.
+        # [FIX-8b] REVERT 0.05 -> 1.2. FIX-8's argument about "restoring the
+        # old effective strength" was WRONG: the old effective strength,
+        # 1.2/24 = 0.05, is precisely the regime in which entropy WAS
+        # COLLAPSING to 0.15 in the first log. Direct measurements:
+        #     lambda=1.2, full auxiliary loss over 24 egos -> usage_entropy_ratio = 0.7758
+        #     lambda=0.05, full auxiliary loss over 24 egos -> usage_entropy_ratio = 0.1430 (collapse)
+        # Reward was NOT caused by the auxiliary loss either: lambda=0.05 gave
+        # episode-50 reward -0.897, worse than lambda=1.2 at -0.711. The reward
+        # problem therefore lies in the policy learner, not L_aux. The remaining
+        # FIX-8 change—separating auxiliary loss from the policy_loss log
+        # column—is RETAINED because it is independently correct.
         "periph_lb_coeff": 1.2,
-        # [FIX-2] phơi orth_coeff ra cfg để ablation No-AuxLoss tắt được CẢ
-        # hai thành phần của L_aux (Eq 27), không chỉ load-balancing.
+        # [FIX-2] Expose orth_coeff through configuration so the No-AuxLoss
+        # ablation disables BOTH Equation 27 components, not only load balancing.
         "periph_orth_coeff": 1e-2,
         "belief_priority_mu_floor": 0.01,
         "shadow_loss_weight": 0.25,
         "graph_score_steps": 8,
 
-        # ---- structural_proxy v2, default = giá trị gốc trong
-        # structural_proxy.py ----
+        # structural_proxy v2 defaults match structural_proxy.py.
         "proxy_n_horizons": 3,
         "proxy_effect_mode": "signed_aristocrat",
         "proxy_use_doubly_robust": True,
         "proxy_iw_clip": 10.0,
         "proxy_bootstrap_ratio": 0.8,
         "proxy_use_belief_input": False,
-        # [FIX-X1] số chiều x_ij trong Eq (8). 5 = mặc định
-        # (drow, dcol, dist, same_zone, zone_diff). Đặt 0 để tái hiện cấu
-        # hình cũ (f_theta mù danh tính neighbour) làm ablation cho H1.
+        # [FIX-X1] x_ij dimensionality in Equation 8. The default five features
+        # are drow, dcol, distance, same_zone, and zone_diff. Set this to zero
+        # to reproduce the old configuration, where f_theta is blind to
+        # neighbour identity, for the H1 ablation.
         "proxy_pair_feat_dim": 5,
         "proxy_ensemble_dropout": 0.0,
         "seed": 0,
 
-        # ---- final_runner.py: sig_tracker / forcer / heads / drift /
-        # matdet / recip, default = giá trị gốc đang hard-code trong
-        # runner (xem models/{influence_signature,intervention,
-        # ego_conditioned_latent,drift_probe,reciprocity}.py) ----
+        # final_runner.py sig_tracker/forcer/heads/drift/matdet/recip defaults
+        # match the runner's original hard-coded values. See
+        # models/{influence_signature,intervention,ego_conditioned_latent,
+        # drift_probe,reciprocity}.py.
         "sig_tracker_window": 30,
 
-        # [EPS-ANNEAL] 0.03 -> 0.05: A1 cho thấy CHỈ eps=0.05 tách được khỏi
-        # nhiễu (Spearman +0.074, 8/8 seed, sống sót Bonferroni).
+        # [EPS-ANNEAL] 0.03 -> 0.05. A1 showed that ONLY eps=0.05 separated
+        # from noise: Spearman +0.074, positive for 8/8 seeds, and surviving
+        # Bonferroni correction.
         "eps": 0.05,
-        # [FIX-P1] 2 -> None. Cap làm xác suất ép THỰC TẾ (eps_eff ~ 0.0282)
-        # lệch khỏi eps ghi vào propensity (0.03) ~6% => DR mất tính không
-        # chệch và claim "b_j known exactly" sai. Với eps=0.03, n=24 thì
-        # E[#forced] = 0.72/bước nên cap gần như không bao giờ chạm — bỏ đi
-        # không mất gì. Xem cảnh báo trong intervention.py.
+        # [FIX-P1] 2 -> None. The cap makes the ACTUAL forcing probability
+        # eps_eff ~ 0.0282 differ by ~6% from the 0.03 recorded in propensity.
+        # DR then loses unbiasedness and the "b_j known exactly" claim becomes
+        # false. With eps=0.03 and n=24, E[#forced] = 0.72 per step, so the cap
+        # is almost never reached and removing it costs essentially nothing.
+        # See the detailed warning in intervention.py.
         "forcer_max_forced_per_step": None,
-        # [EPS-ANNEAL] 0.01 -> 0.05 (tức KHÔNG anneal).
-        # Bằng chứng: min_head_frac suy giảm ĐƠN ĐIỆU theo episode
+        # [EPS-ANNEAL] 0.01 -> 0.05, meaning NO annealing.
+        # Evidence: min_head_frac decreased MONOTONICALLY by episode:
         #     ep14: 0.099   ep28: 0.05   ep42: 0.026   ep56: 0.014
-        # đúng nhịp eps bị anneal 0.03 -> 0.01 trong 60 episode. forced_frac
-        # tụt theo (0.13 -> 0.02), và vì chặn dưới của min_head_frac là
-        # forced_frac/|A|, head của action hiếm lại đói dữ liệu về cuối run —
-        # tức chính giai đoạn ta cần ước lượng tốt nhất.
-        # eps-forcing là NGUỒN NHẬN DIỆN DUY NHẤT; anneal nó xuống là tự cắt
-        # nguồn. Chi phí (nhiễu hành vi) đã được paper cam kết "đo và báo cáo"
-        # chứ không phải giảm thiểu.
+        # exactly tracking eps annealing from 0.03 to 0.01 over 60 episodes.
+        # forced_frac fell with it from 0.13 to 0.02. Because min_head_frac is
+        # lower-bounded by forced_frac/|A|, rare-action heads were starved of
+        # data late in the run, exactly when the best estimate was needed.
+        # Epsilon forcing is the ONLY IDENTIFICATION SOURCE; annealing it away
+        # removes that source. The paper commits to measuring and reporting its
+        # behavioural-noise cost, not to minimizing that cost.
         "forcer_anneal_to": 0.05,
         "forcer_anneal_episodes": 60,
 
@@ -291,29 +296,31 @@ def smoke_cfg():
 
 MAIN_ENV_CLASS_NAMES = [
     # ==================================================================
-    # [ENV-RESOLVE] BUG NGHIÊM TRỌNG NHẤT ĐÃ PHÁT HIỆN — đọc kỹ.
+    # [ENV-RESOLVE] THE MOST SERIOUS DEFECT FOUND IN THE PROJECT.
     #
-    # Bảng này TRƯỚC ĐÂY để AdaptiveResourceFlowArena đứng đầu, nên
-    # make_main_env() luôn dựng envs/adaptive_resource_flow_arena_v3.py,
-    # KHÔNG PHẢI OmniArena. Hệ quả:
+    # This list PREVIOUSLY placed AdaptiveResourceFlowArena first, so
+    # make_main_env() always constructed envs/adaptive_resource_flow_arena_v3.py,
+    # NOT OmniArena. Consequences:
     #
-    #   * run_step_1 / run_step_0 / run_h2 / run_h3 — mọi thứ đi qua
-    #     make_main_env — chạy trên arena_v3.
-    #   * env_audit.py / env_audit_staged.py import OmniArena TRỰC TIẾP nên
-    #     đo OmniArena. => audit và training NÓI VỀ HAI MÔI TRƯỜNG KHÁC NHAU
-    #     suốt toàn bộ dự án. Đó là lý do env_audit xanh mà reward không nhúc
-    #     nhích, và là lý do mọi chẩn đoán chéo giữa hai bên đều mâu thuẫn.
-    #   * TOÀN BỘ C1/C2/C3 (Frenet (s,d), Phi liên tục SGTP, zone asymmetry,
-    #     relay gate, Phi đo lại) nằm trong omni_arena.py => CHƯA TỪNG ảnh
-    #     hưởng một dòng training nào.
+    #   * run_step_1, run_step_0, run_h2, and run_h3 all pass through
+    #     make_main_env and therefore ran on arena_v3.
+    #   * env_audit.py and env_audit_staged.py import OmniArena DIRECTLY and
+    #     therefore measured OmniArena. Audit and training consequently
+    #     REFERRED TO TWO DIFFERENT ENVIRONMENTS throughout the project. This
+    #     explains why env_audit passed while reward did not improve and why
+    #     cross-diagnostics between them contradicted each other.
+    #   * ALL C1/C2/C3 work—Frenet (s,d), continuous SGTP Phi, zone asymmetry,
+    #     relay gate, and remeasured Phi—lived in omni_arena.py and therefore
+    #     NEVER affected a single training step.
     #
-    # BẰNG CHỨNG KHÔNG THỂ CHỐI: arena_v3.get_action_dim() trả về 13, còn
-    # OmniArena.N_ACTIONS = 6. Log [VERIFY-F1] in ra hist_action_forced có
-    # ĐÚNG 13 phần tử. Và min_head_frac quan sát 0.001-0.005 khớp chính xác
-    # chặn dưới forced_frac/13 ~ 0.006 — KHÔNG phải lỗi nhãn action như đã
-    # nghi, chỉ là |A| thật là 13 chứ không phải 6.
+    # CONCLUSIVE EVIDENCE: arena_v3.get_action_dim() returns 13, whereas
+    # OmniArena.N_ACTIONS = 6. The [VERIFY-F1] log printed hist_action_forced
+    # with EXACTLY 13 entries. Observed min_head_frac of 0.001–0.005 also
+    # matches the forced_frac/13 ~ 0.006 lower bound exactly. This was NOT the
+    # suspected action-label defect; the real |A| was 13 rather than 6.
     #
-    # OmniArena đã được xác nhận có đủ 7 method trong MAIN_REQUIRED_METHODS.
+    # OmniArena has been verified to implement all seven methods in
+    # MAIN_REQUIRED_METHODS.
     # ==================================================================
     "OmniArena",
     "AdaptiveResourceFlowArena",
@@ -335,7 +342,7 @@ TINY_ENV_CLASS_NAMES = [
 ]
 
 MAIN_ENV_MODULE_CANDIDATES = [
-    "envs.omni_arena",          # [ENV-RESOLVE] xem ghi chú ở MAIN_ENV_CLASS_NAMES
+    "envs.omni_arena",          # [ENV-RESOLVE] See MAIN_ENV_CLASS_NAMES.
     "envs.adaptive_resource_flow_arena_v3",
     "envs.adaptive_resource_flow_arena",
     "envs.resource_flow_arena",
@@ -653,18 +660,20 @@ def make_main_env(task_mode, n_agents, max_steps, phase_length, seed):
     EnvCls = _resolve_main_env_class()
 
     # ------------------------------------------------------------------
-    # [EXP5-ZONES] n_zones PHẢI scale theo N.
-    # omni_arena chỉ ràng buộc `assert n_agents >= 5 * n_zones` và n_zones là
-    # tham số constructor mặc định 4 — không có công thức nào suy n_zones từ
-    # n_agents. Hệ quả: sweep Experiment 5 với N in {8..96} luôn chạy trên
-    # ĐÚNG 4 zone, N=96 => 24 agent/zone trong đó chỉ 5 có vai trò còn 19 là
-    # ROLE_DRIFTER. Tức Exp5 đang đo "thêm drifter", KHÔNG phải "thêm cấu
-    # trúc" — patch phá-đối-xứng-zone không cứu được lỗi này.
-    # Giữ ~6 agent/zone: N=24 -> 4 zone, N=96 -> 16 zone. Vì zone_param_rng
-    # dùng cùng seed nên 4 zone đầu của N=96 TRÙNG draw với 4 zone của N=24
-    # => đọc được N=96 là "N=24 cộng 12 zone mới", không phải một hệ khác hẳn.
-    # grid_size cũng phải nở theo sqrt(n_zones), nếu không cell_h co lại và
-    # assert path_len trong _init_zone_layout sẽ bắn.
+    # [EXP5-ZONES] n_zones MUST scale with N.
+    # omni_arena only enforces `assert n_agents >= 5 * n_zones`, and n_zones
+    # defaults to the constructor constant 4; no formula derives it from
+    # n_agents. Consequently, the Experiment 5 sweep over N in {8..96} always
+    # ran with EXACTLY four zones. At N=96 this gives 24 agents per zone, of
+    # which only five have functional roles and the other 19 are ROLE_DRIFTER.
+    # Exp5 was therefore measuring "more drifters," NOT "more structure";
+    # the zone-symmetry-breaking patch cannot repair this design error.
+    # Preserve approximately six agents per zone: N=24 -> 4 zones and
+    # N=96 -> 16 zones. Because zone_param_rng uses the same seed, the first
+    # four zones at N=96 reproduce the four draws at N=24. N=96 can therefore
+    # be read as "N=24 plus 12 new zones," not a completely different system.
+    # grid_size must also grow with sqrt(n_zones), or cell_h contracts and the
+    # path_len assertion in _init_zone_layout fires.
     # ------------------------------------------------------------------
     n_zones = max(1, int(n_agents) // 6)
     grid_size = max(24, int(np.ceil(12 * np.sqrt(max(1, n_zones)))))
@@ -686,8 +695,8 @@ def make_main_env(task_mode, n_agents, max_steps, phase_length, seed):
         "resample_hidden_rules_each_reset": False,
     }
 
-    # [ENV-RESOLVE] In thẳng lớp env đang dùng. Bug ở trên tồn tại được lâu
-    # vì KHÔNG CÓ DÒNG NÀO nói mình đang chạy env gì.
+    # [ENV-RESOLVE] Print the concrete environment class. The defect above
+    # persisted because NO LOG LINE identified which environment was running.
     print(f"[ENV-RESOLVE] main env = {EnvCls.__module__}.{EnvCls.__name__} "
           f"(n_agents={n_agents}, n_zones={n_zones}, grid={grid_size})")
 
@@ -776,11 +785,11 @@ def make_runner(model_name, env, cfg, device):
         "NoMultiMemory": "NoMultiMemory",
         "NoTwoTimescale": "NoTwoTimescale",
 
-        # [FIX-O3] OracleCoreRunner/RandomCoreRunner ĐÃ tồn tại trong
-        # baseline_runner.py từ lâu nhưng KHÔNG có trong bảng alias này ->
-        # make_runner() không bao giờ dựng được chúng, nên run_step_0.py phải
-        # mượn FullExplicitLocal làm "thế thân" và gate Experiment 0 chưa từng
-        # được đo đúng. Đăng ký lại.
+        # [FIX-O3] OracleCoreRunner and RandomCoreRunner had long existed in
+        # baseline_runner.py but were ABSENT from this alias table. make_runner()
+        # could never construct them, so run_step_0.py used FullExplicitLocal as
+        # a substitute and the Experiment 0 gate had never been measured
+        # correctly. Register the actual runners here.
         "OracleCore": "OracleCore",
         "oracle_core": "OracleCore",
         "RandomCore": "RandomCore",
@@ -1392,7 +1401,7 @@ def _train_tiny_runner_for_proxy(tiny_env, tiny_cfg, args, device):
         if len(trajectory) > 0:
             last = trajectory[-1]
 
-            # Compute H-step returns for this trajectory so we can pass
+            # Compute H-step returns for this trajectory to provide
             # observed_returns into score_batch for possible DR correction.
             try:
                 h_returns = runner.replay_builder.build_h_step_returns(trajectory, runner.n_agents)
@@ -1517,9 +1526,10 @@ def _score_learned_proxy_for_state(runner, tiny_env, state, ego, neighbor_ids):
             z_core_excl_j_batch=[z_excluding[j] for j in neighbor_ids],
             m_periph_excl_j_batch=[m_excluding[j] for j in neighbor_ids],
             belief_summary_batch=[belief_summary for _ in neighbor_ids],
-            # [FIX-X1] Đường H1 calibration cũng PHẢI truyền x_ij, nếu không
-            # proxy raise (pair_feat_dim>0). Đây chính là đường đo Spearman
-            # vs oracle -- thiếu x_ij ở đây là thiếu ở đúng chỗ quan trọng nhất.
+            # [FIX-X1] The H1 calibration path MUST also provide x_ij; otherwise
+            # the proxy raises when pair_feat_dim > 0. This is the exact path
+            # that measures Spearman correlation against the oracle, so omitting
+            # x_ij here removes it at the most important measurement site.
             pair_feat_batch=[
                 build_pair_feat(
                     tiny_env.positions, tiny_env.agent_zone,

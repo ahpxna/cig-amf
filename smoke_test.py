@@ -1,13 +1,14 @@
 """
-smoke_test.py — Chạy cái này ĐẦU TIÊN sau khi tải về.
+smoke_test.py — run this first after obtaining the repository.
 
     python smoke_test.py
 
-Kiểm tra từng cơ chế đã vá có hoạt động không, TRƯỚC khi cắm vào runner
-thật. Phần numpy chạy được ngay; phần torch tự bỏ qua nếu chưa cài.
+Verify every corrected mechanism before connecting it to the production
+runner. NumPy checks run immediately; Torch checks skip themselves if Torch is
+not installed.
 
-Mỗi test in ra PASS/FAIL kèm con số, để bạn thấy cơ chế làm gì chứ không
-chỉ thấy "ok".
+Every test prints PASS/FAIL with measured values, exposing the mechanism's
+behaviour rather than only returning "ok".
 """
 
 import sys
@@ -66,8 +67,8 @@ try:
     r = np.random.RandomState(0)
 
     for t in range(40):
-        tr.update(0, 1, +0.5 + r.randn() * 0.05, 0.1, 0.2, context_key=t % 3)
-        tr.update(0, 2, 0.5 * (1 if t % 2 else -1), 0.1, 1.0, context_key=t % 3)
+        tr.update(0, 1, +0.5 + r.randn() * 0.05, 0.1, context_key=t % 3)
+        tr.update(0, 2, 0.5 * (1 if t % 2 else -1), 0.1, context_key=t % 3)
 
     s1, s2 = tr.get_signature(0, 1), tr.get_signature(0, 2)
     print(f"       nhất quán  : signed={s1[0]:+.3f} abs={s1[1]:.3f} tstd={s1[3]:.3f}")
@@ -143,10 +144,10 @@ try:
 
     b_yes = copy.deepcopy(b)
 
-    # ---- T4 [GPU_OPTIMIZATION_CONTRACT.md mục 1.3] ----
-    # Reset Pi phải nằm SAU khi đã đọc debiased_mu/sigma. Nếu ai đó vector
-    # hoá và lỡ reset trước, debiased_mu trả điểm neo CŨ thay vì ước lượng
-    # hiện tại -> bơm phồng biến thành xoá trắng thay vì hạ độ tin cậy.
+    # T4 [GPU_OPTIMIZATION_CONTRACT.md section 1.3]. Reset Pi only after
+    # reading debiased_mu/sigma. Resetting first during vectorization makes
+    # debiased_mu return the old anchor instead of the current estimate, so
+    # inflation erases the estimate rather than lowering confidence.
     mu_before_1 = b_yes.debiased_mu(1)
     sig_before_1 = b_yes.debiased_sigma(1)
 
@@ -283,23 +284,21 @@ try:
         observed_returns_batch=rr.randn(8),
         behaviour_probs_obs_batch=np.full(8, 0.3),
     )
-    for k in ("mu", "sigma", "mu_per_h", "latency", "mu_range"):
+    for k in ("mu", "sigma", "mu_per_h", "mu_range"):
         print(f"       {k:<10} shape={np.shape(out[k])}")
 
     check("mu có dấu (không phải luôn ≥0)", bool(np.any(out["mu"] < 0)))
     check("mu_per_h shape [B,H]", out["mu_per_h"].shape == (8, H))
-    check("latency trong [0,H-1]",
-          bool(out["latency"].min() >= -1e-6 and out["latency"].max() <= H - 1 + 1e-6))
+    check("proxy output không còn latency (signature 5D)", "latency" not in out)
     check("mu_range luôn ≥ 0", bool(np.all(out["mu_range"] >= -1e-6)))
 
     dis = px.get_diagnostics()["ensemble_disagreement"]
     check("ensemble THẬT SỰ bất đồng", dis > 1e-6,
           f"disagreement={dis:.5f} (v1 = 0.000)")
 
-    # ---- T1 [BB4]: vmap khớp bản tham chiếu (vòng lặp Python) ----
-    # Cùng MỘT input cho cả hai đường -> chênh lệch chỉ có thể đến từ lỗi
-    # layout (repeat_interleave/repeat/view bị đảo), không phải từ dữ liệu
-    # khác nhau.
+    # T1 [BB4]: vmap must match the Python-loop reference. Both paths receive
+    # the same input, so any difference must come from a layout error such as
+    # inverted repeat_interleave/repeat/view order, not different data.
     t1_obs = rr.randn(6, OD); t1_ai = rr.randint(0, A, 6)
     t1_z = rr.randn(6, CD); t1_m = rr.randn(6, PD); t1_b = rr.randn(6, BD)
     fast = px._predict_all_actions(t1_obs, t1_ai, t1_z, t1_m, t1_b)
@@ -308,10 +307,10 @@ try:
           bool(torch.allclose(fast, ref, atol=1e-5)),
           f"max diff={float((fast - ref).abs().max()):.2e}")
 
-    # ---- T3 [BB3]: thang gradient member-0 không đổi theo n_ensemble ----
-    # Cùng seed -> member 0 của E=1 và E=4 dùng CHUNG bootstrap mask (mask
-    # chỉ phụ thuộc seed*7919+k, không phụ thuộc n_ensemble) -> cùng dữ
-    # liệu train nếu buffer được nạp giống hệt nhau.
+    # T3 [BB3]: member 0's gradient scale must not depend on n_ensemble. With
+    # the same seed, member 0 at E=1 and E=4 uses the same bootstrap mask
+    # because it depends on seed*7919+k rather than n_ensemble. Identically
+    # populated buffers therefore provide identical training data.
     def _make_and_train(n_ens):
         p = LocalCounterfactualProxyEnsemble(
             obs_dim=OD, action_dim=A, core_dim=CD, periph_dim=PD, belief_dim=BD,

@@ -1,23 +1,19 @@
-"""
-[C5 — spec phần C5] Figure mạnh nhất hiện có, theo mẫu SGTP Fig. 4:
-W*_ij(t) CÓ DẤU theo thời gian trong MỘT episode.
+"""[C5 — spec part C5] Strongest figure available, following SGTP Fig. 4 model:
+W*_ij(t) HAS SIGN according to time within ONE episode.
 
-  - một đường mỗi cặp; declared vẽ ĐẬM, control vẽ NHẠT
-  - annotate giai đoạn (phase của behavioural drift / mốc structural shift)
-  - kèm panel dưới: số cặp đang close-coupling (C4) theo thời gian
+  - one line per pair; declared lines are bold, control lines are light
+  - annotate phase (phase of behavioural drift / structural shift milestones)
+  - include a lower panel: number of pairs in close-coupling (C4) over time
 
-Hình này trả lời ba câu trong một cái nhìn:
-  1. control có tách khỏi 0 không            -> T5 / std|W*|(control)
-  2. ảnh hưởng có bật/tắt theo state không   -> T3 / T6
-  3. ảnh hưởng liên tục hay chỉ ở đuôi hiếm  -> câu hỏi Tier-0 vs Tier-1
+This figure answers three questions in one view:
+  1. does control separate from 0?            -> T5 / std|W*|(control)
+  2. does influence turn on/off with state?   -> T3 / T6
+  3. is influence continuous or only at rare tail? -> Tier-0 vs Tier-1 question
 
-Chạy TRƯỚC và SAU C1-C3 rồi để cạnh nhau: bản "trước" ra vài đường phẳng lì
-ở 0 cộng hai đường bậc thang — đó chính là bằng chứng trực quan cho toàn bộ
-chẩn đoán RC-1..RC-5.
+Run BEFORE and AFTER C1-C3 and place side by side: the "before" version produces flat lines at 0 plus two staircase lines — that is the intuitive evidence for the entire RC-1..RC-5 diagnosis.
 
-  python scripts/plot_w_star_timeline.py                    # sau (SGTP phi)
-  python scripts/plot_w_star_timeline.py --no-sgtp --tag before
-"""
+  python scripts/plot_w_star_timeline.py                    # after (SGTP phi)
+  python scripts/plot_w_star_timeline.py --no-sgtp --tag before"""
 import argparse
 import os
 import sys
@@ -51,7 +47,7 @@ def collect(env, horizon, n_steps, max_declared, max_control, seed):
     csd, phases = [], []
 
     for t in range(n_steps):
-        # Guard B: oracle rollout không được cắt ngang ranh giới episode.
+        # Guard B: oracle rollout must not be cut across episode boundary.
         if env.t + horizon > env.max_steps:
             break
         for (i, j, _kind) in pairs:
@@ -108,7 +104,7 @@ def main():
         f"  (đậm = declared, nhạt = control)")
     ax.legend(fontsize=7, ncol=2, loc="upper right")
 
-    # annotate ranh giới phase (behavioural drift) — mẫu SGTP Fig. 4
+    # annotate phase boundary (behavioural drift) — following SGTP Fig. 4 model
     for t in range(1, len(phases)):
         if phases[t] != phases[t - 1]:
             ax.axvline(t, color="tab:red", lw=1.0, ls=":")
@@ -127,7 +123,7 @@ def main():
     fig.savefig(out, dpi=160)
     print(f"[C5] saved {out}")
 
-    # số liệu đi kèm hình — để khỏi phải "đọc bằng mắt"
+    # data accompanying the figure — to avoid having to "read by eye"
     dec = np.array([v for (i, j, k) in pairs if k == "declared"
                     for v in series[(i, j)]], dtype=float)
     ctl = np.array([v for (i, j, k) in pairs if k == "control"

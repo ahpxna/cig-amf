@@ -1,29 +1,26 @@
-"""
-Tầng 0 — Hối tiếc Oracle. Không huấn luyện.
-Đo trần lý thuyết của giá trị cấu trúc: biết chính xác core đang làm gì
-thì tốt hơn bao nhiêu so với chỉ biết thống kê trung bình.
+"""Tier 0 oracle regret without training.
 
-Sửa (xem báo cáo triển khai của người dùng, Task #11/#12/#14):
-- oracle_structure_regret() giờ so sánh CHUỖI hành động k-bước (k_seq, mặc
-  định k=2) của ego, không phải chỉ một hành động đơn -- để oracle có thể
-  phát hiện được các chiến lược thật sự (vd. "đợi 1 bước rồi mới tiến" vs
-  "tiến ngay") mà một phép hối tiếc một-bước không thể thấy.
-- _rollout_custom() (hỏng -- NameError trên `seq`/`ego` không tồn tại, sai
-  thứ tự tham số, trả về scalar nhưng bị subscript như dict) được thay bằng
-  _rollout_seq(), dùng ĐÚNG API thật của OmniArena/TinyOracleDIG:
-  env.clone_state()/restore_state(), env.scripted_policy(i), env.step(acts)
-  -- không có method env.forced_step()/env.rollout_seq() nào tồn tại trong
-  omni_arena.py, nên ta tự dựng acts[] mỗi bước rồi gọi step() trực tiếp,
-  đúng khuôn mẫu oracle_w_star_sustained() trong env_audit.py. Tái sử dụng
-  hạ tầng CRN (set_noise_buffer/_make_crn_buffer/clear_noise_buffer, P0d)
-  để so sánh các nhánh (36 chuỗi x q_full/q_blind) trên cùng một luồng
-  nhiễu, giảm phương sai không liên quan tới can thiệp.
-- q_range (max-min) làm mẫu số chuẩn hoá bị nhiễu bởi hành động/chuỗi TỆ
-  NHẤT (không bao giờ được chọn) -- tăng một penalty bất kỳ có thể kéo
-  min_a Q xuống, làm q_range phình to giả tạo, khiến normalised_regret bị
-  pha loãng dù cấu trúc không hề trở nên "đáng biết hơn". Giữ q_range/
-  normalised_regret cho khả năng so sánh ngược, nhưng bổ sung std(Q) +
-  norm_by_std làm chỉ số chính, cùng các thống kê "| đã đổi hành động".
+This experiment measures the theoretical value ceiling of structural
+information: the benefit of knowing exactly what the core does versus knowing
+only aggregate behavior.
+
+Corrections from Tasks #11, #12, and #14:
+
+- ``oracle_structure_regret`` compares k-step ego action sequences, with
+  k_seq=2 by default, instead of one action. It can therefore detect strategies
+  such as waiting one step before moving versus moving immediately.
+- The broken ``_rollout_custom`` raised NameError for nonexistent seq/ego,
+  ordered parameters incorrectly, and returned a scalar later indexed as a
+  dictionary. ``_rollout_seq`` uses the real OmniArena/TinyOracleDIG API:
+  clone/restore state, scripted_policy, and step. Neither ``forced_step`` nor
+  ``rollout_seq`` exists on OmniArena, so actions are built explicitly as in
+  ``oracle_w_star_sustained``. CRN infrastructure compares 36 sequences across
+  q_full/q_blind on the same noise stream, reducing irrelevant variance.
+- q_range normalization is contaminated by the worst never-selected sequence.
+  Increasing any penalty can lower min Q, inflate q_range, and dilute normalized
+  regret without making structure more valuable. q_range remains for backward
+  comparison; std(Q)-based ``norm_by_std`` and changed-action statistics are
+  primary.
 """
 
 import itertools
@@ -37,21 +34,17 @@ def _rollout_seq(
     env, ego_id, seq, forced_others, horizon, discount, n_trials, rng,
     crn_seed=None,
 ):
-    """
-    Rollout ego-scalar: ego bị ép theo `seq` (list/tuple độ dài k) trong k
-    bước ĐẦU của horizon, sau đó ego quay lại scripted_policy() cho phần
-    còn lại. `forced_others`: dict {agent_id: action} bị ép SUỐT horizon
-    (dùng để mô phỏng "core bị thay bằng hành động hàng xóm trung bình" cho
-    q_blind; {} rỗng cho q_full). Mọi agent khác luôn dùng
-    env.scripted_policy(i) -- không có method forced_step()/rollout_seq()
-    nào tồn tại trên OmniArena, nên acts[] được dựng thủ công mỗi bước rồi
-    gọi env.step(acts) trực tiếp, giống hệt khuôn mẫu
-    oracle_w_star_sustained() trong env_audit.py.
+    """Roll out an ego action sequence and return its scalar return.
 
-    Trả về: float — discounted return CỦA RIÊNG ego, trung bình qua
-    n_trials, dùng chung một buffer CRN (P0d) giữa các trial để giảm
-    phương sai không liên quan tới can thiệp khi so sánh nhiều chuỗi/nhiều
-    nhánh (q_full vs q_blind) với nhau.
+    Force the ego to follow the length-k ``seq`` during the first k horizon
+    steps, then return to scripted_policy. ``forced_others`` maps agents to
+    actions forced throughout the horizon; q_blind uses it to replace the core
+    with average-neighbor behavior, while q_full passes an empty mapping. Other
+    agents always use scripted_policy. Actions are built explicitly because
+    OmniArena has no forced_step/rollout_seq API.
+
+    Return the ego-only discounted return averaged over n_trials. P0d CRN is
+    shared across trials and branches to reduce intervention-unrelated variance.
     """
     saved = env.clone_state()
     k = len(seq)
@@ -74,7 +67,12 @@ def _rollout_seq(
             for j, a in forced_others.items():
                 acts[j] = int(a)
 
-            _, rew, done, _ = env.step(acts)
+            # Exp0 consumes scalar reward only. Avoid constructing observations
+            # and info, especially w_by_pair, millions of times. These flags
+            # affect return values only, preserving dynamics and the estimand.
+            _, rew, done, _ = env.step(
+                acts, return_obs=False, return_info=False
+            )
             total += g * float(rew[ego_id])
             g *= discount
             if done:
@@ -102,7 +100,7 @@ def _marginal_action_dist(env, n_samples=200, rng=None):
             acts = [int(rng.randint(A)) for _ in range(env.n_agents)]
             for act in acts:
                 counts[act] += 1.0
-        env.step(acts)
+        env.step(acts, return_obs=False, return_info=False)
     env.restore_state(saved)
 
     return counts / max(1.0, counts.sum())
@@ -111,49 +109,48 @@ def _marginal_action_dist(env, n_samples=200, rng=None):
 def oracle_structure_regret(
     env, ego_id, k_core=3, horizon=8, discount=0.95,
     n_trials=3, n_mf_samples=8, rng=None, k_seq=2,
+    precomputed_core_ids=None, marginal_action_dist=None,
 ):
     rng = rng or np.random.RandomState(0)
     A = env.get_action_dim()
     N = env.n_agents
     saved = env.clone_state()
 
-    # ---- 1. Core thật: top-k theo |W*| ----
-    # LƯU Ý: intervention_action PHẢI là một hành động thật (env.STAY), KHÔNG
-    # phải None -- compute_oracle_influence_from_current_state() coi
-    # candidate_actions=None mặc định là range(N_ACTIONS), rồi CHỈ append
-    # intervention_action nếu nó "not in candidate_actions"; None không nằm
-    # trong [0..5] nên sẽ bị append THẲNG vào candidate_actions, biến thành
-    # một "hành động" giả (forced_action=None) được rollout thật sự và trộn
-    # vào per_action/signed/range/best/worst -- không crash, nhưng làm bẩn
-    # hồ sơ ảnh hưởng một cách âm thầm. Dùng env.STAY (đã có trong
-    # range(N_ACTIONS)) để candidate_actions không bị thêm phần tử rác.
-    infl = {}
-    for j in range(N):
-        if j == ego_id:
-            continue
-        try:
-            profile = env.compute_oracle_influence_from_current_state(
-                ego_id=ego_id, agent_j=j, intervention_action=env.STAY,
-                horizon=horizon, n_trials=n_trials,
-            )
-            infl[j] = abs(float(profile["signed"]))
-        except Exception:
-            infl[j] = 0.0
-        env.restore_state(saved)
+    # ---- 1. True core: top-k by |W*|. ----
+    # intervention_action MUST be a real action such as env.STAY, not None.
+    # With candidate_actions=None, the oracle starts from range(N_ACTIONS) and
+    # appends an intervention absent from that range. None would become a fake
+    # forced action and silently contaminate per_action/signed/range/best/worst.
+    # env.STAY is already valid and adds no spurious candidate.
+    if precomputed_core_ids is None:
+        infl = {}
+        for j in range(N):
+            if j == ego_id:
+                continue
+            try:
+                profile = env.compute_oracle_influence_from_current_state(
+                    ego_id=ego_id, agent_j=j, intervention_action=env.STAY,
+                    horizon=horizon, n_trials=n_trials,
+                )
+                infl[j] = abs(float(profile["signed"]))
+            except Exception:
+                infl[j] = 0.0
+            env.restore_state(saved)
 
-    core_ids = sorted(infl, key=infl.get, reverse=True)[:int(k_core)]
+        core_ids = sorted(infl, key=infl.get, reverse=True)[:int(k_core)]
+    else:
+        core_ids = list(precomputed_core_ids)
 
-    # ---- 2. Liệt kê toàn bộ chuỗi k_seq-bước trên A hành động ----
-    # k_seq=2, A=6 -> 36 chuỗi (khớp Task #11: k=2, |A|=6).
+    # ---- 2. Enumerate all k_seq-step sequences over A actions. ----
+    # k_seq=2 and A=6 produce 36 sequences, matching Task #11.
     sequences = list(itertools.product(range(A), repeat=int(k_seq)))
     n_seq = len(sequences)
 
-    # Một crn_seed CHUNG cho toàn bộ lệnh gọi này (mọi chuỗi, cả q_full lẫn
-    # q_blind) -- để 36 chuỗi được so sánh trên đúng cùng một luồng nhiễu
-    # resource_respawn, không phải 36 luồng ngẫu nhiên độc lập.
+    # Share one CRN seed across all sequences and q_full/q_blind so all 36
+    # candidates see the same resource-respawn noise stream.
     crn_seed = int(rng.randint(1, 2 ** 31 - 1))
 
-    # ---- 3. Q_full(seq): biết rõ mọi thứ (không thay thế core) ----
+    # ---- 3. Q_full(seq): full information without core replacement. ----
     q_full = np.zeros(n_seq, dtype=np.float64)
     for si, seq in enumerate(sequences):
         env.restore_state(saved)
@@ -162,8 +159,12 @@ def oracle_structure_regret(
             discount=discount, n_trials=n_trials, rng=rng, crn_seed=crn_seed,
         )
 
-    # ---- 4. Q_blind(seq): core bị thay bằng "hàng xóm trung bình" ----
-    marg = _marginal_action_dist(env, rng=rng)
+    # ---- 4. Q_blind(seq): replace the core with average-neighbor actions. ----
+    marg = (
+        np.asarray(marginal_action_dist, dtype=np.float64)
+        if marginal_action_dist is not None
+        else _marginal_action_dist(env, rng=rng)
+    )
     q_blind = np.zeros(n_seq, dtype=np.float64)
 
     for si, seq in enumerate(sequences):
@@ -182,11 +183,10 @@ def oracle_structure_regret(
 
     a_full = int(np.argmax(q_full))
     a_blind = int(np.argmax(q_blind))
-    # Hối tiếc = giá trị THẬT (q_full) của lựa chọn tối ưu thật, trừ giá trị
-    # THẬT (vẫn q_full, không phải q_blind) của lựa chọn mà agent "mù cấu
-    # trúc" sẽ chọn -- đây là chi phí cơ hội thật của việc không biết core,
-    # đánh giá dưới đúng động lực thật (q_full), không phải dưới ước lượng
-    # mean-field của chính nó.
+    # Regret is the true q_full value of the true optimum minus the true q_full
+    # value of the sequence selected under structural blindness. This is the
+    # actual opportunity cost of missing core information under real dynamics,
+    # not under the blind model's own mean-field estimate.
     regret = float(q_full[a_full] - q_full[a_blind])
 
     q_std = float(np.std(q_full))
@@ -206,6 +206,45 @@ def oracle_structure_regret(
     }
 
 
+def _precompute_core_ids_all_egos(env, k_core, horizon, n_trials=3):
+    """Compute the identical signed oracle for all egos while reusing rollouts.
+
+    The legacy API repeated each (ego,j) call even though every rollout already
+    returned all ego rewards. The all-egos API retains that vector, scans
+    j-by-action, and averages actions to produce identical signed scores without
+    repeating each trajectory 24 times.
+    """
+    A, N = env.get_action_dim(), env.n_agents
+    influence = {ego: {} for ego in range(N)}
+    snapshot = env.clone_state()
+
+    for j in range(N):
+        per_action = []
+        for action in range(A):
+            try:
+                delta = env.compute_oracle_influence_all_egos_from_current_state(
+                    agent_j=j,
+                    intervention_action=action,
+                    horizon=horizon,
+                    n_trials=n_trials,
+                )
+            except Exception:
+                delta = np.zeros(N, dtype=np.float64)
+            per_action.append(np.asarray(delta, dtype=np.float64))
+            env.restore_state(snapshot)
+
+        signed = np.mean(np.stack(per_action, axis=0), axis=0)
+        for ego in range(N):
+            if ego != j:
+                influence[ego][j] = abs(float(signed[ego]))
+
+    env.restore_state(snapshot)
+    return {
+        ego: sorted(scores, key=scores.get, reverse=True)[:int(k_core)]
+        for ego, scores in influence.items()
+    }
+
+
 def run_tier0(
     env, n_states=30, steps_between=8, k_core=3, horizon=8, egos=None,
     seed=0, k_seq=2,
@@ -217,17 +256,45 @@ def run_tier0(
     env.reset()
 
     for s in range(int(n_states)):
-        # Tránh lỗi vượt quá episode boundary (P2<->P4 trap)
+        # Avoid crossing the episode boundary in the P2<->P4 trap.
         if env.t + horizon + steps_between >= env.max_steps:
             env.reset()
 
         for _ in range(int(steps_between)):
-            env.step([int(env.scripted_policy(i)) for i in range(env.n_agents)])
+            env.step(
+                [int(env.scripted_policy(i)) for i in range(env.n_agents)],
+                return_obs=False, return_info=False,
+            )
 
-        for ego in egos:
+        # Both quantities depend on current state but not ego. Cache once per
+        # state to preserve the estimand and remove thousands of duplicate
+        # rollouts from full Exp0.
+        state_snapshot = env.clone_state()
+        core_ids_by_ego = _precompute_core_ids_all_egos(
+            env, k_core=k_core, horizon=horizon, n_trials=3
+        )
+        env.restore_state(state_snapshot)
+        marginal = _marginal_action_dist(env, rng=rng)
+        env.restore_state(state_snapshot)
+
+        print(
+            f"[Exp0] state {s + 1}/{int(n_states)}: core cache ready; "
+            f"evaluating {len(egos)} egos",
+            flush=True,
+        )
+
+        for ego_idx, ego in enumerate(egos):
             rows.append(oracle_structure_regret(
                 env, ego, k_core=k_core, horizon=horizon, rng=rng, k_seq=k_seq,
+                precomputed_core_ids=core_ids_by_ego[int(ego)],
+                marginal_action_dist=marginal,
             ))
+            if (ego_idx + 1) % 4 == 0 or ego_idx + 1 == len(egos):
+                print(
+                    f"[Exp0] state {s + 1}/{int(n_states)}: "
+                    f"ego {ego_idx + 1}/{len(egos)} complete",
+                    flush=True,
+                )
 
     regrets = np.array([r["regret"] for r in rows])
     ranges = np.array([r["q_range"] for r in rows])
@@ -258,8 +325,8 @@ def run_tier0(
         "median_regret": float(np.median(regrets)),
         "p90_regret": float(np.percentile(regrets, 90)),
         "p95_regret": p95_regret,
-        "normalised_regret": norm,               # q_range-based (bị nhiễu, xem docstring module)
-        "norm_by_std": norm_by_std,               # std(Q)-based, chỉ số chuẩn hoá CHÍNH
+        "normalised_regret": norm,               # q_range based; contaminated as documented above.
+        "norm_by_std": norm_by_std,               # std(Q) based; primary normalization.
         "frac_action_changed": float(changed.mean()),
         "regret_given_changed": regret_given_changed,
         "norm_given_changed_by_std": norm_given_changed_by_std,

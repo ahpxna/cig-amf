@@ -1,11 +1,13 @@
 """
-test_p2_p4_guards.py — kiểm chứng hai guard chống bẫy P2<->P4 (xem báo cáo
-triển khai staged-audit): structural shift chỉ được trigger tại ranh giới
-episode, và oracle rollout không được bắt đầu quá muộn để cửa sổ H bước
-chạm ranh giới đó. Cả hai PHẢI raise AssertionError khi bị vi phạm, không
-được âm thầm chạy qua.
+test_p2_p4_guards.py — verify two guards against the P2<->P4 traps documented
+in the staged-audit report.
 
-Chạy: python3 test_p2_p4_guards.py
+A structural shift may trigger only at an episode boundary, and an oracle
+rollout may not begin so late that its H-step window reaches that boundary.
+Both guards MUST raise AssertionError when violated rather than silently
+continuing.
+
+Run: python3 test_p2_p4_guards.py
 """
 from omni_arena import OmniArena
 from tiny_oracle_dig import TinyOracleDIG

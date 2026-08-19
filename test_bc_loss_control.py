@@ -1,33 +1,30 @@
-"""
-test_bc_loss_control.py — Control experiment cho BUG B (xem
-docs/CIG-AMF_training_debug_master.md mục 3.4).
+"""Control experiment for BUG B (debug master, Section 3.4).
 
-|A| = 6 -> cross-entropy của một predictor đoán uniform là ln(6) = 1.7918.
-Log thật cho thấy bc_loss đứng ở ~2.29-2.39, CAO HƠN sàn uniform -- tức là
-predictor đang TỰ TIN DỰ ĐOÁN SAI, dấu hiệu kinh điển của lỗi căn chỉnh
-nhãn (off-by-one thời gian, lệch chỉ số neighbour, ...), không phải lỗi
-dung lượng mô hình.
+For |A|=6, a uniform predictor has cross-entropy ln(6)=1.7918. Recorded logs
+placed bc_loss around 2.29-2.39, ABOVE that floor. This indicates confidently
+wrong predictions, a classic sign of label alignment errors such as temporal
+off-by-one or neighbor-index mismatch, rather than insufficient model capacity.
 
-Hai test quyết định:
+Two decisive tests are defined:
 
-  T1 (scripted policy XÁC ĐỊNH): mỗi agent lặp một hành động cố định
-     a_j^t = (t + j) % A, nên a_j^{t+1} = (a_j^t + 1) % A -- một hàm
-     TẤT ĐỊNH và TẦM THƯỜNG của chính input a_j^t đã có sẵn trong x_full.
-     Nếu pipeline căn chỉnh đúng, bc_loss PHẢI hội tụ về ~0.
-     Nếu nó đứng ở ~1.79 -> model không nhìn thấy input hữu ích.
-     Nếu nó đứng ở ~2.3 (đúng như log thật) -> XÁC NHẬN nhãn bị lệch.
+T1, deterministic scripted policy: every agent repeats
+``a_j^t=(t+j)%A``, so ``a_j^{t+1}=(a_j^t+1)%A`` is a deterministic, trivial
+function of ``a_j^t`` already present in x_full. A correctly aligned pipeline
+must drive bc_loss toward zero. A value near 1.79 means the model cannot use the
+input; a value near the recorded 2.3 confirms label misalignment.
 
-  T2 (label shuffle): xáo trộn target_action ngẫu nhiên trong bc_buffer
-     trước khi train. Nhãn lúc này độc lập hoàn toàn với input, nên
-     bc_loss phải hội tụ về ĐÚNG ln(6) = 1.7918 (không hơn, không kém).
-     Nếu nó lại lệch khỏi 1.79 (đặc biệt nếu > 1.79) thì bản thân pipeline
-     nhãn/batching đã hỏng, độc lập với việc nhãn có ý nghĩa hay không.
+T2, shuffled labels: target_action is randomly permuted in bc_buffer before
+training. The target is independent of the input, so the original test expected
+ln(6). [P-5] later established that reported bc_loss includes a 0.25-weighted
+shadow loss, making the correct floor ``(1+0.25)*ln(6)=2.2397``. The earlier
+2.2336 result matches that floor within 6e-3, showing that the pipeline was not
+broken; the test's expected constant was wrong.
 
-Gate (mục 3.5 trong doc): T1 phải < 0.3. T2 phải xấp xỉ 1.79 (+-0.1).
+Gate: T1 < 0.3. T2 within 0.15 of ``(1+0.25)*ln(6)``.
 
-Chạy: python3 test_bc_loss_control.py
-Cần torch thật (không chạy được trong sandbox không có CUDA runtime nếu
-bản torch cài là bản cuda-only -- cần torch CPU hoặc máy có CUDA thật).
+Run: ``python3 test_bc_loss_control.py``. A real PyTorch installation is
+required: either CPU PyTorch or a host with the runtime required by a CUDA-only
+build.
 """
 import random
 
@@ -39,18 +36,17 @@ from models.core_behavior import PairRelationalModule
 
 
 def _deterministic_actions(env, t):
-    """a_j^t = (t + j) % A -- tất định, không phụ thuộc rng."""
+    """Return deterministic ``a_j^t=(t+j)%A`` actions independent of RNG."""
     A = env.get_action_dim()
     return [int((t + j) % A) for j in range(env.n_agents)]
 
 
 def collect_bc_buffer(env, pair_rel, n_steps, action_fn, seed=0):
-    """
-    Chạy đúng loại timing snapshot mà final_runner.py::collect_episode()
-    dùng (xem docstring ở đó): obs_all/actions_list là context tại t,
-    step_population() phải thấy geometry tại t (không phải t+1), và
-    add_bc_transition() phải ghép context tại t với h_prev = z_ij^{t-1}
-    và target = a_j^{t+1}.
+    """Reproduce the snapshot timing used by ``collect_episode()``.
+
+    ``obs_all`` and ``actions_list`` are context at t. ``step_population()``
+    must observe geometry at t, not t+1, while ``add_bc_transition()`` pairs
+    context at t with ``h_prev=z_ij^{t-1}`` and target ``a_j^{t+1}``.
     """
     obs_all = env.reset()
 
@@ -198,11 +194,11 @@ def test_t2_label_shuffle():
             print(f"  epoch {epoch:3d}  bc_loss = {loss:.4f}")
 
     ln6 = float(np.log(6))
-    # [P-5 FINAL DEBUG] bc_loss báo cáo GỘP shadow loss (shadow_loss_weight=0.25
-    # ở khởi tạo module phía trên). Sàn đúng khi shuffle nhãn do đó là
-    # (1 + 0.25) * ln6 = 2.2397, KHÔNG phải ln6 = 1.7918. Lần chạy trước đo
-    # được 2.2336 — khớp sàn đúng tới 6e-3: pipeline chưa bao giờ hỏng, chỉ
-    # hằng số kỳ vọng của test sai.
+    # [P-5 FINAL DEBUG] Reported bc_loss includes the shadow loss with
+    # shadow_loss_weight=0.25. The shuffled-label floor is therefore
+    # (1+0.25)*ln6=2.2397, not ln6=1.7918. The previous 2.2336 measurement
+    # matches the correct floor within 6e-3: the pipeline was never broken;
+    # the expected test constant was wrong.
     floor = (1.0 + 0.25) * ln6
     print(f"\n  bc_loss cuối cùng = {loss:.4f}  (sàn đúng (1+0.25)·ln6 = {floor:.4f})")
 

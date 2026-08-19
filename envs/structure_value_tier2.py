@@ -2,28 +2,28 @@ import sys
 import os
 import numpy as np
 
-# --- 1. XỬ LÝ ĐƯỜNG DẪN ---
-# Lấy thư mục hiện tại (envs)
+# --- 1. PATH SETUP ---
+# Resolve the current directory (envs).
 current_dir = os.path.dirname(os.path.abspath(__file__))
-# Lùi lại 1 cấp để ra thư mục gốc (cig_amf)
+# Move one level up to the repository root (cig_amf).
 root_dir = os.path.abspath(os.path.join(current_dir, '..'))
 
-# Thêm thư mục gốc vào tầm nhìn của Python
+# Make root-level modules importable.
 if root_dir not in sys.path:
     sys.path.append(root_dir)
 
-# --- 2. IMPORT CÁC MODULE TỪ ROOT ---
+# --- 2. IMPORT ROOT-LEVEL MODULES ---
 from models.diagnostics import bootstrap_ci, compare_two_methods
 from runners.baseline_runner import PureMeanFieldRunner, OracleCoreRunner, RandomCoreRunner
 from runners.final_runner import FinalCIGAMFRunner
 
-# Môi trường nằm cùng thư mục envs
+# The environment module is colocated under envs.
 try:
     from omni_arena import OmniArena
 except ModuleNotFoundError:
     from envs.omni_arena import OmniArena
 
-# --- 3. HÀM KẾT NỐI (TRAIN & EVAL) ---
+# --- 3. TRAIN/EVALUATION ADAPTER ---
 def train_and_eval(config, seed, n_episodes, hidden, lr, batch_size, k_core):
     print(f"\n>>> ĐANG CHẠY CẤU HÌNH: {config} | SEED: {seed} <<<")
     
@@ -45,7 +45,7 @@ def train_and_eval(config, seed, n_episodes, hidden, lr, batch_size, k_core):
         "periph_dim": 32,     
         "belief_dim": 32,
         
-        # Các thông số bắt buộc của FinalCIGAMFRunner
+        # Required FinalCIGAMFRunner parameters.
         "n_ensemble": 4,
         "proxy_lr": 1e-3,
         "core_lr": 5e-4,
@@ -86,9 +86,9 @@ def train_and_eval(config, seed, n_episodes, hidden, lr, batch_size, k_core):
     return {"final_window_reward": final_reward}
 
 
-# --- 4. KỊCH BẢN CHẠY CHÍNH ---
+# --- 4. MAIN EXPERIMENT DRIVER ---
 if __name__ == "__main__":
-    # Đang set nhỏ để chạy test thử, sau khi thành công bạn đổi thành N_EP = 100, SEEDS = list(range(8))
+    # Full experiment setting: 100 episodes across eight deterministic seeds.
     N_EP = 100
     CONFIGS = ["random_core", "pure_mf", "cig_amf", "oracle_core"]
     SEEDS = list(range(8))

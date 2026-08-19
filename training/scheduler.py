@@ -1,13 +1,13 @@
-"""
-scheduler_v2.py — Điều phối hai timescale + phát hiện shift + bơm phồng.
+"""Two-timescale scheduling, shift detection, and uncertainty inflation.
 
-Khác bản v1 ở ba chỗ:
-  1. Nhận tín hiệu từ HAI cò súng độc lập (probe đóng băng + ma trận ảnh
-     hưởng) thay vì một residual tự nhiễm bẩn.
-  2. Khi bắn, không chỉ tăng tốc cập nhật mà còn BƠM PHỒNG BẤT ĐỊNH của
-     belief -> core tự co lại -> hệ thận trọng khi chưa hiểu tình hình mới.
-  3. Có thời gian trơ (refractory) để không bắn liên hồi trong lúc hệ đang
-     thích nghi -- nếu không, mỗi lần core đổi lại kích hoạt một lần bắn nữa.
+Version 2 differs from version 1 in three ways:
+  1. It consumes TWO independent triggers (a frozen probe and an influence
+     matrix) instead of one self-contaminating residual.
+  2. A trigger both accelerates updates and INFLATES belief uncertainty. The
+     core then contracts, keeping the system conservative while the new regime
+     remains poorly understood.
+  3. A refractory interval prevents repeated triggers during adaptation;
+     otherwise every core change could trigger the scheduler again.
 """
 
 from typing import Dict, List, Optional
@@ -16,20 +16,21 @@ import numpy as np
 
 
 class TwoTimescaleScheduler:
-    """
-    Giữ nguyên API v1 (`step_episode`, `should_update_graph`, `in_warmup`,
-    `get_status`) nên runner cũ gọi được. Thêm `evaluate_drift`.
+    """Preserve the v1 API while adding ``evaluate_drift``.
+
+    Existing runners can continue to call ``step_episode``,
+    ``should_update_graph``, ``in_warmup``, and ``get_status``.
 
     Args:
-        k0_warmup: số episode Stage 0.
-        alpha_slow_ratio: 0.05 -> cập nhật cấu trúc mỗi ~20 episode.
-        accel_factor / accel_duration: mức và thời lượng tăng tốc.
-        z_threshold: ngưỡng z-score để coi là có shift. 2.5-3.0 hợp lý
-            (z=3 nghĩa là "lệch 3 độ lệch chuẩn so với gần đây").
-        require_both: True = phải CẢ HAI cò súng đồng ý mới bắn (ít báo
-            động giả, phát hiện chậm hơn). False = một cái là đủ.
-        refractory: số episode trơ sau mỗi lần bắn.
-        inflation_factor: hệ số nhân sigma khi bắn.
+        k0_warmup: Number of Stage 0 episodes.
+        alpha_slow_ratio: 0.05 schedules a structure update about every 20 episodes.
+        accel_factor / accel_duration: Magnitude and duration of acceleration.
+        z_threshold: Shift threshold. Values from 2.5 to 3.0 are reasonable;
+            z=3 means three standard deviations from recent behavior.
+        require_both: Require both triggers for fewer false alarms but slower
+            detection. If False, either trigger is sufficient.
+        refractory: Number of refractory episodes after each trigger.
+        inflation_factor: Multiplicative sigma inflation at a trigger.
     """
 
     def __init__(
@@ -69,9 +70,9 @@ class TwoTimescaleScheduler:
         self.last_trigger_episode = None
         self.trigger_log: List[Dict] = []
 
-        # Lịch sử residual thô, chỉ dùng cho wrapper tương thích ngược
-        # `record_structural_residual()` (API v1). Tách riêng khỏi mọi
-        # thứ dùng cho `evaluate_drift()` để không lẫn hai cơ chế.
+        # Raw residual history is used only by the backward-compatible v1
+        # ``record_structural_residual()`` wrapper. Keep it separate from the
+        # state used by ``evaluate_drift()`` so the mechanisms cannot mix.
         self._residual_history: List[float] = []
         self._residual_window = 20
 
@@ -86,7 +87,7 @@ class TwoTimescaleScheduler:
         return self.stage == 1
 
     def force_learned_stage(self):
-        """Dùng cho ablation NoTwoTimescale."""
+        """Force Stage 1 for the NoTwoTimescale ablation."""
         self.stage = 1
         self.alpha_slow = self.alpha_slow_base
         self.accel_remaining = 0
@@ -112,11 +113,10 @@ class TwoTimescaleScheduler:
         return max(1, int(round(1.0 / r)))
 
     def should_update_graph(self) -> bool:
-        """
-        True nếu tới lượt train proxy + cập nhật belief/core.
+        """Return whether proxy training and belief/core updates are due.
 
-        KHÔNG dùng hàm này để quyết định có thu thập replay hay không —
-        replay phải thu thập MỌI episode, kể cả Stage 0.
+        This method MUST NOT gate replay collection. Replay is collected on
+        EVERY episode, including Stage 0.
         """
         if self.stage == 0:
             return False
@@ -128,7 +128,7 @@ class TwoTimescaleScheduler:
         return (self.episode % freq) == 0
 
     # ------------------------------------------------------------------
-    # Phát hiện shift
+    # Shift detection
     # ------------------------------------------------------------------
 
     def _in_refractory(self) -> bool:
@@ -144,17 +144,16 @@ class TwoTimescaleScheduler:
         belief_modules: Optional[Dict] = None,
         drift_detector=None,
     ) -> Dict:
-        """
-        Gọi một lần mỗi episode sau khi đã đo hai cò súng.
+        """Evaluate the two triggers once per episode after measurement.
 
         Args:
-            probe_z: z-score từ DriftDetector.residual_z_score()
-            matrix_z: z-score từ MatrixDriftDetector.z_score()
-            belief_modules: {ego_id: BayesLightBeliefState} để bơm phồng.
-            drift_detector: để hẹn lịch chụp ảnh lại sau khi thích nghi.
+            probe_z: Z-score from ``DriftDetector.residual_z_score()``.
+            matrix_z: Z-score from ``MatrixDriftDetector.z_score()``.
+            belief_modules: ``{ego_id: BayesLightBeliefState}`` to inflate.
+            drift_detector: Detector notified to resnapshot after adaptation.
 
         Returns:
-            dict trạng thái, có khoá "fired".
+            Status dictionary containing the ``fired`` key.
         """
         out = {
             "episode": int(self.episode),
@@ -185,15 +184,15 @@ class TwoTimescaleScheduler:
             out["reason"] = "below_threshold"
             return out
 
-        # ---- BẮN --------------------------------------------------------
+        # ---- TRIGGER ----------------------------------------------------
         self.trigger_count += 1
         self.last_trigger_episode = self.episode
 
-        # (a) tăng tốc cập nhật cấu trúc
+        # (a) Accelerate structure updates.
         self.alpha_slow = self.alpha_slow_base * self.accel_factor
         self.accel_remaining = self.accel_duration
 
-        # (b) bơm phồng bất định -> core tự co lại -> thận trọng
+        # (b) Inflate uncertainty so the core contracts conservatively.
         n_inflated = 0
 
         if belief_modules is not None:
@@ -205,7 +204,7 @@ class TwoTimescaleScheduler:
                     )
                     n_inflated += int(st["n_pairs_inflated"])
 
-        # (c) hẹn lịch chụp ảnh lại cho probe, nếu không nó báo động mãi
+        # (c) Schedule a new probe snapshot; otherwise the alarm persists.
         if drift_detector is not None and hasattr(drift_detector, "notify_trigger"):
             drift_detector.notify_trigger(self.episode)
 
@@ -223,12 +222,15 @@ class TwoTimescaleScheduler:
         return out
 
     # ------------------------------------------------------------------
-    # Tương thích ngược API v1
+    # Backward compatibility with the v1 API
     # ------------------------------------------------------------------
 
     def _residual_z_score(self, residual: float) -> float:
-        """Quy residual thô về z-score dựa trên cửa sổ gần đây (tự quản,
-        tách biệt khỏi DriftDetector/MatrixDriftDetector)."""
+        """Convert a raw residual to a recent-window z-score.
+
+        This history is self-managed and separate from
+        DriftDetector/MatrixDriftDetector.
+        """
         self._residual_history.append(float(residual))
 
         if len(self._residual_history) > 500:
@@ -253,18 +255,17 @@ class TwoTimescaleScheduler:
         return float((h[-1] - mu) / sd)
 
     def record_structural_residual(self, residual: float) -> bool:
-        """
-        Wrapper tương thích ngược cho runner cũ (`final_runner.py`,
-        `baseline_runner.py`) vốn gọi API v1 với MỘT residual thô thay vì
-        hai z-score độc lập của `evaluate_drift()`.
+        """Backward-compatible wrapper for runners that use the v1 API.
 
-        Tự tính z-score nội bộ từ residual rồi coi đó là cò súng "probe";
-        không có cò súng "matrix" (matrix_z=0.0). Nếu runner có sẵn
-        DriftDetector/MatrixDriftDetector thật, nên gọi thẳng
-        `evaluate_drift()` thay vì hàm này.
+        ``final_runner.py`` and ``baseline_runner.py`` historically supplied
+        one raw residual rather than the two independent z-scores consumed by
+        ``evaluate_drift()``. This wrapper derives an internal z-score and
+        treats it as the probe trigger with ``matrix_z=0.0``. Runners with real
+        DriftDetector and MatrixDriftDetector instances should call
+        ``evaluate_drift()`` directly.
 
         Returns:
-            True nếu trigger bắn (tương đương `triggered` ở API v1).
+            True when the trigger fires, equivalent to v1 ``triggered``.
         """
         z = self._residual_z_score(residual)
         out = self.evaluate_drift(probe_z=z, matrix_z=0.0)
@@ -285,5 +286,4 @@ class TwoTimescaleScheduler:
             "in_refractory": bool(self._in_refractory()),
             "z_threshold": float(self.z_threshold),
         }
-
 

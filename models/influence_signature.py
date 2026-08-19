@@ -1,69 +1,74 @@
 """
-influence_signature.py — CHỮ KÝ ẢNH HƯỞNG NHÂN QUẢ. Đây là novelty chính.
+influence_signature.py — CAUSAL INFLUENCE SIGNATURES, the central novelty.
 
 =============================================================================
-Ý TƯỞNG MỘT CÂU
+ONE-SENTENCE IDEA
 =============================================================================
-Đừng nén ảnh hưởng của một neighbour thành MỘT con số. Giữ nó thành một
-HỒ SƠ NHIỀU CHIỀU, rồi dùng hồ sơ đó để gán vai trò chức năng ego-centric.
-
-=============================================================================
-VÌ SAO MỘT CON SỐ LÀ KHÔNG ĐỦ
-=============================================================================
-Hai neighbour có thể có cùng |w| trung bình nhưng khác nhau hoàn toàn:
-
-  Xe A — "blocker" (kẻ chặn):
-      dấu: ÂM mạnh | điều kiện: chỉ khi ego tiến vào lane | trễ: TỨC THÌ
-      -> w = -0.8 khi ego cách lane 2 ô, w ~ 0 khi ego ở zone khác
-
-  Xe B — "relay/signaller" (kẻ truyền tin):
-      dấu: DƯƠNG | điều kiện: rộng | trễ: 3-5 bước
-      -> tín hiệu hôm nay giúp ego né kẹt vài bước sau
-
-  Xe C — "consumer" (tranh tài nguyên):
-      dấu: âm NHẸ | đều đều mọi ngữ cảnh | tức thì
-
-Trung bình |w| của A và C có thể bằng nhau. Nhưng ego phải đối xử KHÁC NHAU
-với chúng. Đây chính là "heterogeneity mà một cái mean không giữ nổi":
-mean chỉ giữ trung bình, vứt hết dấu-theo-ngữ-cảnh, độ trễ, độ biến động.
+Do not compress a neighbour's influence into ONE scalar. Retain a
+MULTIDIMENSIONAL PROFILE and use it to assign ego-centric functional roles.
 
 =============================================================================
-SÁU CHIỀU CỦA SIGNATURE
+WHY ONE SCALAR IS INSUFFICIENT
 =============================================================================
-  0. signed_mu       — dấu + độ lớn của ảnh hưởng (giúp hay hại)
-  1. abs_mu          — độ lớn thuần (dùng cho magnitude/core selection)
-  2. sigma           — bất định epistemic (từ ensemble disagreement)
-  3. temporal_std    — biến động theo THỜI GIAN (hành vi j có ổn định không)
-  4. context_std     — biến động theo NGỮ CẢNH (ảnh hưởng có điều kiện không)
+Two neighbours can have the same mean |w| while being entirely different:
 
-Chiều 3 và 4 khác nhau về bản chất và đây là chỗ dễ nhầm:
-  - temporal_std cao = "hôm nay nó ảnh hưởng mạnh, mai lại yếu" -> KHÔNG ỔN ĐỊNH
-  - context_std cao  = "ở lane thì ảnh hưởng mạnh, ở zone khác thì không"
-                       -> ẢNH HƯỞNG CÓ ĐIỀU KIỆN (đây là tính chất của blocker,
-                          và là thứ SCIC/CAI gọi là situation-dependent influence)
+  Vehicle A — blocker:
+      sign: strongly NEGATIVE | condition: only when ego enters the lane
+      delay: IMMEDIATE
+      -> w = -0.8 when ego is two cells from the lane, but w ~ 0 in another zone
+
+  Vehicle B — relay/signaller:
+      sign: POSITIVE | condition: broad | delay: 3–5 steps
+      -> today's signal helps ego avoid congestion several steps later
+
+  Vehicle C — resource consumer:
+      sign: mildly negative | uniform across contexts | immediate
+
+A and C can have the same mean |w|, yet ego must treat them DIFFERENTLY. This
+is precisely the heterogeneity that a mean cannot retain: averaging discards
+context-dependent sign, delay, and variability.
 
 =============================================================================
-PHÂN ĐỊNH VỚI CÔNG TRÌNH GẦN NHẤT (viết sẵn để dán vào Related Work)
+THE FIVE SIGNATURE DIMENSIONS
+=============================================================================
+  0. signed_mu       — sign and magnitude of influence (help or harm)
+  1. abs_mu          — pure magnitude, used for magnitude/core selection
+  2. sigma           — epistemic uncertainty from ensemble disagreement
+  3. temporal_std    — variation over TIME: whether j's behaviour is stable
+  4. context_std     — variation across CONTEXTS: whether influence is conditional
+
+Dimensions 3 and 4 are fundamentally different and easy to confuse:
+  - high temporal_std = "strong influence today, weak tomorrow" -> UNSTABLE
+  - high context_std  = "strong in the lane, absent in another zone"
+                        -> CONDITIONAL INFLUENCE, a blocker property and what
+                           SCIC/CAI call situation-dependent influence
+
+=============================================================================
+DISTINCTION FROM THE CLOSEST PRIOR WORK
 =============================================================================
   ROMA/RODE/SIRD/LDSA/ACORM (role-based MARL):
-      role suy từ QUAN SÁT (quỹ đạo, hành vi, tác động lên môi trường)
-      -> tương quan; và role là TOÀN CỤC; và dùng để điều kiện hoá POLICY
-         CỦA CHÍNH AGENT ĐÓ.
-      Điểm chết của họ: hai xe cùng đứng yên — một đứa chặn đường bạn, một
-      đứa đậu vô hại — ROMA nhìn hành vi sẽ gán CÙNG role. Chữ ký counterfactual
-      tách được ngay vì nó hỏi "nếu nó làm khác thì tôi có khác không".
+      Roles are inferred from OBSERVATIONS such as trajectories, behaviour,
+      and environmental effects, so they are correlational. Roles are GLOBAL
+      and condition THAT SAME AGENT'S POLICY. Their blind spot is that two
+      stationary vehicles—one blocking ego and one parked harmlessly—look
+      behaviourally identical and receive the SAME role. A counterfactual
+      signature separates them by asking whether ego's outcome would change
+      if the neighbour acted differently.
 
-  Jaques / SCIC / MAGIC (causal influence MARL):
-      cũng dùng can thiệp, nhưng biến influence thành INTRINSIC REWARD
-      (trả lời "tôi nên LÀM gì"), không dùng để cấu trúc hoá biểu diễn.
+  Jaques / SCIC / MAGIC (causal-influence MARL):
+      These methods also use interventions, but convert influence into an
+      INTRINSIC REWARD that answers "what should I DO?" rather than using it
+      to structure a representation.
 
-  Pieroth ICML'24 (TIM/SIM):
-      đo influence structure nhưng CHỦ ĐỘNG TRÁNH counterfactual action,
-      đại lượng KHÔNG DẤU (max-min), mục đích MÔ TẢ. Họ tự nêu trong Final
-      Remarks rằng "dùng TIM/SIM để cải thiện quá trình học" là FUTURE WORK.
+  Pieroth ICML 2024 (TIM/SIM):
+      This work measures influence structure but DELIBERATELY AVOIDS
+      counterfactual actions. Its max-minus-min quantity is UNSIGNED and its
+      goal is DESCRIPTIVE. The Final Remarks explicitly identify using TIM/SIM
+      to improve learning as FUTURE WORK.
 
-  Ô trống của ta = (tín hiệu interventional CÓ DẤU, NHIỀU CHIỀU, EGO-CENTRIC)
-                 x (dùng để TỔ CHỨC BỘ NHỚ + PHÂN BỔ DUNG LƯỢNG)
+  The open cell addressed here is:
+      (SIGNED, MULTIDIMENSIONAL, EGO-CENTRIC interventional signal)
+      x (MEMORY ORGANIZATION and CAPACITY ALLOCATION).
 =============================================================================
 """
 
@@ -73,17 +78,19 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 
-# Số chiều của signature
-# [SIG-5D] 6 -> 5: bỏ latency.
-# Bằng chứng thực nghiệm buộc phải bỏ: T4 H-sweep trên H in {1,2,3,5,8} cho
-# thấy 3/4 vai trò khai báo KHÔNG đổi dấu và đều bão hoà ở H=2 => sign-flip
-# role fraction = 0.25 < ngưỡng 0.30. Bốn vai trò có CÙNG một profile độ trễ,
-# tức arena không sinh ra latency ladder tách được. Giữ chiều thứ 6 là mô tả
-# một thứ không đo được. Multi-horizon head GIỮ NGUYÊN (nó vẫn nuôi v_tim và
-# DR); chỉ thành phần signature bị rút. Xem Limitations trong paper.
+# Number of signature dimensions.
+# [SIG-5D] 6 -> 5: remove latency.
+# Experimental evidence required this removal. The T4 H-sweep over
+# H in {1,2,3,5,8} showed that 3/4 declared roles did NOT change sign and all
+# saturated at H=2, giving a sign-flip role fraction of 0.25, below the 0.30
+# threshold. All four roles had the SAME latency profile, so the arena does
+# not generate a separable latency ladder. Retaining a sixth dimension would
+# describe an unmeasurable quantity. The multi-horizon head is RETAINED because
+# it still supplies v_tim and DR; only the signature component is removed.
+# See the paper's Limitations section.
 SIGNATURE_DIM = 5
 
-# Tên chiều — dùng khi vẽ heatmap centroid cho paper
+# Dimension names used in the paper's centroid heat map.
 SIGNATURE_NAMES = (
     "signed_mu",
     "abs_mu",
@@ -92,11 +99,11 @@ SIGNATURE_NAMES = (
     "context_std",
 )
 
-# Nhãn vai trò
-ROLE_BENEFICIAL = 0   # "Thiện"    — ảnh hưởng dương, mạnh
-ROLE_HARMFUL = 1      # "Ác"       — ảnh hưởng âm, mạnh
-ROLE_NEUTRAL = 2      # "Trung tính" — quanh mức 0
-ROLE_ANOMALOUS = 3    # "Dị biệt"  — bất định cao, chưa hiểu được
+# Role labels.
+ROLE_BENEFICIAL = 0   # Strong positive influence.
+ROLE_HARMFUL = 1      # Strong negative influence.
+ROLE_NEUTRAL = 2      # Influence near zero.
+ROLE_ANOMALOUS = 3    # High uncertainty; not yet understood.
 
 ROLE_NAMES = ("beneficial", "harmful", "neutral", "anomalous")
 ROLE_NAMES_VI = ("Thiện", "Ác", "Trung tính", "Dị biệt")
@@ -106,34 +113,35 @@ N_SEMANTIC_ROLES = 4
 
 class InfluenceSignatureTracker:
     """
-    Theo dõi hồ sơ ảnh hưởng nhiều chiều cho MỌI cặp có hướng (i, j).
+    Track a multidimensional influence profile for EVERY directed pair (i, j).
 
-    Cách dùng trong runner, ngay sau khi gọi proxy.score_batch_full():
+    Runner usage immediately after calling proxy.score_batch_full():
 
         tracker.update(
             ego_id=ego,
             neighbor_id=j,
             signed_mu=out["mu"][b],
             sigma=out["sigma"][b],
-            context_key=env.agent_zone[ego],   # hoặc bất kỳ id ngữ cảnh nào
+            context_key=env.agent_zone[ego],   # or any other context identifier
         )
 
-    Rồi khi cần:
-        sig = tracker.get_signature(ego, j)          # np [6]
+    Subsequent access:
+        sig = tracker.get_signature(ego, j)          # np [5]
         role = tracker.get_role(ego, j)              # int 0..3
-        mat = tracker.get_signature_matrix(ego, ids) # np [n_ids, 6]
+        mat = tracker.get_signature_matrix(ego, ids) # np [n_ids, 5]
 
     Args:
         window:
-            số quan sát gần nhất giữ lại để tính temporal_std.
+            Number of recent observations retained for temporal_std.
         tau_role:
-            ngưỡng |signed_mu| để tách Thiện/Ác khỏi Trung tính.
+            |signed_mu| threshold separating beneficial/harmful roles from
+            the neutral role.
         sigma_hi:
-            ngưỡng sigma để gán Dị biệt. Nên đặt theo phân vị của sigma
-            quan sát được, không đặt cứng -> dùng auto_calibrate().
+            Sigma threshold for the anomalous role. It should be derived from
+            an observed sigma percentile, not hard-coded; use auto_calibrate().
         normalise:
-            nếu True, get_signature_matrix trả bản đã chuẩn hoá z-score
-            theo từng chiều (cần cho k-means, vì các chiều khác thang đo).
+            If True, get_signature_matrix returns per-dimension z-scores.
+            K-means needs this because the dimensions have different scales.
     """
 
     def __init__(
@@ -152,17 +160,17 @@ class InfluenceSignatureTracker:
         self.normalise = bool(normalise)
         self.eps = float(eps)
 
-        # history[(i,j)] = deque các quan sát signed_mu gần nhất
+        # history[(i,j)] stores a deque of recent signed_mu observations.
         self._mu_hist: Dict[Tuple[int, int], deque] = {}
         self._sigma_hist: Dict[Tuple[int, int], deque] = {}
 
-        # context_mu[(i,j)][ctx] = deque các mu quan sát trong ngữ cảnh ctx
+        # context_mu[(i,j)][ctx] stores mu observations from context ctx.
         self._context_mu: Dict[Tuple[int, int], Dict] = {}
 
         self._n_obs: Dict[Tuple[int, int], int] = {}
 
     # =====================================================================
-    # Cập nhật
+    # Updates
     # =====================================================================
 
     def update(
@@ -174,13 +182,12 @@ class InfluenceSignatureTracker:
         context_key=None,
     ):
         """
-        Ghi nhận một quan sát ảnh hưởng cho cặp (ego, neighbor).
+        Record one influence observation for the (ego, neighbour) pair.
 
         context_key:
-            định danh ngữ cảnh. Bất cứ thứ gì hashable: zone id, một hash thô
-            của vị trí tương đối, hay bin khoảng cách. Đây là thứ cho ta
-            chiều context_std — tính điều kiện theo tình huống.
-            Nếu None, chiều context_std sẽ bằng 0.
+            Any hashable context identifier: a zone ID, a coarse hash of
+            relative position, or a distance bin. This supplies context_std,
+            the situation-conditional dimension. If None, context_std is zero.
         """
         key = (int(ego_id), int(neighbor_id))
 
@@ -210,12 +217,12 @@ class InfluenceSignatureTracker:
         context_keys: Optional[List] = None,
     ):
         """
-        Tiện ích: nhận thẳng output của proxy.score_batch_full().
+        Convenience method accepting proxy.score_batch_full() output directly.
 
         Args:
-            neighbor_ids: list[int] length B — thứ tự khớp với batch của proxy
-            proxy_out:    dict từ score_batch_full, cần các khoá mu/sigma
-            context_keys: list length B hoặc None
+            neighbor_ids: list[int] of length B, ordered like the proxy batch.
+            proxy_out: Dictionary from score_batch_full; requires mu and sigma.
+            context_keys: List of length B, or None.
         """
         mu = np.asarray(proxy_out["mu"]).reshape(-1)            # [B]
         sigma = np.asarray(proxy_out["sigma"]).reshape(-1)      # [B]
@@ -235,7 +242,7 @@ class InfluenceSignatureTracker:
             )
 
     # =====================================================================
-    # Truy xuất signature
+    # Signature retrieval
     # =====================================================================
 
     def get_signature(self, ego_id: int, neighbor_id: int) -> np.ndarray:
@@ -243,11 +250,11 @@ class InfluenceSignatureTracker:
         Returns:
             np.ndarray float32 shape [5] = SIGNATURE_DIM
 
-            [0] signed_mu     trung bình có dấu
-            [1] abs_mu        |trung bình|
-            [2] sigma         bất định trung bình
-            [3] temporal_std  std của mu theo thời gian
-            [4] context_std   std của mu-trung-bình-theo-ngữ-cảnh giữa các ngữ cảnh
+            [0] signed_mu     signed mean
+            [1] abs_mu        mean absolute magnitude
+            [2] sigma         mean uncertainty
+            [3] temporal_std  standard deviation of mu over time
+            [4] context_std   standard deviation across context-specific mean mu
         """
         key = (int(ego_id), int(neighbor_id))
 
@@ -260,21 +267,21 @@ class InfluenceSignatureTracker:
         signed_mu = float(np.mean(mus))
 
         # ---------------------------------------------------------------
-        # abs_mu = mean(|mu|), KHÔNG PHẢI |mean(mu)|.
+        # abs_mu = mean(|mu|), NOT |mean(mu)|.
         #
-        # Lỗi này bị bắt trong unit test. Nếu để |mean| thì chiều này DƯ THỪA
-        # hoàn toàn với signed_mu (chỉ là trị tuyệt đối của nó) -> lãng phí
-        # một chiều của signature.
+        # A unit test caught this defect. Using |mean| makes this dimension
+        # COMPLETELY REDUNDANT with signed_mu because it is merely its absolute
+        # value, wasting one signature dimension.
         #
-        # Với mean(|·|) ta có hai kênh ĐỘC LẬP và tỷ số giữa chúng mang
-        # thông tin thật:
-        #     |signed_mu| ~ abs_mu   -> ảnh hưởng NHẤT QUÁN một chiều
-        #                               (blocker luôn cản, relay luôn giúp)
-        #     |signed_mu| << abs_mu  -> ảnh hưởng MẠNH nhưng ĐẢO CHIỀU
-        #                               (lúc giúp lúc hại — loại nguy hiểm,
-        #                                đúng đối tượng của ngăn "Dị biệt")
-        # Đây chính là trường hợp mà một con số vô hướng không thể diễn tả,
-        # và là lý do signature phải nhiều chiều.
+        # With mean(|·|), the two channels are INDEPENDENT and their ratio
+        # carries real information:
+        #     |signed_mu| ~ abs_mu  -> consistently one-directional influence
+        #                              (a blocker always blocks; a relay helps)
+        #     |signed_mu| << abs_mu -> strong but SIGN-REVERSING influence
+        #                              (sometimes helpful and sometimes harmful,
+        #                               precisely the anomalous-slot target)
+        # This is exactly the case a scalar cannot express and why the
+        # signature must be multidimensional.
         # ---------------------------------------------------------------
         abs_mu = float(np.mean(np.abs(mus)))
 
@@ -282,9 +289,10 @@ class InfluenceSignatureTracker:
         temporal_std = float(np.std(mus)) if mus.size > 1 else 0.0
 
         # ---- context_std ------------------------------------------------
-        # Lấy TRUNG BÌNH TRONG TỪNG ngữ cảnh trước, rồi tính STD GIỮA các
-        # ngữ cảnh. Làm vậy để tách "ảnh hưởng khác nhau theo tình huống"
-        # ra khỏi "ảnh hưởng nhiễu ngẫu nhiên" (cái sau đã nằm ở temporal_std).
+        # First compute a mean WITHIN EACH context, then compute the standard
+        # deviation ACROSS contexts. This separates situation-dependent
+        # influence from random influence noise, which temporal_std already
+        # captures.
         ctx_map = self._context_mu.get(key, {})
         ctx_means = [
             float(np.mean(np.asarray(v, dtype=np.float64)))
@@ -314,8 +322,9 @@ class InfluenceSignatureTracker:
         Returns:
             np.ndarray float32 shape [len(neighbor_ids), SIGNATURE_DIM]
 
-        normalise=True: z-score theo từng CỘT (chiều). Cần cho k-means vì
-        các chiều có thang khác nhau (abs_mu >= 0, signed_mu ~[-1,1]).
+        normalise=True applies a z-score to each COLUMN/dimension. K-means
+        needs this because dimensions have different scales, for example
+        abs_mu >= 0 while signed_mu is approximately in [-1, 1].
         """
         if normalise is None:
             normalise = self.normalise
@@ -327,13 +336,13 @@ class InfluenceSignatureTracker:
         if len(rows) == 0:
             return np.zeros((0, SIGNATURE_DIM), dtype=np.float32)
 
-        mat = np.stack(rows, axis=0).astype(np.float32)  # [N, 6]
+        mat = np.stack(rows, axis=0).astype(np.float32)  # [N, 5]
 
         if not normalise or mat.shape[0] < 2:
             return mat
 
-        mean = np.mean(mat, axis=0, keepdims=True)   # [1, 6]
-        std = np.std(mat, axis=0, keepdims=True)     # [1, 6]
+        mean = np.mean(mat, axis=0, keepdims=True)   # [1, 5]
+        std = np.std(mat, axis=0, keepdims=True)     # [1, 5]
 
         return ((mat - mean) / (std + self.eps)).astype(np.float32)
 
@@ -341,20 +350,21 @@ class InfluenceSignatureTracker:
         return int(self._n_obs.get((int(ego_id), int(neighbor_id)), 0))
 
     # =====================================================================
-    # GÁN VAI TRÒ — luật ngữ nghĩa
+    # ROLE ASSIGNMENT — semantic rules
     # =====================================================================
 
     def get_role(self, ego_id: int, neighbor_id: int) -> int:
         """
-        Gán vai trò CỨNG theo luật. Dùng cho logging/diagnostics và để
-        khởi tạo slot. Việc gán MỀM (có gradient) nằm ở soft_role_assignment().
+        Assign a HARD role by rule for logging, diagnostics, and slot
+        initialization. Differentiable SOFT assignment is implemented by
+        soft_role_assignment().
 
-        Thứ tự ưu tiên rất quan trọng — Dị biệt xét TRƯỚC:
-            nếu ta chưa hiểu rõ thằng này (sigma cao), việc gán nó vào
-            Thiện hay Ác đều là võ đoán. Tách riêng ra an toàn hơn.
+        Priority order matters: anomalous is evaluated FIRST. When a neighbour
+        is not understood (high sigma), assigning it to beneficial or harmful
+        is arbitrary; isolating it is safer.
 
         Returns:
-            int trong {0,1,2,3}
+            Integer in {0, 1, 2, 3}.
         """
         sig = self.get_signature(ego_id, neighbor_id)
 
@@ -372,7 +382,7 @@ class InfluenceSignatureTracker:
     def get_role_distribution(
         self, ego_id: int, neighbor_ids: List[int]
     ) -> Dict[str, int]:
-        """Đếm số neighbour mỗi vai trò — số liệu đưa vào bảng trong paper."""
+        """Count neighbours by role for the paper's result tables."""
         counts = {name: 0 for name in ROLE_NAMES}
 
         for j in neighbor_ids:
@@ -381,7 +391,7 @@ class InfluenceSignatureTracker:
         return counts
 
     # =====================================================================
-    # Hiệu chỉnh ngưỡng tự động
+    # Automatic threshold calibration
     # =====================================================================
 
     def auto_calibrate(
@@ -391,15 +401,15 @@ class InfluenceSignatureTracker:
         sigma_percentile: float = 80.0,
     ):
         """
-        Đặt tau_role và sigma_hi theo PHÂN VỊ của dữ liệu thực tế, thay vì
-        cắm hằng số.
+        Set tau_role and sigma_hi from empirical data PERCENTILES instead of
+        fixed constants.
 
-        Vì sao cần: thang đo của mu phụ thuộc hoàn toàn vào thang reward của
-        môi trường. Cắm tau_role = 0.05 có thể khiến TẤT CẢ neighbour rơi vào
-        Trung tính (nếu reward nhỏ) hoặc KHÔNG AI vào Trung tính (nếu reward lớn).
-        Cả hai đều làm slot ngữ nghĩa vô dụng.
+        This is necessary because the scale of mu depends entirely on the
+        environment's reward scale. Fixing tau_role = 0.05 can place EVERY
+        neighbour in the neutral role when rewards are small, or NO neighbour
+        there when rewards are large. Both outcomes make semantic slots useless.
 
-        Gọi hàm này một lần sau Stage 0 warm-up.
+        Call this once after the Stage 0 warm-up.
         """
         all_abs_mu = []
         all_sigma = []
@@ -429,7 +439,7 @@ class InfluenceSignatureTracker:
         }
 
     # =====================================================================
-    # Nhãn ngoài để đánh giá
+    # External evaluation labels
     # =====================================================================
 
     def role_recovery_score(
@@ -439,17 +449,17 @@ class InfluenceSignatureTracker:
         ground_truth_roles: Dict[int, int],
     ) -> Dict[str, float]:
         """
-        So vai trò khám phá được với vai trò THẬT của môi trường.
+        Compare discovered roles with the environment's TRUE roles.
 
-        Đây là thí nghiệm then chốt cho paper: kể cả khi reward không tăng,
-        nếu phương pháp TỰ KHÁM PHÁ RA vai trò khớp ground truth thì vẫn là
-        một kết quả interpretability đăng được.
+        This is a key paper experiment. Even without a reward improvement,
+        autonomously discovering roles that match ground truth remains a
+        publishable interpretability result.
 
         Args:
             ground_truth_roles: {neighbor_id: role_int}
 
         Returns:
-            dict với accuracy tổng và accuracy từng vai trò
+            Dictionary containing overall and per-role accuracy.
         """
         correct = 0
         total = 0
@@ -492,14 +502,14 @@ class InfluenceSignatureTracker:
         neighbor_ids_per_ego: Dict[int, List[int]],
     ) -> np.ndarray:
         """
-        Trung bình signature theo từng vai trò, gộp trên nhiều ego.
+        Average signatures by role, pooled across multiple ego agents.
 
         Returns:
             np.ndarray shape [N_SEMANTIC_ROLES, SIGNATURE_DIM]
 
-        HÌNH CHO PAPER: vẽ ma trận này thành heatmap. Nếu bốn hàng khác nhau
-        rõ rệt -> chứng minh các slot THẬT SỰ chuyên môn hoá, không collapse.
-        Nếu bốn hàng giống nhau -> slot vẫn đang sụp, phải sửa tiếp.
+        PAPER FIGURE: render this matrix as a heat map. Clearly different rows
+        demonstrate that the slots are GENUINELY specialized rather than
+        collapsed. Identical rows mean collapse remains and requires repair.
         """
         buckets = {r: [] for r in range(N_SEMANTIC_ROLES)}
 
@@ -520,7 +530,7 @@ class InfluenceSignatureTracker:
 
 
 # =========================================================================
-# GÁN VAI TRÒ MỀM (có gradient) — dùng trong peripheral_memory_v2
+# SOFT, DIFFERENTIABLE ROLE ASSIGNMENT — used by peripheral_memory_v2
 # =========================================================================
 
 def soft_role_assignment(
@@ -531,27 +541,28 @@ def soft_role_assignment(
     sharpness: float = 3.0,
 ) -> np.ndarray:
     """
-    Phiên bản MỀM của get_role() — trả về phân phối trên 4 vai trò thay vì
-    một nhãn cứng.
+    Soft version of get_role(), returning a distribution over four roles
+    instead of one hard label.
 
-    Vì sao cần mềm: gán cứng bằng if/else thì gradient không chảy qua được,
-    và ở gần biên (mu = tau_role +- epsilon) nhãn nhảy đột ngột gây bất ổn.
-    Sigmoid với độ dốc `sharpness` cho chuyển tiếp trơn.
+    Soft assignment is necessary because gradients cannot flow through hard
+    if/else assignment. Near a boundary (mu = tau_role ± epsilon), hard labels
+    also jump discontinuously and cause instability. A sigmoid with slope
+    `sharpness` provides a smooth transition.
 
-    Cấu trúc cổng:
-        g_anom  = sigmoid(k * (sigma - sigma_hi))        "chưa hiểu được"
-        g_sure  = 1 - g_anom                             "đã hiểu"
-        g_pos   = sigmoid(k * (mu - tau))                "đủ dương"
-        g_neg   = sigmoid(k * (-mu - tau))               "đủ âm"
-        g_neu   = 1 - g_pos - g_neg  (clamp >= 0)        "quanh 0"
+    Gate structure:
+        g_anom  = sigmoid(k * (sigma - sigma_hi))        "not understood"
+        g_sure  = 1 - g_anom                             "understood"
+        g_pos   = sigmoid(k * (mu - tau))                "sufficiently positive"
+        g_neg   = sigmoid(k * (-mu - tau))               "sufficiently negative"
+        g_neu   = 1 - g_pos - g_neg  (clamp >= 0)        "near zero"
 
     Args:
         signed_mu: np [N]
         sigma:     np [N]
 
     Returns:
-        np.ndarray float32 shape [N, 4], mỗi hàng tổng bằng 1.
-        Cột: [beneficial, harmful, neutral, anomalous]
+        float32 array of shape [N, 4], with each row summing to one.
+        Columns: [beneficial, harmful, neutral, anomalous].
     """
     mu = np.asarray(signed_mu, dtype=np.float64).reshape(-1)   # [N]
     sg = np.asarray(sigma, dtype=np.float64).reshape(-1)       # [N]
@@ -560,19 +571,19 @@ def soft_role_assignment(
         return np.zeros((0, N_SEMANTIC_ROLES), dtype=np.float32)
 
     # -----------------------------------------------------------------
-    # CHUẨN HOÁ ĐỘ DỐC THEO NGƯỠNG — lỗi này đã bị bắt trong unit test.
+    # NORMALIZE SLOPE BY THE THRESHOLD. A unit test caught this defect.
     #
-    # Nếu dùng thẳng sigmoid(sharpness * (mu - tau)) thì độ dốc phụ thuộc
-    # vào THANG ĐO của mu. Với sharpness=10, tau=0.05:
-    #     tại mu = 0 (đáng lẽ phải là Trung tính hoàn toàn)
+    # Directly using sigmoid(sharpness * (mu - tau)) makes the slope depend
+    # on the SCALE of mu. With sharpness=10 and tau=0.05:
+    #     at mu = 0, which should be completely neutral,
     #     g_pos = sigmoid(10 * (-0.05)) = sigmoid(-0.5) = 0.378  (!!)
     #     -> g_neu = 1 - 0.378 - 0.378 = 0.244 < g_pos
-    #     -> mu = 0 bị gán nhầm vào "Thiện". SAI.
+    #     -> mu = 0 is incorrectly assigned as beneficial. WRONG.
     #
-    # Sửa: chia sharpness cho ngưỡng, biến nó thành đại lượng KHÔNG THỨ
-    # NGUYÊN, nghĩa là "chuyển tiếp diễn ra trong bao nhiêu lần độ rộng tau".
-    #     k_mu = sharpness / tau  ->  tại mu=0: sigmoid(-sharpness)
-    # Với sharpness=3: sigmoid(-3)=0.047 -> g_neu = 0.906. ĐÚNG.
+    # Fix: divide sharpness by the threshold to make it DIMENSIONLESS, meaning
+    # "the transition spans this many multiples of tau's width."
+    #     k_mu = sharpness / tau  ->  at mu=0: sigmoid(-sharpness)
+    # With sharpness=3: sigmoid(-3)=0.047 -> g_neu = 0.906. CORRECT.
     # -----------------------------------------------------------------
     k_mu = float(sharpness) / max(float(tau_role), 1e-8)
     k_sg = float(sharpness) / max(float(sigma_hi), 1e-8)
@@ -593,7 +604,7 @@ def soft_role_assignment(
     out[:, ROLE_NEUTRAL] = g_sure * g_neu
     out[:, ROLE_ANOMALOUS] = g_anom
 
-    # Chuẩn hoá về tổng 1 (g_pos + g_neg + g_neu có thể lệch nhẹ khỏi 1).
+    # Normalize to sum to one; g_pos + g_neg + g_neu may differ slightly.
     row_sum = np.sum(out, axis=1, keepdims=True)   # [N, 1]
     out = out / np.clip(row_sum, 1e-12, None)
 
@@ -607,18 +618,19 @@ def kmeans_signature_clusters(
     seed: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    K-means thuần numpy trên ma trận signature — không cần sklearn.
+    Pure-NumPy k-means over the signature matrix; sklearn is not required.
 
-    Dùng cho các SLOT TỰ DO (bổ sung cho slot ngữ nghĩa cố định), để bắt
-    những cấu trúc mà bốn luật cứng bỏ sót.
+    This supports FREE-FORM SLOTS that complement fixed semantic slots and
+    capture structures missed by the four hard rules.
 
-    LƯU Ý VỀ THIẾT KẾ: k-means một mình KHÔNG tốt bằng slot ngữ nghĩa, vì
-    ý nghĩa mỗi cụm ĐỔI sau mỗi lần re-cluster -> policy phải học lại từ
-    đầu -> thêm một nguồn non-stationarity, đúng thứ paper đang cố diệt.
-    Nên dùng kiến trúc LAI: slot ngữ nghĩa cố định + vài slot k-means.
+    DESIGN NOTE: k-means alone is NOT as effective as semantic slots because
+    cluster meaning CHANGES after every reclustering. The policy must relearn
+    those meanings from scratch, adding exactly the source of non-stationarity
+    the paper is trying to eliminate. Use a HYBRID architecture: fixed
+    semantic slots plus a small number of k-means slots.
 
     Args:
-        signatures: np [N, D] — NÊN đã chuẩn hoá z-score
+        signatures: np [N, D], preferably already z-score normalized.
 
     Returns:
         labels:    np int [N]
@@ -637,7 +649,7 @@ def kmeans_signature_clusters(
 
     rng = np.random.RandomState(int(seed))
 
-    # k-means++ khởi tạo (ổn định hơn random nhiều)
+    # K-means++ initialization is substantially more stable than random init.
     centroids = np.zeros((k, D), dtype=np.float64)
     centroids[0] = X[rng.randint(N)]
 
@@ -671,7 +683,7 @@ def kmeans_signature_clusters(
             if np.any(mask):
                 centroids[c] = X[mask].mean(axis=0)
 
-    # Pad nếu n_clusters > N
+    # Pad when n_clusters > N.
     if k < n_clusters:
         pad = np.zeros((n_clusters - k, D), dtype=np.float64)
         centroids = np.concatenate([centroids, pad], axis=0)

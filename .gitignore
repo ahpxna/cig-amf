@@ -4,15 +4,19 @@ __pycache__/
 *$py.class
 *.so
 
-# Môi trường ảo (Chặn triệt để cái nùi file bác vừa thấy)
+# Virtual environments
 cig-env/
 venv/
 env/
 
-# Trọng số mô hình và kết quả cũ
+# Model weights and generated results
 *.pt
 *.pth
 results/
 
-# File hệ thống của Mac
+# Local research notes and conversation exports. Files already tracked by Git
+# require an explicit index/history migration; ignore rules affect new files.
+docs/
+
+# macOS metadata
 .DS_Store

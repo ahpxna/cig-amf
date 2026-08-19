@@ -5,14 +5,12 @@ import matplotlib.pyplot as plt
 
 
 def ensure_dir(path):
-    """
-    Tạo thư mục nếu path hợp lệ.
+    """Create directory if path is valid.
 
-    path có thể là:
-    - folder thật
-    - "" nếu file nằm ở current directory
-    - None trong vài nhánh gọi phụ
-    """
+path can be:
+  - real directory
+  - "" if file is in current directory
+  - None in some nested calls"""
     if path is None:
         return
 
@@ -24,12 +22,10 @@ def ensure_dir(path):
 
 
 def _union_keys(rows):
-    """
-    Lấy union keys theo thứ tự xuất hiện.
+    """Take union keys in order of appearance.
 
-    Không dùng keys của row đầu tiên vì mỗi runner có thể có thêm metric riêng.
-    Ví dụ Final-CIGAMF có proxy_buffer_size, PureMeanField thì không.
-    """
+Do not use keys from the first row because each runner may have additional metrics.
+Example: Final-CIGAMF has proxy_buffer_size, PureMeanField does not."""
     keys = []
     seen = set()
 
@@ -43,11 +39,9 @@ def _union_keys(rows):
 
 
 def save_csv(rows, path):
-    """
-    Lưu list[dict] thành CSV.
+    """Save list[dict] as CSV.
 
-    Nếu rows rỗng, vẫn tạo file rỗng để biết experiment đã chạy tới nhánh đó.
-    """
+If rows are empty, still create an empty file to indicate the experiment reached that branch."""
     ensure_dir(os.path.dirname(path) if os.path.dirname(path) else ".")
 
     if rows is None or len(rows) == 0:
@@ -73,16 +67,14 @@ def save_json(obj, path):
 
 
 def save_history_csv(hist, path, extra=None):
-    """
-    Lưu history per evaluation point.
+    """Save history per evaluation point.
 
-    hist:
-        dict[str, list]
+hist:
+    dict[str, list]
 
-    extra:
-        metadata gắn vào mỗi row:
-            experiment, model, seed, n_agents, episodes, max_steps, ...
-    """
+extra:
+    metadata attached to each row:
+        experiment, model, seed, n_agents, episodes, max_steps, ..."""
     ensure_dir(os.path.dirname(path) if os.path.dirname(path) else ".")
 
     extra = extra or {}
@@ -114,11 +106,9 @@ def save_history_csv(hist, path, extra=None):
 
 
 def plot_histories(histories, metric, title, save_path):
-    """
-    Vẽ metric theo evaluation episode.
+    """Plot metric per evaluation episode.
 
-    Không crash nếu một số baseline không có metric đó.
-    """
+Do not crash if some baselines do not have that metric."""
     ensure_dir(os.path.dirname(save_path) if os.path.dirname(save_path) else ".")
 
     plt.figure(figsize=(8, 4.5))

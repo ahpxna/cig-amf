@@ -4,15 +4,15 @@ from run_experiment import make_main_env, make_runner, default_cfg
 def run_comparison():
     cfg = default_cfg()
     
-    # 1. Các mô hình tham gia đua
+    # 1. Models participating in the race
     models_to_test = [
         "PureMeanField", 
         "FullExplicitLocal", 
         "Final-CIGAMF"
     ]
     
-    # 2. Thiết lập bài test: Behavioral Drift (Trôi chính sách)
-    # Tăng episodes lên 120 để các mô hình có đủ thời gian hội tụ
+    # 2. Setting up the test: Behavioral Drift (Policy drift)
+    # Increase episodes to 120 to allow models sufficient time to converge
     n_episodes = 120
     eval_every = 15
     n_seeds = 3
@@ -37,7 +37,7 @@ def run_comparison():
             runner = make_runner(model, env, cfg, device="cpu")
             history = runner.run(n_episodes=n_episodes, eval_every=eval_every)
             
-            # Lấy reward trung bình 20 episodes cuối cùng để đánh giá độ hội tụ
+            # Use the average reward of the last 20 episodes to evaluate convergence
             final_reward = np.mean(history["mean_reward"][-2:])
             results[model].append(final_reward)
 

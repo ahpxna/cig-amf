@@ -23,25 +23,23 @@ class BeliefItemEncoder(nn.Module):
 
 
 class BeliefSummaryBuilder(nn.Module):
-    """
-    B_i = [global_stats || top-k structural profile || pooled context]
+    """B_i = [global_stats || top-k structural profile || pooled context]
 
-    item format:
-        0: mu_bar
-        1: sigma_bar
-        2: p_core
-        3: in_core
-        4: in_seed_core
-        5: rel_row
-        6: rel_col
-        7: zone_diff
-        8: pair_latent_norm
+item format:
+    0: mu_bar
+    1: sigma_bar
+    2: p_core
+    3: in_core
+    4: in_seed_core
+    5: rel_row
+    6: rel_col
+    7: zone_diff
+    8: pair_latent_norm
 
-    Bám paper:
-    - Belief summary không chỉ là binary core set.
-    - Nó chứa global statistics, top-k structural profile, pooled context embedding.
-    - Top-k structural profile phải có tín hiệu ở Stage 0, không được chết khi mu=0/sigma=1.
-    """
+Follow paper:
+- Belief summary is not just a binary core set.
+- It contains global statistics, top-k structural profile, pooled context embedding.
+- Top-k structural profile must have signal in Stage 0, and must not die when mu=0/sigma=1."""
 
     def __init__(
         self,
@@ -189,13 +187,13 @@ class BeliefSummaryBuilder(nn.Module):
             dim=0,
         ).unsqueeze(0)
 
-        # Sửa Stage 0 priority:
-        # Bản yếu:
+        # Fix Stage 0 priority:
+        # Essence:
         #     confidence = clamp(1 - sigma, 0, 1)
         #     priority = |mu| * (0.5 + p) * confidence
         #
-        # Khi sigma=1 và mu=0 thì priority=0 cho mọi item, top-k bị quyết định
-        # gần như theo index. Bản này dùng confidence mềm và mu_floor.
+        # When sigma=1 and mu=0, priority=0 for all items, top-k is decided
+        # almost by index. This version uses soft confidence and mu_floor.
         sigma_safe = torch.clamp(sigma_col, min=0.0)
         confidence = 1.0 / (1.0 + sigma_safe)
 

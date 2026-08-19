@@ -4,10 +4,9 @@ from models.structural_proxy import build_pair_feat  # [FIX-X1]
 
 
 class MultiEgoReplayBuilder:
-    """
-    Xây dữ liệu supervised cho proxy ensemble từ trajectory toàn population.
+    """Build supervised proxy-ensemble data from population trajectories.
 
-    Bám đúng conditioning set của paper:
+    The conditioning set matches the paper:
 
         r_hat_ij(
             s_i,
@@ -18,7 +17,7 @@ class MultiEgoReplayBuilder:
             B_i
         ) -> R_i^(H)
 
-    Mỗi timestep t, ego i, neighbor j:
+    For every time step t, ego i, and neighbor j:
         sample_ij^t = (
             obs_i^t,
             a_i^t,
@@ -29,19 +28,19 @@ class MultiEgoReplayBuilder:
             R_i^{(H)}(t)
         )
 
-    Quan trọng:
-    - File này không tự recompute context.
-    - Context excluding-j lấy từ trajectory cache tại thời điểm action selection.
-    - Như vậy proxy sample khớp với state/context thật lúc policy ra action.
-    - Hàm push_trajectory_to_proxy() phải được gọi every episode, kể cả Stage 0.
-    - Stage 0 không train/update belief, nhưng phải collect proxy buffer.
+    Important invariants:
+    - Context is not recomputed in this module.
+    - Excluding-j context comes from the trajectory cache at action selection.
+    - Each proxy sample therefore matches the state/context used by the policy.
+    - ``push_trajectory_to_proxy()`` runs every episode, including Stage 0.
+    - Stage 0 does not train or update belief, but still fills the proxy buffer.
     """
 
     def __init__(self, discount=0.95, horizon=8):
-        # P2 (Phần 2.2): H_causal >= max_latency + 2. Với 4 latency tier của
-        # Omni-Arena (blocker h=1, gatekeeper h=2-3, relay h=4-5,
-        # controller h=6+), H >= 8. Default bump 3 -> 8 (caller vẫn có thể
-        # truyền horizon= khác nếu cần).
+        # P2 (Section 2.2): H_causal >= max_latency + 2. Omni-Arena has four
+        # latency tiers: blocker h=1, gatekeeper h=2-3, relay h=4-5, and
+        # controller h=6+. Hence H >= 8. The default changed from 3 to 8;
+        # callers may still supply another horizon explicitly.
         self.discount = float(discount)
         self.horizon = int(horizon)
 
@@ -52,13 +51,13 @@ class MultiEgoReplayBuilder:
         Args:
             trajectory:
                 list step dict.
-                Mỗi step phải có key "rewards".
+                Every step must contain the ``rewards`` key.
             n_agents:
-                số agents trong population.
+                Number of agents in the population.
 
         Return:
             list length T.
-            out[t][ego] = H-step return của ego tại timestep t.
+            ``out[t][ego]`` is the ego's H-step return at time t.
         """
         T = len(trajectory)
         out = []
@@ -83,10 +82,10 @@ class MultiEgoReplayBuilder:
 
     def build_h_step_returns_multi(self, trajectory, n_agents, n_horizons=None):
         """
-        P2: bản multi-horizon của build_h_step_returns() -- trả về
-        R_i^(1), R_i^(2), ..., R_i^(n_horizons) cho mỗi (t, ego), tức
-        target_returns_multi thật (không phải broadcast một số) để nạp cho
-        structural_proxy_v2 (n_horizons=8 theo Phần 2.2).
+        P2 multi-horizon form of ``build_h_step_returns()``. It returns
+        R_i^(1), R_i^(2), ..., R_i^(n_horizons) for each (t, ego). These are
+        real ``target_returns_multi`` values rather than a broadcast scalar for
+        structural_proxy_v2 (n_horizons=8 under Section 2.2).
 
         R_i^(h)(t) = sum_{k=0}^{h-1} gamma^k * r_i(t+k)  (h = 1..n_horizons)
 
@@ -138,10 +137,9 @@ class MultiEgoReplayBuilder:
         proxy_ensemble,
         env,
     ):
-        """
-        Đẩy toàn bộ population-wide trajectory vào proxy buffer.
+        """Push a complete population trajectory into the proxy buffer.
 
-        Required fields trong mỗi step:
+        Required fields in each step:
             obs_all
             actions
             rewards
@@ -150,21 +148,21 @@ class MultiEgoReplayBuilder:
             belief_summary_cache
 
         Return:
-            số supervised samples đã push.
+            Number of supervised samples pushed.
 
-        Lưu ý rất quan trọng:
-        - Hàm này phải được gọi mọi episode, kể cả Stage 0.
-        - Stage 0 không train/update belief, nhưng phải collect proxy buffer.
-        - Hàm này không được dùng scheduler.should_update_graph() để quyết định collect.
+        Critical requirements:
+        - Call this method every episode, including Stage 0.
+        - Stage 0 does not train/update belief, but must collect proxy replay.
+        - Do not gate collection on ``scheduler.should_update_graph()``.
         """
         if trajectory is None or len(trajectory) == 0:
             return 0
 
         n_agents = int(env.n_agents)
         h_returns = self.build_h_step_returns(trajectory, n_agents)
-        # P2: target_returns_multi thật (n_horizons phần tử -- mặc định 8),
-        # lấy trực tiếp từ trajectory thay vì để add_sample() broadcast một
-        # số vô hướng ra mọi horizon (fallback cũ, kém chính xác hơn).
+        # P2: read real n_horizons-element targets (default 8) from the
+        # trajectory instead of letting add_sample() broadcast one scalar to
+        # every horizon, which was the less accurate legacy fallback.
         n_horizons_for_push = getattr(proxy_ensemble, "n_horizons", self.horizon)
         h_returns_multi = self.build_h_step_returns_multi(
             trajectory, n_agents, n_horizons=n_horizons_for_push
@@ -178,11 +176,11 @@ class MultiEgoReplayBuilder:
             obs_all = step["obs_all"]
             actions = step["actions"]
 
-            # [intervention.py — DR] forced_mask/behaviour_probs chỉ có ở
-            # final_runner.py (baseline_runner.py không dùng eps-forcing).
-            # .get() để KHÔNG crash với trajectory không có hai field này —
-            # proxy tự tắt DR về plug-in cho mẫu đó (behaviour_prob_j=None
-            # là fallback đã thiết kế sẵn trong add_sample).
+            # [intervention.py — DR] forced_mask/behaviour_probs exist only in
+            # final_runner.py; baseline_runner.py does not use epsilon forcing.
+            # ``get`` preserves compatibility with trajectories lacking these
+            # fields. The proxy then falls back from DR to the plug-in estimator
+            # for that sample via behaviour_prob_j=None, as designed.
             forced_mask = step.get("forced_mask")
             behaviour_probs = step.get("behaviour_probs")
 
@@ -194,9 +192,9 @@ class MultiEgoReplayBuilder:
                     if j == ego:
                         continue
 
-                    # [FIX-X1] x_ij tại ĐÚNG timestep t (ảnh chụp hình học
-                    # được runner lưu lúc thu thập; env.positions ở đây đã là
-                    # state cuối episode nên không dùng được).
+                    # [FIX-X1] x_ij at the correct time t comes from the geometry
+                    # snapshot captured by the runner. env.positions now holds
+                    # the final episode state and cannot be used here.
                     geom = step.get("geom_snapshot")
                     if geom is None:
                         pair_feat = None
@@ -219,18 +217,18 @@ class MultiEgoReplayBuilder:
                         was_forced = bool(forced_mask[j])
 
                     if behaviour_probs is not None:
-                        # b_j(a_j_obs | s) — propensity HIỆU DỤNG (đã tính
-                        # cả forcing), KHÔNG PHẢI policy_probs thô. Lấy nhầm
-                        # sẽ làm DR chệch có hệ thống một cách im lặng.
+                        # b_j(a_j_obs | s) is the EFFECTIVE propensity including
+                        # forcing, not raw policy_probs. Confusing the two causes
+                        # silent systematic bias in the DR estimator.
                         behaviour_prob_j = float(
                             behaviour_probs[j][int(actions[j])]
                         )
 
-                    # [VERIFY-F1b] Đo TẠI ĐIỂM GHI BUFFER: với các mẫu
-                    # was_forced=True, a_j phải phân bố ~uniform trên |A|.
-                    # Nếu ở runner hist_action_forced đều mà ở đây lệch =>
-                    # nhãn bị lệch giữa trajectory và buffer (đúng nghi vấn
-                    # "action_j lưu là action TRƯỚC override").
+                    # [VERIFY-F1b] Measure at the buffer-write boundary. For
+                    # was_forced=True samples, a_j must be approximately uniform
+                    # over |A|. Uniform runner hist_action_forced with a skew here
+                    # identifies trajectory/buffer label misalignment, matching
+                    # the hypothesis that action_j stored the pre-override action.
                     if was_forced:
                         _h = getattr(proxy_ensemble, "_vf1b_hist", None)
                         if _h is None:

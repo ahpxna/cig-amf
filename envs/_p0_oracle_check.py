@@ -46,8 +46,8 @@ def main():
             # the other way (mean_a R(a) - R_base, i.e. effect of active
             # intervention vs baseline scripted behaviour) -- both are valid
             # readings of the same oracle, just different comparison points;
-            # we pick the STAY-referenced one here because it matches what
-            # Phi was designed to encode.
+            # The STAY-referenced orientation is selected here because it
+            # matches the quantity Phi was designed to encode.
             profile = env.compute_oracle_influence_from_current_state(
                 ego_id=ego,
                 agent_j=j,

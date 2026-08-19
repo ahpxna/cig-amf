@@ -1,56 +1,60 @@
 """
-diagnostics.py — Ba thí nghiệm chẩn đoán mà paper ĐANG THIẾU.
+diagnostics.py — three diagnostic experiments still missing from the paper.
 
 =============================================================================
-[D1] SELECTIVE RESPONSIVENESS — hình headline cho paper
+[D1] SELECTIVE RESPONSIVENESS — the paper's headline figure
 =============================================================================
-Đóng góp KHÁI NIỆM MẠNH NHẤT của paper là tách non-stationarity thành hai
-tầng (structural: AI ảnh hưởng ai / behavioural: họ đang hành xử thế nào).
-Cuốn sách MARL chuẩn (Albrecht et al., MIT Press 2024) coi non-stationarity
-là MỘT khối — nên cách tách này thật sự mới.
+The paper's strongest conceptual contribution is separating non-stationarity
+into structural (which agents influence which) and behavioural (how agents
+currently act) tiers. Standard MARL treatments, including Albrecht et al.
+(MIT Press, 2024), treat non-stationarity as one block, making this separation
+a substantive distinction.
 
-NHƯNG PAPER CHƯA BAO GIỜ ĐO TRỰC TIẾP ĐIỀU ĐÓ. Exp1 (behavioural drift) và
-Exp2 (structural shift) chạy riêng rẽ, không bao giờ đối chiếu với nhau.
+The paper has not yet measured that distinction directly. Exp. 1
+(behavioural drift) and Exp. 2 (structural shift) run separately and are not
+contrasted against one another.
 
-Hình cần có, một biểu đồ hai đường, cùng trục tung "độ thay đổi của belief":
-    - dưới BEHAVIOURAL DRIFT (cấu trúc giữ nguyên) -> belief phải PHẲNG
-    - dưới STRUCTURAL SHIFT  (cấu trúc đổi thật)   -> belief phải NHẢY VỌT
-    - baseline correlation-based (attention)       -> nhảy vọt ở CẢ HAI
-Nếu tạo được hình này, TOÀN BỘ luận điểm nằm gọn trong một hình.
+The required headline figure is a two-line plot with "belief change" on the
+shared vertical axis:
+    - under BEHAVIOURAL DRIFT with fixed structure, belief should remain FLAT;
+    - under a true STRUCTURAL SHIFT, belief should JUMP;
+    - a correlation-based attention baseline should jump under BOTH.
+This figure would summarize the complete central claim.
 
-CƠ SỞ LÝ THUYẾT (mượn Pieroth ICML'24, Theorem 5.11):
-    họ chứng minh TIM/SIM LIÊN TỤC theo tham số policy theta. Nghĩa là
-    behavioural drift (theta đổi mượt) chỉ gây thay đổi MƯỢT trong influence.
-    Vậy nếu ma trận influence NHẢY VỌT thì đó BẮT BUỘC phải là structural
-    shift. Đây chính là biện minh toán học cho việc tách hai tầng —
-    mượn từ một định lý đã đăng ICML.
-
-=============================================================================
-[D2] STRUCTURE SENSITIVITY — thí nghiệm PHẢI CHẠY TRƯỚC MỌI THỨ KHÁC
-=============================================================================
-Trong bảng kết quả của paper:
-    Pure Mean Field (bỏ qua MỌI cấu trúc)      : -0.211
-    Full Explicit Local (mô hình hoá MỌI THỨ)  : -0.196
-    chênh lệch = 0.015
-
-Nếu biết HẾT cấu trúc chỉ đáng giá 1.5% reward, thì TRẦN LỢI ÍCH TỐI ĐA của
-BẤT KỲ phương pháp structural nào cũng chỉ trong khoảng đó. Đang thi đấu
-trong một sân mà phần thưởng cho việc thắng gần bằng không.
-
-Hàm structure_sensitivity_test() đo trần này trực tiếp bằng oracle-core
-baseline. Nếu trần quá thấp -> phải sửa MÔI TRƯỜNG trước, không phải thuật toán.
+THEORETICAL BASIS (from Pieroth, ICML 2024, Theorem 5.11):
+    TIM/SIM is continuous in the policy parameter theta. Smooth behavioural
+    drift in theta therefore produces only smooth changes in influence. A
+    discontinuous jump in the influence matrix must consequently indicate a
+    structural shift. This published theorem provides the mathematical basis
+    for separating the two tiers.
 
 =============================================================================
-[D3] PROXY CALIBRATION — bảo vệ chữ "Causal" trong tên bài
+[D2] STRUCTURE SENSITIVITY — experiment required before all others
 =============================================================================
-Tên bài có chữ "Causal" mà KHÔNG có một thí nghiệm nào kiểm chứng.
-Exp3 đã được thiết kế sẵn trong paper nhưng không có số liệu.
+The paper's result table reports:
+    Pure Mean Field (ignores ALL structure)       : -0.211
+    Full Explicit Local (models EVERYTHING)       : -0.196
+    difference                                    :  0.015
 
-CẢNH BÁO ĐỘ KHỚP ESTIMAND (lỗi đã phát hiện trong v1):
-    proxy v1 tính  mean_a |f(a) - f(a_obs)|   (LUÔN >= 0)
-    oracle env tính mean_a (R(a) - R_base)    (CÓ DẤU)
-    Hai đại lượng KHÔNG THỂ khớp nhau -> Exp3 không thể pass dù thuật toán
-    đúng. Hàm bên dưới BẮT BUỘC dùng effect_mode="signed_oracle_matched".
+If complete structural knowledge is worth only 1.5% reward, the maximum
+benefit available to any structural method is limited to that range. The
+benchmark then provides almost no reward for solving the intended problem.
+
+structure_sensitivity_test() measures this ceiling directly with an
+oracle-core baseline. If the ceiling is too low, the environment must be
+corrected before the algorithm.
+
+=============================================================================
+[D3] PROXY CALIBRATION — evidence for "Causal" in the paper title
+=============================================================================
+The title uses "Causal" without a validating experiment. Exp. 3 is already
+designed in the paper but has no results.
+
+ESTIMAND-ALIGNMENT WARNING (defect identified in v1):
+    the v1 proxy computes  mean_a |f(a) - f(a_obs)|   (ALWAYS >= 0)
+    the environment oracle computes mean_a (R(a) - R_base)    (SIGNED)
+These quantities cannot agree, so Exp. 3 cannot pass even with a correct
+algorithm. The function below must use effect_mode="signed_oracle_matched".
 =============================================================================
 """
 
@@ -69,11 +73,11 @@ def influence_matrix_from_beliefs(
     signed: bool = True,
 ) -> np.ndarray:
     """
-    Gom belief của mọi ego thành một ma trận ảnh hưởng.
+    Assemble all ego beliefs into one influence matrix.
 
     Returns:
         np.ndarray [n_agents, n_agents]
-        W[i, j] = ảnh hưởng của j lên i (0 trên đường chéo)
+        W[i, j] = influence of j on i, with zeros on the diagonal.
     """
     W = np.zeros((int(n_agents), int(n_agents)), dtype=np.float64)
 
@@ -94,18 +98,19 @@ def matrix_change(
     normalise: bool = True,
 ) -> float:
     """
-    Độ thay đổi giữa hai ma trận ảnh hưởng, dùng chuẩn Frobenius.
+    Change between two influence matrices under the Frobenius norm.
 
         d = ||W_curr - W_prev||_F / (||W_prev||_F + eps)
 
-    Vì sao đại lượng này TỐT HƠN "temporal variance" của v1:
-      - v1 báo cáo ~1e-8 và diễn giải là "ổn định". Nhưng 1e-8 về bản chất
-        là BẰNG KHÔNG: belief không nhúc nhích. Đó là ĐÓNG BĂNG chứ không
-        phải ổn định — hai thứ khác nhau.
-      - Chuẩn hoá theo ||W_prev|| cho đại lượng KHÔNG THỨ NGUYÊN, so sánh
-        được giữa các phương pháp và không "nhỏ giả tạo" chỉ vì mu bé.
-      - Đo trên TOÀN MA TRẬN nên bắt được cả thay đổi cấu trúc (ai ảnh hưởng
-        ai) chứ không chỉ độ lớn của từng cạnh riêng lẻ.
+    This metric improves on v1's "temporal variance":
+      - v1 reported ~1e-8 and interpreted it as stability. A value of 1e-8 is
+        effectively zero: the belief did not move. That indicates freezing,
+        not stability.
+      - Normalization by ||W_prev|| makes the quantity dimensionless and
+        comparable across methods, avoiding artificially small values caused
+        only by small mu values.
+      - Measuring the entire matrix captures structural changes in who
+        influences whom, not just the magnitude of individual edges.
     """
     diff = float(np.linalg.norm(W_curr - W_prev, ord="fro"))
 
@@ -119,28 +124,28 @@ def matrix_change(
 
 class SelectiveResponsivenessTracker:
     """
-    Theo dõi độ đáp ứng của belief theo từng loại phi-dừng.
+    Track belief responsiveness for each type of non-stationarity.
 
-    Cách dùng:
+    Usage:
         tracker = SelectiveResponsivenessTracker()
 
-        # mỗi kỳ đánh giá, ở CẢ HAI chế độ môi trường:
+        # At each evaluation in both environment modes:
         W = influence_matrix_from_beliefs(belief_modules, n_agents)
         tracker.record(condition="behavioural_drift", episode=ep, W=W)
-        # ... chạy riêng ...
+        # ... run separately ...
         tracker.record(condition="structural_shift", episode=ep, W=W)
 
-        # cuối cùng:
+        # At completion:
         result = tracker.compute_selectivity()
-        curves = tracker.get_curves()   # -> vẽ hình headline
+        curves = tracker.get_curves()   # Data for the headline figure.
 
-    KỲ VỌNG NẾU PHƯƠNG PHÁP ĐÚNG:
-        mean_change[behavioural_drift] THẤP  (cấu trúc không đổi -> đừng động)
-        mean_change[structural_shift]  CAO   (cấu trúc đổi -> phải phản ứng)
+    EXPECTED BEHAVIOUR FOR A CORRECT METHOD:
+        mean_change[behavioural_drift] LOW  (fixed structure: remain stable)
+        mean_change[structural_shift]  HIGH (changed structure: respond)
         selectivity_ratio = structural / behavioural  >> 1
 
-    Với baseline correlation-based (attention), ratio sẽ ~ 1 vì nó không
-    phân biệt được hai loại. ĐÓ CHÍNH LÀ ĐIỂM CẦN CHỨNG MINH.
+    A correlation-based attention baseline should have a ratio near 1 because
+    it cannot distinguish the two types. This is the proposition to test.
     """
 
     def __init__(self, shift_episode: Optional[int] = None):
@@ -157,8 +162,8 @@ class SelectiveResponsivenessTracker:
         Returns:
             {condition: {"episodes": [...], "change": [...]}}
 
-        `change[t]` = độ thay đổi của W từ kỳ đánh giá t-1 sang t.
-        Đây là dữ liệu để vẽ HÌNH HEADLINE.
+        `change[t]` is the change in W from evaluation t-1 to t. These values
+        form the headline figure.
         """
         out = {}
 
@@ -185,13 +190,13 @@ class SelectiveResponsivenessTracker:
         post_shift_only: bool = True,
     ) -> Dict[str, float]:
         """
-        Con số duy nhất tóm tắt toàn bộ luận điểm của paper.
+        Single statistic summarizing the paper's central claim.
 
             selectivity_ratio = mean_change(structural) / mean_change(behavioural)
 
-        >> 1  : phương pháp PHÂN BIỆT ĐƯỢC hai tầng (điều paper tuyên bố)
-        ~ 1   : không phân biệt được — luận điểm trung tâm không đứng vững
-        < 1   : phản ứng NGƯỢC (tệ hơn cả không làm gì)
+        >> 1  : the method distinguishes the two tiers as claimed
+        ~ 1   : no distinction; the central claim is unsupported
+        < 1   : inverted response, worse than no adaptation
         """
         curves = self.get_curves()
 
@@ -244,38 +249,39 @@ def structure_sensitivity_test(
     n_seeds: int = 3,
 ) -> Dict[str, object]:
     """
-    THÍ NGHIỆM PHẢI CHẠY TRƯỚC MỌI THỨ KHÁC.
+    This experiment must run before all others.
 
-    Đo TRẦN LỢI ÍCH của việc biết cấu trúc trong môi trường này.
+    Measure the benefit ceiling of structural knowledge in this environment.
 
     Args:
         run_fn:
-            hàm nhận tên condition, trả về mean reward.
-            "oracle_core" phải là biến thể ĐƯỢC CHO SẴN core đúng (miễn phí,
-            không cần học) — đây là cận trên lý thuyết của mọi phương pháp
-            structural.
+            Function receiving a condition name and returning mean reward.
+            "oracle_core" must receive the correct core at zero cost without
+            learning; it is the theoretical upper bound for every structural
+            method.
         n_seeds:
-            số seed mỗi condition.
+            Number of seeds per condition.
 
     Returns:
-        dict gồm reward từng condition và structure_value.
+        Dictionary containing per-condition rewards and structure_value.
 
-    CÁCH ĐỌC KẾT QUẢ:
+    INTERPRETATION:
         structure_value = reward(oracle_core) - reward(pure_mean_field)
 
-        Nếu structure_value nhỏ (ví dụ < 5% thang reward):
-            -> KHÔNG THUẬT TOÁN NÀO CỨU ĐƯỢC. Phải sửa môi trường:
-               tăng độ chênh lệch ảnh hưởng giữa bottleneck và agent thường,
-               thắt chặt lane, tăng hình phạt tắc nghẽn, giảm số đường vòng.
-            -> Đừng tốn công tối ưu thuật toán trước khi sửa việc này.
+        If structure_value is small, for example <5% of the reward scale, no
+        algorithm can recover a meaningful gain. Correct the environment by
+        increasing the influence contrast between bottleneck and ordinary
+        agents, narrowing lanes, raising congestion penalties, or reducing
+        bypass routes before optimizing the algorithm.
 
-        Nếu structure_value lớn:
-            -> Môi trường ổn, khoảng cách còn lại là do thuật toán.
+        If structure_value is large, the environment is adequate and the
+        remaining gap is algorithmic.
     """
-    # [FIX-5] run_fn nhận (condition, seed) nếu chấp nhận 2 tham số — bắt buộc
-    # để hai condition dùng CHUNG danh sách seed (paired comparison). Bản cũ
-    # chỉ nhận condition và caller tự bốc seed ngẫu nhiên => hai nhánh chạy
-    # trên seed khác nhau, chênh lệch đo được lẫn cả phương sai giữa seed.
+    # [FIX-5] Pass (condition, seed) when run_fn accepts two parameters so both
+    # conditions use the same seed list for a paired comparison. The old form
+    # passed only condition and allowed the caller to sample a seed, causing
+    # branches to use different seeds and mixing between-seed variance into
+    # the measured difference.
     import inspect
     try:
         takes_seed = len(inspect.signature(run_fn).parameters) >= 2
@@ -300,11 +306,11 @@ def structure_sensitivity_test(
         for c, v in results.items()
     }
 
-    # [FIX-5] Bản cũ hard-code tên "oracle_core"; sau khi run_step_0.py đổi tên
-    # condition thành "explicit_local_learned" thì nhánh này KHÔNG BAO GIỜ chạy
-    # => structure_value = NaN, còn verdict vẫn in ra "CẢNH BÁO: sửa MÔI TRƯỜNG"
-    # một cách tự tin. Giờ lấy baseline = condition đầu, treatment = condition
-    # thứ hai, không phụ thuộc tên.
+    # [FIX-5] The old implementation hard-coded "oracle_core". After
+    # run_step_0.py renamed the condition to "explicit_local_learned", that
+    # branch never ran, leaving structure_value as NaN while still printing a
+    # definitive environment warning. Baseline and treatment are now selected
+    # by position rather than name.
     conds = list(conditions)
     base_name = "pure_mean_field" if "pure_mean_field" in summary else conds[0]
     treat_name = next((c for c in conds if c != base_name), None)
@@ -317,9 +323,9 @@ def structure_sensitivity_test(
         b = np.asarray(results[base_name], dtype=float)
         if a.size and b.size:
             val = float(a.mean() - b.mean())
-            # [FIX-5] Bootstrap CI: tài liệu debug yêu cầu rõ "in inconclusive
-            # khi CI chứa 0" thay vì phán quyết dứt khoát trên một điểm ước
-            # lượng nằm trong nhiễu.
+            # [FIX-5] Bootstrap CI: the debug specification requires an
+            # inconclusive result when the interval contains zero instead of a
+            # definitive verdict from a point estimate within noise.
             rng = np.random.RandomState(12345)
             diffs = [
                 rng.choice(a, a.size, replace=True).mean()
@@ -357,8 +363,8 @@ def structure_sensitivity_test(
         "ci95": [ci_lo, ci_hi],
         "significant": significant,
         "verdict": verdict,
-        # Ghi rõ để không ai đọc nhầm lần nữa: đây KHÔNG phải oracle-core
-        # zero-cost của Experiment 0 trừ khi run_fn thực sự cung cấp nó.
+        # This is not Experiment 0's zero-cost oracle core unless run_fn
+        # actually supplies that treatment.
         "note": (
             "structure_value chỉ đúng nghĩa Experiment 0 khi treatment là "
             "oracle-core ZERO-COST (được cho sẵn core đúng, không huấn luyện). "
@@ -373,7 +379,7 @@ def structure_sensitivity_test(
 # =========================================================================
 
 def _spearman(x: np.ndarray, y: np.ndarray) -> float:
-    """Tương quan hạng Spearman, thuần numpy (không cần scipy)."""
+    """Spearman rank correlation in NumPy, without a SciPy dependency."""
     x = np.asarray(x, dtype=np.float64).reshape(-1)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
 
@@ -385,7 +391,7 @@ def _spearman(x: np.ndarray, y: np.ndarray) -> float:
         ranks = np.empty_like(order, dtype=np.float64)
         ranks[order] = np.arange(len(a), dtype=np.float64)
 
-        # xử lý ties bằng cách lấy trung bình hạng
+        # Resolve ties using their mean rank.
         _, inv, counts = np.unique(a, return_inverse=True, return_counts=True)
         sums = np.zeros(len(counts), dtype=np.float64)
         np.add.at(sums, inv, ranks)
@@ -408,29 +414,29 @@ def proxy_calibration_report(
     proxy_scores_baseline: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """
-    Exp3 — so proxy với oracle can thiệp thật.
+    Exp. 3 — compare the proxy with the true interventional oracle.
 
     Args:
         proxy_scores:
-            [N] điểm proxy. PHẢI tính bằng effect_mode="signed_oracle_matched",
-            nếu không sẽ so nhầm đại lượng (xem cảnh báo đầu file).
+            [N] proxy scores. These must use
+            effect_mode="signed_oracle_matched" to align estimands; see the
+            warning at the top of the file.
         oracle_effects:
-            [N] hiệu ứng can thiệp thật, CÓ DẤU, từ
+            [N] true signed intervention effects from
             OracleInterventionSampler.signed_effect().
         proxy_scores_baseline:
-            [N] tuỳ chọn — điểm từ effect_mode="range" (kiểu Pieroth,
-            KHÔNG DẤU). Nếu bản có dấu thắng bản này, đó là bằng chứng
-            TRỰC TIẾP cho novelty.
+            Optional [N] scores from unsigned Pieroth-style
+            effect_mode="range". Better performance from the signed variant
+            directly supports the claimed novelty.
 
     Returns:
-        dict với bias, rank correlation, sign agreement...
+        Dictionary with bias, rank correlation, sign agreement, and related metrics.
 
-    NGƯỠNG DIỄN GIẢI:
-        spearman > 0.3 và ổn định qua seed -> đủ để dùng cho xếp hạng cấu trúc,
-                                              được quyền giữ chữ "Causal".
-        spearman ~ 0                        -> proxy vô dụng, PHẢI đổi tên bài.
-        sign_agreement > 0.7                -> tín hiệu có dấu đáng tin,
-                                              slot Thiện/Ác có căn cứ.
+    INTERPRETATION THRESHOLDS:
+        stable spearman > 0.3 across seeds supports structural ranking and the
+        term "Causal"; spearman near zero makes the proxy unusable and requires
+        renaming; sign_agreement > 0.7 supports reliable signed effects and the
+        beneficial/harmful slots.
     """
     p = np.asarray(proxy_scores, dtype=np.float64).reshape(-1)
     o = np.asarray(oracle_effects, dtype=np.float64).reshape(-1)
@@ -451,7 +457,7 @@ def proxy_calibration_report(
 
     spearman = _spearman(p, o)
 
-    # Chỉ tính đồng thuận dấu trên các mẫu mà oracle thật sự khác 0.
+    # Compute sign agreement only where the oracle is genuinely nonzero.
     mask = np.abs(o) > 1e-8
     sign_agreement = (
         float(np.mean(np.sign(p[mask]) == np.sign(o[mask])))
@@ -473,7 +479,7 @@ def proxy_calibration_report(
     if proxy_scores_baseline is not None:
         b = np.asarray(proxy_scores_baseline, dtype=np.float64).reshape(-1)[:n]
 
-        # Baseline không dấu -> so với |oracle| mới công bằng.
+        # Compare the unsigned baseline with |oracle| for a fair estimand match.
         out["baseline_spearman_vs_abs_oracle"] = _spearman(b, np.abs(o))
         out["signed_spearman_vs_signed_oracle"] = spearman
         out["signed_beats_unsigned"] = bool(
@@ -500,14 +506,15 @@ def bootstrap_ci(
     seed: int = 0,
 ) -> Dict[str, float]:
     """
-    Khoảng tin cậy bootstrap — paper hiện KHÔNG có kiểm định thống kê nào.
+    Bootstrap confidence interval. The paper currently contains no statistical
+    significance tests.
 
-    Vì sao BẮT BUỘC: trong bảng kết quả,
+    This is required because the result table reports:
         Final CIG-AMF  -0.199 +- 0.018
         Pure MF        -0.211 +- 0.008
-    chênh 0.012 trong khi std là 0.018, với 5 seed. Đây KHÔNG phải khác biệt
-    có ý nghĩa. Mọi phát biểu kiểu "moved into the strongest reward group"
-    hiện chưa có căn cứ.
+    The difference is 0.012 while the standard deviation is 0.018 over five
+    seeds. This is not a significant difference, so claims such as "moved into
+    the strongest reward group" are not yet supported.
     """
     v = np.asarray(values, dtype=np.float64).reshape(-1)
 
@@ -535,13 +542,13 @@ def compare_two_methods(
     seed: int = 0,
 ) -> Dict[str, float]:
     """
-    So hai phương pháp bằng bootstrap trên HIỆU SỐ.
+    Compare two methods by bootstrapping their difference.
 
     Returns:
-        prob_a_better: xác suất A tốt hơn B theo phân phối bootstrap.
-        significant  : True nếu khoảng tin cậy của hiệu không chứa 0.
+        prob_a_better: probability that A exceeds B under the bootstrap distribution.
+        significant: True when the confidence interval of the difference excludes zero.
 
-    Báo cáo con số này thay vì chỉ nói "A cao hơn B".
+    Report this statistic instead of merely stating that A is higher than B.
     """
     a = np.asarray(values_a, dtype=np.float64).reshape(-1)
     b = np.asarray(values_b, dtype=np.float64).reshape(-1)

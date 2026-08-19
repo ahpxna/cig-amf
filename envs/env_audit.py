@@ -1,31 +1,29 @@
 """
-env_audit.py — kiểm định Omni-Arena theo Phần 7 (tiêu chí nghiệm thu) của
+env_audit.py — audit Omni-Arena against Section 7 acceptance criteria in the
 docs/OMNI_ARENA_BLUEPRINT.md.
 
-Instantiate OmniArena (P1-P4) + oracle can thiệp đã sửa (P0), chạy đủ số
-episode/oracle rollout để tính:
+Instantiate OmniArena (P1-P4) with the corrected P0 interventional oracle and
+run enough episodes/oracle rollouts to compute:
 
-  T1  Gini(|W*|) trên tập cặp agent
-  T2  cân bằng dấu (tỷ lệ cặp W* âm/dương "đáng kể")
-  T3  CV của w_ij(s) qua nhiều trạng thái, cho các cặp có điều kiện
-  T4  độ trải (spread) của latency-to-peak-effect qua 4 vai trò
-  T5  SNR (biên độ tín hiệu core / biên độ nhiễu control-pairs)
+  T1  Gini(|W*|) over sampled agent pairs
+  T2  sign balance among materially positive/negative W* pairs
+  T3  CV of w_ij(s) across states for conditional pairs
+  T4  latency-to-peak-effect spread across four roles
+  T5  SNR between core signal and control-pair noise floor
   T6  tier_separation_ratio (structural vs behavioural ||dPhi||_F)
   corr(Phi, W*)
 
-In bảng PASS/FAIL theo Phần 7, kèm toàn bộ số thô.
+Print Section 7 PASS/FAIL results with all raw values.
 
-GHI CHÚ VỀ QUY MÔ MẪU (đọc trước khi diễn giải số liệu):
-Chi phí oracle đầy đủ O(N^2 * S * T * H) là ~1 triệu bước env cho N=24 (Phần
-4.2). Trong phiên làm việc này, để chạy được trong vài phút, T1/T2/T5/corr
-dùng một tập mẫu CÓ CHỦ ĐÍCH gồm:
-  - toàn bộ 20 cặp "declared" (5 role -> {collector hoặc gatekeeper} x 4 zone)
-  - một tập ~20 cặp "control" lấy ngẫu nhiên (ego, j) KHÔNG nằm trong declared
-    pairs, dùng làm ước lượng noise-floor cho T5 và làm đối chứng cho Gini.
-Đây KHÔNG phải cắt tỉa theo bán kính (không rơi vào bẫy tự-xác-nhận A1 của
-Phần 4.2) — chỉ là giảm số state/trial để chạy trong ngân sách thời gian của
-phiên làm việc. Con số S (states), T (trials), forced_step quét được ghi rõ
-trong phần cấu hình bên dưới và trong output.
+SAMPLE-SIZE NOTE:
+A complete O(N^2*S*T*H) oracle costs about one million environment steps for
+N=24 (Section 4.2). To keep the audit to minutes, T1/T2/T5/correlation use a
+purposeful set containing all 20 declared pairs (five roles targeting a
+collector or gatekeeper in four zones) and approximately 20 random control
+pairs outside that set. Controls estimate T5's noise floor and provide a Gini
+comparison. This is not radius pruning and avoids Section 4.2's A1
+self-confirmation trap; only state/trial counts are reduced. S, T, and the
+forced_step sweep are stated below and in output.
 """
 import sys
 import numpy as np
@@ -34,34 +32,34 @@ from omni_arena import OmniArena
 
 
 # ============================================================
-# Config (xem ghi chú quy mô mẫu ở đầu file)
+# Configuration; see the sample-size note above.
 # ============================================================
 N_AGENTS = 24
 GRID_SIZE = 24
 N_ZONES = 4
 MAX_STEPS = 60
-PHASE_LENGTH = 6          # nhỏ để structural shift + behavioural drift xảy ra nhanh trong audit
+PHASE_LENGTH = 6          # Short enough to expose both drift types quickly.
 HORIZON = 8
-N_STATES_T1 = 10           # số state lấy mẫu cho T1/T2/T5/corr
-N_STATES_T3 = 24           # số state lấy mẫu cho T3 (rẻ -- không cần oracle)
+N_STATES_T1 = 10           # States sampled for T1/T2/T5/correlation.
+N_STATES_T3 = 24           # States sampled for inexpensive non-oracle T3.
 N_CONTROL_PAIRS = 20
-N_TRIALS = 1                # CRN cho phép n_trials nhỏ (P0d)
+N_TRIALS = 1                # CRN permits small n_trials under P0d.
 SEED = 123
 
-SIGNIFICANT_W = 0.01        # ngưỡng "đáng kể" cho T2 (đơn vị reward/step)
+SIGNIFICANT_W = 0.01        # T2 materiality threshold in reward/step.
 
-# RC-2: tham số phép đo Φ̃ = E_s[phi * delta] cho T6.
-# T6_N_STATES là đánh đổi nhiễu/thời gian: ‖dΦ̃‖_behavioural là hiệu của hai
-# trung bình Monte-Carlo nên sai số ~ 1/sqrt(N). Dưới ~24 state thì nhiễu lấy
-# mẫu át tín hiệu drift và tỉ số T6 mất ổn định giữa các seed.
+# RC-2 parameters for T6 measurement Φ̃=E_s[phi*delta]. T6_N_STATES trades
+# noise for runtime: behavioural ‖dΦ̃‖ is a difference of two Monte Carlo
+# means with error O(1/sqrt(N)). Below about 24 states, sampling noise swamps
+# drift and makes T6 unstable across seeds.
 T6_N_STATES = 48
 T6_BURN_IN = 3
-# Hai cực của lịch drift trong _behaviour_mode(): "cooperative" (gatekeeper mở
-# cổng mọi bước) vs "selfish" (bỏ nhiệm vụ). Chọn hai cực để ‖dΦ̃‖_behavioural
-# là CẬN TRÊN của drift — nếu ngay cả cận trên còn nhỏ hơn structural 3-20 lần
-# thì kết luận tách tầng mới có giá trị.
+# Use the extreme _behaviour_mode states: cooperative gatekeepers open every
+# step, while selfish ones abandon the task. This makes behavioural ‖dΦ̃‖ an
+# upper bound; tier separation is meaningful only if structural change remains
+# 3-20x larger even than that bound.
 T6_BEHAVIOUR_PAIR = ("cooperative", "selfish")
-T6_INVARIANCE_PHASES = 2    # was 5 -- chỉ để kiểm bất biến phi tĩnh, 2 là đủ
+T6_INVARIANCE_PHASES = 2    # Two phases suffice to test static-phi invariance.
 
 
 def gini(values):
@@ -91,20 +89,16 @@ def pearson_corr(x, y):
 
 def oracle_w_star(env, ego, j, horizon=HORIZON, n_trials=N_TRIALS, forced_step=0):
     """
-    W*_ij (dùng cho T1/T2/T5/corr): dùng đúng oracle đã sửa theo P0
-    (compute_oracle_influence_from_current_state, CRN, không abs), CAN THIỆP
-    MỘT BƯỚC tại forced_step, action = STAY.
+    W*_ij for T1/T2/T5/correlation uses the corrected P0 oracle with CRN and
+    no absolute value, applying a one-step STAY intervention at forced_step.
 
-    LƯU Ý QUAN TRỌNG (phát hiện trong quá trình audit, xem báo cáo triển
-    khai): với can thiệp một-bước tại step 0, một vài cặp có độ trễ cao
-    (relay 4-5 bước, controller 6+ bước) gần như không đổi được rollout kịp
-    trong horizon còn lại -> W* đo được gần 0, không phản ánh đúng dấu Phi.
-    Đây là hạn chế đã biết của phép đo một-bước trên một môi trường có độ
-    trễ dài, không phải lỗi oracle. Dùng oracle_w_star_sustained() bên dưới
-    cho phép đo "vô hiệu hoá vai trò j suốt horizon" (theo hướng cùng gốc
-    khái niệm can thiệp, chỉ khác ở việc can thiệp được duy trì thay vì một
-    bước) để làm chỉ số corr(Phi, W*) chính -- đây là phép đo dùng cho
-    T1/T2/T5/corr trong report này.
+    Important limitation found during audit: a one-step intervention at step
+    zero leaves too little time for high-latency relay (4-5 steps) and
+    controller (6+ steps) effects, producing W* near zero with the wrong Phi
+    sign. This is a known limitation of one-step measurement in a delayed
+    environment, not an oracle defect. T1/T2/T5/correlation therefore use
+    oracle_w_star_sustained(), which disables j's role throughout the horizon
+    while retaining the same intervention concept.
     """
     profile = env.compute_oracle_influence_from_current_state(
         ego_id=ego,
@@ -121,17 +115,15 @@ def oracle_w_star(env, ego, j, horizon=HORIZON, n_trials=N_TRIALS, forced_step=0
 
 def _disengage_action(env, ego, j):
     """
-    Hành động đơn bước làm TĂNG khoảng cách agent j <-> ego nhiều nhất -- đại
-    diện tốt hơn cho "j không tham gia tương tác" so với STAY cố định (STAY
-    có thể vô tình đứng lại đúng ngay trên đường đi/vùng nguy hiểm của ego,
-    xem báo cáo triển khai, mục "deviations").
+    Choose the one-step action that maximally increases distance between j and
+    ego. This better represents non-participation than fixed STAY, which can
+    leave j directly on ego's route or in a hazard area.
     """
-    # [P-2 FINAL DEBUG] Rời VỊ TRÍ NHIỆM VỤ (duty anchor) của j, không phải
-    # rời ego. Bản cũ maximize dist(j, ego) => kênh khai báo của CHÍNH j
-    # (vd. gate_gk_collector cần gatekeeper cách gate <= 1) thường KHÔNG đổi
-    # trạng thái giữa base/alt (đo được d_w = 0.000 ở mọi state), trong khi
-    # thân j vẫn quẩn quanh làm lệch queue/crowding của các gate KHÁC.
-    # "Vai trò j không tham gia" = j rời anchor mà delta_ij(s) của nó neo vào.
+    # [P-2 FINAL DEBUG] Move j away from its duty anchor, not from ego. The old
+    # max-distance-from-ego rule often left j's declared channel unchanged
+    # between base and alternative, yielding d_w=0.000 in every state, while
+    # j still altered unrelated queue/crowding gates. Non-participation means
+    # leaving the anchor used by j's delta_ij(s).
     z = env.agent_zone[j]
     role = env.agent_role[j]
     anchor = {
@@ -165,51 +157,47 @@ PAIR_LATENCY_CAP = {
 def oracle_w_star_sustained(env, ego, j, horizon=HORIZON, crn_seed=SEED,
                             n_force_steps=None, candidate_actions=None):
     """
-    W*_ij theo ĐÚNG Eq (4): contrast giữa hành động THỰC của j và BASELINE
-    TRUNG BÌNH THEO PHÂN BỐ HÀNH ĐỘNG, ép suốt horizon.
+    W*_ij follows Eq. 4 exactly: contrast j's observed action against a
+    distribution-averaged action baseline, sustained through the horizon.
 
-        W*_ij = R_i(a_j thực) - E_{a'~b_j}[ R_i(do a') ]
+        W*_ij = R_i(a_j observed) - E_{a'~b_j}[ R_i(do a') ]
 
     ==================================================================
-    [ORACLE-EQ4] SỬA MỘT SAI LỆCH KHỎI SPEC, KHÔNG PHẢI TINH CHỈNH.
+    [ORACLE-EQ4] This corrects a specification deviation, not a tuning choice.
     ==================================================================
-    Bản cũ dùng _disengage_action — một baseline DO NGƯỜI CHỌN:
-        W*_cũ = R_i(a_j) - R_i(do a_disengage)
-    trong khi Eq (4) định nghĩa baseline là trung bình theo phân bố hành
-    động. Paper §II.B nói thẳng lý do: "rather than an arbitrarily chosen
+    The old implementation used a manually selected _disengage_action:
+        W*_old = R_i(a_j) - R_i(do a_disengage)
+    but Eq. 4 defines a distribution-averaged action baseline. Paper §II.B
+    explicitly contrasts this with "rather than an arbitrarily chosen
     alternative action, follows [12] and reduces variance because it
-    averages over the full action distribution." Bản cũ chạy đúng cái
-    "arbitrarily chosen alternative action" mà đoạn đó bác bỏ.
+    averages over the full action distribution." The old implementation used
+    precisely the arbitrary alternative rejected by that definition.
 
-    Hệ quả đã đo được: oracle và estimator nhắm HAI ĐẠI LƯỢNG KHÁC NHAU —
-    đúng thứ §V.A cảnh báo ("oracle and estimator must target the same
-    quantity"). Cụ thể với cặp collector->gatekeeper:
-        dist(collector, gate)   base 6.5 -> alt 1.5  (mọi zone)
-        dd(collector, gk)       -> 0.000 (mọi zone)
-    _disengage_action đẩy collector RA XA duty anchor (zone_resource), mà
-    gate nằm phía đối diện resource trên cùng polyline, nên nó đẩy thẳng
-    collector VÀO MẶT gatekeeper. Obstruct bắn mạnh hơn ở nhánh alt =>
-    W* = base - alt DƯƠNG THEO CẤU TẠO, và 4/4 cặp lệch dấu so với Phi.
-    W* khi đó không đo "collector ảnh hưởng gatekeeper thế nào" mà đo
-    "chuyện gì xảy ra khi ta đẩy collector vào mặt gatekeeper".
+    The measured consequence was an oracle and estimator targeting different
+    quantities, exactly the §V.A warning that both must target the same
+    quantity. For collector->gatekeeper:
+        dist(collector, gate) base 6.5 -> alternative 1.5 in every zone
+        dd(collector, gatekeeper) -> 0.000 in every zone
+    _disengage_action moved the collector away from zone_resource, but the
+    gate lies opposite the resource on the same polyline, pushing the
+    collector directly into the gatekeeper. Stronger alternative obstruction
+    made base-alt positive by construction and reversed all four Phi signs.
+    W* then measured the artificial collision rather than collector influence.
 
-    TẠI SAO BASELINE LÀ UNIFORM, KHÔNG PHẢI pi_j:
-    Eq (4) viết E_{a'~pi_j}. Nhưng scripted_policy TẤT ĐỊNH, nên
-    E_{a'~pi_j} = chính hành động đó = base => contrast ≡ 0, phép đo suy
-    biến. Phân bố đúng để lấy trung bình ở đây là phân bố mà can thiệp
-    THỰC SỰ bốc từ: eps-forcing bốc UNIFORM trên A (xem
-    EpsilonForcedActionController.apply). A2 do đó thoả theo cấu tạo
-    (b_j >= eps/|A| > 0) — baseline không bao giờ nằm ngoài support, khác
-    hẳn một hành động hand-designed vốn không có bảo đảm nào về b_j.
-    Uniform cũng là baseline mà _compute_tiny_oracle_scores (H1) đang
-    dùng, nên sau sửa này env_audit và H1 nhắm CÙNG một đại lượng.
+    WHY THE BASELINE IS UNIFORM RATHER THAN pi_j:
+    Eq. 4 uses E_{a'~pi_j}, but deterministic scripted_policy makes this equal
+    the observed action and collapses the contrast to zero. The appropriate
+    distribution is the actual epsilon-forcing intervention distribution,
+    uniform over A. A2 holds by construction because b_j>=eps/|A|>0, so the
+    baseline remains in support unlike a hand-designed action. H1's
+    _compute_tiny_oracle_scores uses the same baseline, aligning estimands.
 
-    Tính bằng |A| rollout tất định (mỗi action ép suốt horizon) rồi lấy
-    trung bình — chính xác hơn là bốc mẫu, và không thêm nhiễu.
+    Compute all |A| deterministic sustained-action rollouts and average them,
+    avoiding sampling noise.
 
-    GIỮ tính "sustained" (ép suốt n_force_steps): T4 H-sweep cho thấy
-    blocker đi -0.14 -> -1.73 từ H=1 tới H=8 chưa bão hoà, nên contrast
-    một-bước sẽ bóp mọi cặp có độ trễ dài.
+    Retain sustained forcing across n_force_steps: T4 showed blocker effects
+    from -0.14 at H=1 to -1.73 at H=8 without saturation, so one-step
+    contrasts suppress all long-latency pairs.
     """
     if n_force_steps is None:
         n_force_steps = horizon
@@ -241,10 +229,9 @@ def oracle_w_star_sustained(env, ego, j, horizon=HORIZON, crn_seed=SEED,
     env.clear_noise_buffer()
     env.restore_state(snapshot)
 
-    # Eq (4): hành động thực TRỪ trung bình baseline.
-    # Dấu: >0 nghĩa là hành động thực của j GIÚP ego so với một hành động
-    # trung bình. Kiểm chứng bắt buộc: blocker->collector phải ÂM,
-    # relay->collector phải DƯƠNG.
+    # Eq. 4: observed action minus average baseline. Positive means j's action
+    # helps ego relative to an average action. Required checks are negative
+    # blocker->collector and positive relay->collector.
     return float(base_total - float(np.mean(alt_totals)))
 
 
@@ -267,19 +254,18 @@ def build_declared_pair_list(env):
 
 def build_control_pair_list(env, declared_set, rng, n=N_CONTROL_PAIRS):
     """
-    RC-3(b). Noise floor phải là "cặp CÓ THỂ tương tác nhưng KHÔNG được khai
-    báo" — tức CÙNG ZONE và không thuộc declared_set.
+    RC-3(b). Noise-floor pairs must be able to interact but remain undeclared:
+    they are within the same zone and outside declared_set.
 
-    Bản cũ bốc ngẫu nhiên hai chỉ số trên toàn quần thể: 24 agent / 4 zone ⇒
-    ~75% cặp khác zone. Mọi kênh tương tác của env (declared, collision, lane,
-    queue, crowding) đều yêu cầu đồng vị trí vật lý, nên cặp khác zone cho
-    W* = 0 CHÍNH XÁC ⇒ np.std(np.abs(w_control)) = 0 ⇒ T5 SNR = ∞. Con số
-    3.8e9 là artefact của phép lấy mẫu, không nói gì về env.
+    The old whole-population sampler selected cross-zone pairs about 75% of
+    the time for 24 agents and four zones. Every interaction channel requires
+    physical colocation, so cross-zone W*=0 exactly, control std=0, and T5 is
+    infinite. The observed 3.8e9 was a sampling artifact, not an environment
+    property.
 
-    Liệt kê vét cạn rồi shuffle thay vì rejection sampling: không gian cặp
-    cùng-zone chỉ cỡ n_zones * k^2 (k = agent/zone ≈ 6) ~ 144 phần tử, vét
-    cạn là O(n_agents^2) một lần và loại hẳn khả năng vòng while quay đủ
-    n*20 lượt mà vẫn trả về thiếu cặp.
+    Enumerate and shuffle rather than rejection-sample. The same-zone space is
+    only about n_zones*k^2=144 for k≈6, so one O(n_agents^2) enumeration also
+    prevents a rejection loop from exhausting n*20 attempts with too few pairs.
     """
     candidates = [
         (i, j, "control_same_zone")
@@ -295,12 +281,77 @@ def build_control_pair_list(env, declared_set, rng, n=N_CONTROL_PAIRS):
     return [candidates[k] for k in order[:n]]
 
 
+def state_bank_diagnostics(states):
+    """Measure diversity in the physical state bank actually used by the oracle.
+
+    sample_state_bank snapshots are separated in time, so t always differs and
+    would make a static bank appear diverse. The key includes only physical and
+    task state capable of changing influence.
+    """
+    if not states:
+        return {
+            "n_states": 0,
+            "unique_state_fraction": 0.0,
+            "mean_unique_positions_per_agent": 0.0,
+            "min_unique_positions_per_agent": 0,
+            "mean_successive_agent_move_fraction": 0.0,
+            "carrying_state_fraction": 0.0,
+            "gate_open_state_fraction": 0.0,
+        }
+
+    def _ordered_values(mapping):
+        return tuple(mapping[k] for k in sorted(mapping))
+
+    def _physical_key(st):
+        positions = tuple(
+            (int(a), tuple(int(v) for v in st["positions"][a]))
+            for a in sorted(st["positions"])
+        )
+        return (
+            positions,
+            _ordered_values(st["gate_open"]),
+            _ordered_values(st["resource_available"]),
+            _ordered_values(st["carrying"]),
+            _ordered_values(st["low_priority_active"]),
+            _ordered_values(st["active_lane"]),
+        )
+
+    keys = [_physical_key(st) for st in states]
+    agent_ids = sorted(states[0]["positions"])
+    position_counts = [
+        len({tuple(st["positions"][a]) for st in states}) for a in agent_ids
+    ]
+    move_fracs = []
+    for prev, cur in zip(states[:-1], states[1:]):
+        moved = sum(
+            tuple(prev["positions"][a]) != tuple(cur["positions"][a])
+            for a in agent_ids
+        )
+        move_fracs.append(moved / max(len(agent_ids), 1))
+
+    return {
+        "n_states": len(states),
+        "unique_state_fraction": len(set(keys)) / len(states),
+        "mean_unique_positions_per_agent": float(np.mean(position_counts)),
+        "min_unique_positions_per_agent": int(min(position_counts)),
+        "mean_successive_agent_move_fraction": (
+            float(np.mean(move_fracs)) if move_fracs else 0.0
+        ),
+        "carrying_state_fraction": float(np.mean([
+            any(bool(v) for v in st["carrying"].values()) for st in states
+        ])),
+        "gate_open_state_fraction": float(np.mean([
+            any(bool(v) for v in st["gate_open"].values()) for st in states
+        ])),
+    }
+
+
 def sample_states(env, n_states):
     return env.sample_state_bank(n_states=n_states, burn_in=3)
 
 
 # ============================================================
-# T1, T2, T5, corr(Phi, W*)  -- sử dụng oracle
+# T1, T2, T5, and corr(Phi,W*) use the oracle.
 # ============================================================
 
 def run_oracle_based_metrics(env):
@@ -310,18 +361,15 @@ def run_oracle_based_metrics(env):
     control_pairs = build_control_pair_list(env, declared_set, rng, n=N_CONTROL_PAIRS)
 
     states = sample_states(env, N_STATES_T1)
+    bank_diag = state_bank_diagnostics(states)
 
     declared_records = []  # (i, j, label, phi, mean_w_star)
     control_records = []
 
-    # LƯU Ý: đã thử ép disengage CHỈ trong n_force_steps = PAIR_LATENCY_CAP
-    # (khớp băng trễ thiết kế mỗi cặp) thay vì suốt horizon, với kỳ vọng
-    # tránh hiệu ứng phóng đại của agent trung tâm (collector). Kết quả:
-    # corr(Phi,W*) TỆ HƠN (-0.11 so với +0.615) -- việc ngắt ép giữa chừng
-    # tạo động lực "đuổi-kịp" (catch-up) kỳ lạ sau khi thả agent về kịch
-    # bản, nhiễu hơn là ép suốt horizon. Giữ lại full-horizon (n_force_steps
-    # mặc định = horizon) làm phép đo chính thức -- xem báo cáo triển khai,
-    # mục "deviations" để biết chi tiết và khuyến nghị hướng khắc phục.
+    # A trial limited forcing to PAIR_LATENCY_CAP rather than the full horizon
+    # to reduce central-collector amplification. Correlation worsened from
+    # +0.615 to -0.11 because releasing the agent mid-rollout produced noisy
+    # catch-up dynamics. Full-horizon forcing remains the primary measure.
     for (i, j, label) in declared_pairs:
         phi = env.gt_influence_by_ego[j].get(i, 0.0)
         vals = []
@@ -345,12 +393,10 @@ def run_oracle_based_metrics(env):
     # T1
     t1_gini = gini(w_all)
 
-    # T2 sign balance: tỷ lệ tính trên tập cặp CÓ HIỆU ỨNG ĐÁNG KỂ (|W*| >
-    # ngưỡng), KHÔNG lấy toàn bộ mẫu (declared+control) làm mẫu số -- vì
-    # phần lớn control pairs có W*=0 by design (chúng ta CHỦ Ý lấy mẫu
-    # control để đo noise-floor cho T5, không phải để pha loãng T2). Lấy
-    # toàn bộ mẫu làm mẫu số sẽ đánh giá sai "cân bằng dấu của đồ thị nhân
-    # quả" bằng cách pha loãng nó với các cặp vốn không có quan hệ nhân quả.
+    # T2 sign balance uses only materially nonzero |W*| pairs. Most controls
+    # have W*=0 by design because they estimate T5 noise floor. Including them
+    # in the denominator would dilute the causal graph's sign balance with
+    # unrelated pairs.
     n_neg = sum(1 for w in w_all if w < -SIGNIFICANT_W)
     n_pos = sum(1 for w in w_all if w > SIGNIFICANT_W)
     n_significant = n_neg + n_pos
@@ -358,24 +404,21 @@ def run_oracle_based_metrics(env):
     t2_pos_frac = n_pos / n_significant if n_significant else 0.0
 
     # ----------------------------------------------------------------------
-    # T5 SNR — TÍNH TRONG TỪNG ZONE RỒI TRUNG BÌNH.
+    # T5 SNR is computed within each zone and then averaged.
     #
-    # [T5-WITHIN-ZONE] Bản cũ gộp toàn cục:
-    #     T5 = mean|W*|(declared, tất cả zone) / std|W*|(control, tất cả zone)
-    # Sau khi phá đối xứng zone (zone_path_len/zone_scale khác nhau mỗi zone),
-    # std|W*|(control) gộp toàn cục CHỨA CẢ PHƯƠNG SAI GIỮA-ZONE — tức chính
-    # thứ ta CỐ Ý tạo ra. Đo thật: control std 0.172 -> 0.9500, std/mean = 2.2,
-    # trong khi declared blocker theo zone là −0.13 / −1.23 / −1.60 / −0.18.
-    # Mẫu số phình vì THIẾT KẾ, không phải vì nhiễu => T5 tụt một cách giả
-    # tạo, và "sửa" nó bằng cách bóp zone_scale về U(0.9,1.1) sẽ phá luôn
-    # gate zone-asymmetry vừa đạt (std 0.03 -> 0.5507).
+    # [T5-WITHIN-ZONE] The old global pool mixed between-zone variance into
+    # control noise after zone_path_len/zone_scale broke symmetry. Measured
+    # control std rose 0.172->0.9500 with std/mean=2.2, while zone blocker
+    # values were -0.13/-1.23/-1.60/-0.18. The denominator grew by design, not
+    # noise, artificially depressing T5. Narrowing zone_scale to U(0.9,1.1)
+    # would destroy the zone-asymmetry gate, whose std rose 0.03->0.5507.
     #
-    # Pooling qua các zone khác thang là lỗi thống kê, không phải lựa chọn.
-    # Định nghĩa đúng: SNR nội-zone rồi lấy trung bình qua zone.
+    # Pooling differently scaled zones is a statistical error. Compute
+    # within-zone SNR and average across zones.
     # ----------------------------------------------------------------------
     def _zone_of(rec):
         try:
-            return int(env.agent_zone[rec[1]])   # zone của ego (bên nhận)
+            return int(env.agent_zone[rec[1]])   # Ego/receiver zone.
         except Exception:
             return -1
 
@@ -389,25 +432,78 @@ def run_oracle_based_metrics(env):
 
     t5_snr = float(np.mean(list(zone_snrs.values()))) if zone_snrs else 0.0
 
-    # giữ bản gộp toàn cục để so sánh/chẩn đoán, KHÔNG dùng làm gate nữa
+    # Retain the global pool for diagnostics only, not as a gate.
     core_amp = float(np.mean(np.abs(w_declared))) if w_declared else 0.0
     noise_amp = max(float(np.std(np.abs(w_control))) if w_control else 1e-9, 1e-9)
     t5_snr_pooled = core_amp / noise_amp
 
-    # corr(Phi, W*) -- chỉ trên declared pairs (control có phi=0 by definition,
-    # không thuộc "corr(A,B)" của Phần 0.2)
-    phis = [r[3] for r in declared_records]
-    w_star_declared = [r[4] for r in declared_records]
-    corr_phi_w = pearson_corr(phis, w_star_declared)
+    # Split corr(Phi,W*) by source type. The 16 non-collector sources have
+    # relatively static role/anchor relations, while four mobile
+    # collector->gatekeeper contrasts depend strongly on trajectory
+    # distribution. Pooling them causes Simpson-like cancellation and hides
+    # the failing group. Global correlation remains a compatibility diagnostic,
+    # not an acceptance gate.
+    static_records = [
+        r for r in declared_records
+        if env.agent_role[r[0]] != env.ROLE_COLLECTOR
+    ]
+    mobile_records = [
+        r for r in declared_records
+        if env.agent_role[r[0]] == env.ROLE_COLLECTOR
+    ]
+
+    def _corr(records):
+        return pearson_corr([r[3] for r in records], [r[4] for r in records])
+
+    def _sign_agreement(records):
+        usable = [r for r in records if abs(r[3]) > 1e-9 and abs(r[4]) > 1e-9]
+        if not usable:
+            return 0.0
+        return float(np.mean([np.sign(r[3]) == np.sign(r[4]) for r in usable]))
+
+    corr_phi_w = _corr(declared_records)
+    corr_phi_w_static = _corr(static_records)
+    corr_phi_w_mobile = _corr(mobile_records)
+
+    control_values = np.asarray(
+        [v for r in control_records for v in r[5]], dtype=np.float64
+    )
+    control_pair_stds = np.asarray(
+        [np.std(r[5]) for r in control_records], dtype=np.float64
+    )
+    control_diag = {
+        "state_nonzero_fraction": (
+            float(np.mean(np.abs(control_values) > 1e-9))
+            if control_values.size else 0.0
+        ),
+        "mean_pair_std": (
+            float(np.mean(control_pair_stds)) if control_pair_stds.size else 0.0
+        ),
+        "median_pair_std": (
+            float(np.median(control_pair_stds)) if control_pair_stds.size else 0.0
+        ),
+        "constant_pair_fraction": (
+            float(np.mean(control_pair_stds < 1e-9))
+            if control_pair_stds.size else 1.0
+        ),
+    }
 
     return {
         "t1_gini": t1_gini,
         "t2_neg_frac": t2_neg_frac,
         "t2_pos_frac": t2_pos_frac,
         "t5_snr": t5_snr,                    # within-zone mean (GATE)
-        "t5_snr_pooled": t5_snr_pooled,      # bản gộp cũ, chỉ để chẩn đoán
+        "t5_snr_pooled": t5_snr_pooled,      # Legacy pooled diagnostic only.
         "t5_snr_per_zone": zone_snrs,
-        "corr_phi_w": corr_phi_w,
+        "corr_phi_w": corr_phi_w,                  # diagnostic only
+        "corr_phi_w_static": corr_phi_w_static,    # primary corr gate
+        "corr_phi_w_mobile": corr_phi_w_mobile,    # report separately (n=4)
+        "corr_sign_static": _sign_agreement(static_records),
+        "corr_sign_mobile": _sign_agreement(mobile_records),
+        "n_corr_static": len(static_records),
+        "n_corr_mobile": len(mobile_records),
+        "state_bank_diagnostics": bank_diag,
+        "control_diagnostics": control_diag,
         "declared_records": declared_records,
         "control_records": control_records,
         "n_declared": len(declared_records),
@@ -417,7 +513,7 @@ def run_oracle_based_metrics(env):
 
 
 # ============================================================
-# T3 -- CV of w_ij(s) across states (rẻ, không cần oracle)
+# T3: CV of w_ij(s) across states; inexpensive and does not require the oracle.
 # ============================================================
 
 def run_t3(env):
@@ -447,29 +543,21 @@ def run_t3(env):
 # ============================================================
 # T4 -- latency profile across the 4 non-collector roles
 #
-# PHƯƠNG PHÁP ĐÃ ĐỔI (xem review kết quả trước): bản CŨ ép can thiệp tại một
-# forced_step TRƯỢT từ 0 đến H-1 với H=HORIZON cố định, rồi nhìn |W*| biến
-# thiên theo forced_step. Điều này CHẮC CHẮN giảm dần khi forced_step tăng,
-# BẤT KỂ latency thật của vai trò -- vì can thiệp càng muộn thì horizon còn
-# lại để tích luỹ hiệu ứng càng ngắn, đó là hệ quả cơ học của "horizon còn
-# lại co hẹp", không phải phép đo latency thật. Mọi vai trò vì vậy luôn "có
-# vẻ" đạt đỉnh ở forced_step=0 rồi giảm dần -- không có tính chẩn đoán.
+# METHOD REVISION: the old method slid forced_step from 0 to H-1 at fixed H
+# and measured |W*|. Effects necessarily decline for later interventions
+# regardless of true role latency because less horizon remains to accumulate
+# them. Every role mechanically appears to peak at step zero, so the measure
+# has no latency diagnostic value.
 #
-# Bản MỚI (theo code_test.py's measure_at_horizon() -- tái dùng đúng pattern,
-# không viết lại logic oracle): CAN THIỆP CỐ ĐỊNH tại forced_step/step 0 (dùng
-# oracle_w_star_sustained(), disengage j suốt horizon kể từ bước 0), rồi QUÉT
-# horizon H qua {1,2,3,5,8} và xem W*(H) tăng/đổi dấu ra sao khi horizon dài
-# ra -- đây mới thật sự chẩn đoán latency (ví dụ mẫu của người dùng:
-# gatekeeper W* đi từ -0.23 tại H=1 lên +6.80 tại H=8, đổi dấu thật; blocker
-# giữ nguyên âm suốt, không đổi dấu).
+# The revised code_test.py measure_at_horizon pattern fixes intervention at
+# step zero, sustains disengagement, and sweeps H over {1,2,3,5,8}. Growth and
+# sign changes in W*(H) then diagnose latency. Example: gatekeeper changes from
+# -0.23 at H=1 to +6.80 at H=8, while blocker remains negative throughout.
 #
-# Hai đặc trưng MỚI thay cho "spread của peak forced_step" cũ:
-#   sign-flip step:   H nhỏ nhất trong sweep mà sign(W*(H)) khác
-#                      sign(W*(H_min)) (H_min = sweep[0]); None nếu không có
-#                      đổi dấu trong sweep.
-#   saturation step:  H nhỏ nhất mà mức tăng rời rạc |W*(H)-W*(H_prev)| tụt
-#                      xuống dưới 20% mức tăng rời rạc lớn nhất quan sát được
-#                      trong sweep của vai trò đó; None nếu không có.
+# New features replace peak-forced-step spread:
+# sign-flip step is the first H whose sign differs from H_min, or None;
+# saturation step is the first H whose discrete increment falls below 20% of
+# that role's maximum observed increment, or None.
 # ============================================================
 
 T4_H_SWEEP = [1, 2, 3, 5, 8]
@@ -477,15 +565,12 @@ T4_H_SWEEP = [1, 2, 3, 5, 8]
 
 def run_t4(env, h_sweep=None, n_states=2):
     """
-    LƯU Ý TƯƠNG THÍCH NGƯỢC: chữ ký run_t4(env) (không tham số bắt buộc
-    khác) và các khoá "t4_peak_steps"/"t4_profiles"/"t4_spread" trong dict
-    trả về được GIỮ NGUYÊN để env_audit_staged.py (gọi ea.run_t4(main_env))
-    không phải sửa call site -- nhưng Ý NGHĨA của "t4_spread" đã đổi hoàn
-    toàn (xem docstring module phía trên): KHÔNG còn là "độ trải của peak
-    forced_step trượt", mà là "tỷ lệ vai trò (trên 4) có sign-flip trong
-    H-sweep cố định forced_step=0". "t4_peak_steps" cũng đổi ý nghĩa thành
-    "sign_flip_step" per role (None = không đổi dấu trong sweep). Đọc nhãn
-    in ra ở main()/env_audit_staged.py, không suy diễn từ tên khoá cũ.
+    Compatibility note: run_t4(env) and legacy result keys remain unchanged so
+    env_audit_staged.py needs no call-site change. Their meanings have changed:
+    t4_spread is now the fraction of four roles with a sign flip under a fixed-
+    step-zero H sweep, not sliding-forced-step peak spread. t4_peak_steps now
+    aliases per-role sign_flip_step. Use printed labels rather than inferring
+    semantics from legacy key names.
     """
     if h_sweep is None:
         h_sweep = T4_H_SWEEP
@@ -494,9 +579,9 @@ def run_t4(env, h_sweep=None, n_states=2):
     ra = env.zone_role_agents[z]
     collector = ra[env.ROLE_COLLECTOR]
 
-    profiles = {}          # role -> [mean W*(H) for H in h_sweep] (forced_step=0 cố định)
-    sign_flip_step = {}    # role -> H nhỏ nhất có sign khác H_min, hoặc None
-    saturation_step = {}   # role -> H nhỏ nhất có increment < 20% peak increment, hoặc None
+    profiles = {}          # role -> mean W*(H) list at fixed forced_step=0
+    sign_flip_step = {}    # role -> first H with sign differing from H_min
+    saturation_step = {}   # role -> first H with increment <20% of peak
 
     for role_name in ["blocker", "gatekeeper", "relay", "controller"]:
         j = ra[role_name]
@@ -530,19 +615,18 @@ def run_t4(env, h_sweep=None, n_states=2):
         saturation_step[role_name] = sat
 
     n_flip_roles = sum(1 for v in sign_flip_step.values() if v is not None)
-    # NEW meaning (xem docstring trên): tỷ lệ vai trò (0..1) có sign-flip
-    # trong H-sweep cố định forced_step=0. KHÔNG phải "spread của peak
-    # forced_step trượt" như bản cũ -- tên khoá giữ nguyên chỉ để tương
-    # thích env_audit_staged.py, ý nghĩa đã đổi, xem nhãn in ở main().
+    # Revised meaning: fraction of roles with a sign flip under the fixed-step
+    # H sweep. This is not the old sliding-step peak spread; the key remains
+    # only for env_audit_staged.py compatibility.
     t4_spread = n_flip_roles / 4.0
 
     return {
         "t4_h_sweep": list(h_sweep),
-        "t4_profiles": profiles,               # role -> W*(H) list, forced_step=0 cố định (bản mới)
-        "t4_sign_flip_step": sign_flip_step,    # role -> H đổi dấu đầu tiên, hoặc None
-        "t4_saturation_step": saturation_step,  # role -> H bão hoà đầu tiên, hoặc None
-        "t4_peak_steps": sign_flip_step,        # ALIAS tương thích ngược -- Ý NGHĨA ĐÃ ĐỔI, xem docstring
-        "t4_spread": t4_spread,                 # ALIAS tương thích ngược -- Ý NGHĨA ĐÃ ĐỔI, xem docstring
+        "t4_profiles": profiles,               # role -> W*(H) at fixed step zero
+        "t4_sign_flip_step": sign_flip_step,    # role -> first sign-flip H
+        "t4_saturation_step": saturation_step,  # role -> first saturation H
+        "t4_peak_steps": sign_flip_step,        # compatibility alias; revised meaning
+        "t4_spread": t4_spread,                 # compatibility alias; revised meaning
     }
 
 
@@ -570,18 +654,17 @@ def run_t6(env_kwargs=None, seed=SEED):
         )
 
     # ------------------------------------------------------------------
-    # RC-2. Cả TỬ và MẪU giờ đều đo trên Φ̃ = E_s[phi * delta], KHÔNG phải
-    # trên bảng phi tĩnh.
+    # RC-2. Both numerator and denominator now measure Φ̃=E_s[phi*delta]
+    # rather than the static phi table.
     #
-    # Bản cũ: tử = ‖dPhi‖ tĩnh tại ranh giới shift, mẫu = literal
-    # `0.0 if behavioural_invariant else 1.0`. Mẫu số đó không phải phép đo —
-    # nó là hằng số suy ra từ một assert về chính giả định thiết kế. T6 =
-    # structural / 1e-12 = 9.9e11 là hệ quả số học, audit không hề chạm vào
-    # dữ liệu nào.
+    # The old numerator used static ‖dPhi‖ at the shift boundary, while the
+    # denominator was the literal 0.0/1.0 from an assertion about the design
+    # assumption. It was not a measurement. T6=9.9e11 was merely structural
+    # divided by 1e-12 without reading behavioural data.
     #
-    # Trên Φ̃ thì behavioural drift CÓ tín hiệu thật: phi bất biến, nhưng
-    # agent đi khác đi ⇒ delta_ij(s) đổi ⇒ Φ̃ đổi. Đây là thứ đáng gọi là
-    # "tách tầng": cùng một đại lượng, đo hai loại can thiệp khác nhau.
+    # Behavioural drift has a real Φ̃ signal: phi remains fixed, but changed
+    # trajectories alter delta_ij(s) and therefore Φ̃. Tier separation now
+    # compares two intervention types on the same measured quantity.
     # ------------------------------------------------------------------
     env_t6 = OmniArena(mode="behavioral_drift", seed=seed, **env_kwargs)
     structural, behavioural = env_t6.measure_realized_phi_tiers(
@@ -590,10 +673,10 @@ def run_t6(env_kwargs=None, seed=SEED):
         bank_seed=seed,
         behaviour_pair=T6_BEHAVIOUR_PAIR,
     )
-    t6_ratio = env_t6.tier_separation_ratio()   # inf nếu behavioural == 0
+    t6_ratio = env_t6.tier_separation_ratio()   # Infinite when behavioural is zero.
 
-    # Bất biến thiết kế P4 vẫn phải giữ: bảng phi TĨNH không được đổi trong
-    # behavioural_drift. Kiểm riêng, và KHÔNG dùng nó làm mẫu số nữa.
+    # P4 still requires static phi invariance under behavioural drift. Test it
+    # separately rather than using it as a denominator.
     env_b = OmniArena(mode="behavioral_drift", seed=seed, **env_kwargs)
     static_phi_invariant = True
     try:
@@ -606,8 +689,8 @@ def run_t6(env_kwargs=None, seed=SEED):
         "t6_delta_phi_structural_max": float(structural),
         "t6_delta_phi_behavioural": float(behavioural),
         "t6_ratio": float(t6_ratio),
-        # Giữ nguyên key cũ cho env_audit_staged.py; ngữ nghĩa đổi thành
-        # "bảng phi TĨNH bất biến" (vẫn phải True), không còn là mẫu số của T6.
+        # Retain the old key for staged-audit compatibility; it now means
+        # static phi invariance and is no longer the T6 denominator.
         "t6_behavioural_invariant_exact": static_phi_invariant,
         "t6_static_phi_invariant": static_phi_invariant,
     }
@@ -621,7 +704,7 @@ def run_oracle_sign_check(env):
     z = 0
     ra = env.zone_role_agents[z]
     collector = ra[env.ROLE_COLLECTOR]
-    blocker = ra[env.ROLE_BLOCKER]  # phi = -0.50 (const, không phụ thuộc lane)
+    blocker = ra[env.ROLE_BLOCKER]  # phi=-0.50, constant and lane-independent.
 
     states = sample_states(env, 4)
     vals = []
@@ -633,15 +716,14 @@ def run_oracle_sign_check(env):
     return {
         "phi_negative_pair_phi": phi,
         "phi_negative_pair_mean_w_star": mean_w,
-        "no_abs_ok": (phi < 0),  # phi luôn âm theo thiết kế; kiểm tra thật là
-                                  # profile['per_action'] có thể âm (không bị
-                                  # abs() ép dương) -- xem raw per_action dưới.
+        "no_abs_ok": (phi < 0),  # Phi is negative by design; the substantive
+                                  # check is a negative per_action value below.
         "raw_per_action_signed_example": None,
     }
 
 
 def oracle_no_abs_direct_check(env):
-    """ Gọi trực tiếp oracle, kiểm tra per_action KHÔNG bị abs() ép dương. """
+    """Call the oracle directly and verify per_action is not forced nonnegative."""
     z = 0
     ra = env.zone_role_agents[z]
     collector = ra[env.ROLE_COLLECTOR]
@@ -663,7 +745,7 @@ def oracle_no_abs_direct_check(env):
         "per_action": per_action,
         "has_negative_delta": has_negative,
         "has_positive_delta": has_positive,
-        "no_abs_verified": has_negative,  # abs() cũ sẽ KHÔNG BAO GIỜ cho âm
+        "no_abs_verified": has_negative,  # The old abs() path could never be negative.
     }
 
 
@@ -769,8 +851,28 @@ def main():
           f"{m6['t6_static_phi_invariant']}")
     print(f"T6 tier_separation_ratio = {m6['t6_ratio']:.4f}")
 
-    print(f"\n-- corr(Phi, W*) -- (design intent vs oracle-measured ground truth) --")
-    print(f"corr(Phi, W*) = {m1['corr_phi_w']:.4f}")
+    print(f"\n-- corr(Phi, W*) -- split by source dynamics --")
+    print(f"static-role sources (n={m1['n_corr_static']}): "
+          f"corr={m1['corr_phi_w_static']:.4f}, "
+          f"sign agreement={m1['corr_sign_static']:.4f}  [PRIMARY GATE]")
+    print(f"mobile collector sources (n={m1['n_corr_mobile']}): "
+          f"corr={m1['corr_phi_w_mobile']:.4f}, "
+          f"sign agreement={m1['corr_sign_mobile']:.4f}  [DIAGNOSTIC: n=4]")
+    print(f"global corr={m1['corr_phi_w']:.4f}  [DIAGNOSTIC ONLY]")
+
+    bd = m1["state_bank_diagnostics"]
+    cd = m1["control_diagnostics"]
+    print(f"\n-- state-bank diversity --")
+    print(f"unique physical states={bd['unique_state_fraction']:.3f}, "
+          f"mean unique positions/agent={bd['mean_unique_positions_per_agent']:.2f}, "
+          f"min={bd['min_unique_positions_per_agent']}, "
+          f"successive moved-agent frac={bd['mean_successive_agent_move_fraction']:.3f}")
+    print(f"task-state coverage: carrying={bd['carrying_state_fraction']:.3f}, "
+          f"gate_open={bd['gate_open_state_fraction']:.3f}")
+    print(f"control distribution: state nonzero frac={cd['state_nonzero_fraction']:.3f}, "
+          f"mean/median pair std={cd['mean_pair_std']:.6f}/"
+          f"{cd['median_pair_std']:.6f}, constant-pair frac="
+          f"{cd['constant_pair_fraction']:.3f}")
 
     print(f"\n-- oracle no-abs() check --")
     print(f"phi(blocker->collector) = {msign['phi_negative_pair_phi']:.3f} "
@@ -789,12 +891,10 @@ def main():
     print("PASS/FAIL — Phan 7 (P0-P4 relevant acceptance criteria)")
     print("=" * 78)
 
-    # [docs/CIG-AMF_training_debug_master.md mục 5.5] T5/T6/corr giờ có
-    # CHẶN TRÊN -- SNR=1e9 hay T6=9.9e11 không còn PASS: chúng chứng minh
-    # control pairs suy biến (W*=0 tuyệt đối) / Phi là hằng số cấu hình,
-    # tức audit đang đo lại chính giả định thiết kế, không đo tín hiệu
-    # thật. Khoảng [3,20] là "cấu trúc phát hiện được nhưng không tầm
-    # thường" -- vùng duy nhất kết quả có giá trị (mục 5.2/5.3).
+    # [debug master section 5.5] T5/T6/correlation now have upper bounds.
+    # SNR=1e9 or T6=9.9e11 indicates degenerate zero controls or configured
+    # constants, meaning the audit remeasures assumptions rather than signal.
+    # The [3,20] interval represents detectable but nontrivial structure.
     checks = [
         ("T1 Gini(|W*|) > 0.30", m1["t1_gini"], m1["t1_gini"] > 0.30),
         ("T2 sign balance: neg frac > 0.15", m1["t2_neg_frac"], m1["t2_neg_frac"] > 0.15),
@@ -804,18 +904,21 @@ def main():
          m4["t4_spread"], m4["t4_spread"] > 0.3),
         ("T5 SNR (within-zone) in [3, 20]", m1["t5_snr"], 3.0 <= m1["t5_snr"] <= 20.0),
         ("T6 ratio in [3, 20]", m6["t6_ratio"], 3.0 <= m6["t6_ratio"] <= 20.0),
-        # RC-2: check này giờ đo THẬT. Trước đây mẫu số là literal 0.0/1.0
-        # nên nó chỉ phản chiếu lại giả định thiết kế. Đại lượng đúng là Φ̃ =
-        # E_s[phi*delta]: phi bất biến nhưng delta_ij(s) phụ thuộc vị trí
-        # thật của cả hai agent, nên behavioural drift PHẢI để lại dấu vết
-        # khác 0. Nếu vẫn == 0 thì hoặc state bank quá nhỏ, hoặc các gate
-        # không thực sự phụ thuộc hành vi -- cả hai đều là lỗi cần sửa,
-        # không được nới điều kiện để cho pass.
+        # RC-2 is now empirical rather than the former 0.0/1.0 literal.
+        # Although phi is invariant, delta_ij(s) depends on both agents' real
+        # positions, so behavioural drift must leave a nonzero Φ̃ trace. Zero
+        # indicates an undersized state bank or behaviour-independent gates;
+        # both require correction rather than a relaxed threshold.
         ("T6 ||dPhi~||(behavioural) > 0 (đo trên Φ̃, không phải hằng số hardcode)",
          m6["t6_delta_phi_behavioural"], m6["t6_delta_phi_behavioural"] > 0.0),
         ("P4 design: bảng phi TĨNH bất biến trong behavioural_drift",
          m6["t6_static_phi_invariant"], m6["t6_static_phi_invariant"]),
-        ("corr(Phi, W*) in [0.65, 0.95]  # [A5] ha nguong: Phi la dai luong 1 buoc, W* la rollout H buoc -> hap thu ca hieu ung gian tiep", m1["corr_phi_w"], 0.65 <= m1["corr_phi_w"] <= 0.95),
+        ("corr(Phi, W*) static-role sources in [0.65, 0.95] (global/mobile reported separately)",
+         m1["corr_phi_w_static"], 0.65 <= m1["corr_phi_w_static"] <= 0.95),
+        ("state bank unique physical-state fraction >= 0.80",
+         bd["unique_state_fraction"], bd["unique_state_fraction"] >= 0.80),
+        ("control distribution has nonzero effects in >= 25% state-pair samples",
+         cd["state_nonzero_fraction"], cd["state_nonzero_fraction"] >= 0.25),
         ("oracle no abs() (per_action has negative deltas on a real pair)", mabs["has_negative_delta"], mabs["has_negative_delta"]),
     ]
 

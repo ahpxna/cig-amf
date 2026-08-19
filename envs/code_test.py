@@ -1,41 +1,48 @@
 """
-code_test.py -- kiem tra gia thuyet "Phi la per-step, W* la H-step, hai dai
-luong khac don vi" cho corr(Phi,W*) dang ket = 0.54-0.62 xuyen suot moi khoi
-audit (ke ca BASELINE tat het P1-P4).
+code_test.py — Test the hypothesis that Phi is a per-step quantity while W*
+is an H-step quantity, so their differing units explain the persistent
+corr(Phi,W*) = 0.54–0.62 across every audit block, including BASELINE with
+P1–P4 disabled.
 
-KHONG tu chay trong phien nay theo yeu cau -- ban chay tay tren may minh:
+Do not launch automatically. Run manually when requested:
 
-    cd /Users/phanan/cig_amf/envs
-    python3 code_test.py                 # (hoac ../cig-env/bin/python code_test.py)
+    cd /path/to/cig_amf/envs
+    python3 code_test.py                 # or ../cig-env/bin/python code_test.py
 
-Ba phep thu, dung lai ham/so lieu co san trong env_audit.py (khong viet lai
-logic oracle/gini/pearson):
+The script performs three tests while reusing the functions and data already
+defined in env_audit.py rather than reimplementing oracle, Gini, or Pearson
+logic:
 
-  (1) Quet H in {1,2,3,5,8}: tinh corr(Phi,W*) tai moi H, cung mot tap state
-      da sample truoc (apples-to-apples). Neu corr cao o H=1 roi tut dan theo
-      H -> xac nhan gia thuyet "Phi per-step vs W* H-step".
+  (1) Sweep H in {1,2,3,5,8}. Compute corr(Phi,W*) at every H over the same
+      presampled state bank for an apples-to-apples comparison. High
+      correlation at H=1 followed by a decline as H grows would confirm the
+      "per-step Phi versus H-step W*" hypothesis.
 
-  (2) Doi thong ke: thay vi Pearson toan cuc tren moi cap (i,j) (gop cac ego
-      co thang reward khac nhau), tinh:
-        - Spearman TRONG TUNG EGO (group theo j -- agent nhan anh huong) roi
-          lay trung binh cac ego co >=3 diem du lieu (moi ego collector nhan
-          4 cap khai bao: gatekeeper/relay/blocker/controller -> du de rank;
-          ego gatekeeper chi nhan 1 cap tu collector -> khong du de rank, bi
-          loai va bao cao rieng).
-        - Sign agreement: ty le cap co sign(Phi) == sign(mean W*).
-      Neu sign agreement ~ 1.0 ma Pearson van ~0.6 -> moi truong khong hong,
-      chi la nguong 0.70 dat sai cho hai dai luong khac don vi (per-step vs
-      H-step). Khi do sua tieu chi, khong sua moi truong.
+  (2) Change the statistic. Rather than computing global Pearson across all
+      (i,j) pairs and pooling egos with different reward scales, compute:
+        - Spearman WITHIN EACH EGO, grouping by j as the influenced agent, and
+          average over egos with at least three data points. Each collector ego
+          receives four declared pairs—gatekeeper, relay, blocker, and
+          controller—so it can be ranked. A gatekeeper ego receives only one
+          pair from a collector, cannot be ranked, and is excluded and reported.
+        - Sign agreement: the fraction of pairs for which
+          sign(Phi) == sign(mean W*).
+      If sign agreement is approximately 1.0 while Pearson remains near 0.6,
+      the environment is not defective. The 0.70 gate is simply invalid for
+      two quantities with different units. In that case, revise the criterion,
+      not the environment.
 
-  (3) In rieng vi du gatekeeper->collector va blocker->collector qua cac H
-      de doi chieu bang tay voi gia thuyet nhan trong writeup cua ban (mo
-      cong +0.25 mo khoa nhat +1.0 sau; block -0.18 day nhat +1.0 ra ngoai
-      horizon).
+  (3) Print gatekeeper->collector and blocker->collector examples across H for
+      manual comparison with the causal hypothesis in the research write-up:
+      opening a gate contributes +0.25 immediately and unlocks +1.0 later;
+      blocking contributes -0.18 immediately and pushes +1.0 outside the
+      horizon.
 
-Muc (4) trong yeu cau cua ban -- struct_value = reward(oracle-core) -
-reward(pure-MF) -- CHUA duoc cai dat o dau trong repo nay (da grep
-"structure_value" trong envs/, khong co ket qua). Khong bia so: script nay
-CHỈ in canh bao o cuoi, khong tinh gia tri gia.
+Requested item (4), struct_value = reward(oracle-core) - reward(pure-MF), was
+NOT implemented anywhere in the repository at the time this diagnostic was
+written; a search for "structure_value" under envs/ returned no result. To
+avoid fabricating a number, this script ONLY prints a warning at the end and
+does not compute a synthetic value.
 """
 import sys
 import numpy as np
@@ -51,13 +58,13 @@ from env_audit import (
 )
 
 H_VALUES = [1, 2, 3, 5, 8]
-N_STATES = 10          # so state dung chung cho moi H (apples-to-apples)
-SPEARMAN_MIN_N = 3      # so diem toi thieu trong 1 ego de tinh Spearman
-SIGN_EPS = 1e-6          # nguong coi phi/W* la "khac 0" khi so dau
+N_STATES = 10          # Shared states for every H (apples-to-apples).
+SPEARMAN_MIN_N = 3     # Minimum points within one ego for Spearman.
+SIGN_EPS = 1e-6        # Threshold treating Phi/W* as nonzero for sign tests.
 
 
 # ------------------------------------------------------------------
-# Spearman thu cong (khong phu thuoc scipy)
+# Manual Spearman implementation without a SciPy dependency.
 # ------------------------------------------------------------------
 def _rank_avg(x):
     x = np.asarray(x, dtype=np.float64)
@@ -84,7 +91,7 @@ def spearman_corr(x, y):
 
 
 # ------------------------------------------------------------------
-# Chay oracle tai mot H cu the, tren mot tap state co san
+# Run the oracle at one specific H over a presampled state set.
 # ------------------------------------------------------------------
 def measure_at_horizon(env, declared_pairs, states, horizon):
     records = []  # (i, j, label, phi, mean_w, vals_per_state)
@@ -106,7 +113,7 @@ def summarize(records):
 
     pearson = pearson_corr(phis, ws)
 
-    # Spearman trong tung ego (group theo j = agent nhan anh huong)
+    # Spearman within each ego, grouped by j as the influenced agent.
     by_ego = {}
     for (i, j, label, phi, w, _vals) in records:
         by_ego.setdefault(j, []).append((phi, w))
@@ -125,8 +132,8 @@ def summarize(records):
 
     mean_spearman = float(np.mean(ego_spearmans)) if ego_spearmans else None
 
-    # Sign agreement tren toan bo cap khai bao (bo qua cap phi=0, khong co
-    # trong danh sach declared_pairs nhung phong thu)
+    # Sign agreement over all declared pairs. Ignore phi=0 defensively even
+    # though such pairs should not occur in declared_pairs.
     agree = 0
     total = 0
     for phi, w in zip(phis, ws):
@@ -149,7 +156,7 @@ def summarize(records):
 
 def main():
     print("=" * 78)
-    print("code_test.py -- quet H, doi thong ke, kiem tra gia thuyet don vi Phi vs W*")
+    print("code_test.py -- H sweep and statistical test of Phi/W* unit mismatch")
     print("=" * 78)
 
     env = OmniArena(
@@ -181,19 +188,19 @@ def main():
             print(f"  mean Spearman per-ego (n_ego={summ['n_ego_qualified']}) = "
                   f"{summ['mean_spearman_per_ego']:.4f}")
         else:
-            print(f"  mean Spearman per-ego = N/A (khong ego nao du "
-                  f"{SPEARMAN_MIN_N} diem)")
+            print(f"  mean Spearman per-ego = N/A (no ego has at least "
+                  f"{SPEARMAN_MIN_N} points)")
         if summ['n_ego_skipped']:
-            print(f"  ego bi bo qua (khong du diem de rank): {summ['n_ego_skipped']}")
+            print(f"  skipped egos (insufficient points to rank): {summ['n_ego_skipped']}")
         if summ['sign_agreement'] is not None:
             print(f"  sign agreement                    = {summ['sign_agreement']:.4f} "
-                  f"({summ['n_pairs_signed']} cap co phi != 0)")
+                  f"({summ['n_pairs_signed']} pairs with phi != 0)")
 
     # ------------------------------------------------------------
-    # (1) Bang tong hop quet H -- de mat thay xu huong tang/giam
+    # (1) H-sweep summary table that makes the trend directly visible.
     # ------------------------------------------------------------
     print("\n" + "=" * 78)
-    print("BANG TONG HOP -- quet H")
+    print("SUMMARY TABLE -- H sweep")
     print("=" * 78)
     header = f"{'H':>4} | {'Pearson':>9} | {'mean Spearman/ego':>18} | {'sign agree':>10}"
     print(header)
@@ -210,22 +217,22 @@ def main():
         decreasing = all(pearson_series[k] >= pearson_series[k + 1] - 1e-9
                           for k in range(len(pearson_series) - 1))
         peak_at_h1 = pearson_series[0] == max(pearson_series)
-        print(f"\nPearson tai H=1 la max trong day quet: {peak_at_h1}")
-        print(f"Pearson giam dan (khong tang) theo H:    {decreasing}")
+        print(f"\nPearson at H=1 is the sweep maximum: {peak_at_h1}")
+        print(f"Pearson is non-increasing with H:     {decreasing}")
         if peak_at_h1 and decreasing:
-            print(">> XAC NHAN gia thuyet: Phi (per-step) khong khop don vi voi "
-                  "W* (H-step). Moi truong khong hong -- can khai bao lai Phi "
-                  "theo dong gop H-buoc, khong sua dong luc moi truong.")
+            print(">> HYPOTHESIS CONFIRMED: per-step Phi and H-step W* have "
+                  "incompatible units. The environment is not defective; "
+                  "redefine Phi as an H-step contribution rather than changing dynamics.")
         else:
-            print(">> KHONG thay mau hinh 'giam dan theo H' ro rang -- gia thuyet "
-                  "don vi CHUA duoc xac nhan bang du lieu nay, can xem lai raw "
-                  "numbers ben duoi truoc khi ket luan.")
+            print(">> No clear decline with H was observed. This dataset DOES NOT "
+                  "confirm the unit-mismatch hypothesis; inspect the raw values "
+                  "before drawing a conclusion.")
 
     # ------------------------------------------------------------
-    # (3) Vi du tay: gatekeeper->collector va blocker->collector qua cac H
+    # (3) Manual examples across H: gatekeeper/blocker -> collector.
     # ------------------------------------------------------------
     print("\n" + "=" * 78)
-    print("VI DU DOI CHIEU TAY -- gatekeeper->collector va blocker->collector")
+    print("MANUAL CHECK -- gatekeeper->collector and blocker->collector")
     print("=" * 78)
     for label in ("gatekeeper->collector", "blocker->collector"):
         print(f"\n{label}:")
@@ -235,37 +242,38 @@ def main():
                 continue
             phi = recs[0][3]
             mean_w = float(np.mean([r[4] for r in recs]))
-            print(f"  H={H:>2}  phi={phi:+.3f}  mean W* (trung binh {len(recs)} "
-                  f"zone) = {mean_w:+.4f}")
+            print(f"  H={H:>2}  phi={phi:+.3f}  mean W* (averaged over {len(recs)} "
+                  f"zones) = {mean_w:+.4f}")
 
     # ------------------------------------------------------------
-    # (2)/(4) Doc ket luan Pearson vs sign-agreement, va canh bao structure_value
+    # (2)/(4) Interpret Pearson versus sign agreement and warn about structure_value.
     # ------------------------------------------------------------
     print("\n" + "=" * 78)
-    print("DOC KET LUAN")
+    print("INTERPRETATION")
     print("=" * 78)
     last_h = H_VALUES[-1]
     s_last = all_results[last_h]
     if (s_last['sign_agreement'] is not None and s_last['sign_agreement'] >= 0.95
             and s_last['pearson'] is not None and s_last['pearson'] < 0.70):
-        print(f"Tai H={last_h}: sign_agreement={s_last['sign_agreement']:.4f} (~1.0) "
-              f"nhung Pearson={s_last['pearson']:.4f} (<0.70).")
-        print(">> Dung thu tu va dung dau la chinh -- goi y sua TIEU CHI "
-              "(nguong 0.70 dang danh cho hai dai luong cung don vi), khong "
-              "sua MOI TRUONG.")
+        print(f"At H={last_h}: sign_agreement={s_last['sign_agreement']:.4f} (~1.0) "
+              f"but Pearson={s_last['pearson']:.4f} (<0.70).")
+        print(">> Ordering and sign are correct. Revise the CRITERION because "
+              "the 0.70 threshold assumes quantities with the same units; do "
+              "not change the ENVIRONMENT.")
     else:
-        print(f"Tai H={last_h}: sign_agreement="
+        print(f"At H={last_h}: sign_agreement="
               f"{s_last['sign_agreement']}, Pearson={s_last['pearson']}. "
-              "Khong khop dieu kien 'sign tot, Pearson kem' -- xem lai raw "
-              "numbers o tren truoc khi ket luan.")
+              "The 'good signs, weak Pearson' condition is not met; inspect "
+              "the raw values above before drawing a conclusion.")
 
-    print("\n[CANH BAO] structure_value = reward(oracle-core) - reward(pure-MF) "
-          "CHUA duoc cai dat trong repo nay (khong tim thay dinh nghia "
-          "'structure_value' trong envs/). Script nay KHONG tinh gia tri gia "
-          "cho no. Neu can so nay cho Phan 7, phai code rieng: (a) mot policy "
-          "chi dung oracle-core pairs (top-k |W*|) de quyet dinh hanh dong, "
-          "(b) mot policy pure mean-field/random lam doi chung, roi so sanh "
-          "tong reward tren cung mot tap episode/seed.")
+    print("\n[WARNING] structure_value = reward(oracle-core) - reward(pure-MF) "
+          "was NOT implemented in this repository when this diagnostic was "
+          "written; no 'structure_value' definition was found under envs/. "
+          "This script DOES NOT fabricate that value. Computing the Section 7 "
+          "quantity requires separate implementations of (a) a policy that "
+          "acts using only top-k |W*| oracle-core pairs and (b) a pure "
+          "mean-field/random control policy, followed by comparison of total "
+          "reward over identical episodes and seeds.")
 
 
 if __name__ == "__main__":

@@ -1,41 +1,34 @@
-"""
-_diag_congestion.py -- "5-phut" check truc tiep: r_emergent (P3/kenh [3],
-tac nghen -- collision/lane-capacity/queue) co bao gio khac 0 khong, khi
-chay scripted_policy tren OmniArena voi enable_congestion=True.
+"""Direct diagnostic for the P3 emergent-congestion reward channel.
 
-KHONG duoc tu chay trong phien lam viec nay (rang buoc cung: khong chay bat
-ky script nao instantiate OmniArena va step() that -- xem yeu cau cua ban).
-File nay CHI duoc VIET, ban tu chay tren may minh:
+The original observation was that r_emergent, channel [3] for collisions,
+lane capacity, and station queues, appeared to remain zero under
+scripted_policy with enable_congestion=True.
 
-    cd /Users/phanan/cig_amf/envs
-    python3 _diag_congestion.py          # (hoac ../cig-env/bin/python _diag_congestion.py)
+Code inspection established the following facts before measurement:
 
-BOI CANH (doc code, KHONG chay) -- xem bao cao day du kem theo, tom tat:
-  - enable_congestion CO duoc noi voi reward that: gate collision penalty
-    (step(), dong ~837-839: r_emergent[a] -= 0.015 khi occupancy>1) va
-    lane-over-capacity/station-queue (dong ~923-943: r_emergent[a] -= 0.1
-    hoac -= split), roi clip ve [-MAX_EMERGENT_MAGNITUDE, +MAX_EMERGENT_MAGNITUDE]
-    voi MAX_EMERGENT_MAGNITUDE = 0.15 * min|phi_ij| = 0.15*0.25 = 0.0375
-    (KHONG phai 0 -- khong thay bug "clip ve dung 0").
-  - Khong thay dau hieu truncate float32 hay discount lam trit tieu ve 0
-    (r_emergent la python float thuong, cast np.float32 chi o cho khac
-    khong lien quan; discount gamma^h > 0 voi h huu han khong the ep ve 0).
-  - GIA THUYET manh nhat sau khi doc code (CHUA xac nhan bang chay that):
-    mat do 24 agent / grid 24x24 (~4%) + scripted_policy cho tung role di
-    theo duong rieng bit (gate/resource/sink/lane_a/panel) khien dieu kien
-    kich hoat (occupancy>1 tren 1 o, >2 agent trong ban kinh 1 cua 1 lane,
-    >=2 agent trong ban kinh 1 cua resource) HIEM khi/khong bao gio dung
-    trong 1 episode binh thuong -- TRU MOT NGOAI LE dang chu y: blocker
-    CHU DONG duoi theo collector moi buoc (scripted_policy ROLE_BLOCKER =
-    greedy(pos, positions[collector])), nen khi collector dung canh
-    zone_resource de nhat resource, blocker rat co the cung nam trong ban
-    kinh 1 cua resource -> co the du 2 agent de kich hoat "waiting queue"
-    (dong ~932-939). Vi vay KHONG the loai tru hoan toan bang doc code
-    tinh -- can log truc tiep de xac nhan.
+- enable_congestion does affect reward. A gate collision subtracts 0.015 when
+  occupancy exceeds one, while lane-over-capacity and station-queue events
+  subtract 0.1 or a split penalty. The result is clipped to
+  [-MAX_EMERGENT_MAGNITUDE, +MAX_EMERGENT_MAGNITUDE], where
+  MAX_EMERGENT_MAGNITUDE = 0.15 * min|phi_ij| = 0.15 * 0.25 = 0.0375.
+  The clip bound is therefore nonzero.
+- Neither float32 conversion nor discounting explains an exact zero.
+  r_emergent is an ordinary Python float at this point, and gamma**h remains
+  positive for finite h.
+- The leading hypothesis was geometric rarity. With 24 agents on a 24x24 grid
+  (approximately 4% density) and role-specific scripted paths toward separate
+  gates, resources, sinks, lanes, and panels, activation conditions such as
+  occupancy > 1 in one cell, more than two agents within radius one of a lane,
+  or at least two agents within radius one of a resource may almost never occur.
+- A notable exception prevents resolving the question from code inspection
+  alone: ROLE_BLOCKER actively follows a collector every step. When the
+  collector approaches zone_resource, the blocker may also enter radius one
+  and activate the station queue condition.
 
-Script nay lam dung 1 viec: chay N episode voi scripted_policy (+enable_congestion=True),
-log r_emergent MOI BUOC, dem xem no co bao gio != 0 khong, va neu co thi
-kenh nao (collision / lane / queue) kich hoat, agent nao, o buoc nao.
+The diagnostic resolves the question empirically. It runs N scripted episodes
+with congestion enabled, records r_emergent at every step, counts nonzero
+events, and reports the affected agent and timestep. It is included in the
+full validation manifest in scripts/run_all.sh.
 """
 import numpy as np
 

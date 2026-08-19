@@ -20,22 +20,20 @@ class TinyNode:
 
 
 class TinyOracleResourceFlowV1:
-    """
-    Tiny Oracle companion env cho AdaptiveResourceFlowArenaV3.
+    """Tiny Oracle companion env for AdaptiveResourceFlowArenaV3.
 
-    Mục tiêu:
-    - cùng ontology với env chính:
-        source -> buffer -> lane -> station -> sink
-    - nhỏ, clone-state sạch, can thiệp rẻ
-    - dùng cho:
-        sample_state_bank()
-        compute_oracle_influence_from_current_state()
-        estimate_oracle_core_from_current_state()
+Purpose:
+- same ontology as the main env:
+    source -> buffer -> lane -> station -> sink
+- small, clean clone-state, cheap to intervene
+- used for:
+    sample_state_bank()
+    compute_oracle_influence_from_current_state()
+    estimate_oracle_core_from_current_state()
 
-    Vai trò:
-    - không phải benchmark chính để train dài
-    - là oracle env để hiệu chuẩn local surrogate / structural score
-    """
+Role:
+- not the main benchmark for long training
+- is the oracle env for local surrogate / structural score calibration"""
 
     # =========================================================
     # Actions
@@ -747,10 +745,8 @@ class TinyOracleResourceFlowV1:
         n_states: int = 16,
         burn_in: int = 3,
     ) -> List[dict]:
-        """
-        Tạo bank các trạng thái "sống" từ scripted traffic.
-        Mỗi state lấy sau vài bước burn-in để có queue / inventory / signal thật hơn.
-        """
+        """Create a bank of "live" states from scripted traffic.
+Each state is taken after some burn-in steps to have more realistic queue / inventory / signal."""
         bank = []
         attempts = 0
         while len(bank) < n_states and attempts < n_states * 10:
@@ -768,9 +764,7 @@ class TinyOracleResourceFlowV1:
         return bank
 
     def get_supported_egos(self) -> List[int]:
-        """
-        Tiny env không cần dùng hết mọi ego; ta chọn vài ego đại diện.
-        """
+        """Select representative egos; the tiny environment need not use all egos."""
         return list(range(min(3, self.n_agents)))
 
     # =========================================================

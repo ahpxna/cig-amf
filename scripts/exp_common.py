@@ -1,4 +1,4 @@
-"""Helper chung cho scripts/run_h*.py — không chạy trực tiếp."""
+"""Helper for scripts/run_h*.py — do not run directly."""
 import os
 import sys
 import json
@@ -11,7 +11,7 @@ import numpy as np  # noqa: E402
 
 
 def make_args(**over):
-    """Tạo argparse.Namespace đầy đủ default của run_experiment.parse_args()."""
+    """Create a fully populated argparse.Namespace of run_experiment.parse_args()."""
     import run_experiment as RE
     argv = sys.argv
     sys.argv = [argv[0]]
@@ -40,7 +40,7 @@ def save_json(path, obj):
 
 
 def w_matrix(runner, n_agents):
-    """W(t): ma trận mu_bar đã khử chệch từ belief modules (Eq 33 dùng nó)."""
+    """W(t): matrix mu_bar debiased from belief modules (Eq 33 uses it)."""
     W = np.zeros((n_agents, n_agents), dtype=np.float64)
     for ego, mod in runner.belief_modules.items():
         try:
@@ -54,16 +54,14 @@ def w_matrix(runner, n_agents):
 def delta_norm(W_prev, W_new, eps=1e-8, min_ref=1e-3):
     """Eq (33): ||W(t)-W(t-1)||_F / (||W(t-1)||_F + eps).
 
-    [FIX-9] Trong warm-up, belief còn ở prior μ=0 nên ||W(t-1)||_F ≈ 0 và
-    mẫu số tụt về eps=1e-8 => Δ nổ lên hàng TRIỆU (log H2 thật:
-    delta_behav = 9.08e6). Đó không phải "belief biến động mạnh" mà là
-    chia-cho-gần-0 — đúng lớp lỗi đã gặp ở T5/T6/structure_value.
+    [FIX-9] During warm-up, belief is still at prior μ=0 so ||W(t-1)||_F ≈ 0 and
+    the denominator drops to eps=1e-8 => Δ blows up to millions (log H2 true:
+    delta_behav = 9.08e6). That is not "belief strong change" but division by near-zero — exactly the class of error encountered in T5/T6/structure_value.
 
-    Trả NaN khi ma trận tham chiếu chưa có nội dung (||W_prev|| < min_ref):
-    Δ ở điểm đó KHÔNG xác định được, và NaN sẽ bị loại khỏi thống kê thay vì
-    kéo lệch trung bình. Paper (§D, Eq 33) cũng nói rõ mục đích chuẩn hoá là
-    làm đại lượng KHÔNG THỨ NGUYÊN — nó chỉ có nghĩa khi có thang để chuẩn hoá.
-    """
+    Return NaN when the reference matrix has no content (||W_prev|| < min_ref):
+    Δ at that point is undefined, and NaN will be excluded from statistics instead of
+    pulling the mean. The paper (§D, Eq 33) also clearly states the purpose of normalization is
+    to make the quantity dimensionless — it only makes sense when there is a scale to normalize against."""
     ref = float(np.linalg.norm(W_prev))
     if ref < min_ref:
         return float("nan")

@@ -1,19 +1,21 @@
 """
-H2 & RQ2 — Sự tách biệt tầng & Tính chọn lọc (Selectivity Ratio, Eq 33).
+H2 & RQ2 — tier separation and selectivity (Selectivity Ratio, Eq. 33).
 
-Với mỗi model x seed, chạy 2 run cùng cấu hình:
-  - behavioral_drift  -> Delta_behav  (kỳ vọng NHỎ: dependencies cố định)
-  - structural_shift  -> Delta_struct (kỳ vọng LỚN tại/ngay sau shift)
+For each model/seed pair, run two trials with the same configuration:
+  - behavioral_drift  -> Delta_behav  (expected SMALL: dependencies fixed)
+  - structural_shift  -> Delta_struct (expected LARGE at/just after shift)
 SR = mean(Delta_struct quanh shift) / mean(Delta_behav).
-Paper: CIG-AMF cho SR >> 1; baseline tương quan/attention cho SR ~ 1.
+The paper predicts SR >> 1 for CIG-AMF and SR ~ 1 for correlation/attention
+baselines.
 
-Ngoài SR còn log: core F1, recovery latency (đã TRỪ độ trễ H bước của trigger),
+Additional logs include core F1, recovery latency after subtracting the
+trigger's H-step delay,
 trigger event times (CUSUM Eq 32), reward trajectory.
 
 Output: results/h2/<model>_<mode>_seed<S>/eval.jsonl + summary.json
         results/h2/summary_h2.csv
 
-Chạy:  python scripts/run_h2_selectivity.py --seeds 0 1 2 --episodes 400
+Run:  python scripts/run_h2_selectivity.py --seeds 0 1 2 --episodes 400
 """
 import argparse
 import csv
@@ -49,11 +51,11 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root):
     W_prev = w_matrix(runner, env.n_agents) if has_belief else None
     deltas, shift_eps, trigger_eps = [], [], []
 
-    # [FIX-H2a] Phát hiện structural shift bằng CHÍNH bảng ảnh hưởng ground
-    # truth, không phải active_lane. active_lane bị reset()/restore_state ghi
-    # đè giữa các chunk nên so sánh nó gần như luôn cho False => shift_eps
-    # rỗng => delta_struct = mean(mảng rỗng) = NaN => SR = NaN. Đó là lý do
-    # TOÀN BỘ summary_h2.csv trước đây là NaN.
+    # [FIX-H2a] Detect structural shifts from the ground-truth influence table,
+    # not active_lane. reset()/restore_state overwrites active_lane between
+    # chunks, so comparing it almost always returned False. This left
+    # shift_eps empty, delta_struct as the mean of an empty array, and SR as
+    # NaN. This defect caused every earlier summary_h2.csv value to be NaN.
     def _phi_fingerprint(e):
         try:
             return tuple(
@@ -92,14 +94,14 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root):
         row = {
             "episode": ep, "delta": d, "is_shift_window": int(is_shift),
             "triggered": trig,
-            # [FIX-3] Key ĐÚNG trong runner.history là mean_f1 / mean_reward /
-            # mean_core_size. Dùng "f1"/"reward"/"core_size" -> luôn NaN, đây
-            # chính là nhóm cột NaN đang treo trong summary H2/H3.
+            # [FIX-3] The correct runner.history keys are mean_f1, mean_reward,
+            # and mean_core_size. Using f1/reward/core_size always produced
+            # NaN, which caused the unresolved NaN columns in H2/H3 summaries.
             "f1": last(hist, "mean_f1"), "reward": last(hist, "mean_reward"),
             "core_size": last(hist, "mean_core_size"),
             "tier_separation_ratio": float(
                 getattr(env, "tier_separation_ratio", lambda: float("nan"))()),
-            # [C4] CSD-proxy: số cặp đang coupling ở cuối chunk.
+            # [C4] CSD proxy: number of coupled pairs at the end of the chunk.
             "n_close_coupling_pairs": int(
                 env.close_coupling_pairs()
                 if hasattr(env, "close_coupling_pairs") else -1
@@ -121,17 +123,19 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root):
 
     d_struct = float(np.mean(dvals[struct_mask])) if struct_mask.any() else float("nan")
     d_behav = float(np.mean(dvals[~struct_mask])) if (~struct_mask).any() else float("nan")
-    # [FIX-H2b] Chia cho (d_behav + 1e-12) làm SR nổ khi d_behav ~ 0 — đúng
-    # lớp lỗi chia-gần-0 đã gặp ở T5/T6/structure_value. Yêu cầu mẫu số phải
-    # có độ lớn tối thiểu mới cho ra tỉ số.
+    # [FIX-H2b] Dividing by (d_behav + 1e-12) made SR explode when d_behav was
+    # near zero, the same near-zero-division failure class previously seen in
+    # T5/T6/structure_value. Require a minimum denominator magnitude before
+    # reporting a ratio.
     if (np.isfinite(d_struct) and np.isfinite(d_behav) and d_behav > 1e-6):
         sr = float(d_struct / d_behav)
     else:
         sr = float("nan")
 
-    # recovery latency: số eval-interval từ shift tới khi f1 hồi >= 90% mức tiền-shift,
-    # trừ đi độ trễ H bước của trigger (paper yêu cầu account cho H).
-    f1s = [r for r in deltas]  # placeholder giữ thứ tự; đọc f1 từ file
+    # Recovery latency is the number of evaluation intervals from the shift
+    # until F1 recovers to >=90% of its pre-shift level, less the trigger's
+    # H-step delay as required by the paper.
+    f1s = [r for r in deltas]  # Placeholder preserves order; F1 comes from file.
     lat = float("nan")
     if shift_eps:
         import json as _json
@@ -176,7 +180,8 @@ def main():
             for mode in MODES:
                 per_mode[mode] = run_one(model, mode, seed, a.episodes,
                                          a.eval_every, a.device, out_root)
-            # SR liên-run: struct từ run structural, behav từ run drift
+            # Cross-run SR: structural component from the structural run and
+            # behavioural component from the drift run.
             ds = per_mode["structural_shift"]["delta_mean_struct"]
             db = per_mode["behavioral_drift"]["delta_mean_behav"]
             sr_cross = (

@@ -1,63 +1,67 @@
 """
-belief_layer_v2.py — Bayes-light structural belief, bản vá.
+belief_layer_v2.py — corrected Bayes-light structural belief.
 
 =============================================================================
-LỖI CỦA BẢN v1 VÀ CHẨN ĐOÁN BẰNG CHÍNH SỐ LIỆU TRONG PAPER
+V1 DEFECTS, DIAGNOSED USING THE PAPER'S OWN RESULTS
 =============================================================================
 
-[B1] p_core BÃO HOÀ — sigma nằm ở MẪU SỐ.
-     v1 (belief_layer.py dòng 281):
+[B1] p_core SATURATED BECAUSE sigma WAS IN THE DENOMINATOR.
+     v1 used:
          score  = (|mu_bar| - tau) / (sigma_bar + eps)
          p_core = sigmoid(score)
 
-     sigma nhỏ -> mẫu số nhỏ -> đối số sigmoid bị khuếch đại -> BÃO HOÀ 0/1.
-     Kiểm chứng bằng bảng kết quả của chính paper:
-        NoTwoTimescale: sigma = 0.050 -> chia 0.05 tức nhân 20 -> bão hoà
-                        -> chỉ 1 neighbour sống sót -> core = 1.0 (đúng như quan sát)
-        Final CIG-AMF:  sigma = 0.663 -> sigmoid mềm -> nhiều neighbour vượt tau_in
-                        -> core chạm trần max_core_size (đúng như quan sát 6.0)
+     A small sigma made the denominator small, amplified the sigmoid argument,
+     and saturated p_core at zero or one. The paper's own table confirms this:
+        NoTwoTimescale: sigma=0.050 meant division by 0.05, equivalent to 20x
+                        amplification. Only one neighbour survived and core
+                        size was 1.0, exactly as observed.
+        Final CIG-AMF:  sigma=0.663 kept sigmoid softer, so more neighbours
+                        crossed tau_in until core size reached the observed
+                        max_core_size ceiling of 6.0.
 
-     Nghĩa là: CORE SIZE BỊ QUYẾT ĐỊNH BỞI ĐỘ LỚN CỦA SIGMA, không phải bởi
-     cấu trúc ảnh hưởng. Tín hiệu mu (thứ mang thông tin nhân quả) bị nhấn chìm.
+     Core size was therefore determined by sigma magnitude rather than by
+     influence structure. The causal information in mu was overwhelmed.
 
-     Nguyên nhân sâu xa: sigma bị dùng HAI LẦN — một lần điều tiết learning
-     rate (Eq. 13, hợp lý) và một lần làm mẫu số ngưỡng (Eq. 14, gây bão hoà).
-     Hiệu ứng nhân đôi.
+     The deeper cause was that sigma was used TWICE: once to regulate the
+     learning rate in Eq. 13, which is reasonable, and again as the threshold
+     denominator in Eq. 14, which caused saturation. The effects compounded.
 
-     v2: TÁCH HAI VAI TRÒ. sigma chỉ còn điều tiết tốc độ học. Việc chọn core
-     dùng CẬN DƯỚI TIN CẬY (lower confidence bound):
+     v2 SEPARATES THE TWO ROLES. sigma regulates only learning speed. Core
+     selection uses the lower confidence bound:
          score_lcb = |mu_bar| - kappa * sigma_bar
-     Bất định cao -> bị TRỪ đi -> khó vào core (thận trọng, đúng trực giác),
-     nhưng KHÔNG bão hoà vì sigma ở dạng cộng chứ không phải chia.
+     High uncertainty is SUBTRACTED, making core entry conservatively harder,
+     but cannot saturate the score because sigma is additive rather than a
+     divisor.
 
-[B2] CORE SIZE LÀ HẰNG SỐ CỨNG, KHÔNG PHẢI KẾT QUẢ HỌC.
-     v1 có min_core_size / max_core_size. Kết quả: 6.0 +- 0.0 và 1.0 +- 0.0
-     và 2.0 +- 0.0 trên 5 seed. Std = 0 tuyệt đối cho một đại lượng "được học"
-     là điều gần như không thể. Cả ba đều là ĐIỂM BIÊN (chạm trần / sụp đáy /
-     đứng nguyên seed), không có giá trị nào là "lựa chọn".
+[B2] CORE SIZE WAS A HARD CONSTANT, NOT A LEARNED RESULT.
+     v1 used min_core_size/max_core_size. Across five seeds the reported sizes
+     were 6.0+-0.0, 1.0+-0.0, and 2.0+-0.0. Exact zero standard deviation is
+     nearly impossible for a genuinely learned quantity. All three values were
+     boundary outcomes: ceiling saturation, floor collapse, or unchanged seed
+     state. None was a learned choice.
 
-     v2: giữ min/max làm van an toàn NHƯNG:
-       - đếm và báo cáo tỷ lệ chạm biên (get_saturation_stats)
-       - thêm chế độ adaptive_k: k tự co giãn theo entropy của phân phối
-         ảnh hưởng. Ảnh hưởng tập trung vào ít neighbour -> k nhỏ.
-         Ảnh hưởng dàn đều -> k lớn. Khi đó k mới thật sự "adaptive".
+     v2 retains min/max as safety valves but:
+       - counts and reports boundary-hit rates through get_saturation_stats;
+       - adds adaptive_k, which scales k with influence-distribution entropy.
+         Influence concentrated on a few neighbours yields small k; diffuse
+         influence yields large k. Capacity is then genuinely adaptive.
 
-[B3] alpha KHÔNG THOẢ ROBBINS-MONRO -> không thể phát biểu định lý hội tụ.
-     v1: alpha = lambda_0 / (1 + c * sigma)
-     Bị chặn dưới bởi lambda_0/(1+c*sigma_max) > 0 -> sum(alpha^2) = vô cùng.
-     Pieroth (ICML 2024) Theorem 5.6 chứng minh hội tụ a.s. cho đúng dạng
-     iteration này, với điều kiện Assumption 3.3(c):
-         sum(alpha_t) = vô cùng   VÀ   sum(alpha_t^2) < vô cùng
-     Họ dùng alpha_t = alpha_0 / t^d với d = 0.726.
+[B3] alpha VIOLATED ROBBINS-MONRO, PRECLUDING A CONVERGENCE CLAIM.
+     v1 used alpha=lambda_0/(1+c*sigma). Its positive lower bound
+     lambda_0/(1+c*sigma_max)>0 implies sum(alpha^2)=infinity. Pieroth (ICML
+     2024) Theorem 5.6 proves almost-sure convergence for this type of
+     iteration under Assumption 3.3(c):
+         sum(alpha_t)=infinity AND sum(alpha_t^2)<infinity
+     Their implementation uses alpha_t=alpha_0/t^d with d=0.726.
 
-     v2: alpha_t = lambda_0 / (t^decay * (1 + c * sigma))
-     với decay in (0.5, 1]. Giờ thoả Robbins-Monro -> MƯỢN ĐƯỢC khung chứng
-     minh của Pieroth -> paper có thêm một mệnh đề hội tụ gần như miễn phí.
+     v2 uses alpha_t=lambda_0/(t^decay*(1+c*sigma)) with decay in (0.5,1].
+     This satisfies Robbins-Monro and allows the paper to reuse Pieroth's proof
+     framework for an almost-free convergence proposition.
 
-[B4] BELIEF KHÔNG CÓ DẤU.
-     v1 lưu mu_bar rồi mọi chỗ đều lấy |mu_bar|. Không phân biệt được
-     "thằng ngáng đường" với "thằng hỗ trợ".
-     v2: giữ dấu xuyên suốt. Đây là đầu vào cho slot ngữ nghĩa Thiện/Ác.
+[B4] BELIEF HAD NO SIGN.
+     v1 stored mu_bar but applied |mu_bar| everywhere, making harmful agents
+     indistinguishable from helpful ones. v2 preserves sign throughout and
+     supplies it to the beneficial/harmful semantic slots.
 =============================================================================
 """
 
@@ -68,27 +72,24 @@ import numpy as np
 
 class BayesLightBeliefState:
     """
-    Structural belief cho một ego-agent i.
+    Structural belief for ego agent i.
 
-    State mỗi directed pair (i, j):
-        mu_bar     : ảnh hưởng đã làm mượt, CÓ DẤU
-        sigma_bar  : bất định đã làm mượt (epistemic, từ ensemble)
-        p_core     : điểm xác suất vào core, KHÔNG còn bão hoà
-        n_updates  : số lần đã cập nhật (cho lịch trình Robbins-Monro)
+    State per directed pair (i,j): signed smoothed influence mu_bar,
+    smoothed ensemble epistemic uncertainty sigma_bar, nonsaturated p_core,
+    and update count for the Robbins-Monro schedule.
 
     Args:
         core_rule:
-            "lcb"      — mặc định. score = |mu| - kappa*sigma  (khuyến nghị)
-            "p_core"   — dùng ngưỡng trên p_core như v1 (để chạy ablation)
-            "signed"   — chọn riêng top thằng GIÚP và top thằng HẠI, cân bằng dấu
+            "lcb": recommended default, |mu|-kappa*sigma
+            "p_core": legacy p_core threshold for ablation
+            "signed": separately balance top helpful and harmful agents
         kappa:
-            hệ số phạt bất định trong LCB. Lớn -> thận trọng hơn, core nhỏ hơn.
+            LCB uncertainty penalty; larger values produce smaller conservative cores.
         alpha_decay:
-            số mũ d trong lịch trình Robbins-Monro alpha ~ 1/t^d.
-            Phải thuộc (0.5, 1] để thoả sum(a)=inf, sum(a^2)<inf.
-            0 = tắt (quay về hành vi v1, dùng cho ablation).
+            Exponent d in alpha~1/t^d. Values in (0.5,1] satisfy
+            Robbins-Monro; zero restores v1 behaviour for ablation.
         adaptive_k:
-            nếu True, k mục tiêu tự co giãn theo entropy phân phối ảnh hưởng.
+            If true, scale target k with influence-distribution entropy.
     """
 
     def __init__(
@@ -105,7 +106,7 @@ class BayesLightBeliefState:
         max_core_size: int = 4,
         sigma_floor: float = 0.01,
         eps: float = 1e-6,
-        # ---- mới ở v2 ----
+        # v2 parameters.
         core_rule: str = "lcb",
         kappa: float = 1.0,
         alpha_decay: float = 0.7,
@@ -146,19 +147,14 @@ class BayesLightBeliefState:
         self.signed_balance = float(np.clip(signed_balance, 0.0, 1.0))
 
         # ---------------------------------------------------------------
-        # [GPU_OPTIMIZATION_CONTRACT.md mục 1.2/1.4] STATE THẬT nằm ở numpy
-        # array (float64 — đây là [n_neighbors] cho MỘT ego, vài trăm số,
-        # chi phí không đáng kể ngay cả ở float64; xem lưu ý precision
-        # trong contract: KHÔNG đưa lên GPU chỉ để "đồng bộ"). Toàn bộ
-        # phép cập nhật (EWMA, debias, LCB, hysteresis, topk capacity)
-        # chạy vector hoá trên các array này thay vì vòng lặp Python qua
-        # từng neighbour.
+        # [GPU contract sections 1.2/1.4] Authoritative state lives in float64
+        # NumPy arrays. One ego has only a few hundred values, so GPU transfer
+        # for synchronization would add cost without benefit. EWMA, debiasing,
+        # LCB, hysteresis, and top-k capacity are vectorized over these arrays.
         #
-        # self.mu_bar / sigma_bar / p_core / n_updates VẪN là dict như cũ
-        # — models/diagnostics.py đọc trực tiếp `mod.mu_bar.get(j, ...)`
-        # nên không được đổi kiểu — nhưng giờ chỉ là VIEW được đồng bộ
-        # (dict(zip(...)), một lần bulk mỗi update_batch) từ array, không
-        # phải nguồn sự thật.
+        # Legacy dictionaries remain synchronized views because diagnostics.py
+        # reads mod.mu_bar directly. They are bulk-updated once per batch and
+        # are not authoritative.
         # ---------------------------------------------------------------
         n = len(self.neighbor_ids)
         self._pos: Dict[int, int] = {j: i for i, j in enumerate(self.neighbor_ids)}
@@ -171,19 +167,18 @@ class BayesLightBeliefState:
         self._n_updates_arr = np.zeros(n, dtype=np.int64)
         self._p_core_arr = np.full(n, 0.5, dtype=np.float64)
 
-        # Views dict — giữ tương thích ngược cho code đọc trực tiếp.
+        # Dictionary views preserve direct-read compatibility.
         self.mu_bar: Dict[int, float] = dict(zip(self.neighbor_ids, self._mu_arr.tolist()))
         self.sigma_bar: Dict[int, float] = dict(zip(self.neighbor_ids, self._sigma_arr.tolist()))
         self.p_core: Dict[int, float] = dict(zip(self.neighbor_ids, self._p_core_arr.tolist()))
         self.n_updates: Dict[int, int] = dict(zip(self.neighbor_ids, self._n_updates_arr.tolist()))
 
-        # Giữ hai dict này cho _apply_capacity/get_state_for_neighbor cũ
-        # (một vài nhánh vẫn đọc qua .get(j, default) kiểu dict-of-float).
+        # Retain these dictionaries for legacy dict-of-float access paths.
         self._bias_corr: Dict[int, float] = dict(zip(self.neighbor_ids, self._bias_corr_arr.tolist()))
         self._mu_init: Dict[int, float] = dict(zip(self.neighbor_ids, self._mu_init_arr.tolist()))
         self._sigma_init: Dict[int, float] = dict(zip(self.neighbor_ids, self._sigma_init_arr.tolist()))
 
-        # Đếm số lần bơm phồng, để báo cáo trong paper.
+        # Count uncertainty inflations for paper reporting.
         self.n_inflations = 0
         self.last_inflation_episode = None
 
@@ -200,7 +195,7 @@ class BayesLightBeliefState:
         self.p_history: Dict[int, List[float]] = {j: [] for j in self.neighbor_ids}
         self.core_history: List[Set[int]] = []
 
-        # [B2] Đếm chạm biên — con số PHẢI báo cáo trong paper.
+        # [B2] Count boundary hits; this must be reported in the paper.
         self.n_core_updates = 0
         self.n_hit_max = 0
         self.n_hit_min = 0
@@ -209,7 +204,7 @@ class BayesLightBeliefState:
     # Helper
     # =====================================================================
 
-    # Giá trị khởi tạo của belief — cần cho bias correction tổng quát.
+    # Initial belief values required for general bias correction.
     MU_INIT = 0.0
     SIGMA_INIT = 1.0
 
@@ -223,12 +218,12 @@ class BayesLightBeliefState:
 
     def debiased_mu(self, j: int) -> float:
         """
-        mu_bar đã khử chệch khởi tạo.
+        Correct mu_bar for initialization bias.
 
             mu_hat = mu_bar / (1 - prod(1 - alpha_s))
 
-        Dùng cái này ở MỌI CHỖ RA QUYẾT ĐỊNH (chọn core, gán vai trò),
-        còn mu_bar thô chỉ để log.
+        Use this for every decision, including core selection and role
+        assignment. Raw mu_bar is for logging only.
         """
         j = int(j)
         prod = float(self._bias_corr.get(j, 1.0))
@@ -237,19 +232,18 @@ class BayesLightBeliefState:
         mu_init = float(self._mu_init.get(j, self.MU_INIT))
 
         if denom < 1e-3:
-            # Chưa tích luỹ đủ bằng chứng vượt lên trên điểm neo.
-            # Trả về CHÍNH ĐIỂM NEO (không phải 0.0 cứng như bản trước):
-            #  - lúc khởi động, điểm neo = 0.0 -> hành vi y hệt bản cũ
-            #  - sau khi re-anchor (inflate_uncertainty), điểm neo là ước
-            #    lượng tốt nhất đang có -> không bị xoá trắng về 0
+            # Insufficient evidence beyond the anchor. Return the anchor rather
+            # than hard-coded zero: startup remains legacy-equivalent at zero,
+            # while post-inflation re-anchoring preserves the best estimate.
             return mu_init
 
         return (float(self.mu_bar[j]) - prod * mu_init) / denom
 
     def debiased_sigma(self, j: int) -> float:
         """
-        sigma_bar đã khử chệch. Không có bước này, prior sigma=1.0 còn sót
-        lại làm sigma bị THỔI PHỒNG, khiến LCB âm và core rỗng.
+        Correct sigma_bar for initialization bias. Otherwise residual
+        sigma=1.0 prior inflates uncertainty, makes LCB negative, and empties
+        the core.
         """
         j = int(j)
         prod = float(self._bias_corr.get(j, 1.0))
@@ -261,17 +255,16 @@ class BayesLightBeliefState:
             return max(sigma_init, self.sigma_floor)
 
         # ---------------------------------------------------------------
-        # CÔNG THỨC TỔNG QUÁT — lỗi này bị bắt trong unit test.
+        # General formula; a unit test exposed this defect.
         #
-        # Adam dùng m/(1-beta^t) vì m KHỞI TẠO BẰNG 0. Với sigma ta khởi tạo
-        # bằng 1.0 (prior "bất định tối đa"), nên:
+        # Adam uses m/(1-beta^t) because m starts at zero. Sigma starts at 1.0
+        # as a maximum-uncertainty prior, so:
         #     sigma_bar = prod*1.0 + (1-prod)*sigma_thuc
-        # Chia thẳng cho (1-prod) sẽ cho  prod/(1-prod) + sigma_thuc,
-        # tức THỔI PHỒNG sigma. Số đo được từ test: sigma_deb = 1.15 trong
-        # khi giá trị thật ~0.19 (gấp 6 lần!). Hệ quả: LCB = |mu| - kappa*sigma
-        # luôn âm -> KHÔNG AI vào core -> core rơi về min_core_size.
+        # Dividing directly by (1-prod) adds prod/(1-prod) and inflates sigma.
+        # A test measured sigma_deb=1.15 for a true value near 0.19, a 6x error.
+        # LCB then stayed negative and core fell to min_core_size.
         #
-        # Đúng phải TRỪ phần đóng góp còn sót của giá trị khởi tạo trước:
+        # Subtract the remaining initial-value contribution first:
         #     sigma_hat = (sigma_bar - prod*init) / (1 - prod)
         # ---------------------------------------------------------------
         val = (float(self.sigma_bar[j]) - prod * sigma_init) / denom
@@ -280,14 +273,13 @@ class BayesLightBeliefState:
 
     def _lcb_score(self, j: int) -> float:
         """
-        [B1] Cận dưới tin cậy — thay cho công thức bão hoà của v1.
+        [B1] Lower confidence bound replacing v1's saturating formula.
 
             score = |mu_bar| - kappa * sigma_bar
 
-        Trực giác: "tôi tin chắc ít nhất bằng ngần này". Bất định cao bị TRỪ
-        đi chứ không CHIA vào, nên không bao giờ bão hoà.
-        Đây là chuẩn mực trong bandit (LCB/UCB) và khớp tinh thần CASEC
-        (dùng phương sai payoff để thưa hoá cạnh).
+        High uncertainty is subtracted rather than used as a divisor, so it
+        cannot cause saturation. This follows bandit LCB/UCB practice and
+        CASEC's use of payoff variance for edge sparsification.
         """
         j = int(j)
         mu = self.debiased_mu(j)
@@ -296,7 +288,7 @@ class BayesLightBeliefState:
         return float(abs(mu) - self.kappa * sigma)
 
     def _priority(self, j: int) -> float:
-        """Ưu tiên khi fill/prune. Dùng cùng thang với luật chọn core."""
+        """Priority for fill/prune on the same scale as core selection."""
         if self.core_rule == "p_core":
             j = int(j)
             mu = abs(float(self.mu_bar.get(j, 0.0)))
@@ -314,21 +306,18 @@ class BayesLightBeliefState:
         return sorted(cands, key=lambda j: self._priority(j), reverse=True)
 
     # =====================================================================
-    # [B2] k thích nghi
+    # [B2] Adaptive k.
     # =====================================================================
 
     def _effective_max_k(self) -> int:
         """
-        Nếu adaptive_k bật, k mục tiêu co giãn theo ENTROPY của phân phối
-        ảnh hưởng đã chuẩn hoá.
+        If enabled, scale target k with normalized influence entropy.
 
-        Trực giác:
-          - Ảnh hưởng tập trung vào 1-2 neighbour (entropy thấp) -> k nhỏ,
-            không cần nhiều core slot.
-          - Ảnh hưởng dàn đều (entropy cao) -> k lớn hơn, vì không có ai
-            nổi trội rõ ràng.
+        Concentration on one or two neighbours gives low entropy and small k;
+        diffuse influence gives high entropy and larger k because no neighbour
+        clearly dominates.
 
-        Đây là chỗ biến "adaptive" từ tên gọi thành cơ chế thật.
+        This makes adaptive capacity an actual mechanism rather than a label.
         """
         if not self.adaptive_k:
             return int(self.max_core_size)
@@ -349,7 +338,7 @@ class BayesLightBeliefState:
         entropy = float(-np.sum(p * np.log(p)))
         max_entropy = float(np.log(len(vals)))
 
-        # frac in [0,1]: 0 = cực tập trung, 1 = dàn đều hoàn toàn
+        # frac in [0,1]: zero is concentrated and one fully diffuse.
         frac = entropy / max(max_entropy, 1e-12)
 
         k = int(round(
@@ -398,7 +387,7 @@ class BayesLightBeliefState:
     # =====================================================================
 
     def initialize_from_weak_prior(self, prior_scores: Dict[int, float]):
-        """Giữ nguyên hành vi v1."""
+        """Preserve v1 behaviour."""
         ranked = sorted(
             [(int(j), float(prior_scores.get(j, 0.0))) for j in self.neighbor_ids],
             key=lambda x: x[1],
@@ -442,15 +431,14 @@ class BayesLightBeliefState:
         self._record_core_change(old_core, self.core_set)
 
     # =====================================================================
-    # Cập nhật belief
+    # Belief updates.
     # =====================================================================
 
     def _debiased_arr(self, idx: np.ndarray):
         """
-        Bản VECTOR HOÁ của debiased_mu/debiased_sigma cho một tập vị trí
-        `idx` cùng lúc — công thức giữ NGUYÊN debiased_mu/debiased_sigma
-        (không đổi, hai hàm đó vẫn còn nguyên bên dưới làm oracle/đối
-        chiếu), chỉ đổi cách thực thi từ per-j sang mảng.
+        Vectorized debiased_mu/debiased_sigma over index set idx. The formulas
+        remain identical to the scalar reference methods; only execution
+        changes from per-j calls to arrays.
         """
         prod = self._bias_corr_arr[idx]
         denom = 1.0 - prod
@@ -469,21 +457,17 @@ class BayesLightBeliefState:
         return mu_deb, sig_deb
 
     def update_pair(self, j: int, mu: float, sigma: float):
-        """Cập nhật một cặp — nay chỉ là update_batch với 1 phần tử, để
-        đảm bảo CÙNG một công thức vector hoá, không có hai bản song song
-        dễ lệch nhau."""
+        """Update one pair through the single-item vectorized batch path."""
         self.update_batch({int(j): (mu, sigma)})
 
     def update_batch(self, mu_sigma_dict) -> Tuple[Set[int], Set[int]]:
         """
-        GIỮ NGUYÊN chữ ký v1: nhận {j: (mu, sigma)}, trả (promoted, demoted).
+        Preserve the v1 signature: accept {j:(mu,sigma)} and return promoted/demoted.
 
-        [GPU_OPTIMIZATION_CONTRACT.md mục 1.2] Toàn bộ EWMA (Eq. 11-13) +
-        bias correction (Eq. 14) cho MỌI j trong batch chạy trong MỘT lệnh
-        numpy, thay vì gọi update_pair (vòng lặp Python) từng cái — đây là
-        vòng lặp chạy mỗi lần belief cập nhật, tức mỗi bước slow-timescale
-        cho mỗi ego, O(n_neighbors) phép tính Python thuần trước đây.
-        Công thức từng phần tử giữ NGUYÊN 100% so với update_pair cũ.
+        [GPU contract section 1.2] Run Eq. 11-13 EWMA and Eq. 14 bias
+        correction for all j in one NumPy operation instead of an
+        O(n_neighbors) Python loop at every slow-timescale ego update. Each
+        element uses the exact former update_pair formula.
         """
         js, mus, sigmas = [], [], []
         for j, pair_value in mu_sigma_dict.items():
@@ -505,7 +489,7 @@ class BayesLightBeliefState:
             self._n_updates_arr[idx] += 1
             t = self._n_updates_arr[idx].astype(np.float64)
 
-            # [B3] Lịch trình Robbins-Monro — công thức KHÔNG đổi.
+            # [B3] Robbins-Monro schedule; formula unchanged.
             decay_factor = (
                 t ** self.alpha_decay if self.alpha_decay > 0.0 else np.ones_like(t)
             )
@@ -514,16 +498,16 @@ class BayesLightBeliefState:
             )
             alpha = np.clip(alpha, 0.0, 1.0)
 
-            # [B4] Giữ DẤU của mu.
+            # [B4] Preserve mu sign.
             self._mu_arr[idx] = (1.0 - alpha) * self._mu_arr[idx] + alpha * mus_arr
             self._sigma_arr[idx] = (
                 (1.0 - alpha) * self._sigma_arr[idx] + alpha * sigmas_arr
             )
 
-            # Bias correction kiểu Adam — công thức KHÔNG đổi.
+            # Adam-style bias correction; formula unchanged.
             self._bias_corr_arr[idx] = self._bias_corr_arr[idx] * (1.0 - alpha)
 
-            # [B1] p_core — chỉ diagnostic, sigmoid trên LCB đã debias.
+            # [B1] p_core is diagnostic only: sigmoid of debiased LCB.
             mu_deb, sig_deb = self._debiased_arr(idx)
             # --- LCB / P COMPUTATION (rebuilt v3) ---
             safe_sigma_ceiling = max(self.sigma_floor * 10.0, 0.1)
@@ -533,7 +517,7 @@ class BayesLightBeliefState:
             normalized_lcb = (lcb - self.tau) / max(self.tau, 1e-4)
             p = 1.0 / (1.0 + np.exp(-np.clip(normalized_lcb, -10.0, 10.0)))
 
-            # Ghi debug KHÔNG điều kiện — hasattr từng khiến lần ghi đầu tiên luôn bị bỏ qua
+            # Always record debug state; hasattr previously skipped the first write.
             self._last_lcb_debug = {
                 "mu_deb_mean": float(np.mean(np.abs(mu_deb))),
                 "penalty_mean": float(np.mean(self.kappa * effective_sigma)),
@@ -541,18 +525,17 @@ class BayesLightBeliefState:
                 "p_mean": float(np.mean(p)),
             }
 
-            # QUAN TRỌNG: nếu mu_deb/sig_deb/p là MẢNG (vectorized theo neighbour), gán thẳng,
-            # đừng dùng [idx] trừ khi bạn CHẮC CHẮN đoạn này nằm trong vòng lặp có idx hợp lệ.
-            # Gán mảng an toàn tuyệt đối
+            # Vectorized mu_deb/sig_deb/p arrays must be assigned directly.
+            # Index them only when idx is known to match the current context.
             if isinstance(idx, np.ndarray) and idx.dtype == bool:
-                # Nếu idx là boolean mask
+                # Boolean-mask index.
                 self._p_core_arr[idx] = p[idx] if p.shape == idx.shape else p
             else:
-                # Nếu idx là mảng chỉ số nguyên
+                # Integer index array.
                 np.put(self._p_core_arr, idx, p)
 
-            # Đồng bộ dict view + history — bulk assignment/append, không
-            # còn phép TÍNH nào ở đây (đã tính hết bằng numpy ở trên).
+            # Synchronize dictionary views and history; all computation already
+            # occurred in the NumPy block above.
             for pos, jj in zip(idx.tolist(), js):
                 mu_v = float(self._mu_arr[pos])
                 sig_v = float(self._sigma_arr[pos])
@@ -577,23 +560,22 @@ class BayesLightBeliefState:
         return self._update_core_set()
 
     # =====================================================================
-    # Chọn core
+    # Core selection.
     # =====================================================================
 
     def _select_core_lcb(self) -> Set[int]:
         """
-        Luật mặc định v2.
+        Default v2 rule.
 
-        Vào core nếu:   lcb_score > tau
-        Giữ trong core nếu: lcb_score > tau_hold  (tau_hold < tau, hysteresis)
+        Enter core when lcb_score>tau; remain when lcb_score>tau_hold, where
+        tau_hold<tau provides hysteresis.
 
-        Hysteresis giữ nguyên tinh thần v1 (chống nhấp nháy) nhưng áp lên
-        thang LCB thay vì thang p_core bão hoà.
+        Hysteresis preserves v1's anti-chatter intent on the LCB scale instead
+        of the saturated p_core scale.
         """
-        # [GPU_OPTIMIZATION_CONTRACT.md mục 1.4] Luật ngưỡng kép là boolean
-        # elementwise thuần -> vector hoá toàn bộ qua mọi neighbour trong
-        # MỘT lệnh numpy, thay vì gọi _lcb_score (Python) trong vòng lặp.
-        # Công thức KHÔNG đổi so với bản trước.
+        # [GPU contract section 1.4] The dual-threshold rule is elementwise
+        # Boolean logic, vectorized across neighbours in one NumPy operation.
+        # The formula is unchanged.
         ratio = (
             self.tau_out / self.tau_in if self.tau_in > 1e-8 else 0.75
         )
@@ -617,15 +599,15 @@ class BayesLightBeliefState:
 
     def _select_core_signed(self) -> Set[int]:
         """
-        Luật CÓ DẤU — chọn cân bằng giữa thằng GIÚP và thằng HẠI.
+        Signed rule balancing helpful and harmful agents.
 
-        Vì sao đáng thử: MAGIC (2026) chỉ ra "ảnh hưởng mạnh chưa chắc có ích".
-        Nếu chỉ xếp hạng theo |mu|, core có thể bị chiếm hết bởi một loại.
-        Ở đây ta dành signed_balance phần slot cho phía hại (thường quan trọng
-        hơn để né) và phần còn lại cho phía giúp.
+        MAGIC (2026) shows strong influence need not be beneficial. Ranking
+        only by |mu| can fill the core with one sign. Allocate signed_balance
+        of slots to harmful agents, often important to avoid, and the rest to
+        helpful agents.
 
-        Đây là biến thể chưa thấy ai làm — MAGIC dùng dấu để LỌC REWARD,
-        còn đây dùng dấu để CÂN BẰNG NGÂN SÁCH CORE.
+        This variant uses sign to balance core capacity, unlike MAGIC's use of
+        sign for reward filtering.
         """
         eff_max = self._effective_max_k()
 
@@ -646,7 +628,7 @@ class BayesLightBeliefState:
 
         new_core = set(harmful[:n_harm]) | set(helpful[:n_help])
 
-        # Nếu một phía thiếu, bù bằng phía kia (không lãng phí slot).
+        # Fill shortages from the other sign without wasting capacity.
         if len(new_core) < eff_max:
             leftovers = [
                 j for j in self._rank(self.neighbor_ids)
@@ -660,7 +642,7 @@ class BayesLightBeliefState:
         return new_core
 
     def _select_core_p(self) -> Set[int]:
-        """Luật cũ của v1 — giữ để chạy ablation 'trước khi vá'."""
+        """Legacy v1 rule retained for before-correction ablation."""
         new_core = set()
 
         for j in self.neighbor_ids:
@@ -692,7 +674,7 @@ class BayesLightBeliefState:
         return set(self.last_promoted), set(self.last_demoted)
 
     # =====================================================================
-    # Accessors (giữ nguyên API v1)
+    # Accessors preserving the v1 API.
     # =====================================================================
 
     def get_core_set(self) -> Set[int]:
@@ -705,15 +687,15 @@ class BayesLightBeliefState:
         j = int(j)
 
         return {
-            # Xuất bản ĐÃ KHỬ CHỆCH — đây là thứ peripheral memory dùng
-            # để gán slot ngữ nghĩa, nên phải là ước lượng đúng thang.
-            "mu_bar": float(self.debiased_mu(j)),      # CÓ DẤU
+            # Publish debiased values because peripheral semantic assignment
+            # requires a correctly scaled estimate.
+            "mu_bar": float(self.debiased_mu(j)),      # Signed.
             "sigma_bar": float(self.debiased_sigma(j)),
             "mu_bar_raw": float(self.mu_bar[j]),
             "p_core": float(self.p_core[j]),
             "in_core": float(j in self.core_set),
             "in_seed_core": float(j in self.seeded_core_set),
-            # mới: để peripheral memory dùng trực tiếp
+            # Direct peripheral-memory fields.
             "lcb_score": float(self._lcb_score(j)),
             "n_updates": int(self.n_updates[j]),
         }
@@ -727,10 +709,9 @@ class BayesLightBeliefState:
 
     def get_temporal_variance(self, window: int = 50) -> float:
         """
-        LƯU Ý CHO PAPER: v1 báo cáo đại lượng này ~ 1e-8 và diễn giải là
-        "ổn định". Nhưng 1e-8 về bản chất là BẰNG KHÔNG — belief không nhúc
-        nhích, tức ĐÓNG BĂNG chứ không phải ổn định. Hai thứ khác nhau.
-        Nên báo cáo kèm normalised_temporal_variance bên dưới.
+        Paper note: v1 reported approximately 1e-8 as stability. That value is
+        effectively zero movement and indicates freezing rather than stability.
+        Report it with normalised_temporal_variance below.
         """
         vals = []
 
@@ -743,12 +724,12 @@ class BayesLightBeliefState:
 
     def get_normalised_temporal_variance(self, window: int = 50) -> float:
         """
-        Phương sai theo thời gian CHUẨN HOÁ theo thang của chính mu.
+        Temporal variance normalized by mu's own scale.
 
             nvar = var(mu_t) / (mean(|mu_t|)^2 + eps)
 
-        Đại lượng không thứ nguyên -> so sánh được giữa các phương pháp,
-        và không bị "nhỏ giả tạo" chỉ vì mu bé.
+        The dimensionless result is comparable across methods and does not
+        appear artificially small merely because mu is small.
         """
         vals = []
 
@@ -785,7 +766,7 @@ class BayesLightBeliefState:
         return float(np.max(vals)) if vals else 0.0
 
     # =====================================================================
-    # BƠM PHỒNG BẤT ĐỊNH — "quên có kiểm soát" khi phát hiện structural shift
+    # Uncertainty inflation: controlled forgetting after structural shifts.
     # =====================================================================
 
     def inflate_uncertainty(
@@ -796,48 +777,51 @@ class BayesLightBeliefState:
         sigma_ceiling: Optional[float] = None,
     ) -> Dict[str, float]:
         """
-        Gọi khi residual/matrix trigger báo có structural shift.
+        Call when residual or matrix triggers indicate a structural shift.
 
-        VẤN ĐỀ NÓ GIẢI QUYẾT
-        --------------------
-        Lịch trình Robbins-Monro alpha ~ 1/t^d là điều kiện để có định lý hội
-        tụ, nhưng nó tạo một nghịch lý: càng học lâu, alpha càng nhỏ, hệ càng
-        "cứng đầu". Sau vài trăm bước, một bằng chứng mới gần như không lay
-        chuyển được belief nữa. Trong môi trường DỪNG thì đó là tính năng.
-        Trong môi trường PHI DỪNG — đúng bài toán của chúng ta — đó là lỗi:
-        cấu trúc đã đổi thật mà hệ không chịu tin.
+        PROBLEM ADDRESSED
+        -----------------
+        The Robbins-Monro schedule alpha~1/t^d is required for the convergence
+        theorem, but it creates a paradox: the longer the system learns, the
+        smaller alpha becomes and the more resistant the system becomes to new
+        evidence. After a few hundred steps, new evidence can barely move the
+        belief. In a stationary environment this is a feature. In the
+        nonstationary environment studied here it is a defect: the structure
+        can genuinely change while the system refuses to revise its belief.
 
-        Ví dụ đời thường: bạn quen một người 10 năm, đánh giá đã ổn định. Rồi
-        họ đổi việc, đổi hoàn cảnh, tính nết khác hẳn. Nếu bạn vẫn cập nhật
-        ấn tượng với "trọng số 10 năm" thì phải mất thêm nhiều năm mới nhận
-        ra. Người tỉnh táo sẽ nói: "hoàn cảnh nó khác rồi, mình phải xem lại
-        từ đầu" — tức TỰ HẠ ĐỘ TIN CẬY của mình xuống và mở lại tốc độ học.
+        An everyday analogy is an impression of a person formed over ten
+        years. If that person changes job, circumstances, and behaviour, an
+        update still weighted by the full ten-year history could take years to
+        recognize the change. A rational observer instead acknowledges that
+        the context changed, lowers confidence in the old impression, and
+        reopens the learning rate. This method performs the same operation.
 
-        CƠ CHẾ (hai bước, phải làm cùng nhau)
-        -------------------------------------
-        1. RE-ANCHOR: lấy ước lượng đã khử chệch hiện tại làm ĐIỂM NEO mới.
-           Đây là chỗ khác biệt với "reset về 0": ta không xoá những gì đã
-           học, ta chỉ hạ độ tin cậy vào nó.
-        2. BƠM PHỒNG + MỞ LẠI TỐC ĐỘ HỌC: nhân sigma với `factor` và đặt lại
-           bộ đếm t về `t_reset`, khiến alpha bật lại lên mức cao.
+        MECHANISM — BOTH STEPS ARE REQUIRED
+        -----------------------------------
+        1. RE-ANCHOR: use the current debiased estimate as the new anchor. This
+           differs from a reset to zero: learned information is preserved and
+           only confidence in that information is reduced.
+        2. INFLATE AND REOPEN LEARNING: multiply sigma by `factor` and reset the
+           counter t to `t_reset`, returning alpha to a high value.
 
-        HIỆU ỨNG DÂY CHUYỀN (đây là chỗ đẹp)
-        ------------------------------------
-        sigma tăng -> LCB = |mu| - kappa*sigma giảm -> ít neighbour vượt tau
-        -> CORE TỰ CO LẠI. Hệ tự động thận trọng trong lúc chưa hiểu tình
-        hình mới, rồi tự nở ra khi đã học lại. Không cần luật thủ công nào.
+        CASCADING EFFECT
+        ----------------
+        Increased sigma lowers LCB=|mu|-kappa*sigma, so fewer neighbours exceed
+        tau and the CORE CONTRACTS AUTOMATICALLY. The system becomes cautious
+        while it does not understand the new situation, then expands the core
+        again after relearning. No additional manual rule is required.
 
-        Đây chính là `covariance inflation` trong bộ lọc Kalman, và cùng họ
-        với discounted/sliding-window UCB cho bandit phi dừng.
+        This is covariance inflation from Kalman filtering and is related to
+        discounted/sliding-window UCB for nonstationary bandits.
 
         Args:
-            factor: hệ số nhân sigma. 2.0-3.0 là hợp lý.
-            t_reset: đặt lại bộ đếm về giá trị này (1 = mở hết tốc độ học).
-            pairs: chỉ áp cho các cặp này. None = toàn bộ.
-            sigma_ceiling: trần cho sigma sau khi bơm. None = SIGMA_INIT.
+            factor: sigma multiplier; 2.0-3.0 is reasonable.
+            t_reset: new counter value; 1 fully reopens learning.
+            pairs: affected pairs, or None for all.
+            sigma_ceiling: post-inflation cap, or SIGMA_INIT when None.
 
         Returns:
-            dict thống kê để log.
+            Statistics dictionary for logging.
         """
         ids = self.neighbor_ids if pairs is None else [
             int(j) for j in pairs if int(j) in self.mu_bar
@@ -853,11 +837,11 @@ class BayesLightBeliefState:
         )) if ids else 0.0
 
         for j in ids:
-            # --- bước 1: re-anchor vào ước lượng tốt nhất đang có ---
+            # Step 1: re-anchor at the best current estimate.
             mu_hat = self.debiased_mu(j)
             sig_hat = self.debiased_sigma(j)
 
-            # --- bước 2: bơm phồng, có trần ---
+            # Step 2: inflate under a ceiling.
             new_sigma = min(
                 max(sig_hat * float(factor), self.sigma_floor),
                 ceiling,
@@ -866,25 +850,20 @@ class BayesLightBeliefState:
             self.mu_bar[j] = mu_hat
             self.sigma_bar[j] = new_sigma
 
-            # Điểm neo mới = trạng thái vừa đặt. Kết hợp với _bias_corr=1.0,
-            # debiased_* sẽ trả đúng các giá trị này cho tới khi có bằng
-            # chứng mới tích luỹ đủ.
+            # With _bias_corr=1.0, the newly set state is the anchor returned by
+            # debiased_* until sufficient new evidence accumulates.
             self._mu_init[j] = mu_hat
             self._sigma_init[j] = new_sigma
             self._bias_corr[j] = 1.0
 
-            # Mở lại tốc độ học.
+            # Reopen the learning rate.
             self.n_updates[j] = int(max(0, t_reset))
 
             # ---------------------------------------------------------
-            # QUAN TRỌNG: đồng bộ lại ARRAY — update_batch/_select_core_lcb
-            # đọc state qua self._mu_arr/_sigma_arr/_bias_corr_arr/
-            # _mu_init_arr/_sigma_init_arr/_n_updates_arr (mục 1.2), không
-            # còn qua dict. Nếu quên bước này, sau inflate các hàm vector
-            # hoá vẫn thấy state CŨ (trước inflate) — đúng dạng lỗi thứ tự
-            # mà GPU_OPTIMIZATION_CONTRACT.md mục 1.3 cảnh báo, chỉ khác là
-            # ở tầng đồng bộ dict<->array thay vì thứ tự đọc/ghi trong một
-            # hàm.
+            # Synchronize authoritative arrays. update_batch and core selection
+            # no longer read dictionaries; omission would leave vectorized paths
+            # on pre-inflation state, the synchronization-order failure class
+            # described in GPU contract section 1.3.
             # ---------------------------------------------------------
             pos = self._pos[j]
             self._mu_arr[pos] = mu_hat
@@ -909,16 +888,15 @@ class BayesLightBeliefState:
         }
 
     # =====================================================================
-    # Chẩn đoán mới
+    # New diagnostics.
     # =====================================================================
 
     def get_saturation_stats(self) -> Dict[str, float]:
         """
-        [B2] BẮT BUỘC báo cáo trong paper.
+        [B2] Required paper statistic.
 
-        Nếu hit_max_rate ~ 1.0 thì core size KHÔNG phải kết quả học mà là
-        trần cứng — và mọi phát biểu về "adaptive capacity allocation" đều
-        không có căn cứ. Thà tự nêu ra còn hơn để reviewer tìm thấy.
+        If hit_max_rate is near one, core size is a hard ceiling rather than a
+        learned outcome, so adaptive-capacity claims are unsupported.
         """
         n = max(1, self.n_core_updates)
 
@@ -932,7 +910,7 @@ class BayesLightBeliefState:
         }
 
     def get_signed_stats(self) -> Dict[str, float]:
-        """[B4] Thống kê theo dấu — đầu vào cho slot ngữ nghĩa."""
+        """[B4] Signed statistics used by semantic slots."""
         mus = np.array(
             [float(self.mu_bar[j]) for j in self.neighbor_ids], dtype=np.float64
         )
@@ -986,5 +964,5 @@ class BayesLightBeliefState:
         return out
 
 
-# Alias tương thích ngược.
+# Compatibility alias.
 BayesLightBeliefState = BayesLightBeliefState

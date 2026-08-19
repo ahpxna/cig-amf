@@ -3,26 +3,24 @@ import torch.nn as nn
 
 
 class PolicyValueNet(nn.Module):
-    """
-    Policy-value network nhận đúng 4 input của CIG-AMF:
+    """Policy-value network receives the correct 4 inputs of CIG-AMF:
 
         obs_i
         core_summary_i
         peripheral_summary_i
         belief_summary_i
 
-    Không đổi interface so với bản cũ.
+    Maintains the same interface as before.
 
     Method-level role:
-    - obs_i: observation riêng của ego-agent i.
+    - obs_i: observation specific to ego-agent i.
     - core_summary_i: explicit pair-relational core summary Z_i.
     - peripheral_summary_i: peripheral approximation M_i.
     - belief_summary_i: Bayes-light structural belief summary B_i.
 
     Output:
         logits: policy logits over discrete action space.
-        value: scalar value estimate cho actor-critic update.
-    """
+        value: scalar value estimate for actor-critic update."""
 
     def __init__(
         self,
@@ -60,7 +58,7 @@ class PolicyValueNet(nn.Module):
         self.critic = nn.Linear(self.hidden, 1)
 
     def forward(self, obs, core_summary, peripheral_summary, belief_summary):
-        # 1. Gom tất cả input vào 1 list
+        # 1. Gather all inputs into one list
         inputs = [
             obs,
             core_summary,
@@ -68,15 +66,15 @@ class PolicyValueNet(nn.Module):
             belief_summary,
         ]
 
-        # 2. Lấy số lượng batch/agents (ví dụ: B = 24) từ obs
+        # 2. Get the batch/agent count (e.g. B = 24) from obs
         B = obs.shape[0]
 
-        # 3. [FIX-CRIT-1b] Bản cũ .expand(B,-1) MỌI tensor có shape[0]==1 một
-        # cách âm thầm. Đó chính là thứ đã che giấu bug "peripheral memory của
-        # agent cuối bị nhân bản cho cả 24 agent" trong final_runner suốt nhiều
-        # lần debug: input sai shape không crash, chỉ lặng lẽ cho kết quả sai.
-        # Giữ lại expand cho trường hợp HỢP LỆ duy nhất (B == 1, gọi single-ego),
-        # còn lệch shape khi B > 1 thì phải nổ ngay tại chỗ.
+        # 3. [FIX-CRIT-1b] The old .expand(B,-1) applies to every tensor with shape[0]==1
+        # in a silent way. That is exactly what concealed the bug "peripheral memory of
+        # the last agent was duplicated for all 24 agents" in final_runner for many
+        # debugging sessions: input with wrong shape did not crash, only silently gave wrong results.
+        # Keep expand for the only valid case (B == 1, called single-ego),
+        # while shape mismatch when B > 1 must raise an error immediately.
         names = ("obs", "core_summary", "peripheral_summary", "belief_summary")
         expanded_inputs = []
         for name, t in zip(names, inputs):
@@ -89,7 +87,7 @@ class PolicyValueNet(nn.Module):
                 )
             expanded_inputs.append(t)
 
-        # 4. Cat lại an toàn
+        # 4. Safe truncation
         x = torch.cat(expanded_inputs, dim=-1)
 
         h = self.backbone(x)

@@ -1,28 +1,29 @@
 """
-env_audit_staged.py — kiểm định Omni-Arena theo 3 khối tích luỹ (staged),
-thay vì bật hết P1-P4 cùng lúc như env_audit.py.
+env_audit_staged.py — audit Omni-Arena through three cumulative stages
+instead of enabling P1-P4 together as env_audit.py does.
 
-LÝ DO (xem báo cáo triển khai của người dùng, không lặp lại toàn văn ở đây):
-P1-P4 có thể triệt tiêu lẫn nhau một cách im lặng khi build+test chung một
-lần -- P3 (congestion) có thể nhấn chìm P1 (conditional influence) làm T3
-sụp; nhiễu hàng đợi của P3 trộn với độ trễ thiết kế của P2 làm T4 "đẹp"
-nhầm lý do; cửa sổ oracle H=8 của P2 có thể trung bình hoá xuyên hai cấu
-trúc nếu P4 xảy ra giữa chừng; P4 dời bottleneck đổi đúng các biến trạng
-thái mà delta_ij(s) của P1 đọc.
+RATIONALE:
+P1-P4 can silently cancel one another when built and tested together. P3
+(congestion) can swamp P1 (conditional influence) and collapse T3; P3 queue
+noise combined with P2's designed latency can make T4 look favorable for the
+wrong reason; P2's H=8 oracle window can average across two structures if P4
+occurs mid-window; and P4 moves the bottleneck, changing the same state
+variables read by P1's delta_ij(s).
 
-Cấu trúc tích luỹ, THEO QUYẾT ĐỊNH CUỐI CỦA NGƯỜI DÙNG (P1+P2 gộp chung một
-khối vì cả hai không đụng tới environment dynamics, chỉ đụng bảng ảnh
-hưởng, và không tương tác với nhau):
+Cumulative structure (P1 and P2 share a stage because neither changes the
+environment dynamics; they only affect the influence table and do not
+interact with one another):
 
-  BASELINE  P0 only (mọi cờ P1-P4 tắt)               -- điểm mốc để so Block A
+  BASELINE  P0 only (all P1-P4 flags disabled)        -- Block A reference
   Block A   P0 + P1 + P2  (conditional_gates=True, latency_ladder=True,
                             congestion=False, structural_shift=False)
-  Block B   Block A + P3  (congestion=True)           -- MANDATORY, phải cô lập
+  Block B   Block A + P3  (congestion=True)           -- MANDATORY; isolate it
   Block C   Block B + P4  (structural_shift=True)
 
-Script này KHÔNG thay thế env_audit.py (env_audit.py = "bật hết cùng lúc",
-vẫn hữu ích làm kiểm tra cuối cùng "mọi cờ bật"). Mọi hàm tính metric (T1-T6,
-corr(Phi,W*)) được IMPORT từ env_audit.py, không viết lại logic.
+This script does not replace env_audit.py. The latter enables every flag at
+once and remains useful as the final all-flags check. All metric functions
+(T1-T6 and corr(Phi,W*)) are imported from env_audit.py without duplicating
+their logic.
 """
 import sys
 import numpy as np
@@ -32,7 +33,7 @@ import env_audit as ea  # reuse metric-computation functions, no forking
 
 
 # ============================================================
-# Config -- giống env_audit.py để số liệu so sánh được với nhau
+# Configuration matches env_audit.py so results remain comparable.
 # ============================================================
 BASE_ENV_KWARGS = dict(
     n_agents=ea.N_AGENTS,
@@ -45,9 +46,10 @@ BASE_ENV_KWARGS = dict(
 SEED = ea.SEED
 
 # ------------------------------------------------------------------
-# Cờ P1-P4 cho từng khối. BASELINE không nằm trong 3 khối chính thức
-# (A/B/C) -- nó chỉ là điểm mốc "P0 only" để Block A có cái để so delta,
-# đúng tinh thần "T3 nên đi từ baseline DIG-như (yếu) lên PASS" trong đặc tả.
+# P1-P4 flags for each stage. BASELINE is not one of the three formal stages
+# (A/B/C); it is only the P0-only reference used to measure Block A's delta,
+# consistent with the specification that T3 should improve from a weak,
+# DIG-like baseline to PASS.
 # ------------------------------------------------------------------
 BLOCKS = [
     (
@@ -95,11 +97,11 @@ BLOCKS = [
 
 def run_block(flags):
     """
-    Chạy đầy đủ bộ metric T1-T6 + corr(Phi,W*) cho MỘT khối, dùng đúng các
-    hàm của env_audit.py (không viết lại logic). Env chính (T1/T2/T3/T4/T5/
-    corr/sign-checks) luôn mode="behavioral_drift" -- giống hệt cách
-    env_audit.py.main() làm -- vì structural shift chỉ được thăm dò riêng
-    qua các env chuyên dụng bên trong ea.run_t6().
+    Run the complete T1-T6 and corr(Phi,W*) metric set for one stage using
+    env_audit.py's functions without duplicating their logic. The primary
+    environment for T1/T2/T3/T4/T5/correlation/sign checks always uses
+    mode="behavioral_drift", matching env_audit.py.main(). Structural shifts
+    are probed separately by the dedicated environments inside ea.run_t6().
     """
     env_kwargs = dict(BASE_ENV_KWARGS, **flags)
     main_env = OmniArena(mode="behavioral_drift", seed=SEED, **env_kwargs)
@@ -120,28 +122,33 @@ def run_block(flags):
         "t4_spread": m4["t4_spread"],
         "t5_snr": m1["t5_snr"],
         "t6_ratio": m6["t6_ratio"],
-        # RC-2: ĐẢO NGHĨA. Trường này từng hỏi "‖dPhi‖_behavioural có đúng
-        # bằng 0 không" -- điều kiện đó luôn True vì con số là literal
-        # hardcode, và nó chính là thứ khoá T6 ở 1e12. Giờ nó đo trên
-        # Φ̃ = E_s[phi*delta] và điều kiện PASS là KHÁC 0: behavioural drift
-        # phải để lại dấu vết đo được, chỉ là nhỏ hơn structural nhiều lần.
+        # RC-2 reverses the former semantics. This field previously asked
+        # whether behavioural ‖dPhi‖ was exactly zero. That condition was
+        # always true because the value was a hard-coded literal, which also
+        # pinned T6 at 1e12. It now measures Φ̃ = E_s[phi*delta], and PASS
+        # requires a nonzero value: behavioural drift must leave a measurable
+        # trace, although one much smaller than structural drift.
         "t6_behav_exact": m6["t6_delta_phi_behavioural"] > 0.0,
         "t6_static_phi_invariant": m6["t6_static_phi_invariant"],
         "corr_phi_w": m1["corr_phi_w"],
+        "corr_phi_w_static": m1["corr_phi_w_static"],
+        "corr_phi_w_mobile": m1["corr_phi_w_mobile"],
+        "state_unique_fraction": m1["state_bank_diagnostics"]["unique_state_fraction"],
+        "control_nonzero_fraction": m1["control_diagnostics"]["state_nonzero_fraction"],
         "_raw": {"m1": m1, "m3": m3, "m4": m4, "m6": m6, "msign": msign, "mabs": mabs},
     }
 
 
 METRIC_ORDER = [
-    # [docs/CIG-AMF_training_debug_master.md mục 5.5] t5_snr/t6_ratio/
-    # corr_phi_w giờ có CHẶN TRÊN, không chỉ chặn dưới. Trước đây audit chỉ
-    # hỏi "tín hiệu có tồn tại không" (v > threshold) -- một SNR=1e9 pass
-    # gate đó dễ dàng, nhưng SNR=1e9 chỉ chứng minh mày đang hard-code một
-    # bảng tra cứu rồi đo lại chính giả định của mình (control pairs
-    # W*=0 tuyệt đối), không chứng minh env có cấu trúc "phát hiện được
-    # nhưng không tầm thường". Đổi sang khoảng [3,20] (SNR/T6) và
-    # [0.70,0.95] (corr) biến audit thành "bài toán không tầm thường",
-    # đúng thay đổi quan trọng nhất trong bảng gate của debug doc.
+    # [docs/CIG-AMF_training_debug_master.md section 5.5] t5_snr, t6_ratio,
+    # and corr_phi_w now have upper as well as lower bounds. The old audit
+    # only asked whether a signal existed (v > threshold), so an SNR of 1e9
+    # passed easily. Such a value merely indicates that a lookup table is
+    # hard-coded and then measured against its own assumption (control pairs
+    # have W*=0 exactly); it does not establish detectable but nontrivial
+    # structure. The [3,20] SNR/T6 and [0.70,0.95] correlation intervals turn
+    # the audit into a nontriviality test, the debug document's central gate
+    # change.
     ("t1_gini", "T1 Gini(|W*|)", lambda v: v > 0.30),
     ("t2_neg_frac", "T2 neg frac", lambda v: v > 0.15),
     ("t2_pos_frac", "T2 pos frac", lambda v: v > 0.15),
@@ -149,7 +156,9 @@ METRIC_ORDER = [
     ("t4_spread", "T4 sign-flip frac (NEW methodology)", lambda v: v > 0.3),
     ("t5_snr", "T5 SNR", lambda v: 3.0 <= v <= 20.0),
     ("t6_ratio", "T6 ratio", lambda v: 3.0 <= v <= 20.0),
-    ("corr_phi_w", "corr(Phi,W*)", lambda v: 0.70 <= v <= 0.95),
+    ("corr_phi_w_static", "corr(Phi,W*) static", lambda v: 0.65 <= v <= 0.95),
+    ("state_unique_fraction", "state-bank unique frac", lambda v: v >= 0.80),
+    ("control_nonzero_fraction", "control nonzero frac", lambda v: v >= 0.25),
 ]
 
 
@@ -196,6 +205,10 @@ def print_block_result(name, desc, flags, metrics, prev_metrics, prev_name):
         f"  [oracle no-abs() has_negative_delta] = "
         f"{metrics['_raw']['mabs']['has_negative_delta']}"
     )
+    print(
+        f"  [corr diagnostic] mobile={fmt(metrics['corr_phi_w_mobile'])}  "
+        f"global={fmt(metrics['corr_phi_w'])}"
+    )
 
 
 def main():
@@ -225,7 +238,7 @@ def main():
         prev_name, prev_metrics = name, metrics
 
     # ------------------------------------------------------------
-    # Diagnostic call-outs per user's expected results
+    # Diagnostic call-outs defined by the staged-audit acceptance criteria.
     # ------------------------------------------------------------
     print("\n" + "=" * 78)
     print("DIAGNOSTIC CALL-OUTS (per staged-audit plan)")

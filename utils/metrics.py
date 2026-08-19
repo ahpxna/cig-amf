@@ -29,12 +29,10 @@ def core_f1(pred_core, gt_core):
 
 
 def safe_spearman(x, y):
-    """
-    Spearman rank correlation không phát warning khi vector hằng.
+    """Spearman rank correlation does not issue warning when vector is constant.
 
-    Trường hợp vector hằng là tình huống hợp lệ trong tiny oracle hoặc giai đoạn
-    proxy chưa học được gì. Ta ghi constant_case=1 thay vì để scipy warning.
-    """
+A constant vector is valid in the tiny oracle or before the proxy has learned.
+Record constant_case=1 instead of allowing SciPy to emit a warning."""
     x = np.asarray(x, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
 
@@ -58,31 +56,29 @@ def safe_spearman(x, y):
 
 
 def oracle_calibration(learned_scores, oracle_scores, neighbor_ids):
-    """
-    Calibration summary giữa learned proxy score và oracle intervention score.
+    """Calibration summary between learned proxy score and oracle intervention score.
 
-    learned_scores:
-        dict {neighbor_id: learned score}
+learned_scores:
+    dict {neighbor_id: learned score}
 
-    oracle_scores:
-        dict {neighbor_id: oracle intervention score}
+oracle_scores:
+    dict {neighbor_id: oracle intervention score}
 
-    neighbor_ids:
-        list ids cần so sánh
+neighbor_ids:
+    list ids to compare
 
-    Return:
-        bias
-        variance
-        mae
-        rmse
-        rank_correlation
-        p_value
-        constant_case
+Return:
+    bias
+    variance
+    mae
+    rmse
+    rank_correlation
+    p_value
+    constant_case
 
-    Lưu ý:
-        Dùng abs(score) vì core selection dựa trên magnitude ảnh hưởng.
-        Nếu muốn đánh giá signed agreement, nên thêm metric riêng.
-    """
+Note:
+    Use abs(score) because core selection is based on magnitude of influence.
+    If signed agreement is desired, add a separate metric."""
     neighbor_ids = list(neighbor_ids)
 
     learned = np.array(
@@ -120,12 +116,10 @@ def oracle_calibration(learned_scores, oracle_scores, neighbor_ids):
 
 
 def oracle_core_f1_from_scores(learned_scores, oracle_scores, neighbor_ids, top_k):
-    """
-    F1 giữa top-k learned neighbours và top-k oracle neighbours.
+    """F1 between top-k learned neighbours and top-k oracle neighbours.
 
-    Dùng magnitude vì CIG-AMF chọn core theo strength của influence,
-    không phải chỉ influence dương.
-    """
+Use magnitude because CIG-AMF selects core based on strength of influence,
+not just positive influence."""
     neighbor_ids = list(neighbor_ids)
     top_k = int(max(0, top_k))
 
@@ -158,31 +152,29 @@ def recovery_latency(
     horizon=6,
     higher_is_better=True,
 ):
-    """
-    Recovery latency theo evaluation index.
+    """Recovery latency per evaluation index.
 
-    Bản này sửa logic cũ target = threshold * baseline, vì reward của env có thể âm.
-    Với reward âm, baseline=-0.4 thì 0.9*baseline=-0.36, nhìn rất dễ gây hiểu nhầm.
+This version modifies the old logic target = threshold * baseline, because environment reward can be negative.
+With negative reward, baseline=-0.4 then 0.9*baseline=-0.36, which looks very misleading.
 
-    Logic mới:
-        baseline = mean metric trước shift
-        post_shift_extreme = điểm xấu nhất trong cửa sổ sau shift
+New logic:
+    baseline = mean metric before shift
+    post_shift_extreme = worst point in window after shift
 
-    Nếu higher_is_better=True:
-        target = post_shift_min + threshold * (baseline - post_shift_min)
-        recovered khi metric >= target
+If higher_is_better=True:
+    target = post_shift_min + threshold * (baseline - post_shift_min)
+    recovered when metric >= target
 
-    Nếu higher_is_better=False:
-        target = post_shift_max - threshold * (post_shift_max - baseline)
-        recovered khi metric <= target
+If higher_is_better=False:
+    target = post_shift_max - threshold * (post_shift_max - baseline)
+    recovered when metric <= target
 
-    Return:
-        latency, baseline, target
+Return:
+    latency, baseline, target
 
-    latency:
-        số evaluation points từ shift_eval_index tới điểm đầu tiên đạt target.
-        Nếu không recover trong horizon thì latency = -1.
-    """
+latency:
+    number of evaluation points from shift_eval_index to first point reaching target.
+    If not recovered within horizon, latency = -1."""
     xs = history.get(metric_key, [])
     xs = [float(x) for x in xs]
 
@@ -246,10 +238,8 @@ def smooth_curve(xs, k=3):
 
 
 def summarize_final_window(history, metric_key, window=3):
-    """
-    Lấy mean/std của vài evaluation point cuối.
-    Dùng khi report bảng final performance.
-    """
+    """Take mean/std of some final evaluation points.
+Used when reporting final performance table."""
     xs = history.get(metric_key, [])
 
     if xs is None or len(xs) == 0:
@@ -269,21 +259,19 @@ def summarize_final_window(history, metric_key, window=3):
 
 
 def aggregate_seed_runs(rows, group_keys=("task", "model", "n_agents"), metric_keys=None):
-    """
-    Aggregate nhiều seed từ list[dict] kết quả.
+    """Aggregate multiple seeds from list[dict] results.
 
-    rows:
-        list of dict, mỗi row thường là final summary của một seed.
+rows:
+    list of dict, each row is typically the final summary of one seed.
 
-    group_keys:
-        keys dùng để group, ví dụ task/model/n_agents.
+group_keys:
+    keys to group by, e.g. task/model/n_agents.
 
-    metric_keys:
-        nếu None, tự lấy các key numeric không nằm trong group_keys.
+metric_keys:
+    if None, automatically take numeric keys not in group_keys.
 
-    Return:
-        list[dict] gồm mean/std/n theo group.
-    """
+Return:
+    list[dict] containing mean/std/n per group."""
     rows = list(rows)
 
     if len(rows) == 0:

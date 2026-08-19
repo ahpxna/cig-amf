@@ -1,10 +1,8 @@
-"""
-Gom H1/H2/H3 -> bảng tổng hợp (mean +/- std qua seed) cho phần Discussion.
-Không phụ thuộc pandas: dùng csv + statistics thuần.
+"""Aggregate H1/H2/H3 -> summary table (mean +/- std across seed) for the Discussion.
+No pandas dependency: use csv + pure statistics.
 
-Chạy:  python scripts/collect_results.py
-Ghi:   results/summary_tables.md  (+ in ra màn hình)
-"""
+Run:  python scripts/collect_results.py
+Write:   results/summary_tables.md  (+ output to screen)"""
 import csv
 import os
 import statistics as st
@@ -30,7 +28,7 @@ SPECS = [
 def fnum(x):
     try:
         v = float(x)
-        return v if v == v else None       # loại NaN
+        return v if v == v else None       # remove NaN
     except (TypeError, ValueError):
         return None
 

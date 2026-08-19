@@ -1,15 +1,17 @@
 """
-H3 & RQ3 — Influence Signatures chống Slot Collapse + Adaptive Capacity (Eq 17).
+H3 and RQ3 — Influence signatures against slot collapse and adaptive capacity
+(Eq. 17).
 
-LƯU Ý KỸ THUẬT: FinalCIGAMFRunner KHÔNG có method `evaluate()` và `run()` KHÔNG
-trả về history (nó ghi vào runner.history). Nên script này chia run thành chunk
-và đọc thẳng runner.history + get_slot_diagnostics() sau mỗi chunk, thay vì
-monkey-patch `runner.evaluate` (sẽ không bao giờ được gọi -> mảng rỗng).
+Technical note: FinalCIGAMFRunner has no `evaluate()` method, and `run()` does
+not return history; it writes to `runner.history`. This script therefore runs
+in chunks and reads `runner.history` plus `get_slot_diagnostics()` after each
+chunk. Monkey-patching `runner.evaluate` would never be invoked and previously
+produced empty arrays.
 
 Output: results/h3/<variant>_seed<S>/eval.jsonl + summary.json
         results/h3/summary_h3.csv
 
-Chạy:  python scripts/run_h3_slots.py --seeds 0 1 2 --episodes 200
+Run: python scripts/run_h3_slots.py --seeds 0 1 2 --episodes 200
 """
 import argparse
 import csv
@@ -26,8 +28,9 @@ ABLATIONS = [
     ("Full-CIGAMF",  {}),
     ("Scalar-Only",  {"proxy_effect_mode": "range"}),
     ("No-Semantic",  {"periph_use_uniform_mix": True, "periph_uniform_mix": 1.0}),
-    # [FIX-2] tắt CẢ hai thành phần của L_aux (Eq 26 lb + Eq 27 orth); bản cũ
-    # chỉ tắt lb nên ablation gần như trùng khít Full-CIGAMF.
+    # [FIX-2] Disable BOTH L_aux components (Eq. 26 load balancing and Eq. 27
+    # orthogonality). The previous ablation disabled only load balancing and
+    # was therefore nearly identical to Full-CIGAMF.
     ("No-AuxLoss",   {"periph_lb_coeff": 0.0, "periph_orth_coeff": 0.0}),
     ("Fixed-K",      {"belief_adaptive_k": False}),
 ]
@@ -76,7 +79,7 @@ def run_variant(name, cfg_over, seed, episodes, eval_every, device, out_root):
             "throughput": last(hist, "throughput_agent_steps_per_sec"),
         }
         append_jsonl(jsonl, row)
-        if row["post_warmup"]:          # chỉ tính SAU warm-up (bài học BUG N4)
+        if row["post_warmup"]:          # Aggregate only after warm-up (BUG N4).
             ents.append(row["usage_entropy_ratio"])
             cos_off.append(row["slot_cos_offdiag"])
             hitmax.append(row["hit_max_rate"])
@@ -96,9 +99,9 @@ def run_variant(name, cfg_over, seed, episodes, eval_every, device, out_root):
         "slot_cos_offdiag": m(cos_off),
         "hit_max_rate": m(hitmax),
         "mean_core_size": m(ks),
-        # [FIX-4] Bản cũ dùng list-comprehension CÓ FILTER -> mọi phần tử còn
-        # lại đều = 1.0 nên mean luôn bằng 1.0 (hoặc NaN khi rỗng): chỉ số này
-        # chưa bao giờ đo được gì. Phải là indicator trên TOÀN BỘ mẫu.
+        # [FIX-4] The previous filtered list comprehension retained only 1.0
+        # entries, so the mean was always 1.0 (or NaN when empty). It never
+        # measured saturation. Compute an indicator over ALL valid samples.
         "frac_k_at_kmax": (
             float(np.mean([1.0 if v >= kmax - 1e-6 else 0.0
                            for v in ks if np.isfinite(v)]))

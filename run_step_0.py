@@ -3,20 +3,21 @@ from models.diagnostics import structure_sensitivity_test
 from run_experiment import make_main_env, make_runner, default_cfg
 
 def run_one(condition, seed=0):
-    """[FIX-6] Nhận seed từ structure_sensitivity_test để hai condition chạy
-    trên CÙNG danh sách seed (paired). Bản cũ dùng
-    seed=np.random.randint(0,1000) -> (a) không tái lập được, vi phạm nguyên
-    tắc determinism 0.1 của debug doc; (b) hai nhánh chạy trên seed khác nhau
-    nên chênh lệch reward lẫn cả phương sai giữa seed."""
+    """Run paired conditions on the seed supplied by the sensitivity test.
+
+    [FIX-6] The previous implementation used
+    ``seed=np.random.randint(0, 1000)``. That was non-reproducible, violated
+    debugging determinism rule 0.1, and evaluated the two branches on different
+    seeds, mixing between-seed variance into the reward difference.
+    """
     cfg = default_cfg()
 
-    # Map tên condition sang tên mô hình thật.
-    # Dùng FullExplicitLocal làm thế thân cho oracle_core
-    # [FIX-O3] "oracle_core" giờ trỏ tới OracleCoreRunner THẬT (được cho sẵn
-    # core đúng qua oracle |W*|, không tốn chi phí NHẬN DIỆN cấu trúc) — đây
-    # mới là treatment mà Experiment 0 của paper yêu cầu. "explicit_local_learned"
-    # giữ lại làm đối chứng baseline-vs-baseline, và tên của nó nói đúng bản
-    # chất: một baseline PHẢI HỌC, không phải oracle.
+    # Map condition labels to concrete runner names.
+    # [FIX-O3] ``oracle_core`` now selects the real OracleCoreRunner, which is
+    # given the correct core through oracle |W*| at zero structure-identification
+    # cost. This is the treatment required by paper Experiment 0.
+    # ``explicit_local_learned`` remains as a baseline-vs-baseline control; its
+    # name reflects that it must learn and is not an oracle.
     model_map = {
         "pure_mean_field": "PureMeanField",
         "oracle_core": "OracleCore",
@@ -25,7 +26,7 @@ def run_one(condition, seed=0):
     }
     actual_model = model_map.get(condition, condition)
 
-    # Khởi tạo môi trường
+    # Initialize the environment.
     env = make_main_env(
         task_mode="behavioral_drift",
         n_agents=24,
@@ -34,19 +35,19 @@ def run_one(condition, seed=0):
         seed=int(seed),
     )
 
-    # Khởi tạo runner
+    # Initialize the runner.
     runner = make_runner(actual_model, env, cfg, device="cpu")
 
-    # Cho chạy 60 episodes để mạng có thời gian học
+    # Run 60 episodes to allow the network to learn.
     history = runner.run(n_episodes=60, eval_every=59)
 
-    # Lấy mean_reward ở lần lưu cuối cùng
+    # Return mean reward from the final recorded evaluation.
     final_reward = history["mean_reward"][-1]
     return final_reward
 
 if __name__ == "__main__":
     print("Đang chạy Bước 0 - Kiểm tra độ nhạy cấu trúc môi trường...")
-    # Truyền đúng 2 chữ mà diagnostics.py yêu cầu
+    # Pass exactly the two condition labels required by diagnostics.py.
     res = structure_sensitivity_test(
         run_fn=run_one,
         conditions=("pure_mean_field", "oracle_core"),

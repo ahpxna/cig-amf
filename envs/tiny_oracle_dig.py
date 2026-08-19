@@ -4,16 +4,17 @@ import numpy as np
 
 class OracleInfluenceProfile(dict):
     """
-    Hồ sơ ảnh hưởng can thiệp — P0(c).
+    Interventional influence profile — P0(c).
 
-    Là dict với các key {signed, range, best, worst, per_action, base_return}
-    NHƯNG cũng hỗ trợ float(profile)/abs(profile) để tương thích ngược với
-    code cũ gọi compute_oracle_influence_from_current_state() và mong đợi
-    một số vô hướng (vd. run_experiment.py: `abs(float(score))`).
+    A dictionary with {signed, range, best, worst, per_action, base_return}
+    keys that also supports float(profile)/abs(profile) for compatibility with
+    legacy callers of compute_oracle_influence_from_current_state() that
+    expect a scalar, such as run_experiment.py's `abs(float(score))`.
 
-    QUAN TRỌNG: __float__ trả về "signed" — CÓ DẤU, không phải abs. Bất kỳ
-    caller nào cần magnitude phải tự gọi abs() ở phía họ (như run_experiment
-    đã làm) — bản thân oracle không còn tự ý huỷ dấu nữa (P0a).
+    IMPORTANT: __float__ returns the signed value, not its absolute value.
+    Callers that need magnitude must apply abs() themselves, as
+    run_experiment.py does. The oracle no longer discards sign internally
+    (P0a).
     """
 
     def __float__(self):
@@ -25,15 +26,15 @@ class OracleInfluenceProfile(dict):
 
 class TinyOracleDIG:
     """
-    Tiny Oracle nhiều ego dùng cho calibration.
+    Multi-ego Tiny Oracle used for calibration.
 
-    Mỗi zone có:
+    Each zone contains:
     - 1 collector
     - 1 gatekeeper
     - 1 relay
     - 1 blocker
 
-    Clone state được để đo effect can thiệp thật.
+    State can be cloned to measure true intervention effects.
     """
 
     UP = 0
@@ -49,10 +50,10 @@ class TinyOracleDIG:
     ROLE_RELAY = "relay"
     ROLE_BLOCKER = "blocker"
 
-    # P0(d): các "purpose" nhiễu ngẫu nhiên mà step() có thể tiêu thụ.
-    # TinyOracleDIG hiện không có bước nào gọi rng trong step()/scripted_policy()
-    # (mọi động lực đều tất định), nên danh sách này rỗng — nhưng hạ tầng buffer
-    # vẫn được giữ để env con (vd. omni_arena) có thể tái sử dụng cùng cơ chế.
+    # P0(d): random-noise purposes that step() may consume. TinyOracleDIG does
+    # not currently call its RNG in step()/scripted_policy() because all
+    # dynamics are deterministic. The list is therefore empty, but the buffer
+    # infrastructure remains available to subclasses such as omni_arena.
     NOISE_PURPOSES = []
 
     def __init__(self, grid_size=8, max_steps=24, causal_horizon=8, seed=42):
@@ -61,8 +62,8 @@ class TinyOracleDIG:
         self.causal_horizon = causal_horizon
         self.seed = seed
         self.rng = np.random.RandomState(seed)
-        # P0(d): common random numbers buffer, index theo (step, purpose).
-        # None => rng tiêu thụ bình thường (không có CRN).
+        # P0(d): common-random-number buffer indexed by (step, purpose).
+        # None means normal RNG consumption without CRN.
         self.noise_buffer = None
         self._noise_call_counter = {}
 
@@ -216,10 +217,10 @@ class TinyOracleDIG:
     def set_noise_buffer(self, buffer):
         """
         buffer: dict {(step, purpose): value_or_list_of_values}.
-        Khi được set, _draw_noise() sẽ ưu tiên đọc từ đây thay vì gọi rng
-        trực tiếp, và được index theo (step, purpose) — KHÔNG theo thứ tự
-        gọi — nên base-branch và intervened-branch tiêu thụ đúng cùng
-        chuỗi nhiễu bất kể can thiệp có đổi số lần/không thứ tự gọi rng.
+        When set, _draw_noise() reads from this buffer instead of calling the
+        RNG directly. Indexing is by (step, purpose), not call order, so the
+        base and intervened branches consume the same noise sequence even if
+        the intervention changes the number or order of RNG calls.
         """
         self.noise_buffer = buffer
         self._noise_call_counter = {}
@@ -230,10 +231,10 @@ class TinyOracleDIG:
 
     def _draw_noise(self, purpose):
         """
-        Rút một số ngẫu nhiên cho "purpose" tại self.t hiện tại.
-        Nếu noise_buffer có sẵn entry cho (self.t, purpose), dùng nó (hỗ trợ
-        cả giá trị đơn lẫn list nếu purpose được gọi nhiều lần trong 1 step).
-        Ngược lại fallback về self.rng.rand() bình thường.
+        Draw a random value for ``purpose`` at the current ``self.t``.
+        Use an available (self.t, purpose) noise-buffer entry, supporting both
+        scalar values and lists when a purpose is called multiple times per
+        step. Otherwise fall back to self.rng.rand().
         """
         key = (self.t, purpose)
 
@@ -451,11 +452,10 @@ class TinyOracleDIG:
 
     def _make_crn_buffer(self, horizon, seed_rng):
         """
-        P0(d): rút sẵn một buffer nhiễu cố định theo (step, purpose), dùng
-        chung một seed_rng riêng (KHÔNG phải self.rng, để không làm nhiễu
-        state rng chính của env). Nếu env không có NOISE_PURPOSES nào (như
-        TinyOracleDIG, vốn tất định), buffer sẽ rỗng và không có tác dụng —
-        vô hại.
+        P0(d): pre-sample a fixed noise buffer by (step, purpose) using a
+        separate seed_rng rather than self.rng, leaving the environment's
+        primary RNG state untouched. If the environment has no NOISE_PURPOSES,
+        as in deterministic TinyOracleDIG, the buffer is empty and inert.
         """
         buffer = {}
         for step in range(horizon):
@@ -467,8 +467,8 @@ class TinyOracleDIG:
         return buffer
 
     def _noise_calls_per_step(self, purpose):
-        # số lần purpose này có thể được gọi trong một step() — mặc định 1.
-        # Env con override nếu cần nhiều hơn (vd. 1 lần / zone).
+        # Maximum calls to this purpose in one step; default is one. Subclasses
+        # can override when more are needed, such as one call per zone.
         return max(1, getattr(self, "n_zones", 1))
 
     def compute_oracle_influence_from_current_state(
@@ -483,17 +483,17 @@ class TinyOracleDIG:
         crn_seed=None,
     ):
         """
-        P0 — oracle can thiệp đã sửa (4.1a-d):
-        (a) KHÔNG abs() — giữ dấu của (alt - base).
-        (b) forced_step có thể là bất kỳ bước nào trong {0..horizon-1}.
-        (c) Trả về hồ sơ nhiều hành động thay thế: signed / range / best /
-            worst / per_action, thay vì một số duy nhất.
-        (d) Common random numbers: base và mọi alt-branch tiêu thụ cùng một
-            buffer nhiễu rút sẵn theo (step, purpose) -> cho phép n_trials
-            nhỏ (1-2) mà vẫn triệt tiêu phương sai ngẫu nhiên không liên
-            quan tới can thiệp.
+        P0 — corrected interventional oracle (4.1a-d):
+        (a) Do not apply abs(); preserve the sign of alt - base.
+        (b) forced_step may be any step in {0..horizon-1}.
+        (c) Return a multi-alternative-action profile with signed, range,
+            best, worst, and per_action fields instead of a single number.
+        (d) Use common random numbers: the base and every alternative branch
+            consume the same pre-sampled (step, purpose) noise buffer. This
+            permits small n_trials values (1-2) while cancelling random
+            variation unrelated to the intervention.
 
-        Return: dict với các key:
+        Returns a dictionary with:
             signed, range, best, worst, per_action (dict action->mean delta),
             base_return
         """

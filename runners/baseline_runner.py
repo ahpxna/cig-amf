@@ -22,19 +22,20 @@ class PureMeanFieldRunner:
     """
     Pure Mean Field baseline.
 
-    Mục tiêu baseline:
-    - Không dùng Bayes-light belief.
-    - Không dùng core/peripheral learned partition.
-    - Không dùng pair-specific relational latent làm thông tin chính.
-    - Policy nhận:
+    Baseline definition:
+    - Does not use Bayes-light belief.
+    - Does not use a learned core/peripheral partition.
+    - Does not use pair-specific relational latents as primary information.
+    - The policy receives:
           obs_i
-          mean action one-hot của toàn bộ neighbors
-    - Đây là baseline scale rẻ, nhưng mù structural influence.
+          mean one-hot action over all neighbours
+    - This baseline scales cheaply but is blind to structural influence.
 
     Interface:
         run(n_episodes, eval_every) -> history dict
 
-    History keys cố tình gần với Final-CIGAMF để run_experiment.py có thể lưu chung.
+    History keys intentionally mirror Final-CIGAMF so run_experiment.py can
+    store both through the same path.
     """
 
     def __init__(self, env, cfg, device="cpu"):
@@ -121,9 +122,10 @@ class PureMeanFieldRunner:
 
     def _select_actions_population(self, obs_all):
         """
-        Vì action mean của neighbors cần actions hiện tại, khi chọn action ta dùng
-        last_actions của env làm mean-field context. Đây là standard online
-        approximation cho pure mean-field baseline.
+        The neighbours' action mean requires current actions, which are not yet
+        available during action selection. Use env.last_actions as the
+        mean-field context, the standard online approximation for a pure
+        mean-field baseline.
         """
         last_actions = getattr(self.env, "last_actions", [0 for _ in range(self.n_agents)])
 
@@ -224,10 +226,11 @@ class PureMeanFieldRunner:
             dist = torch.distributions.Categorical(probs=probs)
 
             logp = dist.log_prob(action_t)
-            # [docs/CIG-AMF_training_debug_master.md mục 2.2(b)] advantage
-            # chuẩn hoá mean0/std1 trên batch n_agents mỗi timestep -- bản
-            # cũ dùng adv thô, gradient scale bám thẳng vào reward scale.
-            # ret_t (target critic) giữ nguyên thang gốc, không đổi.
+            # [docs/CIG-AMF_training_debug_master.md, Section 2.2(b)]
+            # Normalize advantage to mean zero and standard deviation one over
+            # the n_agents batch at each timestep. The old implementation used
+            # raw advantage, tying gradient scale directly to reward scale.
+            # ret_t remains on the original scale as the unchanged critic target.
             adv_raw = (ret_t - value).detach()
             adv = (adv_raw - adv_raw.mean()) / (adv_raw.std(unbiased=False) + 1e-8)
 
@@ -302,17 +305,20 @@ class PureMeanFieldRunner:
 
 class OracleCoreRunner:
     """
-    Oracle-core baseline cho Experiment 0 (Structure Value gate).
-    Core được CHO SẴN bởi oracle (top-k |W*| thật, qua
-    env.compute_oracle_influence_from_current_state — đúng hàm đã dùng ở
-    structure_value_tier0.py/tier1.py), KHÔNG học từ dữ liệu — "zero-cost"
-    đúng nghĩa paper: không tốn chi phí NHẬN DIỆN cấu trúc, chứ không phải
-    zero-cost huấn luyện policy (policy vẫn học RL, chỉ khác input: one-hot
-    hành động của core thật thay vì mean-field/random).
+    Oracle-core baseline for Experiment 0, the Structure Value gate.
 
-    core_refresh_every: làm mới core mỗi N bước thay vì mỗi bước, vì rollout
-    oracle cho mọi cặp mỗi bước quá đắt. Xấp xỉ có chủ đích — nêu rõ khi báo
-    cáo kết quả, không phải oracle tức thời lý tưởng.
+    The oracle PROVIDES the core as the top-k neighbours by true |W*| through
+    env.compute_oracle_influence_from_current_state, the same function used by
+    structure_value_tier0.py and tier1.py. The core is NOT learned from data.
+    This is "zero cost" in the paper's precise sense: zero structure-
+    identification cost, not zero policy-training cost. The policy still learns
+    through RL, but receives one-hot actions from the true core instead of a
+    mean-field or random context.
+
+    core_refresh_every refreshes the core every N steps rather than at every
+    step because oracle rollouts for every pair are too expensive. This is a
+    deliberate approximation that must be disclosed in reported results; it
+    is not an ideal instantaneous oracle.
     """
 
     _log_tag = "OracleCore"
@@ -350,7 +356,7 @@ class OracleCoreRunner:
         )
 
         self._cached_core = {ego: [] for ego in range(self.n_agents)}
-        self._steps_since_refresh = 10 ** 9  # ép làm mới ngay lần gọi đầu
+        self._steps_since_refresh = 10 ** 9  # Force an immediate first refresh.
 
         self.history = {
             "episodes": [], "mean_reward": [], "reward_per_agent": [],
@@ -364,23 +370,26 @@ class OracleCoreRunner:
         }
 
     def _refresh_core_if_needed(self):
-        """Oracle thật (|W*|) — override ở RandomCoreRunner cho baseline ngẫu nhiên."""
+        """Use true oracle |W*|; RandomCoreRunner overrides this for its control."""
         if self._steps_since_refresh < self.core_refresh_every:
             self._steps_since_refresh += 1
             return
 
-        # [FIX-O1] Bản cũ lặp (ego, j): 24 x 23 = 552 lượt oracle rollout MỖI
-        # lần refresh, ~6-7 refresh/episode => chạy cả đêm không xong.
-        # Chỉ cần lặp theo j: một lần can thiệp lên j cho ra W* của MỌI ego
-        # cùng lúc, vì env.step() trả về reward VECTOR. Giảm đúng 24x, KHÔNG
-        # xấp xỉ, KHÔNG mất chính xác — chỉ là dùng lại thông tin đã có.
+        # [FIX-O1] The old implementation looped over (ego, j), performing
+        # 24 x 23 = 552 oracle rollouts PER refresh and approximately 6–7
+        # refreshes per episode, making a run take all night. Looping only over
+        # j is sufficient: one intervention on j produces W* for EVERY ego at
+        # once because env.step() returns a reward VECTOR. This is an exact
+        # 24x reduction with NO approximation or loss of accuracy; it only
+        # reuses information already produced by the rollout.
         #
-        # [FIX-O2] Bản cũ nuốt lỗi bằng `except Exception: infl[j] = 0.0`.
-        # Ở cuối episode, guard B (self.t + horizon <= max_steps) NÉM assert
-        # cho MỌI cặp => toàn bộ infl = 0 => sorted() trả về 3 agent đầu theo
-        # thứ tự dict, tức "oracle" âm thầm biến thành baseline câm mà không
-        # có một dòng cảnh báo nào. Giờ: bỏ qua refresh (giữ core cũ) và đếm
-        # số lần hỏng để báo cáo.
+        # [FIX-O2] The old implementation swallowed errors with
+        # `except Exception: infl[j] = 0.0`. Near the end of an episode, guard B
+        # (self.t + horizon <= max_steps) raised for EVERY pair, making all
+        # influences zero. sorted() then returned the first three agents in
+        # dictionary order, silently turning the "oracle" into an inert baseline
+        # without a warning. Failed refreshes now retain the previous core and
+        # are counted for reporting.
         saved = self.env.clone_state()
         infl_matrix = np.zeros((self.n_agents, self.n_agents), dtype=np.float64)
         n_failed = 0
@@ -395,13 +404,13 @@ class OracleCoreRunner:
                     if ego != j:
                         infl_matrix[ego, j] = abs(float(profile[ego]))
             except AssertionError:
-                # guard P2<->P4: rollout vượt ranh giới episode/shift
+                # P2/P4 guard: the rollout crossed an episode or shift boundary.
                 n_failed += 1
             except Exception as e:
                 n_failed += 1
                 if not getattr(self, "_oracle_warned", False):
-                    print(f"[OracleCore][WARN] oracle rollout lỗi ({type(e).__name__}: {e}) "
-                          f"-- giữ core cũ, KHÔNG coi ảnh hưởng = 0.")
+                    print(f"[OracleCore][WARN] oracle rollout failed ({type(e).__name__}: {e}) "
+                          f"-- retaining the old core instead of treating influence as zero.")
                     self._oracle_warned = True
             finally:
                 self.env.restore_state(saved)
@@ -410,7 +419,7 @@ class OracleCoreRunner:
         self._oracle_failed_refreshes = getattr(self, "_oracle_failed_refreshes", 0)
 
         if n_failed >= self.n_agents:
-            # Không đo được gì cả -> GIỮ NGUYÊN core cũ thay vì gán rác.
+            # No measurement was possible; RETAIN the old core instead of noise.
             self._oracle_failed_refreshes += 1
             self._steps_since_refresh = 0
             return
@@ -456,7 +465,7 @@ class OracleCoreRunner:
 
     def collect_episode(self):
         obs_all = self.env.reset()
-        self._steps_since_refresh = 10 ** 9  # làm mới core ngay đầu episode
+        self._steps_since_refresh = 10 ** 9  # Refresh immediately at episode start.
         done, trajectory = False, []
         ep_reward = np.zeros(self.n_agents, dtype=np.float32)
         t0 = time.time()
@@ -553,10 +562,11 @@ class OracleCoreRunner:
 
 class RandomCoreRunner(OracleCoreRunner):
     """
-    Control cho Experiment 0. Kiến trúc/kích thước input GIỐNG HỆT
-    OracleCoreRunner (cùng k_core*action_dim) — khác biệt DUY NHẤT là core
-    chọn NGẪU NHIÊN thay vì theo |W*| thật. Đây chính là cái
-    learning_range = R[oracle] - R[random] trong structure_value_tier2.py cần.
+    Experiment 0 control with architecture and input size IDENTICAL to
+    OracleCoreRunner, including k_core*action_dim. The ONLY difference is that
+    the core is selected RANDOMLY rather than by true |W*|. This is precisely
+    the control required for
+    learning_range = R[oracle] - R[random] in structure_value_tier2.py.
     """
 
     _log_tag = "RandomCore"
@@ -578,29 +588,30 @@ class FullExplicitLocalRunner:
     """
     Full Explicit Local baseline.
 
-    Mục tiêu baseline:
-    - Không dùng Bayes-light belief.
-    - Không dùng learned core/peripheral partition.
-    - Không dùng local counterfactual proxy.
-    - Mọi neighbor trong local population được nén bằng explicit local feature pooling.
-    - Đây là baseline richer-than-mean-field nhưng không structural-filtered.
+    Baseline definition:
+    - Does not use Bayes-light belief.
+    - Does not use a learned core/peripheral partition.
+    - Does not use a local counterfactual proxy.
+    - Every neighbour in the local population is compressed through explicit
+      local-feature pooling.
+    - This baseline is richer than mean field but is not structurally filtered.
 
-    Vì không biết env có observation per neighbor riêng hay không, implementation này
-    dùng available fields phổ biến trong env:
+    Because the environment may not expose a separate observation for each
+    neighbour, this implementation uses commonly available fields:
         positions
         agent_zone
         agent_role
         last_actions
         get_obs_of_ego()
 
-    Policy nhận:
+    The policy receives:
         obs_i
         explicit_local_summary_i
 
-    explicit_local_summary_i có dimension:
+    explicit_local_summary_i has dimension:
         action_dim + 4
-    gồm:
-        mean one-hot action của neighbors
+    comprising:
+        mean one-hot action over neighbours
         mean normalized relative row
         mean normalized relative col
         mean same-zone indicator
@@ -814,10 +825,11 @@ class FullExplicitLocalRunner:
             dist = torch.distributions.Categorical(probs=probs)
 
             logp = dist.log_prob(action_t)
-            # [docs/CIG-AMF_training_debug_master.md mục 2.2(b)] advantage
-            # chuẩn hoá mean0/std1 trên batch n_agents mỗi timestep -- bản
-            # cũ dùng adv thô, gradient scale bám thẳng vào reward scale.
-            # ret_t (target critic) giữ nguyên thang gốc, không đổi.
+            # [docs/CIG-AMF_training_debug_master.md, Section 2.2(b)]
+            # Normalize advantage to mean zero and standard deviation one over
+            # the n_agents batch at each timestep. The old implementation used
+            # raw advantage, tying gradient scale directly to reward scale.
+            # ret_t remains on the original scale as the unchanged critic target.
             adv_raw = (ret_t - value).detach()
             adv = (adv_raw - adv_raw.mean()) / (adv_raw.std(unbiased=False) + 1e-8)
 
@@ -893,37 +905,36 @@ class FullExplicitLocalRunner:
 
 class SharedAblationBase:
     """
-    Shared ablation runner cho:
+    Shared ablation runner for:
         - NoBelief
         - NoMultiMemory
         - NoTwoTimescale
 
-    Khác với PureMeanField / FullExplicitLocal, ablation này giữ phần lớn pipeline
-    của Final-CIGAMF để mỗi ablation kiểm tra đúng một module.
+    Unlike PureMeanField and FullExplicitLocal, these ablations retain most of
+    the Final-CIGAMF pipeline so each condition tests exactly one module.
 
     Flags:
         use_belief:
-            False cho NoBelief.
-            Nếu False:
-                - không train proxy/belief.
-                - không update learned core.
-                - core giữ weak-prior seeded partition.
-                - policy vẫn nhận belief_summary nhưng là summary từ fixed seeded belief.
-                - runtime không bị tính chi phí proxy không dùng.
+            False for NoBelief. When False:
+                - do not train the proxy or belief;
+                - do not update the learned core;
+                - retain the weak-prior-seeded core partition;
+                - continue providing belief_summary to the policy, but derive
+                  it from the fixed seeded belief; and
+                - exclude the unused proxy's cost from runtime.
 
         use_multi_memory:
-            False cho NoMultiMemory.
-            Nếu False:
-                - peripheral summary được thay bằng single aggregate projection.
-                - không dùng PeripheralMultiMemory forward.
+            False for NoMultiMemory. When False:
+                - replace the peripheral summary with a single aggregate
+                  projection; and
+                - do not execute PeripheralMultiMemory.forward.
 
         use_two_timescale:
-            False cho NoTwoTimescale.
-            Nếu False:
-                - scheduler bị force Stage 1.
-                - graph update chạy mỗi episode.
-                - không dùng slow-fast delay.
-                - vẫn dùng proxy/belief nếu use_belief=True.
+            False for NoTwoTimescale. When False:
+                - force the scheduler into Stage 1;
+                - update the graph every episode;
+                - remove the slow/fast delay; and
+                - continue using proxy/belief when use_belief=True.
     """
 
     def __init__(
@@ -965,8 +976,8 @@ class SharedAblationBase:
             buffer_size=cfg.get("proxy_buffer_size", 200000),
             grad_clip=cfg.get("proxy_grad_clip", 1.0),
             device=device,
-            # ---- v2, default = giá trị gốc trong structural_proxy.py ->
-            # KHÔNG đổi hành vi nếu cfg không set ----
+            # v2 defaults match structural_proxy.py and therefore do not
+            # change behaviour when the configuration omits these fields.
             n_horizons=cfg.get("proxy_n_horizons", 3),
             effect_mode=cfg.get("proxy_effect_mode", "signed_aristocrat"),
             use_doubly_robust=cfg.get("proxy_use_doubly_robust", True),
@@ -1116,8 +1127,8 @@ class SharedAblationBase:
                 min_core_size=self.cfg.get("min_core_size", 1),
                 sigma_floor=self.cfg.get("sigma_floor", 0.0),
                 max_core_size=self.cfg.get("max_core_size", 4),
-                # ---- v2, default = giá trị "khuyến nghị" gốc trong
-                # belief_layer.py -> KHÔNG đổi hành vi nếu cfg không set ----
+                # v2 defaults match the original recommended values in
+                # belief_layer.py and do not change behaviour when unset.
                 core_rule=self.cfg.get("belief_core_rule", "lcb"),
                 kappa=self.cfg.get("belief_kappa", 1.0),
                 alpha_decay=self.cfg.get("belief_alpha_decay", 0.7),
@@ -1345,8 +1356,8 @@ class SharedAblationBase:
             "core_context_excluding": {},
             "periph_context_excluding": {},
             "value_cache": {},
-            # [FIX-X1] giống final_runner: ảnh chụp hình học tại timestep này
-            # để replay_builder dựng x_ij đúng thời điểm.
+            # [FIX-X1] Match final_runner by capturing geometry at this
+            # timestep so replay_builder constructs time-aligned x_ij.
             "geom_snapshot": {
                 "positions": [list(p) for p in self.env.positions],
                 "agent_zone": [int(z) for z in self.env.agent_zone],
@@ -1574,10 +1585,11 @@ class SharedAblationBase:
             ret_t = torch.tensor(returns_batch, dtype=torch.float32, device=self.device)
 
             logp = dist.log_prob(action_t)
-            # [docs/CIG-AMF_training_debug_master.md mục 2.2(b)] advantage
-            # chuẩn hoá mean0/std1 trên batch n_agents mỗi timestep -- bản
-            # cũ dùng adv thô, gradient scale bám thẳng vào reward scale.
-            # ret_t (target critic) giữ nguyên thang gốc, không đổi.
+            # [docs/CIG-AMF_training_debug_master.md, Section 2.2(b)]
+            # Normalize advantage to mean zero and standard deviation one over
+            # the n_agents batch at each timestep. The old implementation used
+            # raw advantage, tying gradient scale directly to reward scale.
+            # ret_t remains on the original scale as the unchanged critic target.
             adv_raw = (ret_t - value).detach()
             adv = (adv_raw - adv_raw.mean()) / (adv_raw.std(unbiased=False) + 1e-8)
 
@@ -1687,9 +1699,9 @@ class SharedAblationBase:
                 policy_probs_j_batch=None,
                 observed_returns_batch=observed_returns_batch,
                 behaviour_probs_obs_batch=behaviour_probs_obs_batch,
-                # [FIX-X1] ablation runners phải dùng CÙNG conditioning set
-                # với Final-CIGAMF, nếu không so sánh sẽ lẫn cả hiệu ứng của
-                # x_ij vào hiệu ứng của cơ chế bị cắt.
+                # [FIX-X1] Ablation runners must use the SAME conditioning set
+                # as Final-CIGAMF. Otherwise the comparison confounds the effect
+                # of x_ij with the effect of the ablated mechanism.
                 pair_feat_batch=[
                     build_pair_feat(
                         self.env.positions, self.env.agent_zone,
@@ -1757,7 +1769,7 @@ class SharedAblationBase:
 
         promoted = 0
         demoted = 0
-        # Precompute H-step returns so we can pass observed_returns for DR.
+        # Precompute H-step returns to provide observed_returns to DR.
         try:
             h_returns = self.replay_builder.build_h_step_returns(trajectory, self.n_agents)
         except Exception:

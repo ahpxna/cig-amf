@@ -1,7 +1,7 @@
 import sys
 import os
 
-# 1. Ép Python tìm kiếm module bên trong thư mục 'envs'
+# 1. Search for modules within the 'envs' directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
 envs_dir = os.path.join(current_dir, 'envs')
 if envs_dir not in sys.path:
@@ -27,7 +27,7 @@ if __name__ == "__main__":
     
     out, rows = run_tier0(env=env, n_states=20, steps_between=10, k_core=3, horizon=8, seed=123)
     
-    # --- IN TOÀN BỘ CHỈ SỐ GỐC TỪ TIỀN TRÌNH ---
+    # --- COMPLETE ORIGINAL SOURCE CODE FROM TRAINING ---
     print("\n>>> RAW METRICS TỪ HÀM RUN_TIER0:")
     for key, val in out.items():
         if isinstance(val, float):
@@ -35,7 +35,7 @@ if __name__ == "__main__":
         else:
             print(f"  - {key:<25}: {val}")
     
-    # --- TỰ TẠO BẢNG PHÁN QUYẾT GIỐNG STEP 0 ---
+    # --- CREATE SIMILAR DECISION TABLE STEP 0 ---
     frac_changed = out.get("frac_action_changed", 0.0)
     norm_std = out.get("norm_by_std", 0.0)
     
@@ -45,13 +45,13 @@ if __name__ == "__main__":
     print(f"Độ phân tán ảnh hưởng (norm_by_std)    : {norm_std:.4f}")
     print("-" * 65)
     
-    # [FIX-7] Bản cũ phán "PASS ... Đã sẵn sàng cho CIG-AMF!" CHỈ dựa vào
-    # frac_action_changed > 0.05. Đó là tiêu chí YẾU HƠN gate Experiment 0 của
-    # paper: biết cấu trúc có ĐỔI hành động không, chứ không phải khoảng cách
-    # REGRET/reward có đáng kể không. Phải thoả CẢ HAI (đổi hành động + hối
-    # tiếc chuẩn hoá đủ lớn) mới được coi là qua gate.
+    # [FIX-7] Old version phan "PASS ... Ready for CIG-AMF!" BASED ON
+    # frac_action_changed > 0.05. That is a lower criterion than gate Experiment 0 of
+    # paper: knows the structure has different actions not just distance
+    # REGRET/reward is significant. Must satisfy BOTH (change action + high)
+    # regret/reward is large enough to be considered passed gate.
     ok_changed = frac_changed > 0.05
-    ok_regret = (norm_std == norm_std) and norm_std > 0.05   # loại NaN
+    ok_regret = (norm_std == norm_std) and norm_std > 0.05   # NaN type
     if ok_changed and ok_regret:
         verdict = ("PASS: qua gate Experiment 0 — cấu trúc vừa đổi hành động "
                    f"({frac_changed:.1%}) vừa có hối tiếc chuẩn hoá đáng kể "

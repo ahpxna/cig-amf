@@ -27,47 +27,48 @@ class FinalCIGAMFRunner:
     """
     Final CIG-AMF runner.
 
-    Bám đúng methodology hiện tại:
+    Implements the current methodology:
 
     1. Population-wide multi-ego training:
-        - mọi agent đều có thể là ego-agent.
-        - mỗi ego-agent i giữ belief riêng trên các directed pair (i, j).
+        - every agent can be an ego agent;
+        - every ego i maintains a separate belief for directed pair (i,j).
 
     2. Ego-centric directed influence graph:
-        - belief_modules[ego] lưu b_ij = (mu_bar, sigma_bar, p_core).
-        - core/peripheral partition là riêng theo ego.
+        - belief_modules[ego] stores b_ij = (mu_bar, sigma_bar, p_core).
+        - core/peripheral partitions are ego-specific.
 
     3. Pair-specific relational latent:
-        - z_ij không phải z_j global.
-        - z_ij encode relation giữa behaviour của j và ego i.
-        - update z_ij phải dùng context tại thời điểm action selection:
+        - z_ij is not a global z_j;
+        - z_ij encodes the relation between j's behaviour and ego i;
+        - z_ij updates use action-selection-time context:
               o_i^t, o_j^t, a_i^t, a_j^t, Delta_ij^t.
-        - Vì vậy collect_episode() restore env về snapshot trước step
-          trước khi gọi pair_rel_module.step_population().
+        - collect_episode() therefore restores the pre-step snapshot before
+          pair_rel_module.step_population().
 
     4. Shadow warm-start:
-        - mọi pair có shadow state s_ij.
-        - khi j promoted vào core của i, z_ij được warm-start từ s_ij.
+        - every pair has shadow state s_ij;
+        - promotion of j into i's core warm-starts z_ij from s_ij.
 
     5. Local counterfactual proxy:
-        - supervised target là finite-horizon return R_i^(H).
-        - proxy sample dùng context excluding-j cache tại thời điểm policy chọn action:
+        - the supervised target is finite-horizon return R_i^(H);
+        - proxy samples use the excluding-j context cached at policy selection:
               s_i, a_i, a_j, Z_i^{-j}, M_i^{-j}, B_i.
-        - replay/proxy buffer được collect mọi episode, kể cả Stage 0.
+        - replay/proxy buffers collect every episode, including Stage 0.
 
     6. Bayes-light belief:
         - proxy ensemble score directed pairs.
-        - belief update dùng mean influence và uncertainty scale.
-        - core update dùng hysteresis.
+        - belief updates use mean influence and uncertainty scale;
+        - core updates use hysteresis.
 
     7. Two-stage two-timescale:
         - Stage 0: seeded-core warm-up, collect replay, train policy/value/pair latent.
-        - Stage 1: learned belief takeover, proxy/belief/core update định kỳ.
-        - residual EWMA/CUSUM trigger tăng tạm thời tần suất structural update.
+        - Stage 1 transfers control to learned beliefs and performs periodic
+          proxy/belief/core updates;
+        - residual EWMA/CUSUM triggers temporarily raise structural-update frequency.
 
     8. Evaluation:
         - mean reward.
-        - structural F1 nếu env cung cấp diagnostic_core_by_ego.
+        - structural F1 is reported when the environment supplies diagnostic_core_by_ego.
         - temporal variance.
         - uncertainty.
         - mean core size.
@@ -100,8 +101,8 @@ class FinalCIGAMFRunner:
             buffer_size=cfg.get("proxy_buffer_size", 200000),
             grad_clip=cfg.get("proxy_grad_clip", 1.0),
             device=device,
-            # ---- v2, default = giá trị gốc trong structural_proxy.py ->
-            # KHÔNG đổi hành vi nếu cfg không set ----
+            # v2 defaults match structural_proxy.py and preserve behaviour
+            # when the configuration omits them.
             n_horizons=cfg.get("proxy_n_horizons", 3),
             effect_mode=cfg.get("proxy_effect_mode", "signed_aristocrat"),
             use_doubly_robust=cfg.get("proxy_use_doubly_robust", True),
@@ -110,8 +111,8 @@ class FinalCIGAMFRunner:
             use_belief_input=cfg.get("proxy_use_belief_input", False),
             ensemble_dropout=cfg.get("proxy_ensemble_dropout", 0.0),
             seed=cfg.get("seed", 0),
-            # [FIX-X1] x_ij (Eq 8). Đặt 0 để quay lại hành vi cũ (ablation
-            # "no-x_ij" — chính là cấu hình đã làm H1 thất bại ở 8 seed).
+            # [FIX-X1] x_ij from Eq. 8. Set zero for the legacy no-x_ij
+            # ablation, the configuration that failed H1 over eight seeds.
             pair_feat_dim=cfg.get("proxy_pair_feat_dim", PAIR_FEAT_DIM),
         )
 
@@ -139,9 +140,9 @@ class FinalCIGAMFRunner:
             use_uniform_mix=cfg.get("periph_use_uniform_mix", True),
             uniform_mix=cfg.get("periph_uniform_mix", 0.25),
             lb_coeff=cfg.get("periph_lb_coeff", 0.5),
-            # [FIX-2] orth_coeff trước đây KHÔNG đọc từ cfg -> luôn kẹt ở
-            # default 1e-2. Ablation "No-AuxLoss" (Eq 26-27) chỉ tắt được L_lb,
-            # còn L_orth vẫn chạy => ablation không cô lập đúng L_aux.
+            # [FIX-2] orth_coeff previously ignored cfg and remained at 1e-2.
+            # The No-AuxLoss ablation then disabled only L_lb while L_orth
+            # remained active, failing to isolate Eq. 26-27 L_aux.
             orth_coeff=cfg.get("periph_orth_coeff", 1e-2),
         ).to(device)
 
@@ -188,8 +189,9 @@ class FinalCIGAMFRunner:
             n_agents=self.n_agents,
             action_dim=self.action_dim,
             eps=cfg.get("eps", 0.03),
-            # [FIX-P1] default None: cap phá "b_j known exactly" (xem
-            # intervention.py) và gần như không bao giờ chạm ở eps=0.03/n=24.
+            # [FIX-P1] Default None: a cap invalidates the exact-known-b_j
+            # property; see intervention.py. It was almost never reached at
+            # eps=0.03 with n=24.
             max_forced_per_step=cfg.get("forcer_max_forced_per_step", None),
             anneal_to=cfg.get("forcer_anneal_to", 0.01),
             anneal_episodes=cfg.get("forcer_anneal_episodes", 60),
@@ -235,8 +237,8 @@ class FinalCIGAMFRunner:
                 min_core_size=cfg.get("min_core_size", 1),
                 max_core_size=cfg.get("max_core_size", 4),
                 sigma_floor=cfg.get("sigma_floor", 0.05),
-                # ---- v2, default = giá trị "khuyến nghị" gốc trong
-                # belief_layer.py -> KHÔNG đổi hành vi nếu cfg không set ----
+                # v2 defaults match belief_layer.py recommendations and
+                # preserve behaviour when cfg omits them.
                 core_rule=cfg.get("belief_core_rule", "lcb"),
                 kappa=cfg.get("belief_kappa", 1.0),
                 alpha_decay=cfg.get("belief_alpha_decay", 0.7),
@@ -254,7 +256,7 @@ class FinalCIGAMFRunner:
             "mean_reward": [],
             "reward_per_agent": [],
             "mean_f1": [],
-            "mean_f1_role": [],   # [F1-TOPK] chấm theo nhãn role (đối chứng)
+            "mean_f1_role": [],   # [F1-TOPK] control score against role labels
             "mean_temporal_var": [],
             "mean_uncertainty": [],
             "mean_core_size": [],
@@ -273,9 +275,8 @@ class FinalCIGAMFRunner:
             "proxy_loss": [],
             "bc_loss": [],
             "policy_loss": [],
-            # [debug doc mục 1.2 -- schema log mới, "0.2 Không bao giờ debug
-            # bằng số trung bình"] policy_loss cũ là actor+critic+entropy
-            # gộp làm một -- không tách được cái nào hỏng.
+            # [debug doc section 1.2] The old policy_loss combined actor,
+            # critic, and entropy and could not identify the failing component.
             "actor_loss": [],
             "critic_loss": [],
             "entropy": [],
@@ -297,11 +298,10 @@ class FinalCIGAMFRunner:
 
     def _make_belief_state(self, ego):
         """
-        Tạo BayesLightBeliefState.
+        Create BayesLightBeliefState.
 
-        Có fallback để không crash nếu belief_layer.py của bản hiện tại chưa nhận
-        min_core_size hoặc sigma_floor. Nếu file belief_layer.py đã được thay bằng
-        bản mới thì nhánh đầu tiên sẽ chạy.
+        Includes a fallback for belief_layer.py versions that do not yet accept
+        min_core_size or sigma_floor. Updated versions take the first branch.
         """
         common_kwargs = dict(
             ego_id=ego,
@@ -330,16 +330,16 @@ class FinalCIGAMFRunner:
 
     def _compute_weak_prior_scores(self, ego):
         """
-        Weak structural prior, không phải ground truth.
+        Weak structural prior, not ground truth.
 
-        Stage 0 có thể dùng:
+        Stage 0 may use:
         - proximity.
         - same-zone bonus.
         - role relevance.
         - environment-specific local cues.
 
-        Prior này chỉ dùng để seed core lúc warm-up. Sang Stage 1, learned belief
-        takeover sẽ quyết định core/peripheral partition.
+        This prior only seeds the core during warm-up. In Stage 1, learned
+        beliefs determine the core/peripheral partition.
         """
         role_bonus = {
             "hauler": 0.20,
@@ -376,14 +376,12 @@ class FinalCIGAMFRunner:
 
     def _reset_switch_counters_if_available(self):
         """
-        Dùng sau khi Stage 0 chuyển sang Stage 1.
+        Use after the Stage 0 to Stage 1 transition.
 
-        Lý do:
-        - Stage 0 có thể re-seed core mỗi episode theo weak prior.
-        - Nếu env reset positions, weak prior đổi, core switch count bị nhiễu bởi
-          bootstrap chứ không phản ánh learned belief instability.
-        - Nếu belief layer có reset_switch_counter(), gọi nó.
-        - Nếu không có, bỏ qua để không phá backward compatibility.
+        Stage 0 may reseed the core each episode from the weak prior. Position
+        resets can change that prior, contaminating core-switch counts with
+        bootstrap variation rather than learned-belief instability. Call
+        reset_switch_counter() when available and otherwise retain compatibility.
         """
         for ego in range(self.n_agents):
             mod = self.belief_modules[ego]
@@ -455,7 +453,7 @@ class FinalCIGAMFRunner:
         return self.periph_module(inputs)
     
     def _periph_full_from_inputs(self, inputs):
-        """Bản đầy đủ — dùng trong training loop để aux_loss thực sự có gradient."""
+        """Full path used in training so aux_loss retains gradients."""
         return self.periph_module.forward_full(inputs)
     
     def _periph_summary_np_from_inputs(self, inputs):
@@ -470,14 +468,13 @@ class FinalCIGAMFRunner:
 
     def _core_context_excluding(self, ego, exclude_j):
         """
-        [GPU_OPTIMIZATION_CONTRACT.md mục 2.1] Bản cũ gọi get_core_summary()
-        (mean pooling từ đầu) cho MỖI (ego, j) -> O(core_size) việc lặp lại
-        N lần mỗi ego, N^2 lần mỗi timestep. get_core_summary_excluding_all
-        đã tồn tại sẵn trong core_behavior.py (thủ thuật sum-trừ-một, CHỈ
-        đúng với mean pooling — đúng loại pooling paper đang dùng) nhưng
-        chưa được gọi ở đây. Cache theo (ego, core_set hiện tại): 1 lệnh
-        sum-minus-one cho CẢ N neighbour của ego đó, N lệnh tra dict còn
-        lại chỉ là O(1) lookup.
+        [GPU_OPTIMIZATION_CONTRACT.md section 2.1] The old path recomputed
+        get_core_summary() from scratch for every (ego,j), repeating
+        O(core_size) work N times per ego and N^2 times per timestep.
+        core_behavior.py already provides get_core_summary_excluding_all via a
+        sum-minus-one identity valid specifically for mean pooling, the paper's
+        pooling method. Cache by (ego,current core_set): one operation computes
+        all N neighbours and subsequent dictionary lookups are O(1).
         """
         core_set = self.belief_modules[ego].get_core_set()
         cache_key = (ego, frozenset(core_set))
@@ -491,21 +488,20 @@ class FinalCIGAMFRunner:
         if exclude_j in self._core_excl_cache:
             return self._core_excl_cache[exclude_j]
 
-        # Fallback an toàn (không nên xảy ra: exclude_j luôn là neighbour
-        # hợp lệ) — giữ đường chậm cũ để KHÔNG BAO GIỜ trả sai kết quả.
+        # Safe legacy slow-path fallback; exclude_j should always be valid, but
+        # correctness takes priority if that invariant is violated.
         reduced = [x for x in core_set if x != exclude_j]
         return self.pair_rel_module.get_core_summary(ego, reduced)
 
     def _periph_context_excluding(self, ego, exclude_j):
         """
-        [GPU_OPTIMIZATION_CONTRACT.md mục 2.1] Bản cũ: build_inputs() +
-        forward ĐẦY ĐỦ (chạy lại item_encoder/slot_router cho gần hết tập)
-        RIÊNG cho mỗi (ego, j) -> N lần mỗi ego. forward_excluding_all()
-        tính num/den đầy đủ MỘT LẦN rồi trừ-một vector hoá cho cả N
-        neighbour cùng lúc (sum-trừ-một, chỉ đúng weighted-mean pooling —
-        đã xác nhận đúng loại paper dùng, xem docstring của hàm đó).
-        Cache theo (ego, peripheral_set hiện tại); đồng bộ CPU MỘT LẦN
-        cho cả batch thay vì mỗi exclude_j một lần .cpu().numpy().
+        [GPU_OPTIMIZATION_CONTRACT.md section 2.1] The old path ran full
+        build_inputs and forward, including item_encoder/slot_router, once per
+        (ego,j). forward_excluding_all computes the full numerator/denominator
+        once and vectorizes sum-minus-one across N neighbours. The identity is
+        valid for the paper's weighted-mean pooling. Cache by (ego,current
+        peripheral_set) and synchronize CPU once for the batch rather than once
+        per excluded j.
         """
         belief_mod = self.belief_modules[ego]
         periph_ids = sorted(list(belief_mod.get_peripheral_set()))
@@ -543,8 +539,8 @@ class FinalCIGAMFRunner:
         if exclude_j in self._periph_excl_cache:
             return self._periph_excl_cache[exclude_j]
 
-        # Fallback an toàn (không nên xảy ra: exclude_j luôn trong peripheral
-        # set hiện tại) — đường chậm cũ, KHÔNG BAO GIỜ trả sai kết quả.
+        # Safe legacy slow-path fallback; exclude_j should be peripheral, but
+        # never return an incorrect result if the invariant is violated.
         periph_ids_reduced = sorted(
             list(belief_mod.get_peripheral_set() - {exclude_j})
         )
@@ -564,13 +560,11 @@ class FinalCIGAMFRunner:
 
     def _select_actions_population(self, obs_all):
         """
-        Batch policy forward cho toàn population.
+        Batched policy forward for the full population.
 
-        Không đổi logic:
-        - mỗi ego có B_i riêng.
-        - mỗi ego có Z_i riêng.
-        - mỗi ego có M_i riêng.
-        - context excluding-j vẫn cache theo ego/j để proxy sample khớp action-time context.
+        Semantics remain unchanged: every ego has distinct B_i, Z_i, and M_i,
+        while excluding-j context remains cached by ego/j so proxy samples
+        match action-time context.
         """
         actions = {}
 
@@ -583,10 +577,10 @@ class FinalCIGAMFRunner:
             "core_context_excluding": {},
             "periph_context_excluding": {},
             "value_cache": {},
-            # [FIX-X1] Ảnh chụp hình học TẠI timestep này, để replay_builder
-            # dựng x_ij đúng thời điểm mẫu được sinh ra. Không thể tính lại
-            # sau episode vì env.positions lúc đó đã là state cuối.
-            # Chi phí: 24 toạ độ + 24 zone id / timestep — không đáng kể.
+            # [FIX-X1] Snapshot geometry at this timestep so replay_builder can
+            # construct x_ij at sample creation time. It cannot be reconstructed
+            # after the episode because env.positions then contains final state.
+            # Cost is negligible: 24 coordinates and 24 zone IDs per timestep.
             "geom_snapshot": {
                 "positions": [list(self.env.positions[i]) for i in range(self.env.n_agents)],
                 "agent_zone": [int(z) for z in self.env.agent_zone],
@@ -671,19 +665,17 @@ class FinalCIGAMFRunner:
             probs = torch.softmax(logits, dim=-1)
             dist = torch.distributions.Categorical(probs=probs)
             sampled = dist.sample().detach().cpu().numpy()
-            # Một sync CPU<->GPU cho toàn bộ values thay vì gọi .item()
-            # từng agent một (bản cũ: n_agents lần đồng bộ mỗi bước).
+            # One CPU/GPU synchronization for all values replaces the old
+            # n_agents per-step .item() synchronizations.
             values_np = values.detach().cpu().numpy()
             probs_np = probs.detach().cpu().numpy()
 
-        # [EpsilonForcedActionController — intervention.py] PHẢI đứng SAU
-        # khi đã sample action, TRƯỚC khi actions được dùng để env.step().
-        # apply() sửa actions_list IN-PLACE tại vị trí bị ép, và trả về
-        # effective_probs = propensity hiệu dụng (mixture eps*uniform +
-        # (1-eps)*pi), KHÔNG PHẢI policy_probs thô — đây là behaviour
-        # probability đúng cần cho DR trong replay_builder/proxy. Lấy nhầm
-        # policy_probs (bỏ qua forcing) làm propensity sẽ khiến DR chệch có
-        # hệ thống một cách im lặng (không crash, không warning).
+        # [EpsilonForcedActionController] This must run after action sampling
+        # and before env.step(). apply() mutates forced entries in place and
+        # returns effective propensity eps*uniform+(1-eps)*pi, not raw policy
+        # probabilities. DR in replay_builder/proxy requires that behaviour
+        # probability. Using raw probabilities silently introduces systematic
+        # DR bias without an exception or warning.
         actions_list = [int(sampled[ego]) for ego in range(self.n_agents)]
         _pre_forcing = list(actions_list)          # [VERIFY-F1]
         forced_mask, effective_probs = self.forcer.apply(
@@ -692,22 +684,20 @@ class FinalCIGAMFRunner:
         )
 
         # ------------------------------------------------------------------
-        # [VERIFY-F1] Kiểm chứng forced action SỐNG SÓT tới trajectory.
+        # [VERIFY-F1] Verify that forced actions survive into the trajectory.
         #
-        # Lý do phải đo: min_head_frac quan sát được là 0.001-0.005, trong khi
-        # nếu forced action là uniform trên |A|=6 thì CHẶN DƯỚI LÝ THUYẾT là
-        # forced_frac/|A| ~ 0.013-0.033. Thấp hơn chặn dưới 15-30x là BẤT KHẢ
-        # THI nếu pipeline đúng => hoặc a_j ghi vào buffer là action TRƯỚC
-        # override, hoặc override xảy ra sau khi append.
+        # Observed min_head_frac was 0.001-0.005, but uniform forcing over six
+        # actions gives a theoretical lower bound forced_frac/|A| of
+        # 0.013-0.033. A 15-30x deficit is impossible in a correct pipeline and
+        # implies that the buffer stores pre-override a_j or applies override
+        # after append.
         #
-        # Đọc thứ tự code thì hiện tại có vẻ ĐÚNG (apply mutate in-place rồi
-        # actions_list mới được đóng gói). Nhưng "có vẻ đúng" không phải bằng
-        # chứng — đây là đúng loại lỗi mà đọc code không bắt được. Đo thật:
-        #   n_forced_seen      : số agent forcer báo đã ép
-        #   n_actually_changed : số agent action THỰC SỰ đổi so với pre-forcing
-        #   hist_forced        : phân bố action TRÊN CÁC AGENT BỊ ÉP
-        # Nếu forcing đúng thì hist_forced phải xấp xỉ uniform trên |A|.
-        # Nếu n_actually_changed == 0 trong khi n_forced_seen > 0 => bug.
+        # Code order appears correct because apply mutates before packing, but
+        # inspection alone cannot establish this runtime property. Measure
+        # n_forced_seen, n_actually_changed relative to pre-forcing actions,
+        # and hist_forced across forced agents. Correct forcing yields an
+        # approximately uniform histogram. Positive n_forced_seen with zero
+        # actual changes signals a defect.
         # ------------------------------------------------------------------
         try:
             fidx = [k for k in range(self.n_agents) if bool(forced_mask[k])]
@@ -768,7 +758,7 @@ class FinalCIGAMFRunner:
         - env.step(actions_list) moves env to t+1.
         - pair_rel_module.step_population(obs_all, actions_list, env) must see
           geometry at t, not geometry at t+1.
-        - Therefore we restore env_snapshot_before_step before step_population(),
+        - Therefore env_snapshot_before_step is restored before step_population(),
           then restore env_snapshot_after_step after it.
 
         Behavioural cloning fix:
@@ -851,13 +841,12 @@ class FinalCIGAMFRunner:
 
                 self.env.restore_state(env_snapshot_after_step)
 
-                # [ReciprocityTracker — reciprocity.py] Đúng thiết kế trong
-                # file: CÔNG CỤ CHẨN ĐOÁN, không cắm vào action selection.
-                # Dùng z_ij/s_ij tại t (cùng ngữ cảnh add_bc_transition vừa
-                # dùng) + a_j thật tại t+1 + cờ ego_was_forced tại t (a_i^t
-                # bị eps-forcing ép hay không -> a_i^t độc lập cơ học với
-                # mọi thứ khác, nên "biết a_i^t giúp đoán a_j^{t+1}" mới là
-                # nhân quả thật, không phải confounding từ cùng quan sát).
+                # [ReciprocityTracker] Diagnostic only; never feed this into
+                # action selection. Use z_ij/s_ij at t, the same context as
+                # add_bc_transition, true a_j at t+1, and whether a_i^t was
+                # forced. Forcing makes a_i^t mechanically independent, so any
+                # predictive gain for a_j^{t+1} is causal rather than shared-
+                # observation confounding.
                 if prev_forced_mask is not None:
                     self._record_reciprocity(
                         prev_h_snapshot=prev_h_snapshot,
@@ -885,16 +874,15 @@ class FinalCIGAMFRunner:
 
         runtime = time.time() - t0
 
-        # [EpsilonForcedActionController] lịch trình anneal eps -> gọi
-        # đúng một lần sau mỗi episode (xem docstring step_episode()).
-        # [VERIFY-F1] báo cáo mỗi episode — chỉ vài dòng, đủ để kết luận.
+        # Advance the epsilon annealing schedule exactly once per episode; see
+        # step_episode(). VERIFY-F1 reports a small conclusive per-episode set.
         if getattr(self, "_vf1_n_forced", 0) > 0:
             h = self._vf1_hist.astype(np.float64)
             h = h / max(h.sum(), 1.0)
-            # LƯU Ý: forcer là TARGETED (eps per-agent khác nhau, smoke test
-            # §5 đo được tập trung 6.1x), nên "agent nào bị ép" KHÔNG đều.
-            # Nhưng "ép rồi thì chọn action nào" PHẢI đều trên |A| — chính
-            # phân bố này quyết định chặn dưới của min_head_frac.
+            # The forcer is targeted: per-agent epsilon differs and smoke test
+            # section 5 measured 6.1x concentration, so forced-agent identity
+            # is nonuniform. Conditional on forcing, the chosen action must be
+            # uniform over |A|; this determines the min_head_frac lower bound.
             print(
                 f"[VERIFY-F1] forced_seen={self._vf1_n_forced} "
                 f"actually_changed={self._vf1_n_changed} "
@@ -913,11 +901,10 @@ class FinalCIGAMFRunner:
 
     def _record_reciprocity(self, prev_h_snapshot, actions_list, prev_forced_mask):
         """
-        [reciprocity.py] Ghi nhận information gain g_ij (i -> j) cho MỌI
-        cặp có hướng, dùng CHÍNH bc_head/shadow_to_full đã có (không train
-        thêm gì ở đây, chỉ forward dưới no_grad để chẩn đoán). Batch một
-        lần duy nhất cho cả n_agents*(n_agents-1) cặp thay vì gọi bc_head
-        riêng từng cặp.
+        Record reciprocity information gain g_ij for every directed pair using
+        existing bc_head/shadow_to_full. This performs diagnostic no_grad
+        forward only, with no additional training. Batch all
+        n_agents*(n_agents-1) pairs rather than calling bc_head separately.
         """
         pairs = [
             (ego, j)
@@ -976,21 +963,20 @@ class FinalCIGAMFRunner:
 
     def update_policy(self, trajectory):
         """
-        [docs/CIG-AMF_training_debug_master.md mục 2.2(b)/2.2(c)] Hai sửa:
+        [docs/CIG-AMF_training_debug_master.md sections 2.2(b,c)] Two corrections:
 
-        (b) Advantage KHÔNG chuẩn hoá -- bản cũ dùng thẳng
-            `adv = ret_t - value` làm hệ số nhân cho -logp, nên gradient
-            scale bám theo reward scale (biến động mạnh trên horizon dài).
-            Chuẩn hoá adv về mean 0 / std 1 TRÊN TỪNG BATCH timestep
-            (n_agents=24 mẫu mỗi t -- đủ lớn để ước lượng std thô, và
-            không cần forward pass thứ hai để chuẩn hoá toàn episode).
-            ret_t (target của critic) giữ NGUYÊN thang gốc -- chỉ adv dùng
-            cho actor mới bị chuẩn hoá.
+        (b) Advantage was unnormalized. The old `adv = ret_t - value`
+            directly scaled -logp, tying gradient scale to volatile long-
+            horizon reward scale. Normalize advantage to zero mean and unit
+            variance per timestep batch. With 24 agents, each batch is large
+            enough for a rough std estimate and avoids a second episode-wide
+            forward. Keep critic target ret_t on its original scale; normalize
+            only actor advantage.
 
-        (c)/1.2 policy_loss trước đây là MỘT số gộp actor+critic+entropy
-            -> không tách được actor hỏng hay critic hỏng. Giờ tách riêng
-            actor_loss/critic_loss/entropy/grad_norm_preclip, trả về dict
-            thay vì float trần, để log đúng schema mục 1.2 của debug doc.
+        (c)/1.2 policy_loss previously combined actor, critic, and entropy and
+            could not locate a failure. Return separate actor_loss,
+            critic_loss, entropy, and grad_norm_preclip fields in a dictionary
+            matching the debug schema.
         """
         T = len(trajectory)
 
@@ -1044,19 +1030,17 @@ class FinalCIGAMFRunner:
                     )
                 )
 
-                # [FIX-CRIT-1] Khối này TRƯỚC ĐÂY nằm NGOÀI vòng lặp ego (dedent
-                # một cấp), nên nó dùng biến `ego` rò rỉ = n_agents-1: chỉ tính
-                # M_i cho ĐÚNG MỘT ego cuối cùng, rồi PolicyValueNet.forward()
-                # âm thầm .expand(B,-1) tensor [1,D] đó ra cho cả 24 agent.
-                # Hậu quả (giải thích 3 triệu chứng đang treo):
-                #   1. Vi phạm Eq (25): M_i phải ego-specific, thực tế mọi agent
-                #      dùng chung peripheral memory của agent 23.
-                #   2. slot_usage_ema chỉ được cập nhật từ 1 ego mỗi timestep
-                #      => phân phối routing nghèo nàn => usage entropy thấp
-                #      (0.44 < 0.5) dù cơ chế semantic slot đã đúng.
-                #   3. aux_loss (Eq 26-27) chỉ bằng 1/24 độ lớn dự kiến và chỉ
-                #      từ một ego => ablation No-AuxLoss gần như không đổi kết
-                #      quả ("byte-identical" với Full-CIGAMF).
+                # [FIX-CRIT-1] This block was previously dedented outside the
+                # ego loop and used leaked `ego = n_agents-1`. It computed M_i
+                # only for the last ego, then PolicyValueNet.forward silently
+                # expanded [1,D] across all 24 agents. Consequences:
+                # 1. Eq. 25 was violated because every agent shared agent 23's
+                #    memory instead of an ego-specific M_i.
+                # 2. slot_usage_ema updated from one ego per timestep, yielding
+                #    poor routing diversity and entropy 0.44<0.5 despite valid
+                #    semantic slots.
+                # 3. Eq. 26-27 aux_loss had 1/24 expected magnitude from one ego,
+                #    making No-AuxLoss nearly byte-identical to Full-CIGAMF.
                 periph_out = self._periph_full_from_inputs(
                     step["periph_inputs_cache"][ego]
                 )
@@ -1122,12 +1106,12 @@ class FinalCIGAMFRunner:
 
         self.policy_optim.zero_grad()
 
-        # [FIX-8] Sau FIX-CRIT-1, aux_loss được cộng 24 lần/timestep thay vì 1
-        # => trọng số HIỆU DỤNG của L_aux tăng đúng 24x so với lúc λ_lb=1.2
-        # được tinh chỉnh. Bằng chứng: policy_loss log nhảy 0.19 -> 4.58 (~24x)
-        # và reward ep50 tụt xuống -0.711. Thang hiện tại mới là thang ĐÚNG
-        # (mean trên mỗi agent-step, khớp với total_loss), nên không sửa mẫu số
-        # mà phải hạ λ (xem periph_lb_coeff trong default_cfg).
+        # [FIX-8] After FIX-CRIT-1, aux_loss is added 24 rather than once per
+        # timestep, raising effective L_aux weight 24x relative to the scale
+        # used to tune lambda_lb=1.2. Evidence: policy_loss rose 0.19->4.58
+        # (~24x) and episode-50 reward fell to -0.711. The current per-agent-
+        # step mean matches total_loss and is the correct scale, so reduce
+        # lambda via periph_lb_coeff rather than altering the denominator.
         aux_term = total_periph_aux_loss / max(1, count)
         policy_term = total_loss / max(1, count)
         loss = policy_term + aux_term
@@ -1143,9 +1127,9 @@ class FinalCIGAMFRunner:
         self.policy_optim.step()
 
         return {
-            # [FIX-8] "loss" trước đây GỘP cả aux -> cột policy_loss trong log
-            # bị aux nuốt (4.58 trong đó ~4.4 là aux). Vi phạm nguyên tắc 0.2
-            # của debug doc ("không debug bằng số gộp"). Tách hẳn ra.
+            # [FIX-8] The old loss included auxiliary terms, so aux dominated
+            # policy_loss: about 4.4 of 4.58. Keep it separate to satisfy the
+            # debug rule against diagnosing aggregated values.
             "loss": float(policy_term.item()),
             "aux_loss": float(aux_term.item()) if torch.is_tensor(aux_term) else float(aux_term),
             "total_loss_with_aux": float(loss.item()),
@@ -1165,10 +1149,8 @@ class FinalCIGAMFRunner:
         """
         Collect proxy samples every episode.
 
-        Đây là điểm rất quan trọng:
-        - Stage 0 không graph-update.
-        - Nhưng Stage 0 phải collect proxy buffer.
-        - Nếu chỉ push khi should_update_graph(), proxy sẽ thiếu dữ liệu warm-up.
+        Stage 0 performs no graph update but must still collect the proxy
+        buffer. Pushing only when should_update_graph() would omit warm-up data.
         """
         pushed = self.replay_builder.push_trajectory_to_proxy(
             trajectory=trajectory,
@@ -1180,19 +1162,17 @@ class FinalCIGAMFRunner:
 
     def _score_all_pairs_and_update_beliefs(self, obs_all, actions, observed_returns=None, behaviour_probs=None):
         """
-        Score mọi directed pair (ego, j) và update Bayes-light belief.
+        Score every directed pair (ego,j) and update Bayes-light beliefs.
 
-        Không đổi logic:
-        - score bằng proxy ensemble.
-        - context là Z_i^{-j}, M_i^{-j}, B_i.
-        - belief update rồi hysteresis.
-        - nếu j promoted vào core thì warm-start z_ij từ shadow.
+        Semantics remain unchanged: use proxy-ensemble scores with context
+        Z_i^{-j}, M_i^{-j}, B_i; update beliefs followed by hysteresis; and
+        warm-start z_ij from shadow when j enters the core.
         """
         total_promoted = 0
         total_demoted = 0
 
-        # Ma trận ảnh hưởng có dấu [n_agents, n_agents], W[ego, j] = mu_ij.
-        # Dùng cho MatrixDriftDetector (cò súng thứ hai, độc lập với probe).
+        # Signed [n_agents,n_agents] influence matrix W[ego,j]=mu_ij for the
+        # MatrixDriftDetector, an independent second trigger.
         influence_matrix = np.zeros((self.n_agents, self.n_agents), dtype=np.float64)
 
         for ego in range(self.n_agents):
@@ -1247,7 +1227,8 @@ class FinalCIGAMFRunner:
                         bp = None
                     behaviour_probs_obs_batch.append(bp)
 
-            # score_batch_full thêm các input DR nếu có, không đổi output khi absent
+            # score_batch_full accepts optional DR inputs without changing
+            # output when they are absent.
             out = self.proxy.score_batch_full(
                 obs_i_batch=obs_i_batch,
                 action_i_batch=action_i_batch,
@@ -1258,8 +1239,9 @@ class FinalCIGAMFRunner:
                 policy_probs_j_batch=None,
                 observed_returns_batch=observed_returns_batch,
                 behaviour_probs_obs_batch=behaviour_probs_obs_batch,
-                # [FIX-X1] x_ij dựng từ state HIỆN TẠI của env (score path
-                # chạy online), cùng hàm với push path -> không train/serve skew.
+                # [FIX-X1] Build x_ij from current online environment state
+                # using the same function as the push path to prevent
+                # train/serve skew.
                 pair_feat_batch=[
                     build_pair_feat(
                         self.env.positions, self.env.agent_zone,
@@ -1271,10 +1253,9 @@ class FinalCIGAMFRunner:
             )
             mu_arr, sigma_arr = out["mu"], out["sigma"]
 
-            # [InfluenceSignatureTracker — influence_signature.py] Trước đây
-            # tạo xong không ai gọi update() -> signature/get_role() luôn
-            # rỗng. context_key = zone hiện tại của j, dùng cho chiều
-            # context_std (ảnh hưởng có điều kiện theo tình huống hay không).
+            # [InfluenceSignatureTracker] Previously instantiated without any
+            # update call, leaving signature/get_role empty. context_key is j's
+            # current zone and supports context_std for conditional influence.
             self.sig_tracker.update_from_proxy_output(
                 ego_id=ego,
                 neighbor_ids=neighbor_ids,
@@ -1309,8 +1290,8 @@ class FinalCIGAMFRunner:
         """
         Train proxy and update belief/core.
 
-        Không push replay ở đây nữa. Replay đã được push mọi episode trong run().
-        Hàm này chỉ xử lý slow structural update.
+        Replay is no longer pushed here; run() pushes it every episode. This
+        method handles only the slow structural update.
         """
         if len(trajectory) == 0:
             return {
@@ -1338,7 +1319,7 @@ class FinalCIGAMFRunner:
             dtype=int,
         ).tolist()
 
-        # Pre-compute H-step returns for all timesteps so we can pass
+        # Precompute H-step returns for all timesteps to provide
         # observed_returns into the proxy scoring call for DR correction.
         try:
             h_returns = self.replay_builder.build_h_step_returns(trajectory, self.n_agents)
@@ -1369,10 +1350,10 @@ class FinalCIGAMFRunner:
 
         residual = self.proxy.get_latest_residual()
 
-        # ---- Hai cò súng độc lập cho evaluate_drift() (thay cho
-        # record_structural_residual() dùng residual tự nhiễm bẩn ở v1) ----
+        # Two independent evaluate_drift triggers replace v1's self-
+        # contaminated record_structural_residual signal.
 
-        # Cò súng 1: probe đóng băng, bịt mắt, đọc trực tiếp proxy.buffer.
+        # Trigger 1: frozen blinded probe reading proxy.buffer directly.
         drift_info = self.drift.step(
             episode=int(self.scheduler.episode),
             buffer=self.proxy.buffer,
@@ -1380,7 +1361,7 @@ class FinalCIGAMFRunner:
         )
         probe_z = float(drift_info.get("z", 0.0) or 0.0)
 
-        # Cò súng 2: nhảy vọt trong ma trận ảnh hưởng có dấu.
+        # Trigger 2: jump in the signed influence matrix.
         matrix_z = 0.0
         if last_influence_matrix is not None:
             self.matdet.update(last_influence_matrix)
@@ -1467,19 +1448,18 @@ class FinalCIGAMFRunner:
         f1s_role = []   # [F1-TOPK]
 
         # ------------------------------------------------------------------
-        # [F1-TOPK] Ground truth cho Core F1 = TOP-K |Phi| ĐO ĐƯỢC, không phải
-        # nhãn vai trò tĩnh.
+        # [F1-TOPK] Core-F1 ground truth is measured top-k |Phi|, not static
+        # role labels.
         #
-        # gt_core_by_ego / diagnostic_core_by_ego là danh sách vai trò khai
-        # báo (collector -> {gatekeeper, relay, blocker, controller}). Sau khi
-        # Phi được ĐO từ công thức liên tục (xem _measure_phi_from_sgtp trong
-        # omni_arena), hai định nghĩa "core" đã tách hẳn nhau: belief chọn core
-        # theo |mu| còn thước đo lại chấm theo nhãn role. Kết quả f1 = 0.000
-        # SUỐT RUN là lỗi THƯỚC ĐO, không phải model.
+        # gt_core_by_ego/diagnostic_core_by_ego are declared role lists. After
+        # Phi became measured from the continuous SGTP formula, these core
+        # definitions diverged: beliefs select by |mu| while the old metric
+        # scored roles. F1=0.000 throughout a run was a metric defect, not a
+        # model failure.
         #
-        # Báo cáo CẢ HAI: mean_f1 (vs top-k |Phi| đo được — thước đo chính) và
-        # mean_f1_role (vs nhãn role — giữ để có bằng chứng trong paper rằng
-        # nhãn role không còn là ground truth hợp lệ sau refactor Phi).
+        # Report both mean_f1 against measured top-k |Phi| as the primary
+        # metric and mean_f1_role against role labels as evidence that roles
+        # ceased to be valid ground truth after the Phi refactor.
         # ------------------------------------------------------------------
         gt_influence = last_info.get("gt_influence_by_ego", None)
 
@@ -1576,8 +1556,8 @@ class FinalCIGAMFRunner:
             bc_loss = self.pair_rel_module.train_bc(
                 n_steps=self.cfg["bc_train_steps"],
                 batch_size=self.cfg["bc_batch_size"],
-                # [ego_conditioned_latent.py] cắm E1/E2 vào CÙNG loss/backward
-                # của train_bc -> z_ij thật sự bị ép mang thông tin ego, xem
+                # [ego_conditioned_latent.py] Add E1/E2 to the same train_bc
+                # loss/backward so z_ij is forced to carry ego information.
                 # docstring train_bc trong core_behavior.py.
                 heads=self.heads,
                 heads_optim=self.heads_optim,
@@ -1621,10 +1601,10 @@ class FinalCIGAMFRunner:
 
             stage_after_episode_step = int(self.scheduler.stage)
 
-# --- BẮT ĐẦU PATCH RUNNER ---
+# Runner calibration patch.
             import traceback
 
-            # 1. Khởi tạo bộ đếm và Hệ số nhân kiên trì (Persistent Multiplier)
+            # 1. Initialize counters and the persistent multiplier.
             self._calib_fail_count = getattr(self, '_calib_fail_count', 0)
             self._consecutive_zero_max_p = getattr(self, '_consecutive_zero_max_p', 0)
             self._kappa_multiplier = getattr(self, '_kappa_multiplier', 1.0) 
@@ -1635,29 +1615,29 @@ class FinalCIGAMFRunner:
             except:
                 current_max_p = 1.0
 
-            # BẮT BUỘC DÙNG 0.05. Nếu dưới 5% cơ hội vào Core, nghĩa là Core đã sập!
+            # Require 0.05: below a 5% entry probability indicates core collapse.
             if current_max_p <= 0.05:
                 self._consecutive_zero_max_p += 1
             else:
                 self._consecutive_zero_max_p = 0
 
-            # 3. Định nghĩa các điều kiện kích hoạt
+            # 3. Define trigger conditions.
             is_stage_transition = (stage_before_episode_step == 0 and stage_after_episode_step == 1)
             is_periodic_calib = (stage_after_episode_step == 1 and ep > 0 and (ep % 5 == 0 if ep <= 30 else ep % 25 == 0))
             is_reactive_calib = (self._consecutive_zero_max_p >= 3)
             
-            # CẬP NHẬT HỆ SỐ NHÂN (Ghi nhớ tình trạng bệnh)
+            # Update the multiplier while retaining collapse state.
             if is_reactive_calib:
-                # Nếu đang sập: Chém đôi Kappa ngay lập tức, tối thiểu về 0.01
+                # During collapse, halve kappa immediately with floor 0.01.
                 self._kappa_multiplier = max(0.01, self._kappa_multiplier * 0.5) 
             elif is_periodic_calib and current_max_p > 0.1:
-                # Nếu định kỳ chạy mà mô hình đang khỏe (>10%): Phục hồi Kappa dần dần
+                # During healthy periodic runs (>10%), recover kappa gradually.
                 self._kappa_multiplier = min(1.0, self._kappa_multiplier * 1.5)
 
             if is_stage_transition:
                 self._reset_switch_counters_if_available()
 
-            # 4. Thực thi Calibration
+            # 4. Perform calibration.
             if is_stage_transition or is_periodic_calib or is_reactive_calib:
                 calib_reason = "Stage Transition" if is_stage_transition else ("Periodic" if is_periodic_calib else "Reactive (max_p=0)")
                 print(f"\n[STEP 0 DIAGNOSTIC] --- Threshold Calibration Triggered at Ep {ep} | Reason: {calib_reason} ---")
@@ -1678,7 +1658,7 @@ class FinalCIGAMFRunner:
                         sigma_p90 = float(np.percentile(arr, 90.0))
                         sigma_iqr = float(np.percentile(arr, 75.0) - np.percentile(arr, 25.0))
                     else:
-                        sigma_hi = calib["sigma_hi"]  # fallback, chưa đủ mẫu belief thật
+                        sigma_hi = calib["sigma_hi"]  # Fallback before enough real-belief samples.
                         sigma_p50 = sigma_p90 = sigma_iqr = float("nan")
                     g_anom_mean = float(getattr(self.periph_module, "g_anom_usage_ema", torch.zeros(1)).item())
                     print(f"   [SLOT-DEBUG] sigma_p50={sigma_p50:.6f} sigma_p90={sigma_p90:.6f} "
@@ -1686,8 +1666,8 @@ class FinalCIGAMFRunner:
                     print(f"   [VERIFY] sigma_hi={sigma_hi:.6f}  tau_role={tau_role:.6f}")
 
                     if hasattr(self, 'periph_module'):
-                        # [B2.3] truyền CẢ sigma_iqr — trước đây bỏ trống nên
-                        # sigma_iqr_floor rơi về đúng sigma_hi và k_sg vẫn nổ.
+                        # [B2.3] Pass sigma_iqr too. It was previously omitted,
+                        # causing sigma_iqr_floor to equal sigma_hi and k_sg to explode.
                         self.periph_module.set_role_thresholds(
                             tau_role, sigma_hi,
                             sigma_iqr=(
@@ -1705,7 +1685,7 @@ class FinalCIGAMFRunner:
                         b_mod.tau = max(1e-4, tau_role * 0.5)
                         b_mod.sigma_floor = max(1e-4, sigma_hi * 0.1)
                         
-                        # Tính Kappa Gốc và NHÂN VỚI HỆ SỐ KIÊN TRÌ
+                        # Compute base kappa and apply the persistent multiplier.
                         base_kappa = float(np.clip(tau_role / (sigma_hi + 1e-8), 0.05, 2.0))
                         b_mod.kappa = base_kappa * self._kappa_multiplier
                         
@@ -1733,7 +1713,7 @@ class FinalCIGAMFRunner:
                 except Exception as e:
                     self._calib_fail_count += 1
                     print(f"   [ERROR] Calibration failed (Count: {self._calib_fail_count}/3): {e}")
-            # --- KẾT THÚC PATCH RUNNER ---
+            # End runner calibration patch.
 
             if ep % int(eval_every) == 0:
                 self.history["episodes"].append(ep)
@@ -1765,10 +1745,9 @@ class FinalCIGAMFRunner:
                     float(graph_info.get("proxy_holdout_residual", 0.0))
                 )
                 sched_status = self.scheduler.get_status()
-                # v2 scheduler không còn EWMA/CUSUM nội bộ (đã thay bằng
-                # evaluate_drift() với probe_z/matrix_z) nên hai khoá này
-                # không còn trong get_status(); giữ cột lịch sử bằng z-score
-                # mới nhất để không phá format lưu trữ hiện có.
+                # v2 removed internal EWMA/CUSUM in favor of evaluate_drift
+                # with probe_z/matrix_z. Preserve history columns using the
+                # latest z-scores for storage-format compatibility.
                 self.history["scheduler_residual_ewma"].append(
                     float(graph_info.get("probe_z", 0.0) or 0.0)
                 )
@@ -1781,9 +1760,9 @@ class FinalCIGAMFRunner:
                 self.history["proxy_loss"].append(float(graph_info["proxy_loss"]))
                 self.history["bc_loss"].append(float(bc_loss))
                 self.history["policy_loss"].append(float(policy_loss))
-                # [debug doc mục 1.2] actor/critic/entropy/grad_norm tách
-                # riêng -- KHÔNG gộp vào policy_loss nữa, để phân biệt được
-                # actor hỏng hay critic hỏng (mục 2.2c).
+                # [debug doc section 1.2] Keep actor, critic, entropy, and
+                # gradient norm separate from policy_loss so actor and critic
+                # failures remain distinguishable.
                 self.history["actor_loss"].append(
                     float(policy_update_info["actor_loss"])
                 )

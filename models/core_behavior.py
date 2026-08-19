@@ -11,7 +11,7 @@ class PairRelationalEncoder(nn.Module):
     """
     GRUCell encoder cho pair-specific relational latent z_ij.
 
-    Bám paper:
+    Paper correspondence:
         z_ij^t = f_z(z_ij^{t-1}, o_i^t, o_j^t, a_i^t, a_j^t, xi_ij^t)
 
     Input vector:
@@ -51,13 +51,13 @@ class PairRelationalEncoder(nn.Module):
 
 class ShadowPairEncoder(nn.Module):
     """
-    Lightweight shadow state s_ij cho mọi directed pair.
+    Lightweight shadow state s_ij for every directed pair.
 
-    Bám paper:
+    Paper correspondence:
         s_ij^t = f_s(s_ij^{t-1}, o_j^t, a_j^t, xi_ij^t)
 
-    Shadow state rẻ hơn full z_ij.
-    Khi j được promote vào core, z_ij được warm-start từ s_ij.
+    The shadow state is cheaper than the full z_ij state. When j is promoted
+    into the core, z_ij is warm-started from s_ij.
     """
 
     def __init__(
@@ -142,7 +142,7 @@ class PairRelationalModule:
         self.grad_clip = float(grad_clip)
         self.shadow_loss_weight = float(shadow_loss_weight)
 
-        # Backward compatibility: vài bản cũ gọi max_bc_buffer.
+        # Backward compatibility: some older versions use max_bc_buffer.
         if max_bc_buffer is not None:
             bc_buffer_size = int(max_bc_buffer)
         self.bc_buffer_size = int(bc_buffer_size)
@@ -166,7 +166,7 @@ class PairRelationalModule:
             self.hidden_dim,
         ).to(self.device)
 
-        # Head dùng chung trên full latent space.
+        # Shared head over the full latent space.
         # Full path: z_next -> bc_head -> a_j^{t+1}
         # Shadow path: shadow_to_full(s_next) -> bc_head -> a_j^{t+1}
         self.bc_head = nn.Sequential(
@@ -281,7 +281,7 @@ class PairRelationalModule:
         """
         Build xi_ij.
 
-        rel_feat_dim mặc định 6:
+        The default rel_feat_dim is 6:
             0 rel_row
             1 rel_col
             2 manhattan distance normalised
@@ -289,7 +289,7 @@ class PairRelationalModule:
             4 zone_diff normalised
             5 same_role / role_match indicator if available
 
-        Nếu rel_feat_dim khác 6, pad/truncate để không crash.
+        Pad or truncate when rel_feat_dim differs from 6.
         """
         ego_id = int(ego_id)
         neighbor_id = int(neighbor_id)
@@ -319,13 +319,13 @@ class PairRelationalModule:
             except Exception:
                 same_role = 0.0
 
-        # [P-8 FINAL DEBUG] Định danh HỢP LỆ: agent id chuẩn hóa (nhãn tùy ý,
-        # không mang thông tin cấu trúc). Feature thứ 7 chỉ có hiệu lực khi
-        # khởi tạo với rel_feat_dim=7; mặc định 6 sẽ truncate => no-op, không
-        # phá checkpoint/test cũ. TUYỆT ĐỐI KHÔNG thêm ROLE ID thật của
-        # neighbor: role là diagnostic ground truth của paper (Exp 4 chấm
-        # "recovered-role accuracy") — đưa vào input là rò rỉ nhãn, vô hiệu
-        # hóa claim H3/RQ3 và làm bẩn H1.
+        # [P-8 FINAL DEBUG] Valid identity feature: normalized agent ID, an
+        # arbitrary label carrying no structural information. The seventh
+        # feature is active only with rel_feat_dim=7; the default value 6
+        # truncates it to a no-op, preserving old checkpoints and tests. Never
+        # add the neighbour's true ROLE ID: role is the paper's diagnostic
+        # ground truth (Exp. 4 scores recovered-role accuracy). Feeding it as
+        # input leaks labels, invalidates the H3/RQ3 claim, and contaminates H1.
         agent_id_norm = float(neighbor_id) / float(max(1, getattr(env, "n_agents", 1)))
 
         feats = [
@@ -415,7 +415,7 @@ class PairRelationalModule:
         """
         Clone full z_ij states before step_population().
 
-        Runner dùng snapshot này để tạo BC transition đúng thời điểm:
+        The runner uses this snapshot to create a BC transition at the correct time:
             context at t -> predict a_j at t+1
         """
         out = {}
@@ -436,8 +436,8 @@ class PairRelationalModule:
         """
         Clone shadow s_ij states before step_population().
 
-        Không bắt buộc với runner cũ. Nếu runner chưa truyền snapshot này,
-        add_bc_transition() sẽ fallback sang current shadow state.
+        Optional for legacy runners. If no snapshot is supplied,
+        add_bc_transition() falls back to the current shadow state.
         """
         out = {}
 
@@ -459,14 +459,15 @@ class PairRelationalModule:
 
     def step_population(self, obs_all, actions, env):
         """
-        Update z_ij và s_ij cho mọi directed pair ở timestep hiện tại.
+        Update z_ij and s_ij for every directed pair at the current timestep.
 
-        Yêu cầu runner:
-            env phải đang ở snapshot trước step.
-            obs_all và actions là observation/action tại cùng timestep t.
+        Runner requirements:
+            env must be at the pre-step snapshot.
+            obs_all and actions must describe the same timestep t.
 
-        Update này là online state filtering, không giữ graph gradient qua thời gian.
-        Encoder weights vẫn được train bằng train_bc() trên one-step samples.
+        This update performs online state filtering without retaining a
+        gradient graph through time. Encoder weights are still trained by
+        train_bc() on one-step samples.
         """
         with torch.no_grad():
             for ego in range(self.n_agents):
@@ -522,11 +523,11 @@ class PairRelationalModule:
 
     def warm_start_if_promoted(self, ego_id, promoted_ids):
         """
-        Khi j được promote vào core C_i:
+        When j is promoted into core C_i:
             z_ij <- W_proj s_ij
 
         Return:
-            số pair được warm-start.
+            Number of warm-started pairs.
         """
         ego_id = int(ego_id)
         count = 0
@@ -588,7 +589,7 @@ class PairRelationalModule:
         """
         Mean pooling over pair-specific z_ij for j in C_i.
 
-        Bám paper:
+        Paper correspondence:
             Z_i = Pool({z_ij : j in C_i})
         """
         ego_id = int(ego_id)
@@ -617,19 +618,18 @@ class PairRelationalModule:
 
     def get_core_summary_excluding_all(self, ego_id, core_set):
         """
-        Tối ưu cho runner phần sau.
+        Optimization for the downstream runner.
 
         Return:
-            dict {j: Z_i^{-j}} cho mọi neighbour j != ego.
+            Dictionary {j: Z_i^{-j}} for every neighbour j != ego.
 
-        Nếu j không thuộc core:
+        If j is outside the core:
             Z_i^{-j} = mean({z_ik : k in C_i})
 
-        Nếu j thuộc core:
+        If j is in the core:
             Z_i^{-j} = mean({z_ik : k in C_i, k != j})
 
-        Hàm này giúp final_runner không phải gọi get_core_summary()
-        lặp lại N lần.
+        This avoids N repeated get_core_summary() calls in final_runner.
         """
         ego_id = int(ego_id)
 
@@ -883,12 +883,13 @@ class PairRelationalModule:
         """
         Train auxiliary behavioural prediction objective.
 
-        Bám paper:
+        Paper correspondence:
             L_z = -log p(a_j^{t+1} | z_ij^t)
 
-        Sửa critical:
-            full_encoder và shadow_encoder được train qua one-step recurrent update.
-            Không chỉ train một prediction head trên detached h_prev.
+        Critical correction:
+            full_encoder and shadow_encoder are trained through a one-step
+            recurrent update, rather than training only a prediction head on
+            detached h_prev.
 
         Loss:
             full_loss:
@@ -904,30 +905,31 @@ class PairRelationalModule:
 
             total = full_loss + shadow_loss_weight * shadow_loss
 
-        [ego_conditioned_latent.py — vá pair-specificity, xem docstring
-        file đó] Nếu truyền `heads` (EgoConditionedHeads), cắm thêm:
+        [ego_conditioned_latent.py — pair-specificity correction; see that
+        file's docstring] When `heads` (EgoConditionedHeads) is provided, add:
 
             total += w_influence * L_influence + w_contrastive * L_contrastive
 
-        vào CÙNG loss, backward CÙNG lượt với full_loss/shadow_loss. Đây là
-        điểm mấu chốt: L_influence/L_contrastive PHẢI tính trên `z_next`
-        (còn gradient, đầu ra sống của full_encoder ở batch này), KHÔNG
-        PHẢI trên `get_pair_latent()` (đã .detach()). Nếu dùng bản detach,
-        heads học ra thông tin sẵn có trong z nhưng full_encoder không hề
-        bị ép phải NHÉT thêm thông tin về ego vào z -- z_ij vẫn hội tụ về
-        global opponent model y như bug gốc, chỉ là heads "diễn" cho có.
+        to the same loss and backpropagate it together with full_loss and
+        shadow_loss. Crucially, L_influence/L_contrastive must be computed on
+        `z_next`, the live full_encoder output retaining gradients for this
+        batch, not on detached `get_pair_latent()`. With the detached version,
+        the heads can read information already present in z, but full_encoder
+        is never forced to encode additional ego information. z_ij then still
+        converges to a global opponent model as in the original defect, while
+        the heads only create the appearance of pair specificity.
 
-        ego_id/neighbor_id của batch lấy trực tiếp từ bc_buffer (đã có sẵn
-        từ add_bc_transition) -- KHÔNG gom theo ego khi gọi hàm này ở
-        runner, vì một batch bc_buffer tự nhiên trộn nhiều ego với nhau
-        (bc_buffer là buffer chung của mọi pair), nên neg_mask của
-        contrastive_loss (cùng j khác ego) tự nhiên không rỗng.
+        Batch ego_id/neighbor_id values come directly from bc_buffer, where
+        add_bc_transition already stored them. Do not group by ego in the
+        runner: a shared pair buffer naturally mixes egos, ensuring that the
+        contrastive-loss neg_mask for the same j under different egos is not
+        empty.
 
-        w_target_fn: callable(ego_id, neighbor_id) -> float, dùng làm nhãn
-        w_ij cho influence_loss. Không có nhãn causal riêng cho bc_buffer
-        nên dùng belief.debiased_mu(j) hiện tại của runner làm proxy nhãn
-        (đây chính là ước lượng w_ij tốt nhất đang có tại thời điểm gọi).
-        None = bỏ qua influence_loss (chỉ dùng contrastive).
+        w_target_fn: callable(ego_id, neighbor_id) -> float, used as the w_ij
+        target for influence_loss. The BC buffer has no separate causal label,
+        so the runner's current belief.debiased_mu(j) serves as the proxy target,
+        its best available w_ij estimate at call time. None disables
+        influence_loss and retains contrastive loss only.
         """
         self.last_bc_batch_count = 0
         self.last_heads_loss = 0.0
@@ -990,8 +992,8 @@ class PairRelationalModule:
                     nb_ids_batch, dtype=torch.long, device=self.device
                 )
 
-                # [E2] dùng z_next CÒN GRADIENT -> ép full_encoder thật sự
-                # phải nhét thông tin ego vào z_ij (xem docstring hàm này).
+                # [E2] Use z_next with gradients intact so full_encoder must
+                # encode ego information in z_ij; see this method's docstring.
                 con_loss = heads.contrastive_loss(z_next, ego_t, nb_t)
 
                 if w_target_fn is not None:

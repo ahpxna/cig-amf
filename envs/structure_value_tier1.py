@@ -6,31 +6,28 @@ import torch.nn as nn
 
 def collect_dataset(env, n_episodes=40, horizon=8, discount=0.95,
                     k_core=3, seed=0):
-    """
-    Thu thập (obs_i, core_actions, mean_action, R_i^(H)).
+    """Collect ``(obs_i, core_actions, mean_action, R_i^(H))`` samples.
 
-    Ba sửa lỗi so với bản gốc (xem review kết quả MSE_core > MSE_solo/mf,
-    frac_from_core = -88 nghìn tỷ %):
+    Three corrections follow the original result review where
+    MSE_core > MSE_solo/mf and frac_from_core reached -88 trillion percent:
 
-    (a) Hành động thu thập dữ liệu dùng scripted_policy + 15% nhiễu ngẫu
-        nhiên, KHÔNG phải random thuần -- dưới random thuần, gatekeeper gần
-        như không bao giờ mở cổng đúng nhịp nên không có cấu trúc thật để
-        phát hiện (Tier 0 dùng scripted_policy và thấy tín hiệu thật; bản
-        gốc của Tier 1 đo một môi trường "không cấu trúc" khác hẳn).
+    (a) Data collection uses scripted_policy with 15% random noise, not a
+        fully random policy. Under a fully random policy, gatekeepers almost
+        never open gates at the required time, leaving no real structure to
+        detect. Tier 0 uses scripted_policy and observes a signal; the original
+        Tier 1 measured a materially different, effectively unstructured task.
 
-    (b) Đặc trưng mean-field được TILE lại k_core lần (mf_matched, cùng số
-        chiều k_core*A với core one-hot) trước khi đưa vào bộ so sánh MSE,
-        để tránh core (nhiều chiều hơn) overfit "miễn phí" chỉ vì có nhiều
-        tham số hơn với cùng lượng dữ liệu.
+    (b) The mean-field feature is tiled k_core times into ``mf_matched`` with
+        the same k_core*A dimension as the core one-hot vector. This prevents
+        the higher-dimensional core model from receiving free overfitting
+        capacity in the MSE comparison.
 
-    (c) Core KHÔNG còn được xác định một lần duy nhất (giữa episode) rồi
-        dùng lại cho toàn bộ episode. T3 CV=1.035 (đã đo, xem báo cáo) xác
-        nhận độ ảnh hưởng phụ thuộc trạng thái rất mạnh (delta_ij(s), Phần
-        2.1) -- core "đúng" ở đầu/giữa/cuối episode nhiều khả năng khác
-        nhau. Episode được chia làm 3 đoạn (thirds theo T=len(traj)); core
-        được tính riêng cho mỗi đoạn bằng oracle tại một mốc đại diện
-        (midpoint) của đoạn đó; khi tạo mẫu huấn luyện cho bước t, dùng core
-        của ĐÚNG đoạn chứa t.
+    (c) Core membership is no longer measured once at mid-episode and reused
+        for the full episode. Measured T3 CV=1.035 confirms strong state
+        dependence through delta_ij(s), Section 2.1. Correct cores can differ
+        across the beginning, middle, and end. Each episode is divided into
+        thirds; an oracle evaluates a representative midpoint for each third,
+        and every training sample uses the core for its actual segment.
     """
     rng = np.random.RandomState(seed)
     A = env.get_action_dim()
@@ -42,10 +39,10 @@ def collect_dataset(env, n_episodes=40, horizon=8, discount=0.95,
         env.reset()
         traj = []
 
-        # Ba mốc đại diện (~1/6, 1/2, 5/6 của max_steps) cho 3 đoạn
-        # đầu/giữa/cuối episode, mỗi mốc được kẹp <= max_steps - horizon để
-        # oracle luôn còn đủ chỗ rollout horizon bước (assert P2<->P4 trap
-        # guard: self.t + horizon <= self.max_steps).
+        # Representative points near 1/6, 1/2, and 5/6 of max_steps cover the
+        # three segments. Each is capped at max_steps-horizon so the oracle has
+        # room for a complete rollout, satisfying the P2<->P4 trap guard
+        # ``self.t + horizon <= self.max_steps``.
         safe_cap = max(0, env.max_steps - horizon)
         seg_targets = [
             min(safe_cap, max(0, int(env.max_steps * frac)))
@@ -64,10 +61,9 @@ def collect_dataset(env, n_episodes=40, horizon=8, discount=0.95,
             if done:
                 break
 
-        # Nếu episode kết thúc sớm hơn một mốc (không nên xảy ra vì
-        # max_steps là cố định và done chỉ true khi t>=max_steps, nhưng
-        # phòng thủ vẫn xử lý): dùng snapshot hợp lệ gần nhất trước đó, hoặc
-        # trạng thái hiện tại nếu chưa có snapshot nào.
+        # Defensive handling for an episode ending before a target point:
+        # reuse the nearest earlier snapshot, or the current state if none
+        # exists. Fixed max_steps normally makes this path unreachable.
         last_valid = None
         for si in range(3):
             if snapshots[si] is None:
@@ -75,20 +71,17 @@ def collect_dataset(env, n_episodes=40, horizon=8, discount=0.95,
             else:
                 last_valid = snapshots[si]
 
-        # core thật, xác định RIÊNG cho từng đoạn của episode.
+        # Determine the true core separately for each episode segment.
         core_by_ego_segs = []
         for si in range(3):
             env.restore_state(snapshots[si])
             core_by_ego = {}
             for ego in range(N):
-                # intervention_action PHẢI là hành động thật (env.STAY),
-                # không phải None: compute_oracle_influence_from_current_state()
-                # chỉ thêm intervention_action vào candidate_actions nếu nó
-                # "not in candidate_actions" -- None không nằm trong
-                # range(N_ACTIONS) nên bị append thẳng vào, tạo ra một
-                # "hành động" rollout giả (forced_action=None) trộn vào
-                # per_action/signed -- không crash, nhưng làm bẩn hồ sơ
-                # ảnh hưởng.
+                # intervention_action MUST be a real action such as env.STAY,
+                # not None. The oracle appends values absent from
+                # candidate_actions; None is outside range(N_ACTIONS), so it
+                # becomes a fake rollout action with forced_action=None. This
+                # does not crash, but silently contaminates per_action/signed.
                 infl = {j: abs(float(env.compute_oracle_influence_from_current_state(
                             ego_id=ego, agent_j=j, intervention_action=env.STAY,
                             horizon=horizon, n_trials=1)))
@@ -100,7 +93,7 @@ def collect_dataset(env, n_episodes=40, horizon=8, discount=0.95,
         seg_bounds = [0, T // 3, 2 * T // 3, T]
 
         for t in range(T):
-            # xác định đoạn chứa bước t
+            # Select the segment containing time step t.
             if t < seg_bounds[1]:
                 seg_idx = 0
             elif t < seg_bounds[2]:
@@ -109,7 +102,7 @@ def collect_dataset(env, n_episodes=40, horizon=8, discount=0.95,
                 seg_idx = 2
             core_by_ego = core_by_ego_segs[seg_idx]
 
-            # return H bước
+            # Compute the H-step return.
             R = np.zeros(N)
             for h in range(horizon):
                 if t + h < T:
@@ -126,8 +119,8 @@ def collect_dataset(env, n_episodes=40, horizon=8, discount=0.95,
                 others = [acts_t[j] for j in range(N) if j != ego]
                 mf = np.bincount(others, minlength=A).astype(np.float32)
                 mf /= max(1.0, mf.sum())
-                # (b) tile mean-field lên cùng số chiều với core one-hot
-                # (k_core*A) để so sánh MSE công bằng về số tham số.
+                # Tile mean-field to the core one-hot dimension (k_core*A) for
+                # an MSE comparison with matched parameter capacity.
                 mf_matched = np.tile(mf, k_core).astype(np.float32)
 
                 X_obs.append(np.asarray(obs_t[ego], dtype=np.float32))
@@ -140,7 +133,7 @@ def collect_dataset(env, n_episodes=40, horizon=8, discount=0.95,
 
 
 def _fit(X, Y, hidden=128, epochs=60, seed=0):
-    """Hồi quy MLP, trả MSE trên tập kiểm tra."""
+    """Fit an MLP regressor and return held-out MSE."""
     torch.manual_seed(seed)
     n = len(Y)
     idx = np.random.RandomState(seed).permutation(n)
@@ -175,23 +168,23 @@ def run_tier1(env, **kw):
     mse_mf   = _fit(np.concatenate([Xo, Xm], axis=1), Y)
     mse_solo = _fit(Xo, Y)
 
-    # Bao nhiêu phần thông tin mà HÀNG XÓM mang lại đến từ việc biết
-    # ĐÍCH DANH core, thay vì chỉ biết thống kê đám đông?
-    gain_total = mse_solo - mse_core       # tất cả thông tin hàng xóm
-    gain_mf    = mse_solo - mse_mf         # phần mean-field đã bắt được
-    gain_core  = mse_mf - mse_core         # PHẦN THÊM do biết core
+    # Measure how much neighbor information comes from identifying the core,
+    # rather than knowing only aggregate crowd statistics.
+    gain_total = mse_solo - mse_core       # all neighbour information
+    gain_mf    = mse_solo - mse_mf         # information captured by mean field
+    gain_core  = mse_mf - mse_core         # additional information from core identity
 
-    # (d) frac = gain_core / gain_total có thể chia cho một số RẤT nhỏ hoặc
-    # ÂM khi gain_total <= 0 (core dự đoán TỆ HƠN solo) -- max(1e-12, .) ép
-    # mẫu số về epsilon dương bất kể dấu thật của gain_total, sinh ra tỷ lệ
-    # vô nghĩa (vd. -88 nghìn tỷ %). Không còn ép sàn: nếu |gain_total| quá
-    # nhỏ để chia có ý nghĩa, báo NaN thay vì bịa số.
+    # (d) frac=gain_core/gain_total can divide by a tiny or negative value
+    # when the core predictor is worse than solo. The previous
+    # max(1e-12, gain_total) discarded the real sign and produced meaningless
+    # values such as -88 trillion percent. Report NaN when |gain_total| is too
+    # small for a meaningful ratio.
     denom = gain_total if abs(gain_total) > 1e-9 else float("nan")
     frac = gain_core / denom
 
-    # R² là chỉ số phải xem TRƯỚC TIÊN: nếu cả ba mô hình đều có R² ≈ 0 thì
-    # không mô hình nào dự đoán được gì, và so sánh MSE/frac giữa chúng vô
-    # nghĩa (chênh lệch MSE lúc đó chỉ là nhiễu fit, không phải tín hiệu).
+    # R² is the primary diagnostic. If all three values are near zero, none of
+    # the models predicts the target, making MSE/frac comparisons meaningless;
+    # their MSE differences then represent fit noise rather than signal.
     var_y = float(np.var(Y))
     r2 = lambda m: 1.0 - m / max(1e-12, var_y)
     r2_solo, r2_mf, r2_core = r2(mse_solo), r2(mse_mf), r2(mse_core)
@@ -218,15 +211,13 @@ TẦNG 1 — KHOẢNG CÁCH DỰ ĐOÁN GIÁ TRỊ
             "frac_from_core": float(frac)}
 
 if __name__ == "__main__":
-    # Import môi trường của bạn
-    # (Nếu file này nằm cùng thư mục envs, import trực tiếp như sau)
+    # Import the environment directly when this file runs from envs.
     try:
         from omni_arena import OmniArena
     except ImportError:
         from envs.omni_arena import OmniArena
 
-    # Khởi tạo môi trường. 
-    # Bật cờ conditional_gates=True để môi trường có sự phụ thuộc cấu trúc rõ rệt.
+    # Enable conditional gates to create explicit structural dependence.
     env = OmniArena(
         enable_conditional_gates=True,
         enable_latency_ladder=False,
@@ -239,14 +230,12 @@ if __name__ == "__main__":
     print("======================================================================")
     print("Đang thu thập dữ liệu (Rollout)... Quá trình này có thể mất chút thời gian.")
 
-    # Chạy Tier-1
-    # Lưu ý: Nếu chạy 40 episodes mất quá nhiều thời gian, bạn có thể 
-    # giảm n_episodes xuống 10 hoặc 20 để test code trước.
+    # Run Tier 1. Use 10-20 episodes only for a quicker code smoke run.
     results = run_tier1(
         env=env,
         n_episodes=40,    
         horizon=8,        
         discount=0.95,    
-        k_core=2,         # Chọn 2 agent tác động mạnh nhất làm 'core'
+        k_core=2,         # Select the two strongest agents as the core.
         seed=123
     )
