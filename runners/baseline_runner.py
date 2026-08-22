@@ -1,4 +1,6 @@
 import time
+from collections import deque
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,6 +18,30 @@ from models.belief_summary import BeliefSummaryBuilder
 from models.policy_value import PolicyValueNet
 from training.scheduler import TwoTimescaleScheduler
 from training.replay_builder import MultiEgoReplayBuilder
+
+
+def _ordered_geometry_snapshot(env, n_agents):
+    """Return geometry ordered by agent id for replay construction.
+
+    OmniArena stores ``positions`` and ``agent_zone`` as dictionaries.  Plain
+    iteration over those containers yields integer keys, not position vectors;
+    indexing by agent id also keeps this helper compatible with list-backed
+    environments.
+    """
+    return {
+        "positions": [list(env.positions[int(i)]) for i in range(int(n_agents))],
+        "agent_zone": [int(env.agent_zone[int(i)]) for i in range(int(n_agents))],
+        "grid_size": int(getattr(env, "grid_size", 1)),
+        "n_zones": int(getattr(env, "n_zones", 1)),
+    }
+
+
+def _current_behavioral_phase(env):
+    """Return the policy-execution phase active in the collected episode."""
+    phase_fn = getattr(env, "_behaviour_mode", None)
+    if callable(phase_fn):
+        return str(phase_fn())
+    return str(getattr(env, "mode", "unknown"))
 
 
 class PureMeanFieldRunner:
@@ -37,6 +63,8 @@ class PureMeanFieldRunner:
     History keys intentionally mirror Final-CIGAMF so run_experiment.py can
     store both through the same path.
     """
+
+    _log_tag = "PureMeanField"
 
     def __init__(self, env, cfg, device="cpu"):
         self.env = env
@@ -95,6 +123,9 @@ class PureMeanFieldRunner:
             "mean_mu": [],
             "max_p": [],
         }
+        self.episodes_completed = 0
+        self.episode_events = []
+        self._last_behavioral_phase = None
 
     def _neighbor_mean_action(self, actions_list, ego):
         vec = np.zeros(self.action_dim, dtype=np.float32)
@@ -119,6 +150,10 @@ class PureMeanFieldRunner:
         logits = self.actor(h)
         value = self.critic(h).squeeze(-1)
         return logits, value
+
+    def _observe_episode(self, trajectory):
+        """Optional post-episode hook for observational baselines."""
+        return None
 
     def _select_actions_population(self, obs_all):
         """
@@ -259,16 +294,52 @@ class PureMeanFieldRunner:
         return float(loss.item())
 
     def run(self, n_episodes=100, eval_every=10):
-        for ep in range(int(n_episodes)):
+        n_episodes = int(n_episodes)
+        eval_every = int(eval_every)
+        if n_episodes < 0:
+            raise ValueError("n_episodes must be non-negative")
+        if eval_every <= 0:
+            raise ValueError("eval_every must be positive")
+
+        for local_ep in range(n_episodes):
+            episode_number = int(self.episodes_completed) + 1
             trajectory, episode_reward, runtime = self.collect_episode()
             policy_loss = self.update_policy(trajectory)
+            self._observe_episode(trajectory)
 
             agent_steps = float(self.n_agents * len(trajectory))
             throughput = agent_steps / max(float(runtime), 1e-9)
             mean_reward = float(np.mean(episode_reward))
 
-            if ep % int(eval_every) == 0:
-                self.history["episodes"].append(ep)
+            last_info = trajectory[-1].get("info", {}) if trajectory else {}
+            structural_shift_magnitude = float(
+                last_info.get("delta_phi_frobenius_structural", 0.0) or 0.0
+            )
+            behavioral_phase = _current_behavioral_phase(getattr(self, "env", None))
+            behavioral_shift = int(
+                getattr(self, "_last_behavioral_phase", None) is not None
+                and behavioral_phase != self._last_behavioral_phase
+            )
+            self._last_behavioral_phase = behavioral_phase
+            self.episode_events.append({
+                "episode": episode_number,
+                "triggered": 0,
+                "trigger_count": 0,
+                "structural_shift": int(structural_shift_magnitude > 0.0),
+                "structural_shift_magnitude": structural_shift_magnitude,
+                "behavioral_phase": behavioral_phase,
+                "behavioral_shift": behavioral_shift,
+                "mean_f1": 0.0,
+                "mean_reward": mean_reward,
+            })
+            self.episodes_completed = episode_number
+
+            should_record = (
+                episode_number % eval_every == 0
+                or local_ep == n_episodes - 1
+            )
+            if should_record:
+                self.history["episodes"].append(episode_number)
                 self.history["mean_reward"].append(mean_reward)
                 self.history["reward_per_agent"].append(mean_reward)
                 self.history["policy_loss"].append(float(policy_loss))
@@ -295,13 +366,113 @@ class PureMeanFieldRunner:
                 self.history["max_p"].append(0.0)
 
                 print(
-                    f"[PureMeanField ep {ep:04d}] "
+                    f"[{self._log_tag} ep {episode_number:04d}] "
                     f"reward={mean_reward:.3f} "
                     f"policy_loss={policy_loss:.4f} "
                     f"throughput={throughput:.1f}"
                 )
 
         return self.history
+
+
+class CorrelationMeanFieldRunner(PureMeanFieldRunner):
+    """Observational association-weighted mean-field comparator for H2.
+
+    The baseline maintains a non-negative directed association matrix
+    ``W[ego, source]``. For every source action category it computes the
+    absolute Pearson correlation between the category indicator and the ego's
+    contemporaneous reward, then retains the largest supported correlation.
+    W therefore measures association strength, not causal effect.
+
+    Defaults use a rolling 20-episode window, require at least 60 environment
+    steps overall, and require both sides of an action indicator to contain at
+    least five samples. The policy consumes an action histogram weighted by W;
+    if a row has no supported association it falls back to uniform mean field.
+    Eq. 33 and policy weighting both use the same non-negative W.
+    """
+
+    _log_tag = "CorrelationMeanField"
+
+    def __init__(self, env, cfg, device="cpu"):
+        super().__init__(env=env, cfg=cfg, device=device)
+        window_episodes = int(cfg.get("association_window_episodes", 20))
+        max_steps = int(getattr(env, "max_steps", 30))
+        self.association_window_steps = max(1, window_episodes * max_steps)
+        self.association_min_steps = int(cfg.get("association_min_steps", 60))
+        self.association_min_action_support = int(
+            cfg.get("association_min_action_support", 5)
+        )
+        self.association_statistic = (
+            "max_over_actions(abs(PearsonCorr(1[action_source=a], reward_ego)))"
+        )
+        self.association_signed = False
+        self._association_actions = deque(maxlen=self.association_window_steps)
+        self._association_rewards = deque(maxlen=self.association_window_steps)
+        self._association_matrix = np.zeros(
+            (self.n_agents, self.n_agents), dtype=np.float64
+        )
+
+    def _neighbor_mean_action(self, actions_list, ego):
+        weights = np.asarray(self._association_matrix[int(ego)], dtype=np.float64).copy()
+        weights[int(ego)] = 0.0
+        total = float(np.sum(weights))
+        if total <= 1e-12:
+            return super()._neighbor_mean_action(actions_list, ego)
+
+        vector = np.zeros(self.action_dim, dtype=np.float32)
+        for source in range(self.n_agents):
+            if source == int(ego):
+                continue
+            action = int(actions_list[source])
+            if 0 <= action < self.action_dim:
+                vector[action] += float(weights[source] / total)
+        return vector
+
+    def _observe_episode(self, trajectory):
+        for step in trajectory:
+            self._association_actions.append(
+                np.asarray(step["actions"], dtype=np.int64).copy()
+            )
+            self._association_rewards.append(
+                np.asarray(step["rewards"], dtype=np.float64).copy()
+            )
+        self._update_association_matrix()
+
+    def _update_association_matrix(self):
+        n_steps = len(self._association_actions)
+        if n_steps < self.association_min_steps:
+            return
+
+        actions = np.stack(tuple(self._association_actions), axis=0)
+        rewards = np.stack(tuple(self._association_rewards), axis=0)
+        indicators = np.eye(self.action_dim, dtype=np.float64)[actions]
+        features = indicators.reshape(n_steps, self.n_agents * self.action_dim)
+
+        feature_counts = np.sum(features, axis=0)
+        supported = (
+            (feature_counts >= self.association_min_action_support)
+            & ((n_steps - feature_counts) >= self.association_min_action_support)
+        )
+        features = features - np.mean(features, axis=0, keepdims=True)
+        rewards = rewards - np.mean(rewards, axis=0, keepdims=True)
+        feature_norm = np.linalg.norm(features, axis=0)
+        reward_norm = np.linalg.norm(rewards, axis=0)
+        denominator = feature_norm[:, None] * reward_norm[None, :]
+        correlations = np.zeros_like(denominator, dtype=np.float64)
+        valid = (denominator > 1e-12) & supported[:, None]
+        numerator = features.T @ rewards
+        correlations[valid] = np.abs(numerator[valid] / denominator[valid])
+        correlations = correlations.reshape(
+            self.n_agents, self.action_dim, self.n_agents
+        )
+
+        # axes: [source, action, ego] -> W[ego, source]
+        matrix = np.max(correlations, axis=1).T
+        np.fill_diagonal(matrix, 0.0)
+        self._association_matrix = np.clip(matrix, 0.0, 1.0)
+
+    def get_influence_matrix(self):
+        return self._association_matrix.copy()
 
 class OracleCoreRunner:
     """
@@ -908,7 +1079,7 @@ class SharedAblationBase:
     Shared ablation runner for:
         - NoBelief
         - NoMultiMemory
-        - NoTwoTimescale
+        - the historical shared-pipeline scheduler approximation
 
     Unlike PureMeanField and FullExplicitLocal, these ablations retain most of
     the Final-CIGAMF pipeline so each condition tests exactly one module.
@@ -930,7 +1101,7 @@ class SharedAblationBase:
                 - do not execute PeripheralMultiMemory.forward.
 
         use_two_timescale:
-            False for NoTwoTimescale. When False:
+            False for the historical scheduler approximation. When False:
                 - force the scheduler into Stage 1;
                 - update the graph every episode;
                 - remove the slow/fast delay; and
@@ -1108,6 +1279,9 @@ class SharedAblationBase:
             "promoted": [],
             "demoted": [],
         }
+        self.episodes_completed = 0
+        self.episode_events = []
+        self._last_behavioral_phase = None
 
     def _make_belief_state(self, ego):
         common_kwargs = dict(
@@ -1358,12 +1532,9 @@ class SharedAblationBase:
             "value_cache": {},
             # [FIX-X1] Match final_runner by capturing geometry at this
             # timestep so replay_builder constructs time-aligned x_ij.
-            "geom_snapshot": {
-                "positions": [list(p) for p in self.env.positions],
-                "agent_zone": [int(z) for z in self.env.agent_zone],
-                "grid_size": int(getattr(self.env, "grid_size", 1)),
-                "n_zones": int(getattr(self.env, "n_zones", 1)),
-            },
+            "geom_snapshot": _ordered_geometry_snapshot(
+                self.env, self.n_agents
+            ),
         }
 
         obs_batch = []
@@ -1856,6 +2027,7 @@ class SharedAblationBase:
         core_switches = []
 
         diagnostic = last_info.get("diagnostic_core_by_ego", None)
+        gt_influence = last_info.get("gt_influence_by_ego", None)
 
         for ego in range(self.n_agents):
             pred_core = self.belief_modules[ego].get_core_set()
@@ -1864,6 +2036,26 @@ class SharedAblationBase:
                 gt_core = set()
             else:
                 gt_core = diagnostic[ego]
+
+            # Match FinalCIGAMFRunner's primary F1 definition. The role list is
+            # only a diagnostic after continuous SGTP Phi replaced the legacy
+            # static table; learned cores are scored against measured top-k
+            # |Phi| for both treatment and ablation.
+            if gt_influence is not None and ego in gt_influence:
+                row = gt_influence[ego]
+                if row:
+                    k = (
+                        max(1, len(pred_core))
+                        if pred_core
+                        else int(self.cfg.get("seed_core_top_k", 3))
+                    )
+                    gt_core = set(
+                        sorted(
+                            row,
+                            key=lambda source: abs(float(row[source])),
+                            reverse=True,
+                        )[:k]
+                    )
 
             f1s.append(self._core_f1(pred_core, gt_core))
             tvars.append(self.belief_modules[ego].get_temporal_variance())
@@ -1915,7 +2107,15 @@ class SharedAblationBase:
         return self.scheduler.should_update_graph()
 
     def run(self, n_episodes=100, eval_every=10):
-        for ep in range(int(n_episodes)):
+        n_episodes = int(n_episodes)
+        eval_every = int(eval_every)
+        if n_episodes < 0:
+            raise ValueError("n_episodes must be non-negative")
+        if eval_every <= 0:
+            raise ValueError("eval_every must be positive")
+
+        for local_ep in range(n_episodes):
+            episode_number = int(self.episodes_completed) + 1
             stage_before_episode_step = int(self.scheduler.stage)
 
             trajectory, episode_reward, runtime = self.collect_episode()
@@ -1961,18 +2161,47 @@ class SharedAblationBase:
             stage_now = int(self.scheduler.stage)
             trigger_count_now = int(self.scheduler.trigger_count)
 
-            if self.use_two_timescale:
-                self.scheduler.step_episode()
+            # The NoTwoTimescale ablation ignores scheduler frequency but the
+            # scheduler clock must still advance.  Keeping it frozen at zero
+            # made every trigger share episode 0 and left the refractory state
+            # active forever after the first event.
+            self.scheduler.step_episode()
+            stage_after_episode_step = int(self.scheduler.stage)
 
-                stage_after_episode_step = int(self.scheduler.stage)
+            if (self.use_two_timescale
+                    and stage_before_episode_step == 0
+                    and stage_after_episode_step == 1):
+                self._reset_switch_counters_if_available()
 
-                if stage_before_episode_step == 0 and stage_after_episode_step == 1:
-                    self._reset_switch_counters_if_available()
-            else:
-                stage_after_episode_step = int(self.scheduler.stage)
+            last_info = trajectory[-1].get("info", {}) if trajectory else {}
+            structural_shift_magnitude = float(
+                last_info.get("delta_phi_frobenius_structural", 0.0) or 0.0
+            )
+            behavioral_phase = _current_behavioral_phase(getattr(self, "env", None))
+            behavioral_shift = int(
+                getattr(self, "_last_behavioral_phase", None) is not None
+                and behavioral_phase != self._last_behavioral_phase
+            )
+            self._last_behavioral_phase = behavioral_phase
+            self.episode_events.append({
+                "episode": episode_number,
+                "triggered": int(graph_info["triggered"]),
+                "trigger_count": int(trigger_count_now),
+                "structural_shift": int(structural_shift_magnitude > 0.0),
+                "structural_shift_magnitude": structural_shift_magnitude,
+                "behavioral_phase": behavioral_phase,
+                "behavioral_shift": behavioral_shift,
+                "mean_f1": float(snapshot["mean_f1"]),
+                "mean_reward": float(snapshot["mean_reward"]),
+            })
+            self.episodes_completed = episode_number
 
-            if ep % int(eval_every) == 0:
-                self.history["episodes"].append(ep)
+            should_record = (
+                episode_number % eval_every == 0
+                or local_ep == n_episodes - 1
+            )
+            if should_record:
+                self.history["episodes"].append(episode_number)
                 self.history["mean_reward"].append(snapshot["mean_reward"])
                 self.history["reward_per_agent"].append(snapshot["reward_per_agent"])
                 self.history["mean_f1"].append(snapshot["mean_f1"])
@@ -2024,7 +2253,7 @@ class SharedAblationBase:
                 self.history["demoted"].append(int(graph_info["demoted"]))
 
                 print(
-                    f"[{self.name} ep {ep:04d}] "
+                    f"[{self.name} ep {episode_number:04d}] "
                     f"stage={stage_now} "
                     f"reward={snapshot['mean_reward']:.3f} "
                     f"f1={snapshot['mean_f1']:.3f} "
@@ -2076,7 +2305,14 @@ class NoMultiMemoryRunner(SharedAblationBase):
         )
 
 
-class NoTwoTimescaleRunner(SharedAblationBase):
+class LegacySharedNoTwoTimescaleRunner(SharedAblationBase):
+    """Historical approximation retained only for result archaeology.
+
+    This implementation predates Final's forced-action propensity, signature
+    tracker, ego-conditioned heads, and auxiliary-loss path. It is therefore
+    not a valid scheduler-only ablation and is not registered by the factory.
+    """
+
     def __init__(self, env, cfg, device="cpu"):
         super().__init__(
             env=env,

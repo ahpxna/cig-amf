@@ -13,9 +13,10 @@ FOUR V1 DEFECTS CORRECTED HERE
 [L2] THE PLUG-IN ESTIMATE INHERITED REWARD-MODEL BIAS.
      v1 used w = f(a') - f(a), so biased f produced biased w, while
      non-random a_j made f learn from confounded data. The current estimator
-     is doubly robust. MARL supplies exact pi_j because the policy is trained
-     within the system, so exact propensity keeps DR unbiased even if f is
-     misspecified.
+     exposes an augmented inverse-propensity pseudo-outcome using the logged
+     behaviour propensity. A formal conditional double-robust estimator still
+     requires cross-fitting and a second-stage effect regression; the online
+     row-level correction is retained as an explicitly diagnosed ablation.
 
 [L3] THE ENSEMBLE WAS EFFECTIVELY IDENTICAL.
      All three v1 members trained on the same batches in the same order and
@@ -268,7 +269,7 @@ def _clip_grad_norm_per_member(
 
 class LocalCounterfactualProxyEnsemble:
     """
-    Signed, doubly robust, multi-horizon ensemble proxy represented on GPU as
+    Signed, propensity-augmented, multi-horizon ensemble proxy represented on GPU as
     one tensor with an ensemble dimension, rather than n_ensemble models
     iterated in Python.
 
@@ -284,6 +285,15 @@ class LocalCounterfactualProxyEnsemble:
         w = mean_{a in candidates}[ f(s,a) ] - f(s, a_j_obs)
         Exactly matches the environment oracle formula.
 
+    "signed_policy_contrast"  (confirmatory H1)
+        w = E_{a~pi}[f(s,a)] - E_{a~q}[f(s,a)], where q is uniform over
+        candidate actions, pi is supplied via policy_probs_j, and the factual
+        action is logged under behaviour b. Positive values preserve the
+        operational meaning "the current neighbour policy is beneficial
+        relative to random behaviour." This stochastic-policy contrast has a
+        valid AIPW score; unlike a realised-action contrast, its target does
+        not change with the randomly observed action.
+
     "range"  (Pieroth ICML 2024-style control baseline)
         w = max_a f(s,a) - min_a f(s,a), always >= 0
 
@@ -291,19 +301,29 @@ class LocalCounterfactualProxyEnsemble:
         w = mean_{a != a_obs} |f(s,a) - f(s,a_obs)|
 
     ---------------------------------------------------------------------
-    DOUBLY ROBUST
+    AUGMENTED INVERSE-PROPENSITY CONTRAST
     ---------------------------------------------------------------------
-        psi_DR(a) = f_hat(s,a) + (1{a_obs = a} / b_j(a|s)) * (R_obs - f_hat(s,a_obs))
+        tau_pi,q(s) = sum_a [pi(a|s)-q(a|s)] m(s,a)
 
-    Either a correct outcome model or a correct propensity is sufficient for
-    unbiasedness. MARL provides exact propensity, satisfying one condition.
-    Importance weight 1/b is clipped to prevent variance explosion at small b.
+        phi_DR = sum_a [pi(a|s)-q(a|s)] f_hat(s,a)
+                 + [pi(A|s)-q(A|s)] / b(A|s)
+                   * [R - f_hat(s,A)].
+
+    Here ``q`` is the fixed uniform candidate-action reference and ``b`` is
+    the logged epsilon-forcing behaviour policy. This is a fixed stochastic-
+    policy value contrast, not the realised-action quantity
+    ``psi(A)-E_pi[psi]``. The latter has a different residual coefficient and
+    is intentionally not used by confirmatory H1. A row-level orthogonal
+    score still requires a second-stage regression or aggregation for a
+    conditional-effect claim. Inverse propensities are logged and clipping is
+    measured explicitly to expose any variance/bias trade-off.
     """
 
     # Four valid modes.
     MODES = (
         "signed_aristocrat",
         "signed_oracle_matched",
+        "signed_policy_contrast",
         "range",
         "mean_abs",
     )
@@ -456,6 +476,17 @@ class LocalCounterfactualProxyEnsemble:
         self.latest_ensemble_disagreement = 0.0
         self.latest_dr_correction_magnitude = 0.0
         self.n_interventional_samples = 0
+        # A DR-labelled experiment must prove that the correction path was
+        # actually exercised.  These counters make a missing outcome or
+        # propensity input visible instead of silently producing plug-in
+        # scores under a DR configuration.
+        self.latest_dr_applied = False
+        self.latest_dr_applied_rows = 0
+        self.latest_dr_clipped_rows = 0
+        self.latest_dr_raw_inverse_max = 0.0
+        self.total_dr_applied_calls = 0
+        self.total_dr_applied_rows = 0
+        self.total_dr_clipped_rows = 0
 
         # [BB3] Per-member losses let T3 compare member 0's gradient scale at
         # E=1 and E=4 without inspecting the autograd graph. None before the
@@ -729,6 +760,44 @@ class LocalCounterfactualProxyEnsemble:
 
     def get_latest_holdout_residual(self) -> float:
         return float(self.latest_holdout_residual)
+
+    def get_action_coverage_diagnostics(self) -> Dict[str, object]:
+        """Return action-head support measured at the replay boundary.
+
+        Batch-level minimum frequencies are too noisy to validate overlap and
+        can look healthy after resampling even when the underlying replay has
+        an unsupported action.  This diagnostic operates on the complete
+        retained buffer and reports factual and forced-only counts separately.
+        """
+        counts = np.zeros(self.action_dim, dtype=np.int64)
+        forced_counts = np.zeros(self.action_dim, dtype=np.int64)
+
+        for sample in self.buffer:
+            action = int(sample["observed_action_j"])
+            if 0 <= action < self.action_dim:
+                counts[action] += 1
+                if bool(sample.get("was_forced", False)):
+                    forced_counts[action] += 1
+
+        total = int(counts.sum())
+        forced_total = int(forced_counts.sum())
+        fractions = counts.astype(np.float64) / max(1, total)
+        forced_fractions = forced_counts.astype(np.float64) / max(1, forced_total)
+
+        return {
+            "action_counts": counts.tolist(),
+            "action_fractions": fractions.tolist(),
+            "actions_seen": int(np.count_nonzero(counts)),
+            "min_action_fraction": float(fractions.min()) if total else 0.0,
+            "forced_action_counts": forced_counts.tolist(),
+            "forced_action_fractions": forced_fractions.tolist(),
+            "forced_actions_seen": int(np.count_nonzero(forced_counts)),
+            "min_forced_action_fraction": (
+                float(forced_fractions.min()) if forced_total else 0.0
+            ),
+            "n_samples": total,
+            "n_forced_samples": forced_total,
+        }
 
     # =====================================================================
     # Train
@@ -1322,6 +1391,7 @@ class LocalCounterfactualProxyEnsemble:
         mode = self.effect_mode if mode is None else str(mode)
 
         E, B, A, H = preds_all.shape
+        target_prob_obs = None
 
         idx_obs = torch.tensor(
             np.asarray(action_j_obs, dtype=np.int64).reshape(-1),
@@ -1345,14 +1415,24 @@ class LocalCounterfactualProxyEnsemble:
                     (B, A), 1.0 / float(A), dtype=torch.float32, device=self.device
                 )
             else:
+                w_arr = np.asarray(policy_probs_j, dtype=np.float32)
+                if w_arr.shape != (B, A):
+                    raise ValueError(
+                        f"policy_probs_j must have shape {(B, A)}, received "
+                        f"{w_arr.shape}"
+                    )
+                if not np.all(np.isfinite(w_arr)) or np.any(w_arr < 0.0):
+                    raise ValueError("policy_probs_j contains invalid probabilities")
                 w = torch.tensor(
-                    np.asarray(policy_probs_j, dtype=np.float32),
+                    w_arr,
                     dtype=torch.float32,
                     device=self.device,
                 )  # [B, A]
+                w = w / torch.clamp(w.sum(dim=1, keepdim=True), min=self.eps)
 
             baseline = torch.einsum("ebah,ba->ebh", preds_all, w)
             effect_per_h = f_obs - baseline  # [E, B, H]
+            target_prob_obs = torch.gather(w, 1, idx_obs.view(B, 1)).squeeze(1)
 
         elif mode == "signed_oracle_matched":
             cand = torch.tensor(
@@ -1368,6 +1448,53 @@ class LocalCounterfactualProxyEnsemble:
             cand_mean = cand_preds.mean(dim=2)         # [E, B, H]
 
             effect_per_h = cand_mean - f_obs           # [E, B, H]
+            # q(a_obs|s) for the uniform candidate-action intervention.
+            # It is zero when the factual action is outside the candidate set.
+            target_prob_obs = (
+                (idx_obs.view(B, 1) == cand.view(1, -1)).any(dim=1).float()
+                / float(cand.numel())
+            )
+
+        elif mode == "signed_policy_contrast":
+            if policy_probs_j is None:
+                raise ValueError(
+                    "signed_policy_contrast requires the complete target "
+                    "policy distribution in policy_probs_j"
+                )
+            pi_full_arr = np.asarray(policy_probs_j, dtype=np.float32)
+            if pi_full_arr.shape != (B, A):
+                raise ValueError(
+                    f"policy_probs_j must have shape {(B, A)}, received "
+                    f"{pi_full_arr.shape}"
+                )
+            if (
+                not np.all(np.isfinite(pi_full_arr))
+                or np.any(pi_full_arr < 0.0)
+            ):
+                raise ValueError("target policy distribution is invalid")
+            pi_full = torch.tensor(
+                pi_full_arr, dtype=torch.float32, device=self.device,
+            )
+            pi_full = pi_full / torch.clamp(
+                pi_full.sum(dim=1, keepdim=True), min=self.eps
+            )
+            cand = torch.tensor(
+                [a for a in self.candidate_actions if 0 <= a < A],
+                dtype=torch.long,
+                device=self.device,
+            )
+            if cand.numel() == 0:
+                cand = torch.arange(A, dtype=torch.long, device=self.device)
+            q_mean = preds_all[:, :, cand, :].mean(dim=2)
+            pi_mean = torch.einsum("ebah,ba->ebh", preds_all, pi_full)
+            effect_per_h = pi_mean - q_mean
+            target_prob_obs = (
+                (idx_obs.view(B, 1) == cand.view(1, -1)).any(dim=1).float()
+                / float(cand.numel())
+            )
+            policy_prob_obs = torch.gather(
+                pi_full, 1, idx_obs.view(B, 1)
+            ).squeeze(1)
 
         elif mode == "range":
             max_f = preds_all.max(dim=2).values        # [E, B, H]
@@ -1390,51 +1517,92 @@ class LocalCounterfactualProxyEnsemble:
             raise ValueError(f"mode không hợp lệ: {mode}")
 
         # ---------------------------------------------------------------
-        # Doubly robust correction applies only to signed modes.
+        # AIPW applies only to the fixed stochastic-policy contrast. The two
+        # realised-action modes do not have a valid row-level DR correction.
         # ---------------------------------------------------------------
         apply_dr = (
             self.use_doubly_robust
-            and mode in ("signed_aristocrat", "signed_oracle_matched")
+            and mode == "signed_policy_contrast"
             and observed_returns is not None
             and behaviour_probs_obs is not None
         )
 
+        dr_applied = False
+        dr_applied_rows = 0
+        dr_clipped_rows = 0
+        dr_raw_inverse_max = 0.0
+        dr_weight = torch.zeros(B, dtype=torch.float32, device=self.device)
+
         if apply_dr:
+            returns_arr = np.asarray(observed_returns, dtype=np.float32).reshape(-1)
+            propensity_arr = np.asarray(
+                behaviour_probs_obs, dtype=np.float32
+            ).reshape(-1)
+            if returns_arr.shape != (B,) or propensity_arr.shape != (B,):
+                raise ValueError(
+                    "DR inputs must contain one return and one observed-action "
+                    f"propensity per row; received {returns_arr.shape} and "
+                    f"{propensity_arr.shape}, expected {(B,)}"
+                )
+            if not np.all(np.isfinite(returns_arr)):
+                raise ValueError("observed_returns contains NaN or infinity")
+            if (
+                not np.all(np.isfinite(propensity_arr))
+                or np.any(propensity_arr <= 0.0)
+                or np.any(propensity_arr > 1.0 + 1e-6)
+            ):
+                raise ValueError(
+                    "behaviour_probs_obs must be finite and in (0, 1]"
+                )
+
             R_obs = torch.tensor(
-                np.asarray(observed_returns, dtype=np.float32).reshape(-1),
+                returns_arr,
                 dtype=torch.float32,
                 device=self.device,
             )  # [B]
 
             b_obs = torch.tensor(
-                np.asarray(behaviour_probs_obs, dtype=np.float32).reshape(-1),
+                propensity_arr,
                 dtype=torch.float32,
                 device=self.device,
-            ).clamp(min=1.0 / self.iw_clip, max=1.0)  # [B]
+            ).clamp(min=self.eps, max=1.0)  # [B]
 
             residual = R_obs.view(1, B) - f_obs[:, :, -1]  # [E, B]
 
-            iw_minus_one = torch.clamp(
-                1.0 / b_obs - 1.0, min=0.0, max=self.iw_clip
-            )  # [B]
+            # For V_pi(s)-V_q(s), sampled under logging policy b, the AIPW
+            # score is
+            #   sum_a (pi(a)-q(a)) f(a)
+            #   + ((pi(A)-q(A))/b(A)) * (Y-f(A)).
+            # This is an aggregate stochastic-policy contrast. A row-specific
+            # target such as Q(A)-V_pi changes with random A and cannot acquire
+            # conditional double robustness by attaching a residual to that
+            # same row; those legacy modes therefore remain plug-in only.
+            raw_inv_b = 1.0 / b_obs
+            dr_clipped_rows = int(
+                torch.sum(raw_inv_b > self.iw_clip).detach().cpu().item()
+            )
+            dr_raw_inverse_max = float(
+                torch.max(raw_inv_b).detach().cpu().item()
+            )
+            inv_b = torch.clamp(raw_inv_b, max=self.iw_clip)
+            contrast_weight = (
+                policy_prob_obs - target_prob_obs
+            ) * inv_b
 
-            correction = residual * iw_minus_one.view(1, B)  # [E, B]
+            correction = residual * contrast_weight.view(1, B)  # [E, B]
 
-            if mode == "signed_oracle_matched":
-                correction = -correction
-
-            # [FIX-DR-H] Eq. 10 defines DR only for R^(H), so it correctly
-            # applies only to the final horizon. This makes effect_per_h a
-            # mixed-estimator vector: plug-in for h<H and DR-corrected at H.
-            # Eq. 19 latency previously combined |ŵ^(h)| across all h, mixing
-            # estimands and making Eq. 18's sixth component inconsistent.
-            # Retain a pure plug-in vector for latency diagnostics while using
-            # corrected mu/effect for the actual Eq. 10 quantity.
+            # The residual correction is defined for the terminal return, so
+            # earlier horizons remain plug-in values. Keep that pure plug-in
+            # vector for latency diagnostics rather than mixing estimands
+            # across horizons.
             effect_per_h_plugin = effect_per_h
             effect_per_h = effect_per_h.clone()
             effect_per_h[:, :, -1] = effect_per_h[:, :, -1] + correction
 
             dr_correction = torch.mean(torch.abs(correction), dim=0)  # [B]
+            dr_weight = contrast_weight
+            dr_applied = True
+            dr_applied_rows = B
 
         return {
             "effect": effect_per_h[:, :, -1],   # [E, B]
@@ -1444,6 +1612,11 @@ class LocalCounterfactualProxyEnsemble:
                 effect_per_h_plugin if apply_dr else effect_per_h
             ),
             "dr_correction": dr_correction,     # [B]
+            "dr_weight": dr_weight,             # [B]
+            "dr_applied": bool(dr_applied),
+            "dr_applied_rows": int(dr_applied_rows),
+            "dr_clipped_rows": int(dr_clipped_rows),
+            "dr_raw_inverse_max": float(dr_raw_inverse_max),
         }
 
     # =====================================================================
@@ -1518,6 +1691,11 @@ class LocalCounterfactualProxyEnsemble:
                 "mu_per_h": np.zeros((0, self.n_horizons), dtype=np.float32),
                 "mu_range": z,
                 "dr_correction": z,
+                "dr_weight": z,
+                "dr_applied": False,
+                "dr_applied_rows": 0,
+                "dr_clipped_rows": 0,
+                "dr_raw_inverse_max": 0.0,
             }
 
         obs = np.asarray(obs_i_batch, dtype=np.float32)
@@ -1571,6 +1749,14 @@ class LocalCounterfactualProxyEnsemble:
         self.latest_dr_correction_magnitude = float(
             torch.mean(res["dr_correction"]).item()
         )
+        self.latest_dr_applied = bool(res["dr_applied"])
+        self.latest_dr_applied_rows = int(res["dr_applied_rows"])
+        self.latest_dr_clipped_rows = int(res["dr_clipped_rows"])
+        self.latest_dr_raw_inverse_max = float(res["dr_raw_inverse_max"])
+        if self.latest_dr_applied:
+            self.total_dr_applied_calls += 1
+            self.total_dr_applied_rows += self.latest_dr_applied_rows
+            self.total_dr_clipped_rows += self.latest_dr_clipped_rows
 
         # One .cpu().numpy() per output at the API boundary. Leaving GPU is
         # required here because downstream influence_signature.py and
@@ -1584,6 +1770,11 @@ class LocalCounterfactualProxyEnsemble:
             "mu_per_h": to_np(mu_per_h),
             "mu_range": to_np(mu_range),
             "dr_correction": to_np(res["dr_correction"]),
+            "dr_weight": to_np(res["dr_weight"]),
+            "dr_applied": bool(res["dr_applied"]),
+            "dr_applied_rows": int(res["dr_applied_rows"]),
+            "dr_clipped_rows": int(res["dr_clipped_rows"]),
+            "dr_raw_inverse_max": float(res["dr_raw_inverse_max"]),
         }
 
     def score_pair(
@@ -1643,6 +1834,13 @@ class LocalCounterfactualProxyEnsemble:
             "latest_holdout_residual": float(self.latest_holdout_residual),
             "ensemble_disagreement": float(self.latest_ensemble_disagreement),
             "dr_correction_magnitude": float(self.latest_dr_correction_magnitude),
+            "latest_dr_applied": bool(self.latest_dr_applied),
+            "latest_dr_applied_rows": int(self.latest_dr_applied_rows),
+            "latest_dr_clipped_rows": int(self.latest_dr_clipped_rows),
+            "latest_dr_raw_inverse_max": float(self.latest_dr_raw_inverse_max),
+            "total_dr_applied_calls": int(self.total_dr_applied_calls),
+            "total_dr_applied_rows": int(self.total_dr_applied_rows),
+            "total_dr_clipped_rows": int(self.total_dr_clipped_rows),
             "effect_mode": self.effect_mode,
             "use_doubly_robust": bool(self.use_doubly_robust),
             "n_ensemble": int(self.n_ensemble),

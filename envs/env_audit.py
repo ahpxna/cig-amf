@@ -25,6 +25,9 @@ comparison. This is not radius pruning and avoids Section 4.2's A1
 self-confirmation trap; only state/trial counts are reduced. S, T, and the
 forced_step sweep are stated below and in output.
 """
+import argparse
+import json
+import os
 import sys
 import numpy as np
 
@@ -753,7 +756,7 @@ def oracle_no_abs_direct_check(env):
 # Main
 # ============================================================
 
-def main():
+def main(json_out=None):
     print("=" * 78)
     print("OMNI-ARENA env_audit.py -- P0-P4 acceptance check")
     print("=" * 78)
@@ -931,11 +934,55 @@ def main():
     n_pass = sum(1 for _, _, ok in checks if ok)
     print(f"\n{n_pass}/{len(checks)} checks passed.")
 
+    machine_checks = [
+        {
+            "name": name,
+            "value": (
+                float(val)
+                if isinstance(val, (int, float, np.integer, np.floating))
+                else bool(val) if isinstance(val, (bool, np.bool_)) else str(val)
+            ),
+            # T4 is explicitly diagnostic; every other acceptance criterion
+            # is a prerequisite for long hypothesis experiments.
+            "required": "nice-to-have" not in name,
+            "passed": bool(ok),
+        }
+        for name, val, ok in checks
+    ]
+    required_pass = all(
+        row["passed"] for row in machine_checks if row["required"]
+    )
+    print(
+        "Required environment gate: "
+        + ("PASS" if required_pass else "FAIL")
+    )
+
+    if json_out:
+        output_path = os.path.abspath(json_out)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "audit": "all_flags",
+                    "required_gate_pass": required_pass,
+                    "checks": machine_checks,
+                },
+                handle,
+                indent=2,
+            )
+            handle.write("\n")
+
     return {
         "t1": m1, "t3": m3, "t4": m4, "t6": m6,
         "sign_check": msign, "abs_check": mabs, "checks": checks,
+        "required_gate_pass": required_pass,
+        "machine_checks": machine_checks,
     }
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json-out", default=None)
+    cli_args = parser.parse_args()
+    audit_result = main(json_out=cli_args.json_out)
+    raise SystemExit(0 if audit_result["required_gate_pass"] else 2)

@@ -25,6 +25,9 @@ once and remains useful as the final all-flags check. All metric functions
 (T1-T6 and corr(Phi,W*)) are imported from env_audit.py without duplicating
 their logic.
 """
+import argparse
+import json
+import os
 import sys
 import numpy as np
 
@@ -211,7 +214,7 @@ def print_block_result(name, desc, flags, metrics, prev_metrics, prev_name):
     )
 
 
-def main():
+def main(json_out=None):
     print("#" * 78)
     print("# OMNI-ARENA env_audit_staged.py -- 3 cumulative blocks (A, B, C)")
     print("# Reuses T1-T6/corr metric functions from env_audit.py verbatim.")
@@ -324,8 +327,59 @@ def main():
         "Block A's delta; it is not one of the 3 official audited blocks (A/B/C)."
     )
 
-    return results
+    # Gate only the interactions each cumulative block is designed to expose.
+    # BASELINE is a reference, and T4 remains diagnostic rather than required.
+    gate_checks = [
+        ("A conditional variability", a_m["t3_cv_mean"], a_m["t3_cv_mean"] > 0.30),
+        ("B preserves influence inequality", b_m["t1_gini"], b_m["t1_gini"] > 0.30),
+        ("B preserves conditional variability", b_m["t3_cv_mean"], b_m["t3_cv_mean"] > 0.30),
+        ("C structural/behavioural separation", c_m["t6_ratio"], 3.0 <= c_m["t6_ratio"] <= 20.0),
+        ("C behavioural effective-structure response", c_m["t6_behav_exact"], bool(c_m["t6_behav_exact"])),
+        ("C static Phi invariant under behavioural drift", c_m["t6_static_phi_invariant"], bool(c_m["t6_static_phi_invariant"])),
+    ]
+    required_pass = all(bool(ok) for _, _, ok in gate_checks)
+    print(
+        "\nRequired staged environment gate: "
+        + ("PASS" if required_pass else "FAIL")
+    )
+    machine_checks = [
+        {
+            "name": name,
+            "value": (
+                float(value)
+                if isinstance(value, (int, float, np.integer, np.floating))
+                else bool(value)
+            ),
+            "required": True,
+            "passed": bool(ok),
+        }
+        for name, value, ok in gate_checks
+    ]
+    if json_out:
+        output_path = os.path.abspath(json_out)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "audit": "cumulative_staged",
+                    "required_gate_pass": required_pass,
+                    "checks": machine_checks,
+                },
+                handle,
+                indent=2,
+            )
+            handle.write("\n")
+
+    return {
+        "blocks": results,
+        "required_gate_pass": required_pass,
+        "machine_checks": machine_checks,
+    }
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json-out", default=None)
+    cli_args = parser.parse_args()
+    audit_result = main(json_out=cli_args.json_out)
+    raise SystemExit(0 if audit_result["required_gate_pass"] else 2)

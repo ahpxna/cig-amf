@@ -22,20 +22,20 @@ import torch
 try:
     from runners.baseline_runner import (
         PureMeanFieldRunner,
+        CorrelationMeanFieldRunner,
         FullExplicitLocalRunner,
         NoBeliefRunner,
         NoMultiMemoryRunner,
-        NoTwoTimescaleRunner,
         OracleCoreRunner,      # [FIX-O3]
         RandomCoreRunner,      # [FIX-O3]
     )
 except ModuleNotFoundError:
     from runners.baseline_runner import (
         PureMeanFieldRunner,
+        CorrelationMeanFieldRunner,
         FullExplicitLocalRunner,
         NoBeliefRunner,
         NoMultiMemoryRunner,
-        NoTwoTimescaleRunner,
         OracleCoreRunner,      # [FIX-O3]
         RandomCoreRunner,      # [FIX-O3]
     )
@@ -43,9 +43,9 @@ except ModuleNotFoundError:
 from models.structural_proxy import build_pair_feat  # [FIX-X1]
 
 try:
-    from runners.final_runner import FinalCIGAMFRunner
+    from runners.final_runner import FinalCIGAMFRunner, NoTwoTimescaleRunner
 except ModuleNotFoundError:
-    from runners.final_runner import FinalCIGAMFRunner
+    from runners.final_runner import FinalCIGAMFRunner, NoTwoTimescaleRunner
 
 
 # ============================================================
@@ -123,7 +123,9 @@ def default_cfg():
 
         "shadow_dim": 24,
 
-        "num_memory_slots": 4,
+        # Four fixed semantic roles plus two learned residual slots, matching
+        # Eq. 23.  A total of four silently removed every free slot.
+        "num_memory_slots": 6,
         "periph_memory_dim": 32,
 
         "belief_top_k": 4,
@@ -178,20 +180,23 @@ def default_cfg():
 
         "periph_mu_floor": 0.015,
         "periph_beta_floor": 0.05,
-        "periph_uniform_mix": 0.4,
-        "periph_use_uniform_mix": True,
-        # [FIX-8b] REVERT 0.05 -> 1.2. FIX-8's argument about "restoring the
-        # old effective strength" was WRONG: the old effective strength,
-        # 1.2/24 = 0.05, is precisely the regime in which entropy WAS
-        # COLLAPSING to 0.15 in the first log. Direct measurements:
-        #     lambda=1.2, full auxiliary loss over 24 egos -> usage_entropy_ratio = 0.7758
-        #     lambda=0.05, full auxiliary loss over 24 egos -> usage_entropy_ratio = 0.1430 (collapse)
-        # Reward was NOT caused by the auxiliary loss either: lambda=0.05 gave
-        # episode-50 reward -0.897, worse than lambda=1.2 at -0.711. The reward
-        # problem therefore lies in the policy learner, not L_aux. The remaining
-        # FIX-8 change—separating auxiliary loss from the policy_loss log
-        # column—is RETAINED because it is independently correct.
-        "periph_lb_coeff": 1.2,
+        # Uniform mixing recreates the global mean inside every slot and is
+        # therefore reserved for a legacy-collapse ablation, never Full.
+        "periph_uniform_mix": 0.0,
+        "periph_use_uniform_mix": False,
+        "periph_routing_mode": "semantic",
+        "periph_signature_mode": "full",
+        # Main runners may opt into strictness once the signature tracker is
+        # plumbed into build_inputs. H3 overrides this to True and fails fast
+        # if it would otherwise test the legacy derived vector.
+        "periph_require_full_signature": False,
+        "periph_allow_legacy_items": True,
+        # Switch load balancing now applies only to trainable exchangeable
+        # slots. The previous four-slot configuration contained only fixed
+        # semantic gates, so changing this coefficient could not change router
+        # gradients; the apparent 1.2-versus-0.05 tuning result was therefore
+        # not evidence about load balancing. Use the published Switch scale.
+        "periph_lb_coeff": 1e-2,
         # [FIX-2] Expose orth_coeff through configuration so the No-AuxLoss
         # ablation disables BOTH Equation 27 components, not only load balancing.
         "periph_orth_coeff": 1e-2,
@@ -201,7 +206,10 @@ def default_cfg():
 
         # structural_proxy v2 defaults match structural_proxy.py.
         "proxy_n_horizons": 3,
-        "proxy_effect_mode": "signed_aristocrat",
+        # Stable H1 estimand: value of the logged neighbour policy relative to
+        # a uniform reference policy. The former realised-action/range target
+        # changed with the sampled action and could not be ranked consistently.
+        "proxy_effect_mode": "signed_policy_contrast",
         "proxy_use_doubly_robust": True,
         "proxy_iw_clip": 10.0,
         "proxy_bootstrap_ratio": 0.8,
@@ -772,6 +780,10 @@ def make_runner(model_name, env, cfg, device):
         "meanfield": "PureMeanField",
         "MeanField": "PureMeanField",
 
+        "CorrelationMeanField": "CorrelationMeanField",
+        "correlation_meanfield": "CorrelationMeanField",
+        "association": "CorrelationMeanField",
+
         "FullExplicitLocal": "FullExplicitLocal",
         "explicit": "FullExplicitLocal",
         "FullExplicit": "FullExplicitLocal",
@@ -800,6 +812,9 @@ def make_runner(model_name, env, cfg, device):
 
     if canonical == "PureMeanField":
         return PureMeanFieldRunner(env, cfg, device=device)
+
+    if canonical == "CorrelationMeanField":
+        return CorrelationMeanFieldRunner(env, cfg, device=device)
 
     if canonical == "FullExplicitLocal":
         return FullExplicitLocalRunner(env, cfg, device=device)
@@ -1145,35 +1160,15 @@ def run_scalability_task(args, cfg, model_names, device):
 # ============================================================
 
 def _tiny_candidate_intervention_actions(tiny_env):
-    out = []
+    """Return the complete discrete action support used by the proxy.
 
-    preferred = [
-        "STAY",
-        "SIGNAL_A",
-        "SIGNAL_B",
-        "TOGGLE_LANE",
-        "PICK",
-        "DROP_TO_BUFFER",
-        "PROCESS",
-        "DELIVER",
-    ]
-
-    for name in preferred:
-        if hasattr(tiny_env, name):
-            out.append(int(getattr(tiny_env, name)))
-
-    if len(out) == 0:
-        out = list(range(int(tiny_env.get_action_dim())))
-
-    seen = set()
-    unique = []
-
-    for x in out:
-        if x not in seen:
-            seen.add(x)
-            unique.append(int(x))
-
-    return unique
+    Earlier calibration averaged eight hand-picked actions in the oracle while
+    ``signed_oracle_matched`` averaged all thirteen proxy heads.  Correlation
+    between those two quantities cannot validate the estimator.  The tiny
+    environment exposes a finite action space, so exact support matching is
+    both cheaper and clearer than maintaining a partial allow-list.
+    """
+    return list(range(int(tiny_env.get_action_dim())))
 
 
 def _get_obs_all_from_env(env):
@@ -1378,6 +1373,15 @@ def _train_tiny_runner_for_proxy(tiny_env, tiny_cfg, args, device):
     if hasattr(runner.scheduler, "force_learned_stage"):
         runner.scheduler.force_learned_stage()
 
+    # H1 compares plug-in and AIPW scoring on the same nuisance learner and
+    # data-generating process. Letting DR-modified beliefs alter later actions
+    # would make the ablation compare two training distributions rather than
+    # two estimators. Keep online structural scoring plug-in during nuisance
+    # training, then restore the requested evaluation mode below.
+    h1_requested_dr = bool(runner.proxy.use_doubly_robust)
+    if bool(getattr(args, "h1_exact_protocol", False)):
+        runner.proxy.use_doubly_robust = False
+
     train_episodes = int(max(1, getattr(args, "tiny_proxy_train_episodes", 8)))
 
     for ep in range(train_episodes):
@@ -1410,14 +1414,22 @@ def _train_tiny_runner_for_proxy(tiny_env, tiny_cfg, args, device):
                 observed_returns = None
 
             behaviour_probs = last.get("behaviour_probs") if isinstance(last, dict) else None
+            # ``signed_policy_contrast`` is defined for the policy that
+            # generated this action-time state.  The training phase keeps the
+            # plug-in estimator active, but still supplies the logged policy
+            # probabilities so the structural target remains well-defined.
+            policy_probs = last.get("policy_probs") if isinstance(last, dict) else None
 
             runner._score_all_pairs_and_update_beliefs(
                 obs_all=last["obs_all"],
                 actions=last["actions"],
                 observed_returns=observed_returns,
                 behaviour_probs=behaviour_probs,
+                policy_probs=policy_probs,
             )
 
+    if bool(getattr(args, "h1_exact_protocol", False)):
+        runner.proxy.use_doubly_robust = h1_requested_dr
     return runner
 def _core_context_excluding_all_compat(runner, ego):
     """
@@ -1559,6 +1571,500 @@ def _score_learned_proxy_for_state(runner, tiny_env, state, ego, neighbor_ids):
     }, sigmas
 
 
+def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
+    """Score one factual action-time cache with all AIPW inputs present.
+
+    H1 previously restored only the environment and then constructed
+    ``Z^{-j}``, ``M^{-j}``, and belief features from the runner's unrelated
+    end-of-training state.  It also omitted the observed return and propensity,
+    silently turning every DR-labelled evaluation into plug-in scoring.  The
+    trajectory cache is the only source that keeps observation, action,
+    relational context, reward, and propensity aligned at the same time.
+    """
+    required = (
+        "obs_all", "actions", "rewards", "core_context_excluding",
+        "periph_context_excluding", "belief_summary_cache", "geom_snapshot",
+        "behaviour_probs", "policy_probs", "env_snapshot_before_step",
+    )
+    missing = [name for name in required if step.get(name) is None]
+    if missing:
+        raise RuntimeError(
+            "H1 exact protocol requires action-time trajectory fields; missing "
+            + ", ".join(missing)
+        )
+
+    ego = int(ego)
+    neighbor_ids = [int(j) for j in neighbor_ids]
+    actions = [int(a) for a in step["actions"]]
+    geom = step["geom_snapshot"]
+    observed_return = float(step["rewards"][ego])
+
+    behaviour_obs = []
+    policy_rows = []
+    for j in neighbor_ids:
+        action_j = actions[j]
+        behaviour_obs.append(float(step["behaviour_probs"][j][action_j]))
+        policy_rows.append(np.asarray(step["policy_probs"][j], dtype=np.float32))
+
+    old_effect_mode = getattr(runner.proxy, "effect_mode", None)
+    try:
+        runner.proxy.effect_mode = "signed_policy_contrast"
+        out = runner.proxy.score_batch_full(
+            obs_i_batch=[
+                tiny_env.get_obs_of_ego(step["obs_all"], ego)
+                for _ in neighbor_ids
+            ],
+            action_i_batch=[actions[ego] for _ in neighbor_ids],
+            observed_action_j_batch=[actions[j] for j in neighbor_ids],
+            z_core_excl_j_batch=[
+                step["core_context_excluding"][ego][j] for j in neighbor_ids
+            ],
+            m_periph_excl_j_batch=[
+                step["periph_context_excluding"][ego][j] for j in neighbor_ids
+            ],
+            belief_summary_batch=[
+                step["belief_summary_cache"][ego] for _ in neighbor_ids
+            ],
+            policy_probs_j_batch=policy_rows,
+            observed_returns_batch=[observed_return for _ in neighbor_ids],
+            behaviour_probs_obs_batch=behaviour_obs,
+            pair_feat_batch=[
+                build_pair_feat(
+                    geom["positions"], geom["agent_zone"], geom["grid_size"],
+                    geom["n_zones"], ego, j,
+                )
+                for j in neighbor_ids
+            ],
+        )
+    finally:
+        if old_effect_mode is not None:
+            runner.proxy.effect_mode = old_effect_mode
+
+    signed = {j: float(out["mu"][k]) for k, j in enumerate(neighbor_ids)}
+    learned = {
+        "signed": signed,
+        "magnitude": {j: abs(value) for j, value in signed.items()},
+        "range": {
+            j: float(out["mu_range"][k]) for k, j in enumerate(neighbor_ids)
+        },
+    }
+    sigmas = {j: float(out["sigma"][k]) for k, j in enumerate(neighbor_ids)}
+    metadata = {
+        "dr_applied": bool(out.get("dr_applied", False)),
+        "dr_applied_rows": int(out.get("dr_applied_rows", 0)),
+        "dr_clipped_rows": int(out.get("dr_clipped_rows", 0)),
+        "dr_raw_inverse_max": float(out.get("dr_raw_inverse_max", 0.0)),
+        "dr_correction_mean": float(np.mean(out["dr_correction"])),
+        "dr_weight_abs_mean": float(np.mean(np.abs(out["dr_weight"]))),
+        "propensity_min": float(np.min(behaviour_obs)),
+        "propensity_max": float(np.max(behaviour_obs)),
+    }
+    return learned, sigmas, metadata
+
+
+def _h1_one_step_oracle_scores(tiny_env, step, ego, neighbor_ids,
+                               candidate_actions):
+    """Exact one-step V_pi minus V_uniform controlled intervention.
+
+    All other agents retain their factual action.  The intervention changes
+    only neighbour ``j`` at the current step, and each candidate is evaluated
+    from the identical cloned RNG/environment state. Candidate outcomes are
+    weighted by the logged target policy pi and contrasted with a uniform
+    intervention q. With H=1 this matches the proxy target exactly and avoids
+    the previous mismatch where the oracle repeated the forced action for H
+    steps under a scripted future policy.
+    """
+    state = step["env_snapshot_before_step"]
+    factual_actions = [int(a) for a in step["actions"]]
+    ego = int(ego)
+
+    tiny_env.restore_state(state)
+    _, factual_rewards, _, _ = tiny_env.step(list(factual_actions))
+    factual_reward = float(factual_rewards[ego])
+    logged_reward = float(step["rewards"][ego])
+    replay_error = abs(factual_reward - logged_reward)
+
+    signed_scores = {}
+    magnitude_scores = {}
+    range_scores = {}
+
+    for j in neighbor_ids:
+        candidate_returns = []
+        for action in candidate_actions:
+            intervened = list(factual_actions)
+            intervened[int(j)] = int(action)
+            tiny_env.restore_state(state)
+            _, rewards, _, _ = tiny_env.step(intervened)
+            candidate_returns.append(float(rewards[ego]))
+
+        candidate_returns = np.asarray(candidate_returns, dtype=np.float64)
+        policy = np.asarray(step["policy_probs"][int(j)], dtype=np.float64)
+        policy = policy / np.clip(policy.sum(), 1e-12, None)
+        if policy.shape != candidate_returns.shape:
+            raise RuntimeError(
+                "H1 oracle action support does not match the logged policy: "
+                f"{candidate_returns.shape} versus {policy.shape}"
+            )
+        signed = float(
+            np.dot(policy, candidate_returns) - np.mean(candidate_returns)
+        )
+        signed_scores[int(j)] = signed
+        magnitude_scores[int(j)] = abs(signed)
+        range_scores[int(j)] = float(
+            np.max(candidate_returns) - np.min(candidate_returns)
+        )
+
+    tiny_env.restore_state(state)
+    return {
+        "signed": signed_scores,
+        "magnitude": magnitude_scores,
+        "range": range_scores,
+    }, float(replay_error)
+
+
+def _collect_h1_eval_steps(runner, n_states):
+    """Collect held-out factual steps and policy-return endpoints.
+
+    Episodes collected here are never added to proxy replay or used for an
+    optimizer update. Their mean per-agent return is therefore a held-out
+    endpoint that can be paired with the eps=0 arm to report the realised
+    return cost of forcing.
+    """
+    requested = int(max(1, n_states))
+    selected = []
+    episode_returns_mean_per_agent = []
+    attempts = 0
+
+    while len(selected) < requested and attempts < 8:
+        attempts += 1
+        trajectory, episode_reward, _ = runner.collect_episode()
+        if not trajectory:
+            continue
+        episode_returns_mean_per_agent.append(float(np.mean(
+            np.asarray(episode_reward, dtype=np.float64)
+        )))
+
+        remaining = requested - len(selected)
+        take = min(remaining, len(trajectory))
+        indices = np.linspace(0, len(trajectory) - 1, num=take, dtype=int)
+        for idx in dict.fromkeys(indices.tolist()):
+            selected.append(trajectory[int(idx)])
+            if len(selected) >= requested:
+                break
+
+    if len(selected) != requested:
+        raise RuntimeError(
+            f"H1 requested {requested} held-out states but collected "
+            f"{len(selected)}"
+        )
+    return selected, {
+        "heldout_policy_return_mean_per_agent": float(np.mean(
+            episode_returns_mean_per_agent
+        )),
+        "heldout_policy_return_std_per_agent": float(np.std(
+            episode_returns_mean_per_agent
+        )),
+        "heldout_policy_return_n_episodes": int(
+            len(episode_returns_mean_per_agent)
+        ),
+        "policy_return_endpoint_measured": bool(
+            episode_returns_mean_per_agent
+        ),
+    }
+
+
+def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
+    """Evaluate the confirmatory, estimand-aligned H1 protocol (H=1)."""
+    if int(args.tiny_horizon) != 1 or int(runner.proxy.n_horizons) != 1:
+        raise RuntimeError(
+            "Confirmatory H1 requires tiny_horizon=1 and proxy_n_horizons=1; "
+            f"received {args.tiny_horizon} and {runner.proxy.n_horizons}. "
+            "Multi-step policy rollouts are exploratory until a common-policy "
+            "clone protocol is implemented."
+        )
+
+    candidate_actions = _tiny_candidate_intervention_actions(tiny_env)
+    runner.proxy.candidate_actions = list(candidate_actions)
+    eval_steps, policy_return_metadata = _collect_h1_eval_steps(
+        runner, int(args.tiny_states)
+    )
+
+    rows = []
+    aggregate_rows = []
+    dr_rows = 0
+    dr_calls = 0
+    dr_clipped_rows = 0
+    dr_raw_inverse_maxes = []
+    replay_errors = []
+    propensity_mins = []
+    propensity_maxes = []
+    correction_means = []
+
+    for state_idx, step in enumerate(eval_steps):
+        if hasattr(tiny_env, "get_supported_egos"):
+            egos = list(tiny_env.get_supported_egos())
+        else:
+            egos = list(range(int(tiny_env.n_agents)))
+
+        for ego in egos:
+            ego = int(ego)
+            neighbor_ids = [
+                j for j in range(int(tiny_env.n_agents)) if j != ego
+            ]
+            learned_scores, sigmas, score_meta = _score_h1_logged_step(
+                runner, tiny_env, step, ego, neighbor_ids,
+            )
+            oracle_scores, replay_error = _h1_one_step_oracle_scores(
+                tiny_env, step, ego, neighbor_ids, candidate_actions,
+            )
+            replay_errors.append(replay_error)
+            propensity_mins.append(score_meta["propensity_min"])
+            propensity_maxes.append(score_meta["propensity_max"])
+            correction_means.append(score_meta["dr_correction_mean"])
+            dr_rows += int(score_meta["dr_applied_rows"])
+            dr_calls += int(score_meta["dr_applied"])
+            dr_clipped_rows += int(score_meta["dr_clipped_rows"])
+            dr_raw_inverse_maxes.append(score_meta["dr_raw_inverse_max"])
+
+            cal = oracle_calibration(
+                learned_scores=learned_scores["magnitude"],
+                oracle_scores=oracle_scores["magnitude"],
+                neighbor_ids=neighbor_ids,
+            )
+            signed_cal = _signed_calibration(
+                proxy_signed=learned_scores["signed"],
+                oracle_signed=oracle_scores["signed"],
+                neighbor_ids=neighbor_ids,
+            )
+            range_cal = oracle_calibration(
+                learned_scores=learned_scores["range"],
+                oracle_scores=oracle_scores["range"],
+                neighbor_ids=neighbor_ids,
+            )
+            top_k = int(max(
+                1, min(tiny_cfg.get("max_core_size", 4), len(neighbor_ids))
+            ))
+            core_f1 = oracle_core_f1_from_scores(
+                learned_scores=learned_scores["magnitude"],
+                oracle_scores=oracle_scores["magnitude"],
+                neighbor_ids=neighbor_ids,
+                top_k=top_k,
+            )
+
+            aggregate_row = {
+                "seed": int(args.seed),
+                "state_idx": int(state_idx),
+                "ego_id": ego,
+                "top_k": top_k,
+                "oracle_core_f1": float(core_f1),
+                "dr_applied": int(score_meta["dr_applied"]),
+                "dr_applied_rows": int(score_meta["dr_applied_rows"]),
+                "dr_clipped_rows": int(score_meta["dr_clipped_rows"]),
+                "dr_raw_inverse_max": float(score_meta["dr_raw_inverse_max"]),
+                "dr_correction_mean": score_meta["dr_correction_mean"],
+                "replay_consistency_abs_error": replay_error,
+            }
+            aggregate_row.update(cal)
+            aggregate_row.update(signed_cal)
+            aggregate_row.update({f"range_{k}": v for k, v in range_cal.items()})
+            aggregate_rows.append(aggregate_row)
+
+            for j in neighbor_ids:
+                rows.append({
+                    "seed": int(args.seed),
+                    "state_idx": int(state_idx),
+                    "ego_id": ego,
+                    "neighbor_id": int(j),
+                    "learned_score": float(learned_scores["magnitude"][j]),
+                    "oracle_score": float(oracle_scores["magnitude"][j]),
+                    "learned_signed": float(learned_scores["signed"][j]),
+                    "oracle_signed": float(oracle_scores["signed"][j]),
+                    "learned_range": float(learned_scores["range"][j]),
+                    "oracle_range": float(oracle_scores["range"][j]),
+                    "abs_error": float(abs(
+                        learned_scores["magnitude"][j]
+                        - oracle_scores["magnitude"][j]
+                    )),
+                    "signed_error": float(
+                        learned_scores["signed"][j]
+                        - oracle_scores["signed"][j]
+                    ),
+                    "proxy_sigma": float(sigmas[j]),
+                    "dr_applied": int(score_meta["dr_applied"]),
+                })
+
+    dr_requested = bool(runner.proxy.use_doubly_robust)
+    coverage = runner.proxy.get_action_coverage_diagnostics()
+    forcing_stats = runner.forcer.get_stats()
+    metadata = {
+        "protocol_name": "logged_one_step_policy_contrast_v1",
+        "protocol_match": True,
+        "confirmatory_horizon": 1,
+        "exploratory_h3_reported": False,
+        "context_source": "action_time_trajectory_cache",
+        "oracle_baseline": "uniform_action_policy",
+        "oracle_intervention": "V_pi_minus_V_uniform_current_action",
+        "factual_replay_role": "integrity_check_and_AIPW_observed_outcome",
+        "nuisance_training_score_mode": "plugin_fixed_across_ablation",
+        "candidate_actions": list(candidate_actions),
+        "candidate_action_count": int(len(candidate_actions)),
+        "proxy_action_count": int(runner.proxy.action_dim),
+        "dr_requested": dr_requested,
+        "dr_applied_calls_eval": int(dr_calls),
+        "dr_applied_rows_eval": int(dr_rows),
+        "dr_clipped_rows_eval": int(dr_clipped_rows),
+        "dr_clipping_fraction_eval": float(
+            dr_clipped_rows / max(1, dr_rows)
+        ),
+        "dr_raw_inverse_max_eval": float(
+            max(dr_raw_inverse_maxes, default=0.0)
+        ),
+        "proxy_iw_clip": float(runner.proxy.iw_clip),
+        "dr_exercised": bool((not dr_requested) or dr_rows > 0),
+        "dr_clipping_absent": bool((not dr_requested) or dr_clipped_rows == 0),
+        "replay_consistency_max_abs_error": float(max(replay_errors, default=0.0)),
+        "propensity_min_eval": float(min(propensity_mins, default=float("nan"))),
+        "propensity_max_eval": float(max(propensity_maxes, default=float("nan"))),
+        "dr_correction_mean_eval": float(np.mean(correction_means)) if correction_means else 0.0,
+        "action_coverage": coverage,
+        "actions_seen": int(coverage["actions_seen"]),
+        "min_action_fraction": float(coverage["min_action_fraction"]),
+        "forced_actions_seen": int(coverage["forced_actions_seen"]),
+        "min_forced_action_fraction": float(
+            coverage["min_forced_action_fraction"]
+        ),
+        "n_forced_proxy_samples": int(coverage["n_forced_samples"]),
+        "forcing_stats": forcing_stats,
+        "realised_forcing_rate": float(
+            forcing_stats["realised_forcing_rate"]
+        ),
+        "forcing_total_agent_steps": int(
+            forcing_stats["total_agent_steps"]
+        ),
+        "forcing_total_forced": int(forcing_stats["total_forced"]),
+        **policy_return_metadata,
+    }
+    metadata["alignment_protocol_gate_pass"] = bool(
+        metadata["protocol_match"]
+        and metadata["candidate_action_count"] == metadata["proxy_action_count"]
+        and metadata["dr_exercised"]
+        and metadata["replay_consistency_max_abs_error"] <= 1e-6
+        and metadata["propensity_min_eval"] > 0.0
+    )
+    metadata["action_coverage_gate_pass"] = bool(
+        coverage["actions_seen"] == runner.proxy.action_dim
+    )
+    # Backward-compatible process gate. Empirical coverage is scientific
+    # evidence, not a protocol-integrity condition: in particular, eps=0 is
+    # intentionally allowed to expose missing action support and must still be
+    # aggregatable as the observational control.
+    metadata["protocol_gate_pass"] = metadata["alignment_protocol_gate_pass"]
+    return rows, aggregate_rows, metadata
+
+
+def _evaluate_legacy_tiny_protocol(runner, tiny_env, args, tiny_cfg):
+    """Retain the historical state-bank diagnostic for non-H1 CLI callers.
+
+    This path is explicitly marked as non-confirmatory because its restored
+    environment state is not accompanied by matching relational caches or an
+    observed outcome/propensity for the AIPW correction.
+    """
+    try:
+        state_bank = tiny_env.sample_state_bank(
+            n_states=int(args.tiny_states), burn_in=int(args.tiny_burn_in),
+        )
+    except TypeError:
+        state_bank = tiny_env.sample_state_bank(
+            int(args.tiny_states), int(args.tiny_burn_in),
+        )
+
+    rows = []
+    aggregate_rows = []
+    for state_idx, state in enumerate(state_bank):
+        tiny_env.restore_state(state)
+        egos = (
+            list(tiny_env.get_supported_egos())
+            if hasattr(tiny_env, "get_supported_egos")
+            else list(range(int(tiny_env.n_agents)))
+        )
+        for ego in egos:
+            ego = int(ego)
+            neighbor_ids = [j for j in range(int(tiny_env.n_agents)) if j != ego]
+            learned_scores, sigmas = _score_learned_proxy_for_state(
+                runner, tiny_env, state, ego, neighbor_ids,
+            )
+            oracle_scores = _compute_tiny_oracle_scores(
+                tiny_env, state, ego, neighbor_ids, tiny_cfg,
+                int(args.tiny_horizon),
+            )
+            cal = oracle_calibration(
+                learned_scores["magnitude"], oracle_scores["magnitude"],
+                neighbor_ids,
+            )
+            signed_cal = _signed_calibration(
+                learned_scores["signed"], oracle_scores["signed"], neighbor_ids,
+            )
+            range_cal = oracle_calibration(
+                learned_scores["range"], oracle_scores["range"], neighbor_ids,
+            )
+            top_k = int(max(
+                1, min(tiny_cfg.get("max_core_size", 4), len(neighbor_ids))
+            ))
+            core_f1 = oracle_core_f1_from_scores(
+                learned_scores["magnitude"], oracle_scores["magnitude"],
+                neighbor_ids, top_k,
+            )
+            aggregate_row = {
+                "seed": int(args.seed), "state_idx": int(state_idx),
+                "ego_id": ego, "top_k": top_k,
+                "oracle_core_f1": float(core_f1),
+            }
+            aggregate_row.update(cal)
+            aggregate_row.update(signed_cal)
+            aggregate_row.update({f"range_{k}": v for k, v in range_cal.items()})
+            aggregate_rows.append(aggregate_row)
+
+            for j in neighbor_ids:
+                rows.append({
+                    "seed": int(args.seed), "state_idx": int(state_idx),
+                    "ego_id": ego, "neighbor_id": int(j),
+                    "learned_score": float(learned_scores["magnitude"].get(j, 0.0)),
+                    "oracle_score": float(oracle_scores["magnitude"].get(j, 0.0)),
+                    "learned_signed": float(learned_scores["signed"].get(j, 0.0)),
+                    "oracle_signed": float(oracle_scores["signed"].get(j, 0.0)),
+                    "learned_range": float(learned_scores["range"].get(j, 0.0)),
+                    "oracle_range": float(oracle_scores["range"].get(j, 0.0)),
+                    "abs_error": float(abs(
+                        learned_scores["magnitude"].get(j, 0.0)
+                        - oracle_scores["magnitude"].get(j, 0.0)
+                    )),
+                    "signed_error": float(
+                        learned_scores["signed"].get(j, 0.0)
+                        - oracle_scores["signed"].get(j, 0.0)
+                    ),
+                    "proxy_sigma": float(sigmas.get(j, 0.0)),
+                })
+
+    metadata = {
+        "protocol_name": "legacy_scripted_state_bank",
+        "protocol_match": False,
+        "alignment_protocol_gate_pass": False,
+        "action_coverage_gate_pass": False,
+        "protocol_gate_pass": False,
+        "confirmatory_horizon": None,
+        "dr_requested": bool(runner.proxy.use_doubly_robust),
+        "dr_applied_calls_eval": 0,
+        "dr_applied_rows_eval": 0,
+        "dr_exercised": not bool(runner.proxy.use_doubly_robust),
+        "protocol_warning": (
+            "Legacy diagnostic only: action-time contexts and AIPW inputs are "
+            "not aligned. Do not use these metrics for H1."
+        ),
+        "action_coverage": runner.proxy.get_action_coverage_diagnostics(),
+    }
+    return rows, aggregate_rows, metadata
+
+
 def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
     """
     Post-hoc tiny-oracle calibration/evaluation protocol.
@@ -1596,107 +2102,14 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
         device=device,
     )
 
-    try:
-        state_bank = tiny_env.sample_state_bank(
-            n_states=int(args.tiny_states),
-            burn_in=int(args.tiny_burn_in),
+    if bool(getattr(args, "h1_exact_protocol", False)):
+        rows, aggregate_rows, protocol_metadata = _evaluate_h1_exact_protocol(
+            runner, tiny_env, args, tiny_cfg,
         )
-    except TypeError:
-        state_bank = tiny_env.sample_state_bank(
-            int(args.tiny_states),
-            int(args.tiny_burn_in),
+    else:
+        rows, aggregate_rows, protocol_metadata = _evaluate_legacy_tiny_protocol(
+            runner, tiny_env, args, tiny_cfg,
         )
-
-    rows = []
-    aggregate_rows = []
-
-    for state_idx, state in enumerate(state_bank):
-        tiny_env.restore_state(state)
-
-        if hasattr(tiny_env, "get_supported_egos"):
-            egos = list(tiny_env.get_supported_egos())
-        else:
-            egos = list(range(int(tiny_env.n_agents)))
-
-        for ego in egos:
-            ego = int(ego)
-            neighbor_ids = [j for j in range(int(tiny_env.n_agents)) if j != ego]
-
-            learned_scores, sigmas = _score_learned_proxy_for_state(
-                runner=runner,
-                tiny_env=tiny_env,
-                state=state,
-                ego=ego,
-                neighbor_ids=neighbor_ids,
-            )
-
-            oracle_scores = _compute_tiny_oracle_scores(
-                tiny_env=tiny_env,
-                state=state,
-                ego=ego,
-                neighbor_ids=neighbor_ids,
-                cfg=tiny_cfg,
-                tiny_horizon=int(args.tiny_horizon),
-            )
-
-            cal = oracle_calibration(
-                learned_scores=learned_scores["magnitude"],
-                oracle_scores=oracle_scores["magnitude"],
-                neighbor_ids=neighbor_ids,
-            )
-            signed_cal = _signed_calibration(
-                proxy_signed=learned_scores["signed"],
-                oracle_signed=oracle_scores["signed"],
-                neighbor_ids=neighbor_ids,
-            )
-
-            range_cal = oracle_calibration(
-                learned_scores=learned_scores["range"],
-                oracle_scores=oracle_scores["magnitude"],
-                neighbor_ids=neighbor_ids,
-            )
-
-            top_k = int(max(1, min(tiny_cfg.get("max_core_size", 4), len(neighbor_ids))))
-
-            core_f1 = oracle_core_f1_from_scores(
-                learned_scores=learned_scores["magnitude"],
-                oracle_scores=oracle_scores["magnitude"],
-                neighbor_ids=neighbor_ids,
-                top_k=top_k,
-            )
-
-            aggregate_row = {
-                "seed": int(args.seed),
-                "state_idx": int(state_idx),
-                "ego_id": int(ego),
-                "top_k": int(top_k),
-                "oracle_core_f1": float(core_f1),
-            }
-            aggregate_row.update(cal)
-            aggregate_row.update(signed_cal)
-            aggregate_row.update({
-                f"range_{k}": v for k, v in range_cal.items()
-            })
-            aggregate_rows.append(aggregate_row)
-
-            for j in neighbor_ids:
-                rows.append(
-                    {
-                        "seed": int(args.seed),
-                        "state_idx": int(state_idx),
-                        "ego_id": int(ego),
-                        "neighbor_id": int(j),
-                        "learned_score": float(learned_scores["magnitude"].get(j, 0.0)),
-                        "oracle_score": float(oracle_scores["magnitude"].get(j, 0.0)),
-                        "learned_signed": float(learned_scores["signed"].get(j, 0.0)),
-                        "oracle_signed": float(oracle_scores["signed"].get(j, 0.0)),
-                        "learned_range": float(learned_scores["range"].get(j, 0.0)),
-                        "oracle_range": float(oracle_scores["range"].get(j, 0.0)),
-                        "abs_error": float(abs(learned_scores["magnitude"].get(j, 0.0) - oracle_scores["magnitude"].get(j, 0.0))),
-                        "signed_error": float(learned_scores["signed"].get(j, 0.0) - oracle_scores["signed"].get(j, 0.0)),
-                        "proxy_sigma": float(sigmas.get(j, 0.0)),
-                    }
-                )
 
     save_csv(rows, os.path.join(out_dir, "tiny_oracle_pair_rows.csv"))
     save_csv(aggregate_rows, os.path.join(out_dir, "tiny_oracle_calibration_by_state.csv"))
@@ -1712,13 +2125,13 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
         "proxy_buffer_size": int(runner.proxy.get_buffer_size()),
         "tiny_proxy_train_episodes": int(args.tiny_proxy_train_episodes),
         "note": (
-            "learned_score is computed from a tiny-environment calibration "
-            "FinalCIGAMFRunner.proxy.score_pair on the same sampled tiny-oracle "
-            "state and pair. Oracle intervention scores are used only for "
-            "post-hoc evaluation/calibration metrics, not as training labels for "
-            "the main-environment runner."
+            "Oracle intervention scores are used only for held-out post-hoc "
+            "evaluation, never as policy or proxy training labels. Confirmatory "
+            "H1 additionally requires protocol_match=true and "
+            "protocol_gate_pass=true."
         ),
     }
+    summary.update(protocol_metadata)
 
     numeric_keys = [
         "bias",
@@ -1772,7 +2185,18 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
     print(f"sign_agreement_mean={summary.get('sign_agreement_mean', 0.0):.4f}")
     print(f"oracle_core_f1_mean={summary.get('oracle_core_f1_mean', 0.0):.4f}")
     print(f"mae_mean={summary.get('mae_mean', 0.0):.4f}")
+    print(f"protocol={summary.get('protocol_name', 'unknown')}")
+    print(f"protocol_gate_pass={summary.get('protocol_gate_pass', False)}")
+    print(f"dr_applied_rows_eval={summary.get('dr_applied_rows_eval', 0)}")
     print(f"Saved tiny oracle results to: {out_dir}")
+
+    if bool(getattr(args, "h1_exact_protocol", False)) and not bool(
+        summary.get("protocol_gate_pass", False)
+    ):
+        raise RuntimeError(
+            "H1 protocol gate failed; the saved metrics are diagnostic only and "
+            "must not be aggregated as confirmatory evidence."
+        )
 
     del runner
     del tiny_env

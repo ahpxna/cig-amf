@@ -21,16 +21,18 @@ free here because the simulator is under experimental control.
 =============================================================================
 IMPORTANT CONSEQUENCE: PROPENSITY IS EXACT
 =============================================================================
-The effective behaviour policy of agent j at step t is the mixture
+Before the forcing indicator is realised, the marginal behaviour policy of
+agent j at step t is the mixture
 
-    b_j(a | s) = eps * (1/|A|) + (1 - eps) * pi_j(a | s)  if j is forced
-    b_j(a | s) = pi_j(a | s)                              otherwise.
+    b_j(a | s) = eps * (1/|A|) + (1 - eps) * pi_j(a | s).
 
 b_j is KNOWN EXACTLY because pi_j is the learner's own network and eps is a
 chosen constant. Propensity normally has to be estimated in off-policy
-evaluation and is a major source of error. Here it is exact, so the doubly
-robust estimator in structural_proxy_v2.py needs only one of its two models
-to be correct, and one of them is already correct by construction.
+evaluation and is a major source of error. Here it is exact, so the augmented
+inverse-propensity term can use the logged data-generating probability. This
+does not by itself make a row-level conditional effect doubly robust; that
+requires an orthogonal second-stage learner or aggregation over repeated
+contexts.
 
 Epsilon forcing also guarantees the POSITIVITY/OVERLAP assumption:
 
@@ -328,14 +330,11 @@ class EpsilonForcedActionController:
             actions[int(j)] = int(self.rng.randint(0, self.action_dim))
 
         # ---- 3. Compute effective propensities ---------------------------
-        # For an UNFORCED agent: b = pi
-        # For a FORCED agent:   b = eps * uniform + (1-eps) * pi
-        #
-        # Subtle point: use the mixture formula for a forced agent, not the
-        # pure uniform distribution. From the estimator's perspective, the
-        # data-generating process is "uniform with probability eps, otherwise
-        # pi." Its marginal action distribution is the correct propensity for
-        # importance weighting.
+        # The returned value is the MARGINAL propensity before the forcing
+        # indicator is realised, so every row receives
+        # b = eps * uniform + (1-eps) * pi. Conditional on F=1 the action
+        # distribution is pure uniform; conditional on F=0 it is pi. Mixing
+        # those two notions after observing F would yield the wrong weight.
         uniform = np.full(
             (self.n_agents, self.action_dim),
             1.0 / float(self.action_dim),

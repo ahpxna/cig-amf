@@ -23,6 +23,14 @@ from models.drift_probe import DriftDetector, MatrixDriftDetector
 from models.reciprocity import ReciprocityTracker
 
 
+def _current_behavioral_phase(env):
+    """Return the policy-execution phase active in the collected episode."""
+    phase_fn = getattr(env, "_behaviour_mode", None)
+    if callable(phase_fn):
+        return str(phase_fn())
+    return str(getattr(env, "mode", "unknown"))
+
+
 class FinalCIGAMFRunner:
     """
     Final CIG-AMF runner.
@@ -104,7 +112,9 @@ class FinalCIGAMFRunner:
             # v2 defaults match structural_proxy.py and preserve behaviour
             # when the configuration omits them.
             n_horizons=cfg.get("proxy_n_horizons", 3),
-            effect_mode=cfg.get("proxy_effect_mode", "signed_aristocrat"),
+            effect_mode=cfg.get(
+                "proxy_effect_mode", "signed_policy_contrast"
+            ),
             use_doubly_robust=cfg.get("proxy_use_doubly_robust", True),
             iw_clip=cfg.get("proxy_iw_clip", 10.0),
             bootstrap_ratio=cfg.get("proxy_bootstrap_ratio", 0.8),
@@ -144,6 +154,12 @@ class FinalCIGAMFRunner:
             # The No-AuxLoss ablation then disabled only L_lb while L_orth
             # remained active, failing to isolate Eq. 26-27 L_aux.
             orth_coeff=cfg.get("periph_orth_coeff", 1e-2),
+            routing_mode=cfg.get("periph_routing_mode", "semantic"),
+            signature_mode=cfg.get("periph_signature_mode", "full"),
+            require_full_signature=cfg.get(
+                "periph_require_full_signature", False
+            ),
+            allow_legacy_items=cfg.get("periph_allow_legacy_items", True),
         ).to(device)
 
         self.belief_summary_builder = BeliefSummaryBuilder(
@@ -291,6 +307,15 @@ class FinalCIGAMFRunner:
             "promoted": [],
             "demoted": [],
         }
+
+        # ``run`` is intentionally re-entrant because the H2/H3 protocols
+        # inspect the runner at fixed evaluation boundaries.  Episode numbers
+        # therefore belong to the runner, not to an individual ``run`` call.
+        # ``episode_events`` retains the per-episode event stream even when
+        # scalar metrics are sampled less frequently through ``eval_every``.
+        self.episodes_completed = 0
+        self.episode_events = []
+        self._last_behavioral_phase = None
 
     # ============================================================
     # Construction helpers
@@ -447,6 +472,10 @@ class FinalCIGAMFRunner:
             env=self.env,
             belief_state=belief_state,
             prev_core_set=belief_mod.prev_core_set,
+            influence_signatures={
+                int(j): self.sig_tracker.get_signature(ego, j)
+                for j in periph_ids
+            },
         )
 
     def _periph_summary_tensor_from_inputs(self, inputs):
@@ -493,6 +522,13 @@ class FinalCIGAMFRunner:
         reduced = [x for x in core_set if x != exclude_j]
         return self.pair_rel_module.get_core_summary(ego, reduced)
 
+    def _reset_exclusion_caches(self):
+        """Invalidate action-time contexts whenever state or signatures move."""
+        self._core_excl_cache_key = None
+        self._core_excl_cache = {}
+        self._periph_excl_cache_key = None
+        self._periph_excl_cache = {}
+
     def _periph_context_excluding(self, ego, exclude_j):
         """
         [GPU_OPTIMIZATION_CONTRACT.md section 2.1] The old path ran full
@@ -519,6 +555,10 @@ class FinalCIGAMFRunner:
                     env=self.env,
                     belief_state=belief_state,
                     prev_core_set=belief_mod.prev_core_set,
+                    influence_signatures={
+                        int(j): self.sig_tracker.get_signature(ego, j)
+                        for j in periph_ids
+                    },
                 )
                 raw = self.periph_module.forward_excluding_all(inputs, periph_ids)
                 if raw:
@@ -551,6 +591,10 @@ class FinalCIGAMFRunner:
             env=self.env,
             belief_state=belief_state,
             prev_core_set=belief_mod.prev_core_set,
+            influence_signatures={
+                int(j): self.sig_tracker.get_signature(ego, j)
+                for j in periph_ids_reduced
+            },
         )
         return self._periph_summary_np_from_inputs(inputs)
 
@@ -567,6 +611,10 @@ class FinalCIGAMFRunner:
         match action-time context.
         """
         actions = {}
+        # Core latents, geometry, last actions, beliefs, and influence
+        # signatures all change over time. Set-membership-only cache keys are
+        # therefore insufficient across action-selection calls.
+        self._reset_exclusion_caches()
 
         cache = {
             "belief_items_cache": {},
@@ -583,7 +631,9 @@ class FinalCIGAMFRunner:
             # Cost is negligible: 24 coordinates and 24 zone IDs per timestep.
             "geom_snapshot": {
                 "positions": [list(self.env.positions[i]) for i in range(self.env.n_agents)],
-                "agent_zone": [int(z) for z in self.env.agent_zone],
+                "agent_zone": [
+                    int(self.env.agent_zone[i]) for i in range(self.n_agents)
+                ],
                 "grid_size": int(getattr(self.env, "grid_size", 1)),
                 "n_zones": int(getattr(self.env, "n_zones", 1)),
             },
@@ -1160,7 +1210,14 @@ class FinalCIGAMFRunner:
 
         return int(pushed)
 
-    def _score_all_pairs_and_update_beliefs(self, obs_all, actions, observed_returns=None, behaviour_probs=None):
+    def _score_all_pairs_and_update_beliefs(
+        self,
+        obs_all,
+        actions,
+        observed_returns=None,
+        behaviour_probs=None,
+        policy_probs=None,
+    ):
         """
         Score every directed pair (ego,j) and update Bayes-light beliefs.
 
@@ -1168,6 +1225,11 @@ class FinalCIGAMFRunner:
         Z_i^{-j}, M_i^{-j}, B_i; update beliefs followed by hysteresis; and
         warm-start z_ij from shadow when j enters the core.
         """
+        # Graph scoring restores historical environment snapshots and updates
+        # signatures between score points, so no exclusion context may be
+        # reused from action selection or a previous historical timestep.
+        self._reset_exclusion_caches()
+
         total_promoted = 0
         total_demoted = 0
 
@@ -1205,6 +1267,7 @@ class FinalCIGAMFRunner:
             # Prepare optional DR inputs: observed_returns and behaviour_probs
             observed_returns_batch = None
             behaviour_probs_obs_batch = None
+            policy_probs_j_batch = None
 
             if observed_returns is not None:
                 try:
@@ -1227,6 +1290,26 @@ class FinalCIGAMFRunner:
                         bp = None
                     behaviour_probs_obs_batch.append(bp)
 
+            if policy_probs is not None:
+                candidate_policy_rows = []
+                policy_rows_valid = True
+                for j in neighbor_ids:
+                    try:
+                        row = np.asarray(
+                            policy_probs[j], dtype=np.float32
+                        ).reshape(-1)
+                        if (
+                            row.shape != (self.action_dim,)
+                            or not np.all(np.isfinite(row))
+                        ):
+                            policy_rows_valid = False
+                    except Exception:
+                        row = None
+                        policy_rows_valid = False
+                    candidate_policy_rows.append(row)
+                if policy_rows_valid:
+                    policy_probs_j_batch = candidate_policy_rows
+
             # score_batch_full accepts optional DR inputs without changing
             # output when they are absent.
             out = self.proxy.score_batch_full(
@@ -1236,7 +1319,7 @@ class FinalCIGAMFRunner:
                 z_core_excl_j_batch=z_batch,
                 m_periph_excl_j_batch=m_batch,
                 belief_summary_batch=b_batch,
-                policy_probs_j_batch=None,
+                policy_probs_j_batch=policy_probs_j_batch,
                 observed_returns_batch=observed_returns_batch,
                 behaviour_probs_obs_batch=behaviour_probs_obs_batch,
                 # [FIX-X1] Build x_ij from current online environment state
@@ -1335,12 +1418,14 @@ class FinalCIGAMFRunner:
             self.env.restore_state(step["env_snapshot_before_step"])
             observed_returns = h_returns[int(idx)] if h_returns is not None else None
             behaviour_probs = step.get("behaviour_probs") if isinstance(step, dict) else None
+            policy_probs = step.get("policy_probs") if isinstance(step, dict) else None
 
             p_i, d_i, w_i = self._score_all_pairs_and_update_beliefs(
                 obs_all=step["obs_all"],
                 actions=step["actions"],
                 observed_returns=observed_returns,
                 behaviour_probs=behaviour_probs,
+                policy_probs=policy_probs,
             )
             promoted += int(p_i)
             demoted += int(d_i)
@@ -1526,6 +1611,10 @@ class FinalCIGAMFRunner:
     # Main loop
     # ============================================================
 
+    def _should_update_graph_this_episode(self):
+        """Return the graph-update cadence selected by the scheduler."""
+        return self.scheduler.should_update_graph()
+
     def run(self, n_episodes=100, eval_every=10):
         """
         Main training loop.
@@ -1540,7 +1629,19 @@ class FinalCIGAMFRunner:
         7. scheduler.step_episode().
         8. if Stage 0 -> Stage 1 transition happened, reset switch counters.
         """
-        for ep in range(int(n_episodes)):
+        n_episodes = int(n_episodes)
+        eval_every = int(eval_every)
+        if n_episodes < 0:
+            raise ValueError("n_episodes must be non-negative")
+        if eval_every <= 0:
+            raise ValueError("eval_every must be positive")
+
+        for local_ep in range(n_episodes):
+            # One-based global numbering preserves the environment's exact
+            # reset semantics: behavioral phase 1 begins in episode 40, while
+            # the structural relocation after 40 completed episodes is logged
+            # in episode 41.
+            episode_number = int(self.episodes_completed) + 1
             stage_before_episode_step = int(self.scheduler.stage)
 
             trajectory, episode_reward, runtime = self.collect_episode()
@@ -1580,7 +1681,7 @@ class FinalCIGAMFRunner:
                 "demoted": 0,
             }
 
-            if self.scheduler.should_update_graph():
+            if self._should_update_graph_this_episode():
                 t_graph = time.time()
                 graph_info = self.update_graph_modules(trajectory)
                 graph_runtime = time.time() - t_graph
@@ -1623,7 +1724,14 @@ class FinalCIGAMFRunner:
 
             # 3. Define trigger conditions.
             is_stage_transition = (stage_before_episode_step == 0 and stage_after_episode_step == 1)
-            is_periodic_calib = (stage_after_episode_step == 1 and ep > 0 and (ep % 5 == 0 if ep <= 30 else ep % 25 == 0))
+            is_periodic_calib = (
+                stage_after_episode_step == 1
+                and (
+                    episode_number % 5 == 0
+                    if episode_number <= 30
+                    else episode_number % 25 == 0
+                )
+            )
             is_reactive_calib = (self._consecutive_zero_max_p >= 3)
             
             # Update the multiplier while retaining collapse state.
@@ -1640,7 +1748,7 @@ class FinalCIGAMFRunner:
             # 4. Perform calibration.
             if is_stage_transition or is_periodic_calib or is_reactive_calib:
                 calib_reason = "Stage Transition" if is_stage_transition else ("Periodic" if is_periodic_calib else "Reactive (max_p=0)")
-                print(f"\n[STEP 0 DIAGNOSTIC] --- Threshold Calibration Triggered at Ep {ep} | Reason: {calib_reason} ---")
+                print(f"\n[STEP 0 DIAGNOSTIC] --- Threshold Calibration Triggered at Ep {episode_number} | Reason: {calib_reason} ---")
 
                 try:
                     calib = self.sig_tracker.auto_calibrate()
@@ -1715,8 +1823,38 @@ class FinalCIGAMFRunner:
                     print(f"   [ERROR] Calibration failed (Count: {self._calib_fail_count}/3): {e}")
             # End runner calibration patch.
 
-            if ep % int(eval_every) == 0:
-                self.history["episodes"].append(ep)
+            last_info = trajectory[-1].get("info", {}) if trajectory else {}
+            structural_shift_magnitude = float(
+                last_info.get("delta_phi_frobenius_structural", 0.0) or 0.0
+            )
+            behavioral_phase = _current_behavioral_phase(getattr(self, "env", None))
+            behavioral_shift = int(
+                getattr(self, "_last_behavioral_phase", None) is not None
+                and behavioral_phase != self._last_behavioral_phase
+            )
+            self._last_behavioral_phase = behavioral_phase
+            self.episode_events.append({
+                "episode": episode_number,
+                "triggered": int(graph_info["triggered"]),
+                "trigger_count": int(trigger_count_now),
+                "structural_shift": int(structural_shift_magnitude > 0.0),
+                "structural_shift_magnitude": structural_shift_magnitude,
+                "behavioral_phase": behavioral_phase,
+                "behavioral_shift": behavioral_shift,
+                "mean_f1": float(snapshot["mean_f1"]),
+                "mean_reward": float(snapshot["mean_reward"]),
+            })
+            self.episodes_completed = episode_number
+
+            # Always retain the terminal point of a call.  This preserves an
+            # exact chunk-boundary snapshot without resetting the global
+            # evaluation cadence when ``run`` is called repeatedly.
+            should_record = (
+                episode_number % eval_every == 0
+                or local_ep == n_episodes - 1
+            )
+            if should_record:
+                self.history["episodes"].append(episode_number)
                 self.history["mean_reward"].append(snapshot["mean_reward"])
                 self.history["reward_per_agent"].append(snapshot["reward_per_agent"])
                 self.history["mean_f1"].append(snapshot["mean_f1"])
@@ -1794,7 +1932,7 @@ class FinalCIGAMFRunner:
                 self.history["demoted"].append(int(graph_info["demoted"]))
 
                 print(
-                    f"[Final-CIGAMF ep {ep:04d}] "
+                    f"[Final-CIGAMF ep {episode_number:04d}] "
                     f"stage={stage_now} "
                     f"reward={snapshot['mean_reward']:.3f} "
                     f"f1={snapshot['mean_f1']:.3f} "
@@ -1819,3 +1957,22 @@ class FinalCIGAMFRunner:
                 )
 
         return self.history
+
+
+class NoTwoTimescaleRunner(FinalCIGAMFRunner):
+    """Faithful scheduler-only ablation of Final CIG-AMF.
+
+    Every model, estimator, forced-action propensity, signature tracker,
+    auxiliary loss, and policy input is inherited unchanged. The only
+    intervention is removal of the slow graph cadence and Stage-0 delay:
+    structure modules update every episode from the start.
+    """
+
+    ablation_contract = "scheduler_only_graph_update_every_episode"
+
+    def __init__(self, env, cfg, device="cpu"):
+        super().__init__(env=env, cfg=cfg, device=device)
+        self.scheduler.force_learned_stage()
+
+    def _should_update_graph_this_episode(self):
+        return True

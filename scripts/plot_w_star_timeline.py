@@ -72,6 +72,12 @@ def main():
     ap.add_argument("--declared", type=int, default=8)
     ap.add_argument("--control", type=int, default=8)
     ap.add_argument("--seed", type=int, default=123)
+    ap.add_argument(
+        "--out-dir",
+        type=str,
+        default=os.path.join(ROOT, "results", "figures"),
+        help="Directory for the figure; defaults to results/figures.",
+    )
     a = ap.parse_args()
 
     tag = a.tag or ("before" if a.no_sgtp else "after")
@@ -116,7 +122,7 @@ def main():
     ax2.set_xlabel("timestep trong episode")
     ax2.grid(alpha=0.3)
 
-    out_dir = os.path.join(ROOT, "results", "figures")
+    out_dir = os.path.abspath(os.path.expanduser(a.out_dir))
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, f"w_star_timeline_{tag}.png")
     fig.tight_layout()
