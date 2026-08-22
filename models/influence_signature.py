@@ -4,8 +4,8 @@ influence_signature.py — CAUSAL INFLUENCE SIGNATURES, the central novelty.
 =============================================================================
 ONE-SENTENCE IDEA
 =============================================================================
-Do not compress a neighbour's influence into ONE scalar. Retain a
-MULTIDIMENSIONAL PROFILE and use it to assign ego-centric functional roles.
+Do not compress a neighbour's response into one scalar. Retain structural
+capacity, behavioural direction, separate uncertainties, and contextuality.
 
 =============================================================================
 WHY ONE SCALAR IS INSUFFICIENT
@@ -31,11 +31,11 @@ context-dependent sign, delay, and variability.
 =============================================================================
 THE FIVE SIGNATURE DIMENSIONS
 =============================================================================
-  0. signed_mu       — sign and magnitude of influence (help or harm)
-  1. abs_mu          — pure magnitude, used for magnitude/core selection
-  2. sigma           — epistemic uncertainty from ensemble disagreement
-  3. temporal_std    — variation over TIME: whether j's behaviour is stable
-  4. context_std     — variation across CONTEXTS: whether influence is conditional
+  0. C               — standardised structural causal capacity
+  1. D               — current-policy behavioural direction
+  2. sigma_C         — uncertainty of capacity
+  3. sigma_D         — uncertainty of direction
+  4. v_ctx           — variation of capacity across contexts
 
 Dimensions 3 and 4 are fundamentally different and easy to confuse:
   - high temporal_std = "strong influence today, weak tomorrow" -> UNSTABLE
@@ -91,13 +91,7 @@ import numpy as np
 SIGNATURE_DIM = 5
 
 # Dimension names used in the paper's centroid heat map.
-SIGNATURE_NAMES = (
-    "signed_mu",
-    "abs_mu",
-    "sigma",
-    "temporal_std",
-    "context_std",
-)
+SIGNATURE_NAMES = ("capacity", "direction", "sigma_capacity", "sigma_direction", "context_std")
 
 # Role labels.
 ROLE_BENEFICIAL = 0   # Strong positive influence.
@@ -160,12 +154,15 @@ class InfluenceSignatureTracker:
         self.normalise = bool(normalise)
         self.eps = float(eps)
 
-        # history[(i,j)] stores a deque of recent signed_mu observations.
-        self._mu_hist: Dict[Tuple[int, int], deque] = {}
-        self._sigma_hist: Dict[Tuple[int, int], deque] = {}
+        # C and D must remain distinct: C tracks standardised structural
+        # capacity, while D tracks the current execution policy's direction.
+        self._capacity_hist: Dict[Tuple[int, int], deque] = {}
+        self._direction_hist: Dict[Tuple[int, int], deque] = {}
+        self._sigma_capacity_hist: Dict[Tuple[int, int], deque] = {}
+        self._sigma_direction_hist: Dict[Tuple[int, int], deque] = {}
 
-        # context_mu[(i,j)][ctx] stores mu observations from context ctx.
-        self._context_mu: Dict[Tuple[int, int], Dict] = {}
+        # Contextuality is defined on C, not policy-dependent D.
+        self._context_capacity: Dict[Tuple[int, int], Dict] = {}
 
         self._n_obs: Dict[Tuple[int, int], int] = {}
 
@@ -177,12 +174,21 @@ class InfluenceSignatureTracker:
         self,
         ego_id: int,
         neighbor_id: int,
-        signed_mu: float,
-        sigma: float,
+        signed_mu: Optional[float] = None,
+        sigma: Optional[float] = None,
         context_key=None,
+        *,
+        capacity: Optional[float] = None,
+        direction: Optional[float] = None,
+        sigma_capacity: Optional[float] = None,
+        sigma_direction: Optional[float] = None,
     ):
         """
-        Record one influence observation for the (ego, neighbour) pair.
+        Record one C/D response-profile observation for the pair.
+
+        ``signed_mu``/``sigma`` are legacy aliases for direction and its
+        uncertainty.  Their fallback capacity is ``abs(direction)`` so older
+        callers remain executable but cannot be used for a C/D claim.
 
         context_key:
             Any hashable context identifier: a zone ID, a coarse hash of
@@ -191,23 +197,36 @@ class InfluenceSignatureTracker:
         """
         key = (int(ego_id), int(neighbor_id))
 
-        if key not in self._mu_hist:
-            self._mu_hist[key] = deque(maxlen=self.window)
-            self._sigma_hist[key] = deque(maxlen=self.window)
-            self._context_mu[key] = {}
+        if capacity is None:
+            capacity = abs(float(0.0 if signed_mu is None else signed_mu))
+        if direction is None:
+            direction = float(0.0 if signed_mu is None else signed_mu)
+        if sigma_capacity is None:
+            sigma_capacity = float(0.0 if sigma is None else sigma)
+        if sigma_direction is None:
+            sigma_direction = float(0.0 if sigma is None else sigma)
+
+        if key not in self._capacity_hist:
+            self._capacity_hist[key] = deque(maxlen=self.window)
+            self._direction_hist[key] = deque(maxlen=self.window)
+            self._sigma_capacity_hist[key] = deque(maxlen=self.window)
+            self._sigma_direction_hist[key] = deque(maxlen=self.window)
+            self._context_capacity[key] = {}
             self._n_obs[key] = 0
 
-        self._mu_hist[key].append(float(signed_mu))
-        self._sigma_hist[key].append(float(sigma))
+        self._capacity_hist[key].append(max(0.0, float(capacity)))
+        self._direction_hist[key].append(float(direction))
+        self._sigma_capacity_hist[key].append(max(0.0, float(sigma_capacity)))
+        self._sigma_direction_hist[key].append(max(0.0, float(sigma_direction)))
         self._n_obs[key] += 1
 
         if context_key is not None:
-            ctx = self._context_mu[key]
+            ctx = self._context_capacity[key]
 
             if context_key not in ctx:
                 ctx[context_key] = deque(maxlen=self.window)
 
-            ctx[context_key].append(float(signed_mu))
+            ctx[context_key].append(max(0.0, float(capacity)))
 
     def update_from_proxy_output(
         self,
@@ -224,18 +243,19 @@ class InfluenceSignatureTracker:
             proxy_out: Dictionary from score_batch_full; requires mu and sigma.
             context_keys: List of length B, or None.
         """
-        mu = np.asarray(proxy_out["mu"]).reshape(-1)            # [B]
-        sigma = np.asarray(proxy_out["sigma"]).reshape(-1)      # [B]
-        _unused_latency = np.asarray(
-            proxy_out.get("latency", np.zeros_like(mu))
-        ).reshape(-1)                                            # [B]
+        d_mu = np.asarray(proxy_out.get("d_mu", proxy_out["mu"])).reshape(-1)
+        d_sigma = np.asarray(proxy_out.get("d_sigma", proxy_out["sigma"])).reshape(-1)
+        c_mu = np.asarray(proxy_out.get("c_mu", proxy_out.get("mu_range", np.abs(d_mu)))).reshape(-1)
+        c_sigma = np.asarray(proxy_out.get("c_sigma", d_sigma)).reshape(-1)
 
         for b, j in enumerate(neighbor_ids):
             self.update(
                 ego_id=ego_id,
                 neighbor_id=int(j),
-                signed_mu=float(mu[b]),
-                sigma=float(sigma[b]),
+                capacity=float(c_mu[b]),
+                direction=float(d_mu[b]),
+                sigma_capacity=float(c_sigma[b]),
+                sigma_direction=float(d_sigma[b]),
                 context_key=(
                     None if context_keys is None else context_keys[b]
                 ),
@@ -247,53 +267,29 @@ class InfluenceSignatureTracker:
 
     def get_signature(self, ego_id: int, neighbor_id: int) -> np.ndarray:
         """
-        Returns:
-            np.ndarray float32 shape [5] = SIGNATURE_DIM
-
-            [0] signed_mu     signed mean
-            [1] abs_mu        mean absolute magnitude
-            [2] sigma         mean uncertainty
-            [3] temporal_std  standard deviation of mu over time
-            [4] context_std   standard deviation across context-specific mean mu
+        Returns ``[C, D, sigma_C, sigma_D, v_ctx]``.
         """
         key = (int(ego_id), int(neighbor_id))
 
-        if key not in self._mu_hist or len(self._mu_hist[key]) == 0:
+        if key not in self._capacity_hist or len(self._capacity_hist[key]) == 0:
             return np.zeros(SIGNATURE_DIM, dtype=np.float32)
 
-        mus = np.asarray(self._mu_hist[key], dtype=np.float64)          # [T]
-        sigmas = np.asarray(self._sigma_hist[key], dtype=np.float64)    # [T]
+        capacities = np.asarray(self._capacity_hist[key], dtype=np.float64)
+        directions = np.asarray(self._direction_hist[key], dtype=np.float64)
+        sigmas_c = np.asarray(self._sigma_capacity_hist[key], dtype=np.float64)
+        sigmas_d = np.asarray(self._sigma_direction_hist[key], dtype=np.float64)
 
-        signed_mu = float(np.mean(mus))
-
-        # ---------------------------------------------------------------
-        # abs_mu = mean(|mu|), NOT |mean(mu)|.
-        #
-        # A unit test caught this defect. Using |mean| makes this dimension
-        # COMPLETELY REDUNDANT with signed_mu because it is merely its absolute
-        # value, wasting one signature dimension.
-        #
-        # With mean(|·|), the two channels are INDEPENDENT and their ratio
-        # carries real information:
-        #     |signed_mu| ~ abs_mu  -> consistently one-directional influence
-        #                              (a blocker always blocks; a relay helps)
-        #     |signed_mu| << abs_mu -> strong but SIGN-REVERSING influence
-        #                              (sometimes helpful and sometimes harmful,
-        #                               precisely the anomalous-slot target)
-        # This is exactly the case a scalar cannot express and why the
-        # signature must be multidimensional.
-        # ---------------------------------------------------------------
-        abs_mu = float(np.mean(np.abs(mus)))
-
-        sigma = float(np.mean(sigmas))
-        temporal_std = float(np.std(mus)) if mus.size > 1 else 0.0
+        capacity = float(np.mean(capacities))
+        direction = float(np.mean(directions))
+        sigma_capacity = float(np.mean(sigmas_c))
+        sigma_direction = float(np.mean(sigmas_d))
 
         # ---- context_std ------------------------------------------------
         # First compute a mean WITHIN EACH context, then compute the standard
         # deviation ACROSS contexts. This separates situation-dependent
         # influence from random influence noise, which temporal_std already
         # captures.
-        ctx_map = self._context_mu.get(key, {})
+        ctx_map = self._context_capacity.get(key, {})
         ctx_means = [
             float(np.mean(np.asarray(v, dtype=np.float64)))
             for v in ctx_map.values()
@@ -308,7 +304,7 @@ class InfluenceSignatureTracker:
 
 
         return np.array(
-            [signed_mu, abs_mu, sigma, temporal_std, context_std],
+            [capacity, direction, sigma_capacity, sigma_direction, context_std],
             dtype=np.float32,
         )
 
@@ -324,7 +320,7 @@ class InfluenceSignatureTracker:
 
         normalise=True applies a z-score to each COLUMN/dimension. K-means
         needs this because dimensions have different scales, for example
-        abs_mu >= 0 while signed_mu is approximately in [-1, 1].
+        capacity is non-negative while direction is signed.
         """
         if normalise is None:
             normalise = self.normalise
@@ -368,16 +364,16 @@ class InfluenceSignatureTracker:
         """
         sig = self.get_signature(ego_id, neighbor_id)
 
-        signed_mu = float(sig[0])
-        sigma = float(sig[2])
+        direction = float(sig[1])
+        sigma_direction = float(sig[3])
 
-        if sigma > self.sigma_hi:
+        if sigma_direction > self.sigma_hi:
             return ROLE_ANOMALOUS
 
-        if abs(signed_mu) < self.tau_role:
+        if abs(direction) < self.tau_role:
             return ROLE_NEUTRAL
 
-        return ROLE_BENEFICIAL if signed_mu > 0.0 else ROLE_HARMFUL
+        return ROLE_BENEFICIAL if direction > 0.0 else ROLE_HARMFUL
 
     def get_role_distribution(
         self, ego_id: int, neighbor_ids: List[int]
@@ -414,13 +410,13 @@ class InfluenceSignatureTracker:
         all_abs_mu = []
         all_sigma = []
 
-        for key in self._mu_hist:
+        for key in self._capacity_hist:
             if ego_ids is not None and key[0] not in ego_ids:
                 continue
 
             sig = self.get_signature(key[0], key[1])
-            all_abs_mu.append(float(sig[1]))
-            all_sigma.append(float(sig[2]))
+            all_abs_mu.append(abs(float(sig[1])))
+            all_sigma.append(float(sig[3]))
 
         if len(all_abs_mu) >= 4:
             self.tau_role = float(

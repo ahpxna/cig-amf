@@ -108,11 +108,16 @@ LEGACY_ITEM_DIM = 9
 FULL_ITEM_DIM = 12
 
 ITEM_ACTION = 0
-ITEM_SIGNED_MU = 1
-ITEM_ABS_MU = 2
-ITEM_SIGMA = 3
-ITEM_TEMPORAL_STD = 4
+ITEM_CAPACITY = 1
+ITEM_DIRECTION = 2
+ITEM_SIGMA_CAPACITY = 3
+ITEM_SIGMA_DIRECTION = 4
 ITEM_CONTEXT_STD = 5
+# Compatibility aliases for callers that still import the former names.
+ITEM_SIGNED_MU = ITEM_DIRECTION
+ITEM_ABS_MU = ITEM_CAPACITY
+ITEM_SIGMA = ITEM_SIGMA_DIRECTION
+ITEM_TEMPORAL_STD = ITEM_SIGMA_CAPACITY
 ITEM_P_CORE = 6
 ITEM_PREV_CORE = 7
 ITEM_REL_ROW = 8
@@ -134,11 +139,11 @@ class PeripheralMultiMemory(nn.Module):
 
     Full item format has twelve dimensions:
         0: action_j
-        1: signed_mu
-        2: mean_abs_mu
-        3: sigma
-        4: temporal_std
-        5: context_std
+        1: structural capacity C
+        2: behavioural direction D
+        3: sigma_C
+        4: sigma_D
+        5: context_std(v_C)
         6: p_core
         7: in_prev_core
         8: rel_row
@@ -146,10 +151,9 @@ class PeripheralMultiMemory(nn.Module):
        10: zone_diff
        11: distance_norm
 
-    Nine-dimensional legacy items are upgraded to this layout by deriving
-    ``mean_abs_mu=abs(signed_mu)`` and filling temporal/context variation with
-    zero.  That path is deliberately exposed in diagnostics and cannot be used
-    when ``require_full_signature=True``.
+    Nine-dimensional legacy items are upgraded only for compatibility.  They
+    do not provide separate C/D uncertainty and cannot support the redesigned
+    representation claim.
 
     Input:
         periph_items: np/tensor [N_p, 9]
@@ -433,11 +437,20 @@ class PeripheralMultiMemory(nn.Module):
         action_oh = self._one_hot_actions(action_col)  # [N, action_dim]
         rest = items[:, 1:].to(dtype=torch.float32).clone()
 
+        # p_core is a calibrated structural diagnostic, not a peripheral
+        # semantic feature.  Letting it affect routing/pooling reintroduced a
+        # hidden partition -> proxy feedback path through memory values.
+        rest[:, ITEM_P_CORE - 1] = 0.0
+
         if self.signature_mode == "scalar":
-            # Indices are relative to `rest`, whose column zero is signed_mu.
-            # Remove every other signature channel while leaving belief and
-            # geometry controls unchanged.
-            rest[:, ITEM_ABS_MU - 1:ITEM_CONTEXT_STD] = 0.0
+            # Keep D only; remove C, both uncertainty channels, and v_ctx.
+            # Indices are relative to ``rest`` (item columns 1..).
+            rest[:, [
+                ITEM_CAPACITY - 1,
+                ITEM_SIGMA_CAPACITY - 1,
+                ITEM_SIGMA_DIRECTION - 1,
+                ITEM_CONTEXT_STD - 1,
+            ]] = 0.0
 
         return torch.cat([action_oh, rest], dim=-1)
 
@@ -489,13 +502,13 @@ class PeripheralMultiMemory(nn.Module):
         Anomalous takes priority because assigning an uncertain item as
         beneficial or harmful would be arbitrary.
         """
-        mu = items[:, ITEM_SIGNED_MU]
+        direction = items[:, ITEM_DIRECTION]
         if self.signature_mode == "scalar":
             # A genuine scalar-signature ablation has no uncertainty channel,
             # so it cannot use the anomalous role as a hidden second feature.
-            sigma = torch.zeros_like(mu)
+            sigma = torch.zeros_like(direction)
         else:
-            sigma = torch.clamp(items[:, ITEM_SIGMA], min=0.0)
+            sigma = torch.clamp(items[:, ITEM_SIGMA_DIRECTION], min=0.0)
 
         # Normalize slope by threshold. Otherwise at mu=0 sigmoid has not
         # saturated and neutral loses to beneficial/harmful. A unit test in
@@ -527,8 +540,8 @@ class PeripheralMultiMemory(nn.Module):
             g_anom = torch.sigmoid(k_sg * (sigma - self.sigma_hi))
         g_sure = 1.0 - g_anom                                   # [N]
 
-        g_pos = torch.sigmoid(k_mu * (mu - self.tau_role))      # [N]
-        g_neg = torch.sigmoid(k_mu * (-mu - self.tau_role))     # [N]
+        g_pos = torch.sigmoid(k_mu * (direction - self.tau_role))      # [N]
+        g_neg = torch.sigmoid(k_mu * (-direction - self.tau_role))     # [N]
         g_neu = torch.clamp(1.0 - g_pos - g_neg, min=0.0, max=1.0)  # [N]
 
         probs = torch.zeros(
@@ -558,25 +571,21 @@ class PeripheralMultiMemory(nn.Module):
         absolute value here after sign has already selected the slot, not in
         the estimator.
 
-        beta = (beta_floor + p_core) * (|mu| + mu_floor) * 1/(1+sigma)
+        beta = beta_floor * (C + mu_floor) * 1/(1+sigma_C)
 
         Returns: [N]
         """
-        mu = items[:, ITEM_SIGNED_MU]
+        capacity = torch.clamp(items[:, ITEM_CAPACITY], min=0.0)
         sigma = (
-            torch.zeros_like(mu)
+            torch.zeros_like(capacity)
             if self.signature_mode == "scalar"
-            else torch.clamp(items[:, ITEM_SIGMA], min=0.0)
+            else torch.clamp(items[:, ITEM_SIGMA_CAPACITY], min=0.0)
         )
-        p_core = torch.clamp(
-            items[:, ITEM_P_CORE], min=0.0, max=1.0
-        )
-
         confidence = 1.0 / (1.0 + sigma + self.eps)  # [N]
 
         beta = (
-            (self.beta_floor + p_core)
-            * (torch.abs(mu) + self.mu_floor)
+            self.beta_floor
+            * (capacity + self.mu_floor)
             * confidence
         )  # [N]
 
@@ -637,7 +646,7 @@ class PeripheralMultiMemory(nn.Module):
             )
             max_prob = torch.mean(torch.max(slot_probs, dim=1).values)
 
-            signatures = items[:, ITEM_SIGNED_MU:ITEM_CONTEXT_STD + 1]
+            signatures = items[:, ITEM_CAPACITY:ITEM_CONTEXT_STD + 1]
             support = slot_probs.sum(dim=0)
             centroids = (slot_probs.t() @ signatures) / torch.clamp(
                 support.unsqueeze(1), min=self.eps
@@ -969,9 +978,9 @@ class PeripheralMultiMemory(nn.Module):
         Build the item matrix for one ego agent.
 
         ``influence_signatures`` must map neighbour ID to the tracker output
-        ``[signed_mu, mean_abs_mu, sigma, temporal_std, context_std]``.  When
-        omitted, an explicitly labelled compatibility vector is derived as
-        ``[belief_mu, abs(belief_mu), belief_sigma, 0, 0]``.  Compatibility
+        ``[C, D, sigma_C, sigma_D, v_ctx]``.  When omitted, an explicitly
+        labelled compatibility vector is derived from the legacy belief.
+        Compatibility
         data are rejected when ``require_full_signature`` is true.
 
         This distinction is an experiment-validity requirement: derived
@@ -1027,11 +1036,13 @@ class PeripheralMultiMemory(nn.Module):
                         f"for ego={ego_id}, neighbour={j}"
                     )
                 mu_legacy = float(b["mu_bar"])
+                sigma_legacy = float(b["sigma_bar"])
                 signature = np.asarray(
                     [
-                        mu_legacy,
                         abs(mu_legacy),
-                        float(b["sigma_bar"]),
+                        mu_legacy,
+                        sigma_legacy,
+                        sigma_legacy,
                         0.0,
                         0.0,
                     ],

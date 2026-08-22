@@ -57,7 +57,7 @@ SEED = ea.SEED
 BLOCKS = [
     (
         "BASELINE",
-        "P0 only (mọi cờ P1-P4 tắt) -- điểm mốc, KHÔNG phải 1 trong 3 khối chính thức",
+        "P0 only (all P1-P4 flags disabled) — reference point, not a formal block",
         dict(
             enable_conditional_gates=False,
             enable_latency_ladder=False,
@@ -67,7 +67,7 @@ BLOCKS = [
     ),
     (
         "A",
-        "P0 + P1 + P2 (conditional_gates, latency_ladder) -- rủi ro THẤP, chỉ đụng bảng ảnh hưởng",
+        "P0 + P1 + P2 (conditional_gates, latency_ladder) — low risk; influence table only",
         dict(
             enable_conditional_gates=True,
             enable_latency_ladder=True,
@@ -77,7 +77,7 @@ BLOCKS = [
     ),
     (
         "B",
-        "A + P3 (congestion) -- rủi ro CAO, có thể phá T1 -- MANDATORY, phải cô lập",
+        "A + P3 (congestion) — high risk; can disrupt T1 and must be isolated",
         dict(
             enable_conditional_gates=True,
             enable_latency_ladder=True,
@@ -87,7 +87,7 @@ BLOCKS = [
     ),
     (
         "C",
-        "B + P4 (structural_shift) -- rủi ro TRUNG BÌNH, tương tác với H",
+        "B + P4 (structural_shift) — medium risk; interacts with the horizon",
         dict(
             enable_conditional_gates=True,
             enable_latency_ladder=True,
@@ -200,9 +200,9 @@ def print_block_result(name, desc, flags, metrics, prev_metrics, prev_name):
         print(line)
 
     print(
-        f"  [T6 ||dPhi~||(behavioural) > 0 (đo trên Φ̃)] = "
+        f"  [T6 ||dPhi~||(behavioural) > 0 on Phi-tilde] = "
         f"{metrics['t6_behav_exact']}   "
-        f"[phi tĩnh bất biến = {metrics['t6_static_phi_invariant']}]"
+        f"[static Phi invariant = {metrics['t6_static_phi_invariant']}]"
     )
     print(
         f"  [oracle no-abs() has_negative_delta] = "
@@ -294,7 +294,7 @@ def main(json_out=None):
     )
     print(
         f"[Block C] ||dPhi~||(behavioural) > 0: {c_m['t6_behav_exact']}  "
-        f"({'PASS' if c_m['t6_behav_exact'] else 'FAIL -- Φ̃ không phản ứng với behavioural drift: state bank quá nhỏ hoặc gate không phụ thuộc hành vi'})"
+        f"({'PASS' if c_m['t6_behav_exact'] else 'FAIL — Phi-tilde does not respond to behavioural drift; the state bank may be too small or gates may be behaviour-independent'})"
     )
 
     # ------------------------------------------------------------

@@ -44,6 +44,48 @@ def _current_behavioral_phase(env):
     return str(getattr(env, "mode", "unknown"))
 
 
+def _scripted_execution_distribution(env, agent_id, action_dim):
+    """Read the scripted H2 policy without consuming environment RNG."""
+    fn = getattr(env, "scripted_policy_distribution", None)
+    if callable(fn):
+        values = np.asarray(fn(int(agent_id)), dtype=np.float64).reshape(-1)
+        if values.shape == (int(action_dim),) and np.all(np.isfinite(values)):
+            values = np.clip(values, 0.0, None)
+            if float(values.sum()) > 0.0:
+                return (values / values.sum()).astype(np.float32)
+    return np.full(int(action_dim), 1.0 / float(action_dim), dtype=np.float32)
+
+
+def _adapt_executed_policy(env, cfg, learned_probs):
+    """Controlled H2 action-policy intervention for non-causal baselines."""
+    learned = np.asarray(learned_probs, dtype=np.float32)
+    n_agents, action_dim = learned.shape
+    learned = np.clip(learned, 0.0, None)
+    learned = learned / np.clip(learned.sum(axis=1, keepdims=True), 1e-12, None)
+    requested = float(cfg.get("behavioral_adapter_lambda", 0.0))
+    active = requested > 0.0 and (
+        not bool(cfg.get("behavioral_adapter_only_in_behavioral_drift", True))
+        or str(getattr(env, "mode", "")) == "behavioral_drift"
+    )
+    lam = float(np.clip(requested, 0.0, 1.0)) if active else 0.0
+    scripted = np.stack(
+        [_scripted_execution_distribution(env, agent, action_dim) for agent in range(n_agents)],
+        axis=0,
+    )
+    executed = (1.0 - lam) * learned + lam * scripted
+    executed = executed / np.clip(executed.sum(axis=1, keepdims=True), 1e-12, None)
+    eps = 1e-12
+    kl = np.sum(executed * (np.log(np.clip(executed, eps, 1.0))
+                              - np.log(np.clip(learned, eps, 1.0))), axis=1)
+    tv = 0.5 * np.abs(executed - learned).sum(axis=1)
+    return executed.astype(np.float32), {
+        "behavioral_adapter_active": int(active),
+        "behavioral_adapter_lambda": lam,
+        "behavioral_adapter_kl": float(np.mean(kl)),
+        "behavioral_adapter_tv": float(np.mean(tv)),
+    }
+
+
 class PureMeanFieldRunner:
     """
     Pure Mean Field baseline.
@@ -177,9 +219,17 @@ class PureMeanFieldRunner:
         with torch.no_grad():
             logits, values = self._forward(obs_t, mf_t)
             probs = torch.softmax(logits, dim=-1)
-            dist = torch.distributions.Categorical(probs=probs)
-            sampled = dist.sample().detach().cpu().numpy()
+            learned_probs = probs.detach().cpu().numpy()
 
+        executed_probs, diagnostics = _adapt_executed_policy(
+            self.env, self.cfg, learned_probs
+        )
+        self._last_execution_policy_probs = executed_probs
+        sampled = [
+            int(np.random.choice(self.action_dim, p=executed_probs[ego]))
+            for ego in range(self.n_agents)
+        ]
+        self.last_behavioral_adapter_metrics = diagnostics
         actions = [int(a) for a in sampled]
         values_np = values.detach().cpu().numpy().astype(np.float32)
 
@@ -211,6 +261,10 @@ class PureMeanFieldRunner:
                     "actions": list(actions),
                     "rewards": list(rewards),
                     "values": list(values_np),
+                    "execution_policy_probs": np.asarray(
+                        getattr(self, "_last_execution_policy_probs", []),
+                        dtype=np.float32,
+                    ),
                     "env_snapshot_before_step": env_snapshot_before_step,
                     "env_snapshot_after_step": env_snapshot_after_step,
                     "info": info,
@@ -220,6 +274,28 @@ class PureMeanFieldRunner:
             obs_all = next_obs_all
 
         runtime = time.time() - t0
+        adapter_rows = [
+            np.asarray(step.get("execution_policy_probs"), dtype=np.float64)
+            for step in trajectory
+            if np.asarray(step.get("execution_policy_probs", [])).shape
+            == (self.n_agents, self.action_dim)
+        ]
+        if adapter_rows:
+            expected = np.mean(np.concatenate(adapter_rows, axis=0), axis=0)
+            realised = np.asarray(
+                [action for step in trajectory for action in step["actions"]],
+                dtype=np.int64,
+            )
+            observed = np.bincount(
+                realised, minlength=self.action_dim
+            ).astype(np.float64)
+            observed /= max(1.0, float(observed.sum()))
+            self.last_behavioral_adapter_metrics = {
+                **getattr(self, "last_behavioral_adapter_metrics", {}),
+                "behavioral_adapter_action_freq_tv": float(
+                    0.5 * np.abs(observed - expected).sum()
+                ),
+            }
         return trajectory, ep_reward, runtime
 
     def update_policy(self, trajectory):
@@ -321,6 +397,7 @@ class PureMeanFieldRunner:
                 and behavioral_phase != self._last_behavioral_phase
             )
             self._last_behavioral_phase = behavioral_phase
+            adapter_metrics = getattr(self, "last_behavioral_adapter_metrics", {})
             self.episode_events.append({
                 "episode": episode_number,
                 "triggered": 0,
@@ -331,6 +408,21 @@ class PureMeanFieldRunner:
                 "behavioral_shift": behavioral_shift,
                 "mean_f1": 0.0,
                 "mean_reward": mean_reward,
+                "behavioral_adapter_active": int(
+                    adapter_metrics.get("behavioral_adapter_active", 0)
+                ),
+                "behavioral_adapter_lambda": float(
+                    adapter_metrics.get("behavioral_adapter_lambda", 0.0)
+                ),
+                "behavioral_adapter_kl": float(
+                    adapter_metrics.get("behavioral_adapter_kl", 0.0)
+                ),
+                "behavioral_adapter_tv": float(
+                    adapter_metrics.get("behavioral_adapter_tv", 0.0)
+                ),
+                "behavioral_adapter_action_freq_tv": float(
+                    adapter_metrics.get("behavioral_adapter_action_freq_tv", 0.0)
+                ),
             })
             self.episodes_completed = episode_number
 
@@ -1306,6 +1398,7 @@ class SharedAblationBase:
                 core_rule=self.cfg.get("belief_core_rule", "lcb"),
                 kappa=self.cfg.get("belief_kappa", 1.0),
                 alpha_decay=self.cfg.get("belief_alpha_decay", 0.7),
+                sigma_alpha_max=self.cfg.get("belief_sigma_alpha_max", 1.0),
                 adaptive_k=self.cfg.get("belief_adaptive_k", False),
                 adaptive_k_min=self.cfg.get("belief_adaptive_k_min", 1),
                 signed_balance=self.cfg.get("belief_signed_balance", 0.5),
@@ -1497,6 +1590,63 @@ class SharedAblationBase:
         reduced = [x for x in core_set if x != exclude_j]
         return self.pair_rel_module.get_core_summary(ego, reduced)
 
+    @staticmethod
+    def _fit_raw_context(values, width):
+        """Place a raw leave-one-out summary in a proxy context tensor."""
+        out = np.zeros(int(width), dtype=np.float32)
+        source = np.asarray(values, dtype=np.float32).reshape(-1)
+        out[:min(out.size, source.size)] = source[:out.size]
+        return out
+
+    def _raw_proxy_context_excluding(self, ego, exclude_j):
+        """Build the proxy's partition-independent leave-one-out context.
+
+        The shared ablations retain the same causal measurement contract as
+        the final runner: current observable geometry, zones, and prior
+        actions may condition the proxy, while belief state, core membership,
+        memory, and pair latents may not.  This prevents an ablation from
+        reintroducing the ``proxy -> partition -> proxy`` feedback path.
+        """
+        ego = int(ego)
+        exclude_j = int(exclude_j)
+        pos_i = self.env.positions[ego]
+        zone_i = int(self.env.agent_zone[ego])
+        grid = max(1.0, float(getattr(self.env, "grid_size", 1)))
+        zones = max(1.0, float(getattr(self.env, "n_zones", 1) - 1))
+        last_actions = getattr(self.env, "last_actions", {})
+        rows = []
+
+        for other in range(self.n_agents):
+            if other in (ego, exclude_j):
+                continue
+            pos = self.env.positions[other]
+            drow = (float(pos[0]) - float(pos_i[0])) / grid
+            dcol = (float(pos[1]) - float(pos_i[1])) / grid
+            distance = abs(drow) + abs(dcol)
+            zone_delta = (float(self.env.agent_zone[other]) - zone_i) / zones
+            same_zone = float(int(self.env.agent_zone[other]) == zone_i)
+            try:
+                action = float(last_actions[other]) / max(1.0, self.action_dim - 1.0)
+            except (KeyError, IndexError, TypeError):
+                action = 0.0
+            rows.append([drow, dcol, distance, same_zone, zone_delta, action])
+
+        table = np.asarray(rows, dtype=np.float32)
+        if table.size == 0:
+            summary = np.zeros(18, dtype=np.float32)
+        else:
+            summary = np.concatenate(
+                [table.mean(axis=0), table.std(axis=0), table.max(axis=0)], axis=0
+            ).astype(np.float32)
+
+        return (
+            self._fit_raw_context(summary, self.core_dim),
+            self._fit_raw_context(
+                np.concatenate([summary[6:12], summary[:6], summary[12:]]),
+                self.periph_dim,
+            ),
+        )
+
     def _periph_context_excluding(self, ego, exclude_j):
         if not self.use_multi_memory:
             return self._single_periph_summary_np_for_ego(
@@ -1529,6 +1679,7 @@ class SharedAblationBase:
             "periph_summary_cache": {},
             "core_context_excluding": {},
             "periph_context_excluding": {},
+            "proxy_context_excluding": {},
             "value_cache": {},
             # [FIX-X1] Match final_runner by capturing geometry at this
             # timestep so replay_builder constructs time-aligned x_ij.
@@ -1565,6 +1716,7 @@ class SharedAblationBase:
 
             cache["core_context_excluding"][ego] = {}
             cache["periph_context_excluding"][ego] = {}
+            cache["proxy_context_excluding"][ego] = {}
 
             for j in range(self.n_agents):
                 if j == ego:
@@ -1576,6 +1728,10 @@ class SharedAblationBase:
                 )
 
                 cache["periph_context_excluding"][ego][j] = self._periph_context_excluding(
+                    ego,
+                    j,
+                )
+                cache["proxy_context_excluding"][ego][j] = self._raw_proxy_context_excluding(
                     ego,
                     j,
                 )
@@ -1646,6 +1802,7 @@ class SharedAblationBase:
                     "periph_summary_cache": cache["periph_summary_cache"],
                     "core_context_excluding": cache["core_context_excluding"],
                     "periph_context_excluding": cache["periph_context_excluding"],
+                    "proxy_context_excluding": cache["proxy_context_excluding"],
                     "value_cache": cache["value_cache"],
                     "geom_snapshot": cache["geom_snapshot"],   # [FIX-X1]
                     "env_snapshot_before_step": env_snapshot_before_step,
@@ -1827,8 +1984,9 @@ class SharedAblationBase:
                 obs_i_batch.append(obs_i)
                 action_i_batch.append(action_i)
                 action_j_batch.append(int(actions[j]))
-                z_batch.append(self._core_context_excluding(ego, j))
-                m_batch.append(self._periph_context_excluding(ego, j))
+                raw_core, raw_periph = self._raw_proxy_context_excluding(ego, j)
+                z_batch.append(raw_core)
+                m_batch.append(raw_periph)
                 b_batch.append(belief_summary)
                 neighbor_ids.append(j)
 
@@ -1860,7 +2018,7 @@ class SharedAblationBase:
                         bp = None
                     behaviour_probs_obs_batch.append(bp)
 
-            mu_arr, sigma_arr = self.proxy.score_batch(
+            out = self.proxy.score_batch_full(
                 obs_i_batch=obs_i_batch,
                 action_i_batch=action_i_batch,
                 observed_action_j_batch=action_j_batch,
@@ -1882,6 +2040,12 @@ class SharedAblationBase:
                     for j in neighbor_ids
                 ],
             )
+
+            # C is the standardized response range and is the only signal
+            # allowed to update structural belief/core membership.  D remains
+            # a behavioural directional diagnostic for the Paper-A protocol.
+            mu_arr = out.get("c_mu", out.get("mu_range", out["mu"]))
+            sigma_arr = out.get("c_sigma", out["sigma"])
 
             mu_sigma = {
                 j: (float(mu_arr[k]), float(sigma_arr[k]))
@@ -2044,11 +2208,10 @@ class SharedAblationBase:
             if gt_influence is not None and ego in gt_influence:
                 row = gt_influence[ego]
                 if row:
-                    k = (
-                        max(1, len(pred_core))
-                        if pred_core
-                        else int(self.cfg.get("seed_core_top_k", 3))
-                    )
+                    # Ground truth is independent of the predicted allocation
+                    # budget.  Selecting oracle top-k with |pred_core| lets a
+                    # collapsed selector inflate its own F1.
+                    k = int(self.cfg.get("ground_truth_core_k", 3))
                     gt_core = set(
                         sorted(
                             row,

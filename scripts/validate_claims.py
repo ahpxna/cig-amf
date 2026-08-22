@@ -185,9 +185,6 @@ def _bootstrap_mean_ci(values, seed, n_bootstrap=10000):
 def _h1_status(rows):
     claim = H1._claim_gate(rows)
     main = claim["h1_main"]
-    plugin = claim["h1_plugin_control"]
-    observational = claim["h1_observational_control"]
-    epsilon_trend = claim["h1_epsilon_absolute_bias_trend"]
     forcing = claim["h1_forcing_reporting"]
     alignment_protocol = all(
         _boolean(
@@ -199,33 +196,19 @@ def _h1_status(rows):
         and int(float(row.get("confirmatory_horizon", -1))) == 1
         for row in rows
     )
-    main_signed_rank = float(main["signed_spearman_mean"])
-    main_range_rank = float(main["range_rank_correlation_mean"])
-    main_sign = float(main["sign_agreement_mean"])
     conditions = {
         "alignment_protocol_valid": alignment_protocol,
-        "main_action_coverage_and_aipw_exercised": bool(
-            claim["h1_main_action_coverage_gate_pass"]
+        "H1a_response_surface_Q_recovery": bool(claim["h1a_q_recovery_pass"]),
+        "H1b_structural_capacity_C_recovery": bool(
+            claim["h1b_capacity_recovery_pass"]
         ),
-        "signed_rank_exceeds_plugin": (
-            main_signed_rank > float(plugin["signed_spearman_mean"])
+        "H1c_directional_effect_D_recovery": bool(
+            claim["h1c_direction_recovery_pass"]
         ),
-        "signed_rank_exceeds_observational_control": (
-            main_signed_rank > float(observational["signed_spearman_mean"])
+        "intervention_support_integrity": bool(
+            claim["h1_support_integrity_pass"]
         ),
-        "sign_agreement_at_least_0_75": main_sign >= 0.75,
-        "signed_rank_exceeds_unsigned_range": main_signed_rank > main_range_rank,
-        "mean_absolute_bias_below_plugin": (
-            float(main["signed_bias_abs_mean"])
-            < float(plugin["signed_bias_abs_mean"])
-        ),
-        "paired_rank_and_bias_ci_above_zero": bool(
-            claim["h1_paired_uncertainty_gate_pass"]
-        ),
-        "epsilon_bias_trend_gate": bool(epsilon_trend["gate_pass"]),
-        "forcing_rate_and_return_cost_reported": bool(
-            forcing["reporting_complete"]
-        ),
+        "forcing_return_cost_reported": bool(forcing["reporting_complete"]),
     }
     supported = bool(claim["h1_claim_gate_pass"] and all(conditions.values()))
     return {
@@ -233,20 +216,16 @@ def _h1_status(rows):
         "supported": supported,
         "conditions": conditions,
         "metrics": {
-            "dr_eps005_signed_rank": main_signed_rank,
-            "dr_eps005_unsigned_range_rank": main_range_rank,
-            "dr_eps005_sign_agreement": main_sign,
-            "plugin_signed_rank": float(plugin["signed_spearman_mean"]),
-            "observational_signed_rank": float(
-                observational["signed_spearman_mean"]
+            "q_spearman": float(main["q_spearman_mean"]),
+            "capacity_rank_correlation": float(
+                main["capacity_rank_correlation_mean"]
             ),
-            "paired_rank_dr_minus_plugin": claim[
-                "h1_signed_rank_dr_minus_plugin_paired_bootstrap"
-            ],
-            "paired_abs_bias_improvement": claim[
-                "h1_absolute_bias_plugin_minus_dr_paired_bootstrap"
-            ],
-            "epsilon_absolute_bias_trend": epsilon_trend,
+            "capacity_core_f1": float(main["oracle_core_f1_mean"]),
+            "direction_spearman": float(main["direction_spearman_mean"]),
+            "direction_sign_agreement": float(
+                main["direction_sign_agreement_mean"]
+            ),
+            "estimator_ablation": claim["h1_estimator_ablation"],
             "forcing_reporting": forcing,
         },
         "scope_note": (
@@ -262,13 +241,11 @@ def _h2_status(rows, h1_supported):
     correlation = grouped["CorrelationMeanField"]
     no_two = grouped["NoTwoTimescale"]
 
-    sr_difference = _paired_difference(
-        final, correlation, "SR_cross_run"
-    )
+    sr_difference = _paired_difference(final, correlation, "SR_C")
     sr_ci = _bootstrap_mean_ci(sr_difference, seed=2201)
-    final_sr = _mean(final, "SR_cross_run")
-    correlation_sr = _mean(correlation, "SR_cross_run")
-    no_two_sr = _mean(no_two, "SR_cross_run")
+    final_sr = _mean(final, "SR_C")
+    correlation_sr = _mean(correlation, "SR_C")
+    no_two_sr = _mean(no_two, "SR_C")
 
     required_rows = final + correlation + no_two
     evaluable = all(
@@ -285,6 +262,10 @@ def _h2_status(rows, h1_supported):
     )
     full_recovery_coverage = all(
         _h2_joint_recovery_trigger_coverage(row) == 1.0
+        for row in final
+    )
+    directional_manipulation = all(
+        _boolean(row.get("direction_manipulation_pass", False))
         for row in final
     )
     no_two_coverage_delta = _paired_derived_difference(
@@ -327,6 +308,7 @@ def _h2_status(rows, h1_supported):
         "paired_final_minus_correlation_sr_ci_above_zero": sr_ci[0] > 0.0,
         "final_recovers_and_triggers_for_every_structural_shift": full_recovery_coverage,
         "two_timescale_scheduler_beats_every_episode_control": scheduler_effect,
+        "executed_behavioral_policy_moves_direction_D": directional_manipulation,
     }
     mechanism_supported = all(mechanism_conditions.values())
     supported = bool(mechanism_supported and h1_supported)
@@ -359,6 +341,7 @@ def _h2_status(rows, h1_supported):
                 paired_latency_differences
             ),
             "paired_no_two_minus_final_recovery_latency_ci95": no_two_latency_ci,
+            "final_direction_behavioral_delta_mean": _mean(final, "direction_behav"),
         },
     }
 

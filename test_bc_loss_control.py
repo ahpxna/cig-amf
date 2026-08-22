@@ -130,7 +130,7 @@ def _make_env_and_module(seed=0):
 
 def test_t1_scripted_policy_deterministic():
     print("\n" + "=" * 70)
-    print("T1 — scripted policy XÁC ĐỊNH: bc_loss phải hội tụ về ~0")
+    print("T1 — deterministic scripted policy: BC loss should converge to ~0")
     print("=" * 70)
 
     torch.manual_seed(0)
@@ -149,22 +149,21 @@ def test_t1_scripted_policy_deterministic():
             print(f"  epoch {epoch:3d}  bc_loss = {loss:.4f}")
 
     ln6 = float(np.log(6))
-    print(f"\n  bc_loss cuối cùng = {loss:.4f}  (sàn uniform ln6 = {ln6:.4f})")
+    print(f"\n  final BC loss = {loss:.4f}  (uniform floor ln6 = {ln6:.4f})")
 
     ok = loss < 0.3
     print(f"  [{'PASS' if ok else 'FAIL'}] T1: bc_loss < 0.3  (gate G2)")
 
     if not ok and loss > ln6:
         print(
-            "  >> bc_loss NẰM TRÊN sàn uniform trên bài toán TẤT ĐỊNH TUYỆT ĐỐI "
-            "-> XÁC NHẬN bug căn chỉnh nhãn (mục 3.3 trong debug doc). "
-            "Không phải learning rate, không phải dung lượng model."
+            "  >> BC loss is above the uniform floor on a deterministic task. "
+            "This confirms a label-alignment defect rather than a learning-rate "
+            "or model-capacity issue."
         )
     elif not ok:
         print(
-            "  >> bc_loss dưới ln6 nhưng chưa về gần 0 -> có thể chỉ là thiếu "
-            "epoch/dung lượng, không nhất thiết là bug căn chỉnh. Tăng epoch/"
-            "batch rồi thử lại trước khi kết luận."
+            "  >> BC loss is below ln6 but not close to zero. More epochs or "
+            "capacity may be needed; do not infer a label-alignment defect yet."
         )
 
     return ok
@@ -172,7 +171,7 @@ def test_t1_scripted_policy_deterministic():
 
 def test_t2_label_shuffle():
     print("\n" + "=" * 70)
-    print("T2 — label shuffle: bc_loss phải hội tụ về ĐÚNG ln(6) = 1.7918")
+    print("T2 — shuffled labels: BC loss should converge to the corrected floor")
     print("=" * 70)
 
     torch.manual_seed(0)
@@ -200,15 +199,16 @@ def test_t2_label_shuffle():
     # matches the correct floor within 6e-3: the pipeline was never broken;
     # the expected test constant was wrong.
     floor = (1.0 + 0.25) * ln6
-    print(f"\n  bc_loss cuối cùng = {loss:.4f}  (sàn đúng (1+0.25)·ln6 = {floor:.4f})")
+    print(f"\n  final BC loss = {loss:.4f}  (correct floor (1+0.25)·ln6 = {floor:.4f})")
 
     ok = abs(loss - floor) < 0.15
     print(f"  [{'PASS' if ok else 'FAIL'}] T2: |bc_loss - (1+0.25)·ln6| < 0.15")
 
     if not ok:
         print(
-            "  >> Nhãn shuffle thật nhưng bc_loss lệch khỏi sàn (1+w_shadow)·ln6 "
-            "-> kiểm tra lại pipeline batching/loss hoặc shadow_loss_weight."
+            "  >> Labels are shuffled but BC loss differs from the "
+            "(1+w_shadow)·ln6 floor. Check batching, loss composition, and "
+            "shadow_loss_weight."
         )
 
     return ok
@@ -219,7 +219,7 @@ if __name__ == "__main__":
     ok2 = test_t2_label_shuffle()
 
     print("\n" + "=" * 70)
-    print(f"KẾT QUẢ: T1={'PASS' if ok1 else 'FAIL'}  T2={'PASS' if ok2 else 'FAIL'}")
+    print(f"RESULT: T1={'PASS' if ok1 else 'FAIL'}  T2={'PASS' if ok2 else 'FAIL'}")
     print("=" * 70)
 
     if not (ok1 and ok2):

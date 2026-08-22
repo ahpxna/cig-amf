@@ -8,14 +8,9 @@ class MultiEgoReplayBuilder:
 
     The conditioning set matches the paper:
 
-        r_hat_ij(
-            s_i,
-            a_i,
-            a_j,
-            Z_i^{-j},
-            M_i^{-j},
-            B_i
-        ) -> R_i^(H)
+        r_hat_ij(s_i, a_i, a_j, H_i^{-j}) -> R_i^(H), where H is a raw
+        leave-one-out observable-set summary independent of the learned
+        core/peripheral partition.
 
     For every time step t, ego i, and neighbor j:
         sample_ij^t = (
@@ -117,8 +112,7 @@ class MultiEgoReplayBuilder:
             "obs_all",
             "actions",
             "rewards",
-            "core_context_excluding",
-            "periph_context_excluding",
+            "proxy_context_excluding",
             "belief_summary_cache",
         ]
 
@@ -143,9 +137,7 @@ class MultiEgoReplayBuilder:
             obs_all
             actions
             rewards
-            core_context_excluding
-            periph_context_excluding
-            belief_summary_cache
+            proxy_context_excluding
 
         Return:
             Number of supervised samples pushed.
@@ -204,8 +196,13 @@ class MultiEgoReplayBuilder:
                             geom["grid_size"], geom["n_zones"], ego, j,
                         )
 
-                    z_ex = step["core_context_excluding"][ego][j]
-                    m_ex = step["periph_context_excluding"][ego][j]
+                    try:
+                        z_ex, m_ex = step["proxy_context_excluding"][ego][j]
+                    except (KeyError, TypeError, ValueError):
+                        raise KeyError(
+                            "Proxy replay requires partition-independent "
+                            "proxy_context_excluding[ego][neighbor]."
+                        )
                     belief_summary = step["belief_summary_cache"][ego]
                     target_h = h_returns[t][ego]
                     target_multi = h_returns_multi[t][ego]

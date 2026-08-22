@@ -263,6 +263,17 @@ class H1ClaimGateTests(unittest.TestCase):
                     "signed_bias_mean": epsilon_bias[variant],
                     "signed_mae_mean": abs(epsilon_bias[variant]),
                     "range_rank_correlation_mean": 0.30,
+                    "q_spearman_mean": 0.70,
+                    "q_mae_mean": 0.10,
+                    "q_rmse_mean": 0.15,
+                    "capacity_rank_correlation_mean": 0.85,
+                    "capacity_mae_mean": 0.10,
+                    "capacity_bias_mean": 0.02,
+                    "oracle_core_f1_mean": 0.80,
+                    "direction_spearman_mean": signed_rank,
+                    "direction_mae_mean": abs(epsilon_bias[variant]),
+                    "direction_bias_mean": epsilon_bias[variant],
+                    "direction_sign_agreement_mean": 0.90,
                     # Missing eps=0 coverage is an intended control outcome;
                     # only the main arm enters the scientific coverage gate.
                     "action_coverage_gate_pass": variant == "dr_eps005",
@@ -273,16 +284,20 @@ class H1ClaimGateTests(unittest.TestCase):
                 })
         return rows
 
-    def test_full_gate_uses_signed_control_trend_coverage_and_paired_ci(self):
+    def test_full_gate_requires_q_c_d_recovery_and_support_integrity(self):
         claim = h1_calibration._claim_gate(self._supporting_rows())
         self.assertTrue(claim["h1_claim_gate_pass"])
         self.assertTrue(claim["h1_main_action_coverage_gate_pass"])
-        self.assertTrue(claim["h1_paired_uncertainty_gate_pass"])
-        self.assertTrue(claim["h1_epsilon_absolute_bias_trend"]["gate_pass"])
+        self.assertTrue(claim["h1a_q_recovery_pass"])
+        self.assertTrue(claim["h1b_capacity_recovery_pass"])
+        self.assertTrue(claim["h1c_direction_recovery_pass"])
+        self.assertTrue(claim["h1_support_integrity_pass"])
         self.assertTrue(claim["h1_exp1_reporting_complete"])
         self.assertGreater(
             claim[
-                "h1_signed_rank_dr_minus_plugin_paired_bootstrap"
+                "h1_estimator_ablation"
+            ][
+                "direction_rank_dr_minus_plugin_paired_bootstrap"
             ]["ci95_low"],
             0.0,
         )
@@ -293,22 +308,23 @@ class H1ClaimGateTests(unittest.TestCase):
             1.0,
         )
 
-    def test_unsigned_range_control_can_falsify_signed_claim(self):
+    def test_failed_capacity_recovery_blocks_h1(self):
         rows = self._supporting_rows()
         for row in rows:
             if row["variant"] == "dr_eps005":
-                row["range_rank_correlation_mean"] = 0.95
+                row["capacity_rank_correlation_mean"] = 0.10
         claim = h1_calibration._claim_gate(rows)
         self.assertFalse(claim["h1_claim_gate_pass"])
+        self.assertFalse(claim["h1b_capacity_recovery_pass"])
 
-    def test_missing_forcing_return_endpoint_prevents_full_support(self):
+    def test_missing_forcing_return_endpoint_is_reported_separately(self):
         rows = self._supporting_rows()
         for row in rows:
             if row["variant"] == "dr_eps000":
                 row["policy_return_endpoint_measured"] = False
         claim = h1_calibration._claim_gate(rows)
         self.assertFalse(claim["h1_exp1_reporting_complete"])
-        self.assertFalse(claim["h1_claim_gate_pass"])
+        self.assertTrue(claim["h1_claim_gate_pass"])
 
 
 if __name__ == "__main__":

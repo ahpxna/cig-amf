@@ -1675,8 +1675,9 @@ class LocalCounterfactualProxyEnsemble:
         Full version providing every field needed by influence_signature.py.
 
         Returns dict of np.ndarray:
-            mu            [B] ensemble-mean signed effect
-            sigma         [B] ensemble std/epistemic uncertainty
+            d_mu/d_sigma  [B] directional contrast and its uncertainty
+            c_mu/c_sigma  [B] structural capacity and its uncertainty
+            mu/sigma      legacy aliases for d_mu/d_sigma
             mu_per_h      [B,H] raw per-horizon effect diagnostic
             mu_range      [B] nonnegative Pieroth-style baseline impact
             dr_correction [B] DR magnitude diagnostic for model bias
@@ -1688,6 +1689,10 @@ class LocalCounterfactualProxyEnsemble:
             return {
                 "mu": z,
                 "sigma": z,
+                "d_mu": z,
+                "d_sigma": z,
+                "c_mu": z,
+                "c_sigma": z,
                 "mu_per_h": np.zeros((0, self.n_horizons), dtype=np.float32),
                 "mu_range": z,
                 "dr_correction": z,
@@ -1738,13 +1743,31 @@ class LocalCounterfactualProxyEnsemble:
         # R^5; see influence_signature.py. mu_per_h remains only as a raw
         # horizon diagnostic and carries no latency-centroid claim.
 
-        # Always compute mu_range for the Pieroth baseline.
+        # Capacity C is always the per-action response range, independent of
+        # the selected diagnostic effect mode.  It is the only quantity passed
+        # to the structural belief/core selector.
         res_range = self._compute_effects(
             preds_all=preds_all,
             action_j_obs=a_j,
             mode="range",
         )
-        mu_range = torch.mean(res_range["effect"], dim=0)        # [B]
+        c_effect = res_range["effect"]
+        c_mu = torch.mean(c_effect, dim=0)                         # [B]
+        c_sigma = (
+            torch.zeros_like(c_mu)
+            if c_effect.shape[0] <= 1
+            else torch.sqrt(torch.var(c_effect, dim=0, unbiased=True) + self.eps)
+        )
+
+        # q(a)=E_member[Q(a)] is exported for H1a response-surface calibration
+        # and oracle diagnostics.  The runner does not use it as a graph input.
+        q_terminal = preds_all[:, :, :, -1]
+        q_mu = torch.mean(q_terminal, dim=0)                       # [B,A]
+        q_sigma = (
+            torch.zeros_like(q_mu)
+            if q_terminal.shape[0] <= 1
+            else torch.sqrt(torch.var(q_terminal, dim=0, unbiased=True) + self.eps)
+        )
 
         self.latest_dr_correction_magnitude = float(
             torch.mean(res["dr_correction"]).item()
@@ -1767,8 +1790,14 @@ class LocalCounterfactualProxyEnsemble:
         return {
             "mu": to_np(mu),
             "sigma": to_np(sigma),
+            "d_mu": to_np(mu),
+            "d_sigma": to_np(sigma),
+            "c_mu": to_np(c_mu),
+            "c_sigma": to_np(c_sigma),
             "mu_per_h": to_np(mu_per_h),
-            "mu_range": to_np(mu_range),
+            "mu_range": to_np(c_mu),
+            "q_mu": to_np(q_mu),
+            "q_sigma": to_np(q_sigma),
             "dr_correction": to_np(res["dr_correction"]),
             "dr_weight": to_np(res["dr_weight"]),
             "dr_applied": bool(res["dr_applied"]),

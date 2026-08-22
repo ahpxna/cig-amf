@@ -162,6 +162,9 @@ def default_cfg():
         "belief_tau_in": 0.55,
         "belief_tau_out": 0.35,
         "seed_core_top_k": 3,
+        # Fixed oracle truth cardinality.  Evaluation never adapts the target
+        # core size to a model's predicted core, which would inflate F1.
+        "ground_truth_core_k": 3,
         "min_core_size": 2,
         "max_core_size": 4,
         "sigma_floor": 0.08,
@@ -169,6 +172,7 @@ def default_cfg():
         "belief_core_rule": "lcb",
         "belief_kappa": 1.0,
         "belief_alpha_decay": 0.7,
+        "belief_sigma_alpha_max": 1.0,
         # [P-6 FINAL DEBUG] Enable Equation 17: an entropy-adaptive core budget.
         # False makes capacity allocation constant, leaving the RQ3 claim
         # untestable. The paper also requires reporting the "fraction of updates
@@ -220,6 +224,12 @@ def default_cfg():
         # neighbour identity, for the H1 ablation.
         "proxy_pair_feat_dim": 5,
         "proxy_ensemble_dropout": 0.0,
+        # Controlled H2 behavioural manipulation.  The active policy becomes
+        # (1-lambda)*pi_learned + lambda*pi_scripted before epsilon forcing.
+        # Default zero preserves ordinary training; the H2 protocol sets this
+        # to one in its behavioural arm and verifies KL/TV diagnostics.
+        "behavioral_adapter_lambda": 0.0,
+        "behavioral_adapter_only_in_behavioral_drift": True,
         "seed": 0,
 
         # final_runner.py sig_tracker/forcer/heads/drift/matdet/recip defaults
@@ -227,6 +237,7 @@ def default_cfg():
         # models/{influence_signature,intervention,ego_conditioned_latent,
         # drift_probe,reciprocity}.py.
         "sig_tracker_window": 30,
+        "semantic_calibration_every": 25,
 
         # [EPS-ANNEAL] 0.03 -> 0.05. A1 showed that ONLY eps=0.05 separated
         # from noise: Spearman +0.074, positive for 8/8 seeds, and surviving
@@ -1318,6 +1329,38 @@ def _signed_calibration(proxy_signed, oracle_signed, neighbor_ids):
     }
 
 
+def _response_surface_calibration(proxy_q, oracle_q, neighbor_ids):
+    """Calibrate the primitive action-response surface Q before C/D.
+
+    The flattened comparison keeps every (neighbour, candidate-action) value;
+    reporting only C or D can hide an action-head failure whose aggregation
+    happens to look plausible.
+    """
+    learned, oracle = [], []
+    for neighbor in neighbor_ids:
+        p = np.asarray(proxy_q.get(int(neighbor), []), dtype=np.float64).reshape(-1)
+        q = np.asarray(oracle_q.get(int(neighbor), []), dtype=np.float64).reshape(-1)
+        if p.shape != q.shape or p.size == 0:
+            raise ValueError(
+                f"Q calibration action support mismatch for neighbor={neighbor}: "
+                f"{p.shape} vs {q.shape}"
+            )
+        learned.extend(p.tolist())
+        oracle.extend(q.tolist())
+    if not learned:
+        return {"q_mae": 0.0, "q_rmse": 0.0, "q_spearman": 0.0, "q_constant_case": 1}
+    learned = np.asarray(learned, dtype=np.float64)
+    oracle = np.asarray(oracle, dtype=np.float64)
+    rho, _p, constant = safe_spearman(learned, oracle)
+    diff = learned - oracle
+    return {
+        "q_mae": float(np.mean(np.abs(diff))),
+        "q_rmse": float(np.sqrt(np.mean(diff ** 2))),
+        "q_spearman": float(rho),
+        "q_constant_case": int(constant),
+    }
+
+
 def _tiny_train_cfg_from_base(cfg):
     tiny_cfg = dict(cfg)
 
@@ -1492,6 +1535,7 @@ def _periph_context_excluding_all_compat(runner, ego):
 
 def _score_learned_proxy_for_state(runner, tiny_env, state, ego, neighbor_ids):
     tiny_env.restore_state(state)
+    neighbor_ids = [int(j) for j in neighbor_ids]
 
     obs_all = _get_obs_all_from_env(tiny_env)
 
@@ -1508,20 +1552,20 @@ def _score_learned_proxy_for_state(runner, tiny_env, state, ego, neighbor_ids):
     belief_items = runner._build_belief_items_for_ego(int(ego))
     belief_summary = runner._belief_summary_np_from_items(belief_items)
 
-    z_excluding = _core_context_excluding_all_compat(
-        runner=runner,
-        ego=int(ego),
-    )
-
-    m_excluding = _periph_context_excluding_all_compat(
-        runner=runner,
-        ego=int(ego),
-    )
+    if hasattr(runner, "_raw_proxy_context_excluding"):
+        raw_excluding = {
+            int(j): runner._raw_proxy_context_excluding(int(ego), int(j))
+            for j in neighbor_ids if int(j) != int(ego)
+        }
+        z_excluding = {j: raw_excluding[j][0] for j in raw_excluding}
+        m_excluding = {j: raw_excluding[j][1] for j in raw_excluding}
+    else:
+        z_excluding = _core_context_excluding_all_compat(runner=runner, ego=int(ego))
+        m_excluding = _periph_context_excluding_all_compat(runner=runner, ego=int(ego))
 
     obs_i = tiny_env.get_obs_of_ego(obs_all, int(ego))
     action_i = int(current_actions[int(ego)])
 
-    neighbor_ids = [int(j) for j in neighbor_ids]
     learned_signed = {}
     learned_magnitude = {}
     learned_range = {}
@@ -1582,8 +1626,8 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
     relational context, reward, and propensity aligned at the same time.
     """
     required = (
-        "obs_all", "actions", "rewards", "core_context_excluding",
-        "periph_context_excluding", "belief_summary_cache", "geom_snapshot",
+        "obs_all", "actions", "rewards", "proxy_context_excluding",
+        "belief_summary_cache", "geom_snapshot",
         "behaviour_probs", "policy_probs", "env_snapshot_before_step",
     )
     missing = [name for name in required if step.get(name) is None]
@@ -1617,10 +1661,10 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
             action_i_batch=[actions[ego] for _ in neighbor_ids],
             observed_action_j_batch=[actions[j] for j in neighbor_ids],
             z_core_excl_j_batch=[
-                step["core_context_excluding"][ego][j] for j in neighbor_ids
+                step["proxy_context_excluding"][ego][j][0] for j in neighbor_ids
             ],
             m_periph_excl_j_batch=[
-                step["periph_context_excluding"][ego][j] for j in neighbor_ids
+                step["proxy_context_excluding"][ego][j][1] for j in neighbor_ids
             ],
             belief_summary_batch=[
                 step["belief_summary_cache"][ego] for _ in neighbor_ids
@@ -1640,15 +1684,30 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
         if old_effect_mode is not None:
             runner.proxy.effect_mode = old_effect_mode
 
-    signed = {j: float(out["mu"][k]) for k, j in enumerate(neighbor_ids)}
+    signed = {
+        j: float(out.get("d_mu", out["mu"])[k])
+        for k, j in enumerate(neighbor_ids)
+    }
+    capacity = {
+        j: float(out.get("c_mu", out["mu_range"])[k])
+        for k, j in enumerate(neighbor_ids)
+    }
+    response_surface = {
+        j: [float(value) for value in out["q_mu"][k]]
+        for k, j in enumerate(neighbor_ids)
+    }
     learned = {
+        "direction": signed,
+        "capacity": capacity,
+        "q": response_surface,
         "signed": signed,
         "magnitude": {j: abs(value) for j, value in signed.items()},
-        "range": {
-            j: float(out["mu_range"][k]) for k, j in enumerate(neighbor_ids)
-        },
+        "range": capacity,
     }
-    sigmas = {j: float(out["sigma"][k]) for k, j in enumerate(neighbor_ids)}
+    sigmas = {
+        j: float(out.get("d_sigma", out["sigma"])[k])
+        for k, j in enumerate(neighbor_ids)
+    }
     metadata = {
         "dr_applied": bool(out.get("dr_applied", False)),
         "dr_applied_rows": int(out.get("dr_applied_rows", 0)),
@@ -1687,6 +1746,7 @@ def _h1_one_step_oracle_scores(tiny_env, step, ego, neighbor_ids,
     signed_scores = {}
     magnitude_scores = {}
     range_scores = {}
+    response_surfaces = {}
 
     for j in neighbor_ids:
         candidate_returns = []
@@ -1698,6 +1758,7 @@ def _h1_one_step_oracle_scores(tiny_env, step, ego, neighbor_ids,
             candidate_returns.append(float(rewards[ego]))
 
         candidate_returns = np.asarray(candidate_returns, dtype=np.float64)
+        response_surfaces[int(j)] = candidate_returns.tolist()
         policy = np.asarray(step["policy_probs"][int(j)], dtype=np.float64)
         policy = policy / np.clip(policy.sum(), 1e-12, None)
         if policy.shape != candidate_returns.shape:
@@ -1716,6 +1777,9 @@ def _h1_one_step_oracle_scores(tiny_env, step, ego, neighbor_ids,
 
     tiny_env.restore_state(state)
     return {
+        "direction": signed_scores,
+        "capacity": range_scores,
+        "q": response_surfaces,
         "signed": signed_scores,
         "magnitude": magnitude_scores,
         "range": range_scores,
@@ -1827,26 +1891,24 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
             dr_raw_inverse_maxes.append(score_meta["dr_raw_inverse_max"])
 
             cal = oracle_calibration(
-                learned_scores=learned_scores["magnitude"],
-                oracle_scores=oracle_scores["magnitude"],
+                learned_scores=learned_scores["capacity"],
+                oracle_scores=oracle_scores["capacity"],
                 neighbor_ids=neighbor_ids,
             )
             signed_cal = _signed_calibration(
-                proxy_signed=learned_scores["signed"],
-                oracle_signed=oracle_scores["signed"],
+                proxy_signed=learned_scores["direction"],
+                oracle_signed=oracle_scores["direction"],
                 neighbor_ids=neighbor_ids,
             )
-            range_cal = oracle_calibration(
-                learned_scores=learned_scores["range"],
-                oracle_scores=oracle_scores["range"],
-                neighbor_ids=neighbor_ids,
+            q_cal = _response_surface_calibration(
+                learned_scores["q"], oracle_scores["q"], neighbor_ids,
             )
             top_k = int(max(
                 1, min(tiny_cfg.get("max_core_size", 4), len(neighbor_ids))
             ))
             core_f1 = oracle_core_f1_from_scores(
-                learned_scores=learned_scores["magnitude"],
-                oracle_scores=oracle_scores["magnitude"],
+                learned_scores=learned_scores["capacity"],
+                oracle_scores=oracle_scores["capacity"],
                 neighbor_ids=neighbor_ids,
                 top_k=top_k,
             )
@@ -1866,7 +1928,23 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
             }
             aggregate_row.update(cal)
             aggregate_row.update(signed_cal)
-            aggregate_row.update({f"range_{k}": v for k, v in range_cal.items()})
+            aggregate_row.update(q_cal)
+            # Explicit Paper-A names.  The historical fields above remain for
+            # compatibility, but H1a/H1b/H1c must not require readers to infer
+            # which scalar is Q, C, or D.
+            aggregate_row.update({
+                "capacity_rank_correlation": cal["rank_correlation"],
+                "capacity_mae": cal["mae"],
+                "capacity_bias": cal["bias"],
+                "direction_spearman": signed_cal["signed_spearman"],
+                "direction_mae": signed_cal["signed_mae"],
+                "direction_bias": signed_cal["signed_bias"],
+                "direction_sign_agreement": signed_cal["sign_agreement"],
+            })
+            # Retain the historical column names for collectors while their
+            # meaning is now explicitly C recovery (the action-response
+            # range), not a separate realised-action baseline.
+            aggregate_row.update({f"range_{k}": v for k, v in cal.items()})
             aggregate_rows.append(aggregate_row)
 
             for j in neighbor_ids:
@@ -1875,15 +1953,15 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                     "state_idx": int(state_idx),
                     "ego_id": ego,
                     "neighbor_id": int(j),
-                    "learned_score": float(learned_scores["magnitude"][j]),
-                    "oracle_score": float(oracle_scores["magnitude"][j]),
-                    "learned_signed": float(learned_scores["signed"][j]),
-                    "oracle_signed": float(oracle_scores["signed"][j]),
-                    "learned_range": float(learned_scores["range"][j]),
-                    "oracle_range": float(oracle_scores["range"][j]),
+                    "learned_score": float(learned_scores["capacity"][j]),
+                    "oracle_score": float(oracle_scores["capacity"][j]),
+                    "learned_signed": float(learned_scores["direction"][j]),
+                    "oracle_signed": float(oracle_scores["direction"][j]),
+                    "learned_range": float(learned_scores["capacity"][j]),
+                    "oracle_range": float(oracle_scores["capacity"][j]),
                     "abs_error": float(abs(
-                        learned_scores["magnitude"][j]
-                        - oracle_scores["magnitude"][j]
+                        learned_scores["capacity"][j]
+                        - oracle_scores["capacity"][j]
                     )),
                     "signed_error": float(
                         learned_scores["signed"][j]
@@ -2150,6 +2228,16 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
         "signed_constant_case",
         "sign_agreement",
         "range_rank_correlation",
+        "q_mae",
+        "q_rmse",
+        "q_spearman",
+        "capacity_rank_correlation",
+        "capacity_mae",
+        "capacity_bias",
+        "direction_spearman",
+        "direction_mae",
+        "direction_bias",
+        "direction_sign_agreement",
     ]
 
     for key in numeric_keys:

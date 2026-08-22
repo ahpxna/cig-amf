@@ -31,6 +31,18 @@ def _current_behavioral_phase(env):
     return str(getattr(env, "mode", "unknown"))
 
 
+def _safe_distribution(values, action_dim):
+    """Return a finite probability vector, falling back to uniform."""
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.shape != (int(action_dim),) or not np.all(np.isfinite(arr)):
+        return np.full(int(action_dim), 1.0 / float(action_dim), dtype=np.float32)
+    arr = np.clip(arr, 0.0, None)
+    total = float(arr.sum())
+    if total <= 0.0:
+        return np.full(int(action_dim), 1.0 / float(action_dim), dtype=np.float32)
+    return (arr / total).astype(np.float32)
+
+
 class FinalCIGAMFRunner:
     """
     Final CIG-AMF runner.
@@ -261,6 +273,7 @@ class FinalCIGAMFRunner:
                 adaptive_k=cfg.get("belief_adaptive_k", False),
                 adaptive_k_min=cfg.get("belief_adaptive_k_min", 1),
                 signed_balance=cfg.get("belief_signed_balance", 0.5),
+                sigma_alpha_max=cfg.get("belief_sigma_alpha_max", 1.0),
             )
             for ego in range(self.n_agents)
         }
@@ -316,6 +329,9 @@ class FinalCIGAMFRunner:
         self.episodes_completed = 0
         self.episode_events = []
         self._last_behavioral_phase = None
+        self._latest_direction_matrix = np.zeros(
+            (self.n_agents, self.n_agents), dtype=np.float64
+        )
 
     # ============================================================
     # Construction helpers
@@ -598,9 +614,144 @@ class FinalCIGAMFRunner:
         )
         return self._periph_summary_np_from_inputs(inputs)
 
+    @staticmethod
+    def _fit_raw_context(values, width):
+        """Place a fixed raw-set summary in a declared proxy context width."""
+        out = np.zeros(int(width), dtype=np.float32)
+        source = np.asarray(values, dtype=np.float32).reshape(-1)
+        out[:min(out.size, source.size)] = source[:out.size]
+        return out
+
+    def _raw_proxy_context_excluding(self, ego, exclude_j):
+        """Build a partition-independent leave-one-neighbour context.
+
+        This measurement input is derived only from current observable
+        geometry, zones, and previous actions.  It deliberately does not use
+        the learned core, peripheral memory, pair latent, or belief state, so
+        the path is ``proxy -> partition -> policy`` rather than a feedback
+        loop from an earlier partition into the proxy target.
+        """
+        ego = int(ego)
+        exclude_j = int(exclude_j)
+        pos_i = self.env.positions[ego]
+        zone_i = int(self.env.agent_zone[ego])
+        grid = max(1.0, float(getattr(self.env, "grid_size", 1)))
+        zones = max(1.0, float(getattr(self.env, "n_zones", 1) - 1))
+        last_actions = getattr(self.env, "last_actions", {})
+        rows = []
+        for other in range(self.n_agents):
+            if other in (ego, exclude_j):
+                continue
+            pos = self.env.positions[other]
+            drow = (float(pos[0]) - float(pos_i[0])) / grid
+            dcol = (float(pos[1]) - float(pos_i[1])) / grid
+            distance = (abs(drow) + abs(dcol))
+            zone_delta = (float(self.env.agent_zone[other]) - zone_i) / zones
+            same_zone = float(int(self.env.agent_zone[other]) == zone_i)
+            try:
+                action = float(last_actions[other]) / max(1.0, self.action_dim - 1.0)
+            except (KeyError, IndexError, TypeError):
+                action = 0.0
+            rows.append([drow, dcol, distance, same_zone, zone_delta, action])
+
+        table = np.asarray(rows, dtype=np.float32)
+        if table.size == 0:
+            summary = np.zeros(18, dtype=np.float32)
+        else:
+            summary = np.concatenate(
+                [table.mean(axis=0), table.std(axis=0), table.max(axis=0)], axis=0
+            ).astype(np.float32)
+        # Two independent fixed views avoid giving a semantic interpretation to
+        # the historical Z/M labels while preserving the proxy's public shape.
+        return (
+            self._fit_raw_context(summary, self.core_dim),
+            self._fit_raw_context(np.concatenate([summary[6:12], summary[:6], summary[12:]]), self.periph_dim),
+        )
+
     # ============================================================
     # Action selection
     # ============================================================
+
+    def _behavioural_execution_distribution(self, agent_id):
+        """Return the environment's scripted execution distribution.
+
+        The H2 behavioural arm must alter executed actions, not merely a
+        diagnostic label in the environment.  ``OmniArena`` provides this
+        distribution without sampling so that querying the intervention does
+        not perturb the environment RNG.  Older environments may expose only
+        a deterministic ``scripted_policy``; that compatibility path is safe
+        only for deterministic scripted policies.
+        """
+        distribution_fn = getattr(self.env, "scripted_policy_distribution", None)
+        if callable(distribution_fn):
+            return _safe_distribution(distribution_fn(int(agent_id)), self.action_dim)
+
+        policy_fn = getattr(self.env, "scripted_policy", None)
+        if callable(policy_fn):
+            action = int(policy_fn(int(agent_id)))
+            out = np.zeros(self.action_dim, dtype=np.float32)
+            out[np.clip(action, 0, self.action_dim - 1)] = 1.0
+            return out
+
+        return np.full(self.action_dim, 1.0 / float(self.action_dim), dtype=np.float32)
+
+    def _execution_policy_adapter(self, learned_probs):
+        """Mix learned and scripted policy distributions for controlled H2.
+
+        The returned distribution is the policy that is actually sampled
+        before epsilon forcing.  It is therefore also the target ``pi`` used
+        for the directional contrast D and the base distribution for the
+        logged behaviour propensity b.  The adapter is disabled by default
+        and enabled only by the controlled behavioural-drift protocol.
+        """
+        learned = np.asarray(learned_probs, dtype=np.float32)
+        expected = (self.n_agents, self.action_dim)
+        if learned.shape != expected:
+            raise ValueError(
+                f"learned policy matrix must have shape {expected}, got {learned.shape}"
+            )
+        learned = np.stack(
+            [_safe_distribution(row, self.action_dim) for row in learned], axis=0
+        )
+
+        configured_lambda = float(self.cfg.get("behavioral_adapter_lambda", 0.0))
+        active_mode = str(getattr(self.env, "mode", ""))
+        only_behavioral = bool(
+            self.cfg.get("behavioral_adapter_only_in_behavioral_drift", True)
+        )
+        adapter_active = configured_lambda > 0.0 and (
+            not only_behavioral or active_mode == "behavioral_drift"
+        )
+        lam = float(np.clip(configured_lambda, 0.0, 1.0)) if adapter_active else 0.0
+
+        scripted = np.stack(
+            [self._behavioural_execution_distribution(agent) for agent in range(self.n_agents)],
+            axis=0,
+        )
+        executed = (1.0 - lam) * learned + lam * scripted
+        executed = np.stack(
+            [_safe_distribution(row, self.action_dim) for row in executed], axis=0
+        )
+
+        # Population means make the manipulation auditable without retaining
+        # raw policy tensors in every H2 summary row.
+        eps = 1e-12
+        kl = np.sum(
+            executed * (np.log(np.clip(executed, eps, 1.0))
+                        - np.log(np.clip(learned, eps, 1.0))),
+            axis=1,
+        )
+        tv = 0.5 * np.abs(executed - learned).sum(axis=1)
+        diagnostics = {
+            "behavioral_adapter_active": int(adapter_active),
+            "behavioral_adapter_lambda": lam,
+            "behavioral_adapter_kl": float(np.mean(kl)),
+            "behavioral_adapter_tv": float(np.mean(tv)),
+            "behavioral_adapter_scripted_mass": float(
+                np.mean(np.sum(executed * scripted, axis=1))
+            ),
+        }
+        return executed.astype(np.float32), scripted.astype(np.float32), diagnostics
 
     def _select_actions_population(self, obs_all):
         """
@@ -624,6 +775,7 @@ class FinalCIGAMFRunner:
             "periph_summary_cache": {},
             "core_context_excluding": {},
             "periph_context_excluding": {},
+            "proxy_context_excluding": {},
             "value_cache": {},
             # [FIX-X1] Snapshot geometry at this timestep so replay_builder can
             # construct x_ij at sample creation time. It cannot be reconstructed
@@ -660,6 +812,7 @@ class FinalCIGAMFRunner:
 
             cache["core_context_excluding"][ego] = {}
             cache["periph_context_excluding"][ego] = {}
+            cache["proxy_context_excluding"][ego] = {}
 
             for j in range(self.n_agents):
                 if j == ego:
@@ -671,6 +824,10 @@ class FinalCIGAMFRunner:
                 )
 
                 cache["periph_context_excluding"][ego][j] = self._periph_context_excluding(
+                    ego,
+                    j,
+                )
+                cache["proxy_context_excluding"][ego][j] = self._raw_proxy_context_excluding(
                     ego,
                     j,
                 )
@@ -713,12 +870,23 @@ class FinalCIGAMFRunner:
             )
 
             probs = torch.softmax(logits, dim=-1)
-            dist = torch.distributions.Categorical(probs=probs)
-            sampled = dist.sample().detach().cpu().numpy()
             # One CPU/GPU synchronization for all values replaces the old
             # n_agents per-step .item() synchronizations.
             values_np = values.detach().cpu().numpy()
-            probs_np = probs.detach().cpu().numpy()
+            learned_probs_np = probs.detach().cpu().numpy()
+
+        probs_np, scripted_probs_np, adapter_diagnostics = self._execution_policy_adapter(
+            learned_probs_np
+        )
+
+        # Sample from the actually executed pre-forcing policy.  Sampling from
+        # the learned distribution here would leave H2's scripted mixture as a
+        # logging-only value and reintroduce the original behavioural-drift
+        # no-op.
+        sampled = np.asarray([
+            np.random.choice(self.action_dim, p=probs_np[ego])
+            for ego in range(self.n_agents)
+        ], dtype=np.int64)
 
         # [EpsilonForcedActionController] This must run after action sampling
         # and before env.step(). apply() mutates forced entries in place and
@@ -777,6 +945,9 @@ class FinalCIGAMFRunner:
         # downstream diagnostics and for runners that expect policy_probs
         # in the trajectory. Shape: [n_agents, A]
         cache["policy_probs"] = probs_np
+        cache["learned_policy_probs"] = learned_probs_np
+        cache["scripted_policy_probs"] = scripted_probs_np
+        cache["behavioral_adapter"] = adapter_diagnostics
 
         return actions, cache
 
@@ -857,12 +1028,16 @@ class FinalCIGAMFRunner:
                     "belief_items_cache": cache["belief_items_cache"],
                     "behaviour_probs": cache.get("behaviour_probs"),
                     "policy_probs": cache.get("policy_probs"),
+                    "learned_policy_probs": cache.get("learned_policy_probs"),
+                    "scripted_policy_probs": cache.get("scripted_policy_probs"),
+                    "behavioral_adapter": cache.get("behavioral_adapter", {}),
                     "belief_summary_cache": cache["belief_summary_cache"],
                     "core_summary_cache": cache["core_summary_cache"],
                     "periph_inputs_cache": cache["periph_inputs_cache"],
                     "periph_summary_cache": cache["periph_summary_cache"],
                     "core_context_excluding": cache["core_context_excluding"],
                     "periph_context_excluding": cache["periph_context_excluding"],
+                    "proxy_context_excluding": cache["proxy_context_excluding"],
                     "value_cache": cache["value_cache"],
                     "geom_snapshot": cache["geom_snapshot"],   # [FIX-X1]
                     "forced_mask": cache["forced_mask"],
@@ -923,6 +1098,42 @@ class FinalCIGAMFRunner:
             obs_all = next_obs_all
 
         runtime = time.time() - t0
+
+        adapter_rows = [
+            step.get("behavioral_adapter", {}) for step in trajectory
+            if isinstance(step, dict)
+        ]
+        if adapter_rows:
+            self.last_behavioral_adapter_metrics = {
+                key: float(np.mean([
+                    float(row.get(key, 0.0)) for row in adapter_rows
+                ]))
+                for key in (
+                    "behavioral_adapter_active",
+                    "behavioral_adapter_lambda",
+                    "behavioral_adapter_kl",
+                    "behavioral_adapter_tv",
+                    "behavioral_adapter_scripted_mass",
+                )
+            }
+            expected_actions = np.mean(
+                np.concatenate(
+                    [np.asarray(step["behaviour_probs"], dtype=np.float64)
+                     for step in trajectory], axis=0,
+                ),
+                axis=0,
+            )
+            realised = np.asarray(
+                [action for step in trajectory for action in step["actions"]],
+                dtype=np.int64,
+            )
+            counts = np.bincount(realised, minlength=self.action_dim).astype(np.float64)
+            observed_actions = counts / max(1.0, float(counts.sum()))
+            self.last_behavioral_adapter_metrics["behavioral_adapter_action_freq_tv"] = float(
+                0.5 * np.abs(observed_actions - expected_actions).sum()
+            )
+        else:
+            self.last_behavioral_adapter_metrics = {}
 
         # Advance the epsilon annealing schedule exactly once per episode; see
         # step_episode(). VERIFY-F1 reports a small conclusive per-episode set.
@@ -1233,9 +1444,10 @@ class FinalCIGAMFRunner:
         total_promoted = 0
         total_demoted = 0
 
-        # Signed [n_agents,n_agents] influence matrix W[ego,j]=mu_ij for the
-        # MatrixDriftDetector, an independent second trigger.
+        # Structural-capacity matrix C[ego,j].  D is intentionally excluded:
+        # behaviour changes should not by themselves trigger structural reset.
         influence_matrix = np.zeros((self.n_agents, self.n_agents), dtype=np.float64)
+        direction_matrix = np.zeros((self.n_agents, self.n_agents), dtype=np.float64)
 
         for ego in range(self.n_agents):
             obs_i = self.env.get_obs_of_ego(obs_all, ego)
@@ -1259,8 +1471,9 @@ class FinalCIGAMFRunner:
                 obs_i_batch.append(obs_i)
                 action_i_batch.append(action_i)
                 action_j_batch.append(int(actions[j]))
-                z_batch.append(self._core_context_excluding(ego, j))
-                m_batch.append(self._periph_context_excluding(ego, j))
+                raw_core, raw_periph = self._raw_proxy_context_excluding(ego, j)
+                z_batch.append(raw_core)
+                m_batch.append(raw_periph)
                 b_batch.append(belief_summary)
                 neighbor_ids.append(j)
 
@@ -1334,7 +1547,9 @@ class FinalCIGAMFRunner:
                     for j in neighbor_ids
                 ],
             )
-            mu_arr, sigma_arr = out["mu"], out["sigma"]
+            c_mu_arr = out.get("c_mu", out.get("mu_range"))
+            c_sigma_arr = out.get("c_sigma", out["sigma"])
+            d_mu_arr = out.get("d_mu", out["mu"])
 
             # [InfluenceSignatureTracker] Previously instantiated without any
             # update call, leaving signature/get_role empty. context_key is j's
@@ -1347,12 +1562,13 @@ class FinalCIGAMFRunner:
             )
 
             mu_sigma = {
-                j: (float(mu_arr[k]), float(sigma_arr[k]))
+                j: (float(c_mu_arr[k]), float(c_sigma_arr[k]))
                 for k, j in enumerate(neighbor_ids)
             }
 
             for k, j in enumerate(neighbor_ids):
-                influence_matrix[ego, j] = float(mu_arr[k])
+                influence_matrix[ego, j] = float(c_mu_arr[k])
+                direction_matrix[ego, j] = float(d_mu_arr[k])
 
             update_result = self.belief_modules[ego].update_batch(mu_sigma)
 
@@ -1367,6 +1583,7 @@ class FinalCIGAMFRunner:
             total_promoted += len(promoted)
             total_demoted += len(demoted)
 
+        self._latest_direction_matrix = direction_matrix
         return int(total_promoted), int(total_demoted), influence_matrix
 
     def update_graph_modules(self, trajectory):
@@ -1509,10 +1726,31 @@ class FinalCIGAMFRunner:
                 mu_vals.append(float(item["mu_bar"]))
                 p_vals.append(float(item["p_core"]))
 
-        mean_mu = float(np.mean(np.abs(mu_vals))) if len(mu_vals) > 0 else 0.0
+        mean_mu = float(np.mean(np.clip(mu_vals, 0.0, None))) if len(mu_vals) > 0 else 0.0
         max_p = float(np.max(p_vals)) if len(p_vals) > 0 else 0.0
 
         return mean_mu, max_p
+
+    def get_influence_matrix(self):
+        """Return the current structural-capacity matrix C used by the core."""
+        matrix = np.zeros((self.n_agents, self.n_agents), dtype=np.float64)
+        for ego, belief in self.belief_modules.items():
+            for neighbor in belief.neighbor_ids:
+                matrix[int(ego), int(neighbor)] = max(
+                    0.0, float(belief.debiased_mu(int(neighbor)))
+                )
+        return matrix
+
+    def get_direction_matrix(self):
+        """Return the latest D matrix; it is never used for core selection."""
+        return np.asarray(
+            getattr(
+                self,
+                "_latest_direction_matrix",
+                np.zeros((self.n_agents, self.n_agents), dtype=np.float64),
+            ),
+            dtype=np.float64,
+        ).copy()
 
     def evaluate_episode_snapshot(
         self,
@@ -1533,8 +1771,9 @@ class FinalCIGAMFRunner:
         f1s_role = []   # [F1-TOPK]
 
         # ------------------------------------------------------------------
-        # [F1-TOPK] Core-F1 ground truth is measured top-k |Phi|, not static
-        # role labels.
+        # Core F1 uses a fixed oracle-capacity top-k target.  Its cardinality
+        # must not depend on the predicted core size: adapting k to a model
+        # output makes a recovery metric self-serving and non-comparable.
         #
         # gt_core_by_ego/diagnostic_core_by_ego are declared role lists. After
         # Phi became measured from the continuous SGTP formula, these core
@@ -1557,8 +1796,9 @@ class FinalCIGAMFRunner:
             if gt_influence is not None and ego in gt_influence:
                 row = gt_influence[ego]
                 if row:
-                    k = max(1, len(pred_core)) if pred_core else self.cfg.get(
-                        "seed_core_top_k", 3)
+                    k = int(max(1, self.cfg.get(
+                        "ground_truth_core_k", self.cfg.get("seed_core_top_k", 3)
+                    )))
                     gt_core = set(
                         sorted(row, key=lambda j: abs(float(row[j])),
                                reverse=True)[:int(k)]
@@ -1702,126 +1942,40 @@ class FinalCIGAMFRunner:
 
             stage_after_episode_step = int(self.scheduler.stage)
 
-# Runner calibration patch.
-            import traceback
-
-            # 1. Initialize counters and the persistent multiplier.
-            self._calib_fail_count = getattr(self, '_calib_fail_count', 0)
-            self._consecutive_zero_max_p = getattr(self, '_consecutive_zero_max_p', 0)
-            self._kappa_multiplier = getattr(self, '_kappa_multiplier', 1.0) 
-
-            # 2. CẬP NHẬT CỜ REACTIVE
-            try:
-                current_max_p = max([float(np.max(b_mod._p_core_arr)) for b_mod in self.belief_modules.values() if hasattr(b_mod, '_p_core_arr')])
-            except:
-                current_max_p = 1.0
-
-            # Require 0.05: below a 5% entry probability indicates core collapse.
-            if current_max_p <= 0.05:
-                self._consecutive_zero_max_p += 1
-            else:
-                self._consecutive_zero_max_p = 0
-
-            # 3. Define trigger conditions.
+            # Semantic thresholds may be calibrated after warm-up because D's
+            # reward scale is environment-dependent.  Structural C selection
+            # remains fixed: reactive tau/sigma/kappa changes would turn the
+            # stated LCB rule into a hidden threshold controller.
             is_stage_transition = (stage_before_episode_step == 0 and stage_after_episode_step == 1)
             is_periodic_calib = (
                 stage_after_episode_step == 1
                 and (
-                    episode_number % 5 == 0
-                    if episode_number <= 30
-                    else episode_number % 25 == 0
+                    episode_number % int(self.cfg.get("semantic_calibration_every", 25)) == 0
                 )
             )
-            is_reactive_calib = (self._consecutive_zero_max_p >= 3)
-            
-            # Update the multiplier while retaining collapse state.
-            if is_reactive_calib:
-                # During collapse, halve kappa immediately with floor 0.01.
-                self._kappa_multiplier = max(0.01, self._kappa_multiplier * 0.5) 
-            elif is_periodic_calib and current_max_p > 0.1:
-                # During healthy periodic runs (>10%), recover kappa gradually.
-                self._kappa_multiplier = min(1.0, self._kappa_multiplier * 1.5)
 
             if is_stage_transition:
                 self._reset_switch_counters_if_available()
 
-            # 4. Perform calibration.
-            if is_stage_transition or is_periodic_calib or is_reactive_calib:
-                calib_reason = "Stage Transition" if is_stage_transition else ("Periodic" if is_periodic_calib else "Reactive (max_p=0)")
-                print(f"\n[STEP 0 DIAGNOSTIC] --- Threshold Calibration Triggered at Ep {episode_number} | Reason: {calib_reason} ---")
+            if is_stage_transition or is_periodic_calib:
+                calib_reason = "stage transition" if is_stage_transition else "periodic"
+                print(f"[SEMANTIC-CALIBRATION] ep={episode_number} reason={calib_reason}")
 
                 try:
                     calib = self.sig_tracker.auto_calibrate()
                     tau_role = calib["tau_role"]
-
-                    all_sigma_bar = [
-                        float(v.get("sigma_bar", 0.0))
-                        for ego in range(self.n_agents)
-                        for v in self.belief_modules[ego].get_state_dict().values()
-                    ]
-                    if len(all_sigma_bar) >= 4:
-                        arr = np.asarray(all_sigma_bar)
-                        sigma_hi = float(np.percentile(arr, 80.0))
-                        sigma_p50 = float(np.percentile(arr, 50.0))
-                        sigma_p90 = float(np.percentile(arr, 90.0))
-                        sigma_iqr = float(np.percentile(arr, 75.0) - np.percentile(arr, 25.0))
-                    else:
-                        sigma_hi = calib["sigma_hi"]  # Fallback before enough real-belief samples.
-                        sigma_p50 = sigma_p90 = sigma_iqr = float("nan")
-                    g_anom_mean = float(getattr(self.periph_module, "g_anom_usage_ema", torch.zeros(1)).item())
-                    print(f"   [SLOT-DEBUG] sigma_p50={sigma_p50:.6f} sigma_p90={sigma_p90:.6f} "
-                          f"sigma_hi={sigma_hi:.6f} g_anom_mean={g_anom_mean:.4f}")
-                    print(f"   [VERIFY] sigma_hi={sigma_hi:.6f}  tau_role={tau_role:.6f}")
+                    sigma_hi = calib["sigma_hi"]
 
                     if hasattr(self, 'periph_module'):
-                        # [B2.3] Pass sigma_iqr too. It was previously omitted,
-                        # causing sigma_iqr_floor to equal sigma_hi and k_sg to explode.
                         self.periph_module.set_role_thresholds(
                             tau_role, sigma_hi,
-                            sigma_iqr=(
-                                sigma_iqr if np.isfinite(sigma_iqr) else None
-                            ),
                         )
-
-                    modules_list = list(self.belief_modules.values()) if isinstance(self.belief_modules, dict) else list(self.belief_modules)
-
-                    _tau, _sig, _kap = 0.0, 0.0, 0.0
-                    for b_mod in modules_list:
-                        if not hasattr(b_mod, 'tau'):
-                            continue
-                        
-                        b_mod.tau = max(1e-4, tau_role * 0.5)
-                        b_mod.sigma_floor = max(1e-4, sigma_hi * 0.1)
-                        
-                        # Compute base kappa and apply the persistent multiplier.
-                        base_kappa = float(np.clip(tau_role / (sigma_hi + 1e-8), 0.05, 2.0))
-                        b_mod.kappa = base_kappa * self._kappa_multiplier
-                        
-                        _tau, _sig, _kap = b_mod.tau, b_mod.sigma_floor, b_mod.kappa
-
-                    print(f"   [SYNC] Param Update: tau={_tau:.5f}, sigma_floor={_sig:.5f}, kappa={_kap:.5f} (Multiplier: {self._kappa_multiplier:.3f})")
-
-                    target_mod = modules_list[0]
-                    dbg = getattr(target_mod, '_last_lcb_debug', None)
-                    if dbg:
-                        print(f"   [MATH CHECK] |mu_deb| mean={dbg.get('mu_deb_mean', float('nan')):.6f}"
-                              f" | Penalty mean={dbg.get('penalty_mean', float('nan')):.6f}"
-                              f" | p mean={dbg.get('p_mean', float('nan')):.4f}")
-
-                    try:
-                        sample_p = np.atleast_1d(target_mod._p_core_arr).flatten()[:5]
-                        print(f"   [SANITY] p_core_arr[0:5] hiện tại: {sample_p}")
-                    except Exception as sanity_e:
-                        pass
-
-                    self._calib_fail_count = 0
-                    if is_reactive_calib:
-                        self._consecutive_zero_max_p = 0
-
+                    print(
+                        f"[SEMANTIC-CALIBRATION] tau_D={tau_role:.6f} "
+                        f"sigma_D_hi={sigma_hi:.6f}; C-LCB unchanged"
+                    )
                 except Exception as e:
-                    self._calib_fail_count += 1
-                    print(f"   [ERROR] Calibration failed (Count: {self._calib_fail_count}/3): {e}")
-            # End runner calibration patch.
+                    print(f"[SEMANTIC-CALIBRATION][ERROR] {type(e).__name__}: {e}")
 
             last_info = trajectory[-1].get("info", {}) if trajectory else {}
             structural_shift_magnitude = float(
@@ -1833,6 +1987,7 @@ class FinalCIGAMFRunner:
                 and behavioral_phase != self._last_behavioral_phase
             )
             self._last_behavioral_phase = behavioral_phase
+            adapter_metrics = getattr(self, "last_behavioral_adapter_metrics", {})
             self.episode_events.append({
                 "episode": episode_number,
                 "triggered": int(graph_info["triggered"]),
@@ -1843,6 +1998,21 @@ class FinalCIGAMFRunner:
                 "behavioral_shift": behavioral_shift,
                 "mean_f1": float(snapshot["mean_f1"]),
                 "mean_reward": float(snapshot["mean_reward"]),
+                "behavioral_adapter_active": int(
+                    round(float(adapter_metrics.get("behavioral_adapter_active", 0.0)))
+                ),
+                "behavioral_adapter_lambda": float(
+                    adapter_metrics.get("behavioral_adapter_lambda", 0.0)
+                ),
+                "behavioral_adapter_kl": float(
+                    adapter_metrics.get("behavioral_adapter_kl", 0.0)
+                ),
+                "behavioral_adapter_tv": float(
+                    adapter_metrics.get("behavioral_adapter_tv", 0.0)
+                ),
+                "behavioral_adapter_action_freq_tv": float(
+                    adapter_metrics.get("behavioral_adapter_action_freq_tv", 0.0)
+                ),
             })
             self.episodes_completed = episode_number
 

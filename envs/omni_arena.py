@@ -1794,6 +1794,36 @@ class OmniArena:
             return self.rng.randint(0, self.N_ACTIONS - 1)
         return self.STAY if (self.t % 2 == 0) else self.rng.randint(0, self.N_ACTIONS - 1)
 
+    def scripted_policy_distribution(self, agent_id):
+        """Return the scripted action distribution without consuming RNG.
+
+        This is used by the controlled H2 execution-policy adapter.  The
+        deterministic roles preserve exactly the action selected by
+        ``scripted_policy``.  Drifter branches that sample uniformly are
+        represented as their analytic distribution, so observing the policy
+        does not alter the random stream used by the environment.
+        """
+        agent_id = int(agent_id)
+        role = self.agent_role[agent_id]
+        if role != self.ROLE_DRIFTER:
+            action = int(self.scripted_policy(agent_id))
+            out = np.zeros(self.N_ACTIONS, dtype=np.float32)
+            out[np.clip(action, 0, self.N_ACTIONS - 1)] = 1.0
+            return out
+
+        if agent_id % 3 == 0:
+            action = self.STAY
+            out = np.zeros(self.N_ACTIONS, dtype=np.float32)
+            out[action] = 1.0
+            return out
+        if agent_id % 3 == 1:
+            return np.full(self.N_ACTIONS, 1.0 / float(self.N_ACTIONS), dtype=np.float32)
+        if self.t % 2 == 0:
+            out = np.zeros(self.N_ACTIONS, dtype=np.float32)
+            out[self.STAY] = 1.0
+            return out
+        return np.full(self.N_ACTIONS, 1.0 / float(self.N_ACTIONS), dtype=np.float32)
+
     # ============================================================
     # Step
     # ============================================================
@@ -2090,6 +2120,142 @@ class OmniArena:
     # ============================================================
     # Oracle rollout support aligned with the tiny_oracle_dig.py interface
     # ============================================================
+
+    def _rollout_reward_sequence_from_current_state(
+        self,
+        forced=None,
+        horizon=None,
+        continuation_policy=None,
+    ):
+        """Roll out per-step rewards under a declared reference continuation.
+
+        ``continuation_policy`` is the fixed reference policy :math:`rho` for
+        a standardized response measurement.  It is held fixed across the
+        intervention and reference branches; the policy may observe the state,
+        but its definition does not depend on the intervened action.  The
+        caller owns snapshot restoration and common-random-number setup.
+        """
+        if horizon is None:
+            horizon = self.causal_horizon
+        if continuation_policy is None:
+            continuation_policy = self.scripted_policy
+
+        rewards_by_lag = []
+        done = False
+        for local_t in range(int(horizon)):
+            if done:
+                break
+            actions = [int(continuation_policy(agent)) for agent in range(self.n_agents)]
+            if forced is not None:
+                agent_id, intervention_action, forced_step = forced
+                if local_t == int(forced_step):
+                    actions[int(agent_id)] = int(intervention_action)
+            _, rewards, done, _ = self.step(
+                actions,
+                return_obs=False,
+                return_info=False,
+            )
+            rewards_by_lag.append(np.asarray(rewards, dtype=np.float64))
+
+        out = np.zeros((int(horizon), self.n_agents), dtype=np.float64)
+        if rewards_by_lag:
+            out[:len(rewards_by_lag)] = np.stack(rewards_by_lag, axis=0)
+        return out
+
+    def compute_oracle_lag_response_from_current_state(
+        self,
+        ego_id,
+        agent_j,
+        intervention_action,
+        horizon=None,
+        n_trials=1,
+        forced_step=0,
+        continuation_policy=None,
+        crn_seed=None,
+    ):
+        """Measure the lag-specific causal response under fixed policy ``rho``.
+
+        This is the latency oracle for the optional Paper-A contribution.  It
+        compares an intervention only at ``forced_step`` with a reference
+        rollout, then applies the same declared continuation policy to both
+        branches.  Unlike the former horizon/sign-flip diagnostic, it returns
+        the impulse-response vector directly.  The caller must establish an
+        oracle gate before this quantity is introduced into a learned proxy.
+
+        The returned ``onset_lag``, ``peak_lag``, and ``centre_of_mass_lag``
+        are summaries of absolute response mass; ``None`` denotes a response
+        with no measurable mass rather than an inferred zero-latency effect.
+        """
+        if horizon is None:
+            horizon = self.causal_horizon
+        horizon = int(horizon)
+        ego_id = int(ego_id)
+        agent_j = int(agent_j)
+        forced_step = int(forced_step)
+        if not 0 <= forced_step < horizon:
+            raise ValueError("forced_step must lie in [0, horizon)")
+        if self.t + horizon > self.max_steps:
+            raise AssertionError(
+                "lag-response oracle window crosses an episode boundary; "
+                "sample a state with t + horizon <= max_steps"
+            )
+
+        snapshot = self.clone_state()
+        accumulated = np.zeros(horizon, dtype=np.float64)
+        try:
+            for trial in range(max(1, int(n_trials))):
+                crn_rng = np.random.RandomState(
+                    ((crn_seed if crn_seed is not None else self.seed) * 65537 + trial)
+                    % (2 ** 32)
+                )
+                buffer = self._make_crn_buffer(horizon, crn_rng)
+
+                self.restore_state(snapshot)
+                self.set_noise_buffer(buffer)
+                base = self._rollout_reward_sequence_from_current_state(
+                    horizon=horizon,
+                    continuation_policy=continuation_policy,
+                )[:, ego_id]
+
+                self.restore_state(snapshot)
+                self.set_noise_buffer(buffer)
+                intervened = self._rollout_reward_sequence_from_current_state(
+                    forced=(agent_j, intervention_action, forced_step),
+                    horizon=horizon,
+                    continuation_policy=continuation_policy,
+                )[:, ego_id]
+                accumulated += intervened - base
+        finally:
+            self.clear_noise_buffer()
+            self.restore_state(snapshot)
+
+        response = accumulated / float(max(1, int(n_trials)))
+        mass = np.abs(response)
+        total_mass = float(mass.sum())
+        if total_mass <= 1e-12:
+            onset_lag = None
+            peak_lag = None
+            centre_of_mass_lag = None
+        else:
+            # A relative onset threshold is stable across role-specific scales
+            # and distinguishes a delayed response from numerical noise.
+            onset_lag = int(np.flatnonzero(mass >= 0.10 * float(mass.max()))[0])
+            peak_lag = int(np.argmax(mass))
+            centre_of_mass_lag = float(
+                np.dot(np.arange(horizon, dtype=np.float64), mass) / total_mass
+            )
+
+        discount = 0.95 ** np.arange(horizon, dtype=np.float64)
+        return {
+            "per_lag_response": response.astype(np.float64),
+            "discounted_response": float(np.dot(discount, response)),
+            "onset_lag": onset_lag,
+            "peak_lag": peak_lag,
+            "centre_of_mass_lag": centre_of_mass_lag,
+            "response_mass": total_mass,
+            "horizon": horizon,
+            "forced_step": forced_step,
+        }
 
     def rollout_from_current_state(self, forced=None, horizon=None):
         if horizon is None:

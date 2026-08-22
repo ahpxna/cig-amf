@@ -72,11 +72,11 @@ import numpy as np
 
 class BayesLightBeliefState:
     """
-    Structural belief for ego agent i.
+    Structural-capacity belief for ego agent i.
 
-    State per directed pair (i,j): signed smoothed influence mu_bar,
-    smoothed ensemble epistemic uncertainty sigma_bar, nonsaturated p_core,
-    and update count for the Robbins-Monro schedule.
+    State per directed pair stores smoothed capacity ``C_bar`` and
+    ``sigma_C_bar``.  Direction ``D`` is intentionally not a state variable:
+    it belongs to the fast peripheral semantic representation.
 
     Args:
         core_rule:
@@ -113,6 +113,7 @@ class BayesLightBeliefState:
         adaptive_k: bool = False,
         adaptive_k_min: int = 1,
         signed_balance: float = 0.5,
+        sigma_alpha_max: float = 1.0,
     ):
         self.ego_id = int(ego_id)
         self.neighbor_ids = [int(j) for j in neighbor_ids]
@@ -145,6 +146,7 @@ class BayesLightBeliefState:
         self.adaptive_k = bool(adaptive_k)
         self.adaptive_k_min = int(max(1, adaptive_k_min))
         self.signed_balance = float(np.clip(signed_balance, 0.0, 1.0))
+        self.sigma_alpha_max = max(float(sigma_alpha_max), self.sigma_floor)
 
         # ---------------------------------------------------------------
         # [GPU contract sections 1.2/1.4] Authoritative state lives in float64
@@ -285,13 +287,13 @@ class BayesLightBeliefState:
         mu = self.debiased_mu(j)
         sigma = self._safe_sigma(self.debiased_sigma(j))
 
-        return float(abs(mu) - self.kappa * sigma)
+        return float(max(mu, 0.0) - self.kappa * sigma)
 
     def _priority(self, j: int) -> float:
         """Priority for fill/prune on the same scale as core selection."""
         if self.core_rule == "p_core":
             j = int(j)
-            mu = abs(float(self.mu_bar.get(j, 0.0)))
+            mu = max(float(self.debiased_mu(j)), 0.0)
             sigma = self._safe_sigma(self.sigma_bar.get(j, 1.0))
             return float(mu / (sigma + self.eps))
 
@@ -323,7 +325,7 @@ class BayesLightBeliefState:
             return int(self.max_core_size)
 
         vals = np.array(
-            [abs(float(self.mu_bar[j])) for j in self.neighbor_ids],
+            [max(float(self.debiased_mu(j)), 0.0) for j in self.neighbor_ids],
             dtype=np.float64,
         )  # [n_neighbors]
 
@@ -493,8 +495,14 @@ class BayesLightBeliefState:
             decay_factor = (
                 t ** self.alpha_decay if self.alpha_decay > 0.0 else np.ones_like(t)
             )
+            # Bounded uncertainty is required for the within-regime
+            # Robbins--Monro argument.  The belief still stores the raw
+            # uncertainty; only its learning-rate modulation is clipped.
+            sigma_for_alpha = np.clip(
+                sigmas_arr, self.sigma_floor, self.sigma_alpha_max
+            )
             alpha = self.lambda_0 / (
-                decay_factor * (1.0 + self.uncertainty_scale * sigmas_arr)
+                decay_factor * (1.0 + self.uncertainty_scale * sigma_for_alpha)
             )
             alpha = np.clip(alpha, 0.0, 1.0)
 
@@ -507,13 +515,12 @@ class BayesLightBeliefState:
             # Adam-style bias correction; formula unchanged.
             self._bias_corr_arr[idx] = self._bias_corr_arr[idx] * (1.0 - alpha)
 
-            # [B1] p_core is diagnostic only: sigmoid of debiased LCB.
+            # p_core is a calibrated diagnostic of the exact same structural
+            # score used for membership.  It is not a separate control signal.
             mu_deb, sig_deb = self._debiased_arr(idx)
-            # --- LCB / P COMPUTATION (rebuilt v3) ---
-            safe_sigma_ceiling = max(self.sigma_floor * 10.0, 0.1)
-            effective_sigma = np.clip(sig_deb, self.sigma_floor, safe_sigma_ceiling)
+            effective_sigma = np.maximum(sig_deb, self.sigma_floor)
 
-            lcb = np.abs(mu_deb) - self.kappa * effective_sigma
+            lcb = np.maximum(mu_deb, 0.0) - self.kappa * effective_sigma
             normalized_lcb = (lcb - self.tau) / max(self.tau, 1e-4)
             p = 1.0 / (1.0 + np.exp(-np.clip(normalized_lcb, -10.0, 10.0)))
 
@@ -583,7 +590,7 @@ class BayesLightBeliefState:
 
         idx_all = np.arange(len(self.neighbor_ids), dtype=np.int64)
         mu_deb, sig_deb = self._debiased_arr(idx_all)
-        g = np.abs(mu_deb) - self.kappa * np.maximum(sig_deb, self.sigma_floor)  # [n]
+        g = np.maximum(mu_deb, 0.0) - self.kappa * np.maximum(sig_deb, self.sigma_floor)  # [n]
 
         was_in_prev = np.array(
             [j in self.prev_core_set for j in self.neighbor_ids], dtype=bool
@@ -691,6 +698,8 @@ class BayesLightBeliefState:
             # requires a correctly scaled estimate.
             "mu_bar": float(self.debiased_mu(j)),      # Signed.
             "sigma_bar": float(self.debiased_sigma(j)),
+            "capacity_bar": float(max(self.debiased_mu(j), 0.0)),
+            "sigma_capacity_bar": float(self.debiased_sigma(j)),
             "mu_bar_raw": float(self.mu_bar[j]),
             "p_core": float(self.p_core[j]),
             "in_core": float(j in self.core_set),
@@ -758,7 +767,7 @@ class BayesLightBeliefState:
         return set(self.last_demoted)
 
     def get_mean_abs_mu(self) -> float:
-        vals = [abs(float(self.mu_bar[j])) for j in self.neighbor_ids]
+        vals = [max(float(self.debiased_mu(j)), 0.0) for j in self.neighbor_ids]
         return float(np.mean(vals)) if vals else 0.0
 
     def get_max_p_core(self) -> float:

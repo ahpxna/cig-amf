@@ -19,13 +19,15 @@ def _h2_rows():
                     "seed": seed,
                     "claim_evaluable": True,
                     "episodes": 400,
-                    "SR_cross_run": sr,
+                    "SR_C": sr,
                     "recovery_latency": latency,
                     "n_shift_events": 2,
                     "n_recovered_shifts": 2,
                     "n_shift_with_trigger": 2,
                     "n_complete_structural_windows": 2,
                     "n_complete_behavioral_windows": 2,
+                    "direction_manipulation_pass": model != "CorrelationMeanField",
+                    "direction_behav": 0.2 if model != "CorrelationMeanField" else 0.0,
                 }
             )
     return rows

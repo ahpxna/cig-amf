@@ -55,7 +55,7 @@ import run_experiment as RE
 # cannot define Eq. 33.
 MODELS = ["Final-CIGAMF", "CorrelationMeanField", "NoTwoTimescale"]
 MODES = ["behavioral_drift", "structural_shift"]
-PROTOCOL_VERSION = "h2_matched_change_v2"
+PROTOCOL_VERSION = "h2_cd_execution_adapter_v3"
 CHANGE_WINDOW_EVAL_INTERVALS = 2
 
 
@@ -160,6 +160,19 @@ def _runner_influence_matrix(runner, n_agents):
     if hasattr(runner, "belief_modules"):
         return w_matrix(runner, n_agents)
     return None
+
+
+def _runner_direction_matrix(runner, n_agents):
+    getter = getattr(runner, "get_direction_matrix", None)
+    if not callable(getter):
+        return None
+    matrix = np.asarray(getter(), dtype=np.float64)
+    expected = (int(n_agents), int(n_agents))
+    if matrix.shape != expected:
+        raise RuntimeError(
+            f"runner direction matrix has shape {matrix.shape}; expected {expected}"
+        )
+    return matrix.copy()
 
 
 def _recovery_statistics(
@@ -321,6 +334,12 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
     RE.set_global_seed(seed)
     cfg = RE.default_cfg()
     cfg["seed"] = seed
+    # The old behavioural arm changed only environment metadata while every
+    # learned runner continued sampling its own policy.  This intervention is
+    # the executed policy: pi_tilde=(1-lambda)pi+lambda*pi_scripted.  It is
+    # disabled in the structural arm so the two perturbations remain separate.
+    cfg["behavioral_adapter_lambda"] = 1.0 if mode == "behavioral_drift" else 0.0
+    cfg["behavioral_adapter_only_in_behavioral_drift"] = True
     make_args(seed=seed, device=device)  # Validate the shared CLI defaults.
 
     max_steps = 30
@@ -337,8 +356,11 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
     causal_horizon = int(cfg.get("causal_horizon", 8))
     previous_w = _runner_influence_matrix(runner, env.n_agents)
     has_influence_matrix = previous_w is not None
+    previous_d = _runner_direction_matrix(runner, env.n_agents)
+    has_direction_matrix = previous_d is not None
     previous_phi = _phi_fingerprint(env)
     deltas = []
+    direction_deltas = []
     previous_delta_episode = 0
     eval_records = []
     shift_episodes = []
@@ -376,6 +398,22 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
             for event in new_events
             if int(event.get("behavioral_shift", 0))
         ]
+        adapter_rows = [
+            event for event in new_events
+            if int(event.get("behavioral_adapter_active", 0))
+        ]
+        adapter_kl = _mean_finite([
+            event.get("behavioral_adapter_kl", float("nan"))
+            for event in adapter_rows
+        ])
+        adapter_tv = _mean_finite([
+            event.get("behavioral_adapter_tv", float("nan"))
+            for event in adapter_rows
+        ])
+        adapter_action_freq_tv = _mean_finite([
+            event.get("behavioral_adapter_action_freq_tv", float("nan"))
+            for event in adapter_rows
+        ])
 
         # Compatibility fallback for a future runner that has not yet adopted
         # the per-episode event interface. Current H2 runners use exact events.
@@ -395,11 +433,18 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
             delta = delta_norm(previous_w, current_w)
             previous_w = current_w
 
+        direction_delta = float("nan")
+        if has_direction_matrix:
+            current_d = _runner_direction_matrix(runner, env.n_agents)
+            direction_delta = delta_norm(previous_d, current_d)
+            previous_d = current_d
+
         history = getattr(runner, "history", {})
         row = {
             "run_id": run_id,
             "episode": completed,
             "delta": delta,
+            "direction_delta": direction_delta,
             "delta_interval_start": previous_delta_episode,
             "delta_interval_end": completed,
             "n_shift_events": len(chunk_shifts),
@@ -410,6 +455,10 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
             "n_triggers": len(chunk_triggers),
             "trigger_episodes": chunk_triggers,
             "triggered": int(bool(chunk_triggers)),
+            "n_behavioral_adapter_events": len(adapter_rows),
+            "behavioral_adapter_kl": adapter_kl,
+            "behavioral_adapter_tv": adapter_tv,
+            "behavioral_adapter_action_freq_tv": adapter_action_freq_tv,
             "f1": last(history, "mean_f1"),
             "reward": last(history, "mean_reward"),
             "core_size": last(history, "mean_core_size"),
@@ -425,6 +474,7 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
         append_jsonl(jsonl, row)
         eval_records.append(row)
         deltas.append((previous_delta_episode, completed, delta))
+        direction_deltas.append((previous_delta_episode, completed, direction_delta))
         previous_delta_episode = completed
         print(
             f"[H2 {model}/{mode} s{seed}] ep={completed} delta={delta:.4f} "
@@ -452,6 +502,14 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
     delta_values = np.asarray(
         [delta for _, _, delta in finite_rows], dtype=np.float64
     )
+    finite_direction_rows = [
+        (start_ep, end_ep, delta)
+        for start_ep, end_ep, delta in direction_deltas
+        if np.isfinite(delta)
+    ]
+    direction_values = np.asarray(
+        [delta for _, _, delta in finite_direction_rows], dtype=np.float64
+    )
     delta_struct = (
         float(np.mean(delta_values[structural_mask]))
         if structural_mask.any()
@@ -468,7 +526,22 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
         if background_mask.any()
         else float("nan")
     )
-    selectivity_ratio = (
+    # Direction D is a separate behavioural object.  Use the same interval
+    # masks only when C and D have identical complete evaluation coverage.
+    direction_struct = (
+        float(np.mean(direction_values[structural_mask]))
+        if len(direction_values) == len(delta_values) and structural_mask.any()
+        else float("nan")
+    )
+    direction_behav = (
+        float(np.mean(direction_values[behavioral_mask]))
+        if len(direction_values) == len(delta_values) and behavioral_mask.any()
+        else float("nan")
+    )
+    # This is a within-run background-drift diagnostic.  It is deliberately
+    # not the paper's selectivity ratio: the latter compares the same C
+    # estimator across the matched structural and behavioural interventions.
+    background_drift_ratio = (
         float(delta_struct / delta_background)
         if np.isfinite(delta_struct)
         and np.isfinite(delta_background)
@@ -504,7 +577,10 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
         "delta_mean_struct": delta_struct,
         "delta_mean_behav": delta_behav,
         "delta_mean_background": delta_background,
-        "selectivity_ratio": selectivity_ratio,
+        "direction_metric_applicable": bool(has_direction_matrix),
+        "direction_mean_struct": direction_struct,
+        "direction_mean_behav": direction_behav,
+        "background_drift_ratio": background_drift_ratio,
         "change_window_eval_intervals": CHANGE_WINDOW_EVAL_INTERVALS,
         "structural_change_windows": structural_windows,
         "behavioral_change_windows": behavioral_windows,
@@ -518,6 +594,19 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
         "shift_episodes": sorted(set(shift_episodes)),
         "n_behavioral_shift_events": len(set(behavioral_shift_episodes)),
         "behavioral_shift_episodes": sorted(set(behavioral_shift_episodes)),
+        "behavioral_adapter_required": int(mode == "behavioral_drift"),
+        "behavioral_adapter_event_count": int(sum(
+            int(row["n_behavioral_adapter_events"]) for row in eval_records
+        )),
+        "behavioral_adapter_kl": _mean_finite([
+            row["behavioral_adapter_kl"] for row in eval_records
+        ]),
+        "behavioral_adapter_tv": _mean_finite([
+            row["behavioral_adapter_tv"] for row in eval_records
+        ]),
+        "behavioral_adapter_action_freq_tv": _mean_finite([
+            row["behavioral_adapter_action_freq_tv"] for row in eval_records
+        ]),
         "n_triggers": len(set(trigger_episodes)),
         "trigger_episodes": sorted(set(trigger_episodes)),
         "final_f1": last(getattr(runner, "history", {}), "mean_f1"),
@@ -677,6 +766,10 @@ def main(argv=None):
                     == behavioral["n_complete_behavioral_windows"]
                     and structural["n_complete_structural_windows"] > 0
                     and np.isfinite(sr_cross)
+                    and behavioral["behavioral_adapter_event_count"] > 0
+                    and np.isfinite(behavioral["behavioral_adapter_kl"])
+                    and np.isfinite(behavioral["behavioral_adapter_tv"])
+                    and behavioral["behavioral_adapter_tv"] > 1e-6
                 )
                 rows.append({
                     "run_id": run_id,
@@ -705,14 +798,37 @@ def main(argv=None):
                     "delta_background_behavioral_run": behavioral[
                         "delta_mean_background"
                     ],
-                    "SR_cross_run": sr_cross,
-                    "SR_within_structural": structural["selectivity_ratio"],
+                    "direction_struct": structural["direction_mean_struct"],
+                    "direction_behav": behavioral["direction_mean_behav"],
+                    "direction_manipulation_pass": int(
+                        model in {"Final-CIGAMF", "NoTwoTimescale"}
+                        and np.isfinite(behavioral["direction_mean_behav"])
+                        and behavioral["direction_mean_behav"] > 1e-6
+                    ),
+                    # Paper A's primary selectivity endpoint:
+                    # SR_C = mean(delta C | structural) /
+                    #        mean(delta C | behavioural).
+                    "SR_C": sr_cross,
+                    # Compatibility names retain the two diagnostics without
+                    # confusing either one with the paper endpoint.
+                    "SR_cross_run_legacy": sr_cross,
+                    "background_drift_ratio_structural": structural[
+                        "background_drift_ratio"
+                    ],
                     "recovery_latency": structural["recovery_latency_intervals"],
                     "recovery_latency_raw": structural["recovery_latency_raw_intervals"],
                     "trigger_delay_intervals": structural["trigger_delay_intervals"],
                     "n_shift_events": structural["n_shift_events"],
                     "n_behavioral_shift_events": behavioral[
                         "n_behavioral_shift_events"
+                    ],
+                    "behavioral_adapter_event_count": behavioral[
+                        "behavioral_adapter_event_count"
+                    ],
+                    "behavioral_adapter_kl": behavioral["behavioral_adapter_kl"],
+                    "behavioral_adapter_tv": behavioral["behavioral_adapter_tv"],
+                    "behavioral_adapter_action_freq_tv": behavioral[
+                        "behavioral_adapter_action_freq_tv"
                     ],
                     "n_complete_structural_windows": structural[
                         "n_complete_structural_windows"

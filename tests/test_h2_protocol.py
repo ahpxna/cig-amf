@@ -347,7 +347,7 @@ class H2ProtocolTests(unittest.TestCase):
                 writer.writeheader()
                 writer.writerow({
                     "run_id": "run-1",
-                    "protocol_version": "h2_matched_change_v2",
+                    "protocol_version": "h2_cd_execution_adapter_v3",
                     "model": "Final-CIGAMF",
                     "seed": 0,
                     "claim_evaluable": 1,
@@ -361,7 +361,7 @@ class H2ProtocolTests(unittest.TestCase):
             marker = {
                 "run_id": "run-1",
                 "status": "complete",
-                "protocol_version": "h2_matched_change_v2",
+                "protocol_version": "h2_cd_execution_adapter_v3",
                 "required_comparator_present": True,
                 "required_claim_models_present": True,
                 "models": ["Final-CIGAMF"],
@@ -405,14 +405,14 @@ class H2ProtocolTests(unittest.TestCase):
                 {
                     **attempt,
                     "run_id": "h1-run",
-                    "protocol_version": "h1_exact_v1",
+                    "protocol_version": "h1_qcd_v2",
                     "config_fingerprint": "abc123",
                     "attempt_complete": True,
-                    "rank_correlation_mean": 0.1,
-                    "signed_spearman_mean": 0.1,
-                    "sign_agreement_mean": 0.8,
-                    "bias_mean": 0.0,
-                    "mae_mean": 0.1,
+                    "q_spearman_mean": 0.1,
+                    "capacity_rank_correlation_mean": 0.1,
+                    "oracle_core_f1_mean": 0.8,
+                    "direction_spearman_mean": 0.1,
+                    "direction_sign_agreement_mean": 0.8,
                 }
                 for attempt in h1_attempts
             ]
@@ -420,7 +420,7 @@ class H2ProtocolTests(unittest.TestCase):
             self._write_csv(h1_summary, h1_rows)
             h1_manifest = {
                 "run_id": "h1-run",
-                "protocol_version": "h1_exact_v1",
+                "protocol_version": "h1_qcd_v2",
                 "status": "complete",
                 "expected_attempts": h1_attempts,
                 "completed_attempts": h1_attempts,
@@ -434,7 +434,7 @@ class H2ProtocolTests(unittest.TestCase):
             with open(os.path.join(h1_dir, "latest_complete_run.json"), "w", encoding="utf-8") as f:
                 json.dump({
                     "run_id": "h1-run",
-                    "protocol_version": "h1_exact_v1",
+                    "protocol_version": "h1_qcd_v2",
                     "summary_path": h1_summary,
                     "manifest_path": h1_manifest_path,
                 }, f)
@@ -445,7 +445,7 @@ class H2ProtocolTests(unittest.TestCase):
             h2_rows = [
                 {
                     "run_id": "h2-run",
-                    "protocol_version": "h2_matched_change_v2",
+                    "protocol_version": "h2_cd_execution_adapter_v3",
                     "model": model,
                     "seed": 0,
                     "claim_evaluable": 1,
@@ -453,7 +453,7 @@ class H2ProtocolTests(unittest.TestCase):
                     "delta_struct": 0.2,
                     "delta_background_structural_run": 0.05,
                     "delta_background_behavioral_run": 0.05,
-                    "SR_cross_run": 2.0,
+                    "SR_C": 2.0,
                     "recovery_latency": 1.0,
                     "n_shift_events": 1,
                     "n_shift_with_trigger": 1,
@@ -485,7 +485,7 @@ class H2ProtocolTests(unittest.TestCase):
                 json.dump({
                     "run_id": "h2-run",
                     "status": "complete",
-                    "protocol_version": "h2_matched_change_v2",
+                    "protocol_version": "h2_cd_execution_adapter_v3",
                     "required_comparator_present": True,
                     "required_claim_models_present": True,
                     "expected_attempts": [

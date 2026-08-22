@@ -41,27 +41,28 @@ H3_VARIANTS = {
     "Fixed-Cardinality",
     "NoMultiMemory-SingleMean",
 }
-H2_PROTOCOL_VERSION = "h2_matched_change_v2"
+H2_PROTOCOL_VERSION = "h2_cd_execution_adapter_v3"
+H1_PROTOCOL_VERSION = "h1_qcd_v2"
 
 SPECS = {
     "h1": {
-        "title": "H1 — RQ1: causal identification and calibration",
+        "title": "H1 — Paper A: Q/C/D causal response recovery",
         "filename": "summary_h1.csv",
         "group_key": "variant",
         "expected_groups": H1_VARIANTS,
         "metrics": [
-            "rank_correlation_mean",
-            "signed_spearman_mean",
-            "sign_agreement_mean",
-            "bias_mean",
-            "mae_mean",
+            "q_spearman_mean",
+            "capacity_rank_correlation_mean",
+            "oracle_core_f1_mean",
+            "direction_spearman_mean",
+            "direction_sign_agreement_mean",
         ],
         "required_finite": [
-            "rank_correlation_mean",
-            "signed_spearman_mean",
-            "sign_agreement_mean",
-            "bias_mean",
-            "mae_mean",
+            "q_spearman_mean",
+            "capacity_rank_correlation_mean",
+            "oracle_core_f1_mean",
+            "direction_spearman_mean",
+            "direction_sign_agreement_mean",
         ],
     },
     "h2": {
@@ -74,7 +75,7 @@ SPECS = {
             "delta_background_structural_run",
             "delta_background_behavioral_run",
             "delta_struct",
-            "SR_cross_run",
+            "SR_C",
             "recovery_latency",
             "n_shift_events",
             "n_shift_with_trigger",
@@ -85,7 +86,7 @@ SPECS = {
             "delta_background_structural_run",
             "delta_background_behavioral_run",
             "delta_struct",
-            "SR_cross_run",
+            "SR_C",
             "recovery_latency",
             "n_shift_events",
             "n_shift_with_trigger",
@@ -277,8 +278,10 @@ def _load_h1_complete_rows(h1_dir):
     except (OSError, ValueError) as exc:
         raise ResultValidationError(f"invalid H1 complete-run pointer: {exc}") from exc
     run_id = str(pointer.get("run_id", ""))
-    if not run_id or pointer.get("protocol_version") != "h1_exact_v1":
-        raise ResultValidationError("H1 pointer is not an h1_exact_v1 run")
+    if not run_id or pointer.get("protocol_version") != H1_PROTOCOL_VERSION:
+        raise ResultValidationError(
+            f"H1 pointer is not a {H1_PROTOCOL_VERSION} run"
+        )
 
     manifest_path = _resolve_metadata_path(pointer.get("manifest_path"))
     summary_path = _resolve_metadata_path(pointer.get("summary_path"))
@@ -290,7 +293,7 @@ def _load_h1_complete_rows(h1_dir):
     if (
         manifest.get("status") != "complete"
         or str(manifest.get("run_id", "")) != run_id
-        or manifest.get("protocol_version") != "h1_exact_v1"
+        or manifest.get("protocol_version") != H1_PROTOCOL_VERSION
         or manifest.get("failed_attempts")
     ):
         raise ResultValidationError("H1 manifest is incomplete, failed, or mismatched")
@@ -318,7 +321,7 @@ def _load_h1_complete_rows(h1_dir):
     for row in rows:
         if (
             str(row.get("run_id", "")) != run_id
-            or row.get("protocol_version") != "h1_exact_v1"
+            or row.get("protocol_version") != H1_PROTOCOL_VERSION
             or str(row.get("attempt_complete", "")).lower() not in {"true", "1"}
             or not str(row.get("config_fingerprint", ""))
         ):

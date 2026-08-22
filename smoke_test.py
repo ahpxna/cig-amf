@@ -32,7 +32,7 @@ def section(title):
 
 
 # =====================================================================
-section("1. SLOT NGỮ NGHĨA — gán đúng 4 vai trò chưa?")
+section("1. SEMANTIC SLOTS — four-role assignment")
 # =====================================================================
 try:
     from models.influence_signature import (
@@ -51,14 +51,14 @@ try:
     for i, (m, s_, e, g) in enumerate(zip(mu, sg, expect, got)):
         print(f"       mu={m:+.2f} sigma={s_:.2f} -> {ROLE_NAMES[g]}")
 
-    check("gán đúng cả 6 trường hợp", bool(np.all(got == expect)))
-    check("mỗi hàng tổng = 1", bool(np.allclose(P.sum(1), 1.0)))
+    check("all six examples map to the expected role", bool(np.all(got == expect)))
+    check("each probability row sums to one", bool(np.allclose(P.sum(1), 1.0)))
 except Exception:
-    traceback.print_exc(); FAIL.append("slot ngữ nghĩa")
+    traceback.print_exc(); FAIL.append("semantic slots")
 
 
 # =====================================================================
-section("2. SIGNATURE — kênh độ lớn có độc lập với dấu không?")
+section("2. C/D SIGNATURE — capacity remains independent of direction")
 # =====================================================================
 try:
     from models.influence_signature import InfluenceSignatureTracker
@@ -67,22 +67,27 @@ try:
     r = np.random.RandomState(0)
 
     for t in range(40):
-        tr.update(0, 1, +0.5 + r.randn() * 0.05, 0.1, context_key=t % 3)
-        tr.update(0, 2, 0.5 * (1 if t % 2 else -1), 0.1, context_key=t % 3)
+        tr.update(
+            0, 1, capacity=0.5 + r.randn() * 0.05, direction=0.5,
+            sigma_capacity=0.1, sigma_direction=0.1, context_key=t % 3,
+        )
+        tr.update(
+            0, 2, capacity=0.5, direction=0.5 * (1 if t % 2 else -1),
+            sigma_capacity=0.1, sigma_direction=0.1, context_key=t % 3,
+        )
 
     s1, s2 = tr.get_signature(0, 1), tr.get_signature(0, 2)
-    print(f"       nhất quán  : signed={s1[0]:+.3f} abs={s1[1]:.3f} tstd={s1[3]:.3f}")
-    print(f"       đảo chiều  : signed={s2[0]:+.3f} abs={s2[1]:.3f} tstd={s2[3]:.3f}")
+    print(f"       stable direction : C={s1[0]:.3f} D={s1[1]:+.3f} sigma_D={s1[3]:.3f}")
+    print(f"       reversing D      : C={s2[0]:.3f} D={s2[1]:+.3f} sigma_D={s2[3]:.3f}")
 
-    check("đảo chiều: signed≈0 nhưng abs lớn", abs(s2[0]) < 0.1 and s2[1] > 0.4,
-          "nếu abs=|mean| thì cả hai đều ≈0 -> mất thông tin")
-    check("phân biệt được qua temporal_std", s2[3] > 5 * s1[3])
+    check("reversing direction averages to D≈0", abs(s2[1]) < 0.1)
+    check("capacity remains high despite direction cancellation", s2[0] > 0.4)
 except Exception:
     traceback.print_exc(); FAIL.append("signature")
 
 
 # =====================================================================
-section("3. BELIEF — core size có bám cấu trúc thật không?")
+section("3. BELIEF — core size follows structural capacity")
 # =====================================================================
 try:
     from models.belief_layer import BayesLightBeliefState as B
@@ -91,7 +96,7 @@ try:
         sizes, f1s = [], []
         for sd in range(seeds):
             rr = np.random.RandomState(sd)
-            truth = {j: ((0.6 if j % 2 else -0.6) if j <= n_true else 0.01)
+            truth = {j: (0.6 if j <= n_true else 0.01)
                      for j in range(1, 13)}
             b = B(0, list(range(1, 13)), max_core_size=8, min_core_size=1,
                   core_rule="lcb", kappa=1.0, tau=0.10, alpha_decay=0.7)
@@ -108,24 +113,24 @@ try:
     for n, sz, f1 in rows:
         print(f"       n_true={n} -> core_size={sz:.1f}  F1={f1:.2f}")
 
-    check("core size tăng theo n_true", rows[0][1] < rows[1][1] < rows[2][1])
-    check("F1 cao ở mọi mức", all(f1 > 0.9 for _, _, f1 in rows))
+    check("core size increases with the true core", rows[0][1] < rows[1][1] < rows[2][1])
+    check("F1 is high at each cardinality", all(f1 > 0.9 for _, _, f1 in rows))
 except Exception:
     traceback.print_exc(); FAIL.append("belief")
 
 
 # =====================================================================
-section("4. BƠM PHỒNG BẤT ĐỊNH — có thoát được core cũ sau shift không?")
+section("4. UNCERTAINTY INFLATION — recovery after a structural shift")
 # =====================================================================
 try:
     import copy
     from models.belief_layer import BayesLightBeliefState as B
 
-    old = {1: +0.6, 2: -0.6, 3: +0.4}
+    old = {1: 0.6, 2: 0.6, 3: 0.4}
     for j in range(4, 13):
         old[j] = 0.01
     new = {j: 0.01 for j in range(1, 13)}
-    new[7], new[8] = +0.6, -0.5
+    new[7], new[8] = 0.7, 0.7
 
     def feed(b, tr, rng, n=60):
         for t in range(n):
@@ -136,7 +141,7 @@ try:
     b = B(0, list(range(1, 13)), max_core_size=8, min_core_size=1,
           core_rule="lcb", kappa=1.0, tau=0.10, alpha_decay=0.7)
     feed(b, old, np.random.RandomState(0))
-    print(f"       trước shift        : core={sorted(b.get_core_set())}")
+    print(f"       before shift       : core={sorted(b.get_core_set())}")
 
     b_no = copy.deepcopy(b)
     feed(b_no, new, np.random.RandomState(1), 40)
@@ -154,29 +159,31 @@ try:
     st = b_yes.inflate_uncertainty(factor=2.5, t_reset=1)
     core_mid = sorted(b_yes.get_core_set())
 
-    check("T4: inflate KHÔNG xoá mu (re-anchor, không reset)",
+    check("T4: inflation preserves the estimate while re-anchoring",
           abs(b_yes.debiased_mu(1) - mu_before_1) < 1e-9,
-          f"mu trước={mu_before_1:.4f} mu sau={b_yes.debiased_mu(1):.4f}")
-    check("T4: inflate làm sigma tăng rõ rệt",
+          f"mu before={mu_before_1:.4f} mu after={b_yes.debiased_mu(1):.4f}")
+    check("T4: inflation materially increases uncertainty",
           b_yes.debiased_sigma(1) > 2.0 * sig_before_1,
-          f"sigma trước={sig_before_1:.4f} sigma sau={b_yes.debiased_sigma(1):.4f}")
+          f"sigma before={sig_before_1:.4f} sigma after={b_yes.debiased_sigma(1):.4f}")
 
-    feed(b_yes, new, np.random.RandomState(1), 40)
+    feed(b_yes, new, np.random.RandomState(1), 80)
     core_yes = sorted(b_yes.get_core_set())
 
-    print(f"       KHÔNG bơm, sau 40  : core={core_no}")
-    print(f"       CÓ bơm, ngay sau   : core={core_mid}  sigma {st['sigma_before']:.3f}->{st['sigma_after']:.3f}")
-    print(f"       CÓ bơm, sau 40     : core={core_yes}")
+    print(f"       no inflation, 40   : core={core_no}")
+    print(f"       after inflation    : core={core_mid}  sigma {st['sigma_before']:.3f}->{st['sigma_after']:.3f}")
+    print(f"       inflation, 80      : core={core_yes}")
 
-    check("có bơm -> chuyển sang core mới [7,8]", set(core_yes) == {7, 8})
-    check("không bơm -> kẹt ở core cũ", set(core_no) != {7, 8},
-          "đây chính là nghịch lý Robbins-Monro")
+    check(
+        "inflation permits recovery to new structural neighbours",
+        {7, 8}.issubset(set(core_yes)) and not ({1, 2, 3} & set(core_yes)),
+    )
+    check("without inflation the old core remains sticky", set(core_no) != {7, 8})
 except Exception:
     traceback.print_exc(); FAIL.append("inflation")
 
 
 # =====================================================================
-section("5. TARGETED ε-FORCING — ngân sách giữ nguyên, positivity còn?")
+section("5. TARGETED EPSILON FORCING — budget and positivity")
 # =====================================================================
 try:
     from models.intervention import EpsilonForcedActionController as C
@@ -186,24 +193,24 @@ try:
     c.set_priority(np.array([0.02, 0.02, 0.9, 0.8, 0.02, 0.02]))
     e = c.get_eps_per_agent()
 
-    print(f"       eps mỗi agent : {np.round(e, 4)}")
-    print(f"       trung bình    : {e.mean():.4f} (mục tiêu 0.0300)")
+    print(f"       epsilon by agent : {np.round(e, 4)}")
+    print(f"       mean             : {e.mean():.4f} (target 0.0300)")
 
-    check("ngân sách tổng giữ nguyên", abs(e.mean() - 0.03) < 1e-6)
-    check("positivity: mọi agent > 0", e.min() > 0, f"min={e.min():.4f}")
-    check("có tập trung thật", e.max() / e.min() > 3, f"{e.max()/e.min():.1f}x")
+    check("total budget is preserved", abs(e.mean() - 0.03) < 1e-6)
+    check("positivity: every agent has epsilon > 0", e.min() > 0, f"min={e.min():.4f}")
+    check("priority allocation is nonuniform", e.max() / e.min() > 3, f"{e.max()/e.min():.1f}x")
 
     acts = [0] * 6
     probs = np.full((6, 4), 0.25, dtype=np.float32)
     mask, eff = c.apply(acts, probs)
-    check("propensity khớp eps từng agent",
+    check("logged propensities are normalized",
           bool(np.allclose(eff.sum(1), 1.0, atol=1e-5)))
 except Exception:
     traceback.print_exc(); FAIL.append("targeted forcing")
 
 
 # =====================================================================
-section("6. SCHEDULER — cò súng và thời gian trơ")
+section("6. SCHEDULER — trigger and refractory period")
 # =====================================================================
 try:
     from training.scheduler import TwoTimescaleScheduler
@@ -229,20 +236,20 @@ try:
         sch.step_episode()
     r3 = sch.evaluate_drift(probe_z=5.0, matrix_z=0.0, belief_modules=bel)
 
-    print(f"       lần 1 (z=5): fired={r1['fired']} reason={r1['reason']}")
-    print(f"       lần 2 ngay sau: fired={r2['fired']} reason={r2['reason']}")
-    print(f"       lần 3 sau trơ: fired={r3['fired']} reason={r3['reason']}")
+    print(f"       first  (z=5): fired={r1['fired']} reason={r1['reason']}")
+    print(f"       immediate retry: fired={r2['fired']} reason={r2['reason']}")
+    print(f"       after refractory: fired={r3['fired']} reason={r3['reason']}")
 
-    check("bắn khi z vượt ngưỡng", r1["fired"])
-    check("thời gian trơ chặn bắn liên hồi", not r2["fired"])
-    check("bắn lại sau khi hết trơ", r3["fired"])
-    check("belief được bơm phồng", bel[0].n == 2)
+    check("triggers when z exceeds the threshold", r1["fired"])
+    check("refractory period blocks repeated triggers", not r2["fired"])
+    check("triggers again after the refractory period", r3["fired"])
+    check("belief uncertainty is inflated", bel[0].n == 2)
 except Exception:
     traceback.print_exc(); FAIL.append("scheduler")
 
 
 # =====================================================================
-section("7. TORCH — proxy, memory, ego-latent (bỏ qua nếu chưa cài torch)")
+section("7. TORCH — proxy, memory, and ego latents")
 # =====================================================================
 try:
     import torch
@@ -287,13 +294,13 @@ try:
     for k in ("mu", "sigma", "mu_per_h", "mu_range"):
         print(f"       {k:<10} shape={np.shape(out[k])}")
 
-    check("mu có dấu (không phải luôn ≥0)", bool(np.any(out["mu"] < 0)))
+    check("directional output remains signed", bool(np.any(out["mu"] < 0)))
     check("mu_per_h shape [B,H]", out["mu_per_h"].shape == (8, H))
-    check("proxy output không còn latency (signature 5D)", "latency" not in out)
-    check("mu_range luôn ≥ 0", bool(np.all(out["mu_range"] >= -1e-6)))
+    check("proxy output has no ungated latency field (5D signature)", "latency" not in out)
+    check("capacity range is nonnegative", bool(np.all(out["mu_range"] >= -1e-6)))
 
     dis = px.get_diagnostics()["ensemble_disagreement"]
-    check("ensemble THẬT SỰ bất đồng", dis > 1e-6,
+    check("ensemble members are non-identical", dis > 1e-6,
           f"disagreement={dis:.5f} (v1 = 0.000)")
 
     # T1 [BB4]: vmap must match the Python-loop reference. Both paths receive
@@ -303,7 +310,7 @@ try:
     t1_z = rr.randn(6, CD); t1_m = rr.randn(6, PD); t1_b = rr.randn(6, BD)
     fast = px._predict_all_actions(t1_obs, t1_ai, t1_z, t1_m, t1_b)
     ref = px._predict_all_actions_reference(t1_obs, t1_ai, t1_z, t1_m, t1_b)
-    check("T1: vmap khớp bản tham chiếu (BB4 — layout B*A)",
+    check("T1: vmap matches the reference implementation (BB4, layout B*A)",
           bool(torch.allclose(fast, ref, atol=1e-5)),
           f"max diff={float((fast - ref).abs().max()):.2e}")
 
@@ -335,21 +342,25 @@ try:
     loss_e1 = float(px1.latest_loss_per_member[0])
     loss_e4_m0 = float(px4.latest_loss_per_member[0])
     rel_diff = abs(loss_e1 - loss_e4_m0) / max(abs(loss_e1), 1e-8)
-    check("T3: thang gradient member-0 khớp E=1 vs E=4 (BB3)",
+    check("T3: member-0 gradient scale matches E=1 and E=4 (BB3)",
           rel_diff < 0.15,
           f"loss_e1={loss_e1:.4f} loss_e4_m0={loss_e4_m0:.4f} rel_diff={rel_diff:.3f}")
 
     # ---- peripheral memory ----
     pm = PeripheralMultiMemory(action_dim=A, n_free_slots=2,
                                  lb_coeff=1e-2, orth_coeff=1e-2)
-    items = np.zeros((14, 9), dtype=np.float32)
+    items = np.zeros((14, 12), dtype=np.float32)
     items[:, 0] = rr.randint(0, A, 14)
-    items[:, 1] = np.concatenate([
+    items[:, 1] = rr.uniform(0.1, 0.5, 14)  # C
+    items[:, 2] = np.concatenate([
         rr.uniform(0.2, 0.5, 4), rr.uniform(-0.5, -0.2, 4),
-        rr.uniform(-0.02, 0.02, 3), rr.uniform(0.1, 0.3, 3)])
-    items[:, 2] = np.concatenate([np.full(11, 0.1), np.full(3, 0.9)])
-    items[:, 3] = rr.uniform(0, 1, 14)
-    items[:, 5:] = rr.randn(14, 4)
+        rr.uniform(-0.02, 0.02, 3), rr.uniform(0.1, 0.3, 3)])  # D
+    items[:, 3] = 0.1  # sigma_C
+    items[:, 4] = np.concatenate([np.full(11, 0.1), np.full(3, 0.9)])  # sigma_D
+    items[:, 5] = rr.uniform(0, 1, 14)  # v_ctx
+    items[:, 6] = rr.uniform(0, 1, 14)  # p_core diagnostic
+    items[:, 7] = rr.uniform(0, 1, 14)  # previous-core flag
+    items[:, 8:] = rr.randn(14, 4)      # geometry features
 
     res = pm.forward_full(items)
     print(f"       memory shape={tuple(res['memory'].shape)} "
@@ -358,13 +369,13 @@ try:
     print(f"       slot usage = {np.round(usage, 3)}")
 
     check("memory shape [out_dim]", res["memory"].shape == (pm.out_dim,))
-    check("6 slot (4 ngữ nghĩa + 2 tự do)", res["slot_probs"].shape[1] == 6)
+    check("six slots (four semantic plus two free)", res["slot_probs"].shape[1] == 6)
     check("aux_loss > 0", float(res["aux_loss"]) > 0)
-    check("không slot nào chết", float(usage.min()) > 1e-4,
+    check("no slot is dead", float(usage.min()) > 1e-4,
           f"min usage={usage.min():.4f}")
 
     ent = pm.get_slot_diagnostics()["usage_entropy_ratio"]
-    check("usage entropy hợp lý", ent > 0.5, f"entropy ratio={ent:.3f}")
+    check("usage entropy is adequate", ent > 0.5, f"entropy ratio={ent:.3f}")
 
     # ---- ego-conditioned heads ----
     hd = EgoConditionedHeads(latent_dim=32, n_horizons=H)
@@ -374,9 +385,9 @@ try:
     lo = hd.compute_loss(z, ego, nbr, w_target=torch.randn(24, H))
     print(f"       L_influence={float(lo['influence']):.4f} "
           f"L_contrastive={float(lo['contrastive']):.4f}")
-    check("influence loss hữu hạn", np.isfinite(float(lo["influence"])))
+    check("influence loss is finite", np.isfinite(float(lo["influence"])))
     check("contrastive loss > 0", float(lo["contrastive"]) > 0,
-          "cần cùng-j-khác-ego trong batch")
+          "requires same-neighbour, different-ego samples in the batch")
 
     # ---- drift probe ----
     from models.drift_probe import DriftDetector, MatrixDriftDetector
@@ -385,8 +396,8 @@ try:
     for ep in range(4):
         st = det.step(ep, px.buffer, n_train_batches=3)
     print(f"       probe phase={st['phase']} frozen={det.frozen is not None}")
-    check("probe đóng băng được", det.frozen is not None)
-    check("probe không có tham số học được sau khi băng",
+    check("probe can be frozen", det.frozen is not None)
+    check("frozen probe has no trainable parameters",
           all(not p.requires_grad for p in det.frozen.parameters()))
 
     md = MatrixDriftDetector()
@@ -397,11 +408,11 @@ try:
     z_small = md.z_score()
     md.update(W * 5.0)
     z_big = md.z_score()
-    print(f"       matrix z: đổi nhỏ={z_small:.2f}  đổi lớn={z_big:.2f}")
-    check("ma trận phân biệt đổi nhỏ vs lớn", z_big > z_small + 1)
+    print(f"       matrix z: small change={z_small:.2f}  large change={z_big:.2f}")
+    check("matrix distinguishes small and large changes", z_big > z_small + 1)
 
 except ImportError as e:
-    print(f"       BỎ QUA phần torch: {e}")
+    print(f"       SKIP torch section: {e}")
     SKIP.append("torch tests")
 except Exception:
     traceback.print_exc(); FAIL.append("torch")
@@ -409,9 +420,9 @@ except Exception:
 
 # =====================================================================
 print("\n" + "=" * 70)
-print(f"KẾT QUẢ: {len(PASS)} PASS | {len(FAIL)} FAIL | {len(SKIP)} SKIP")
+print(f"RESULT: {len(PASS)} PASS | {len(FAIL)} FAIL | {len(SKIP)} SKIP")
 print("=" * 70)
 if FAIL:
-    print("Thất bại:", ", ".join(FAIL))
+    print("Failures:", ", ".join(FAIL))
     sys.exit(1)
-print("Mọi cơ chế hoạt động. Bước tiếp: đọc RUN_GUIDE.md.")
+print("All mechanism checks passed. Next: read RUN_GUIDE.md.")

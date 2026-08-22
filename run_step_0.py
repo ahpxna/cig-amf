@@ -46,7 +46,7 @@ def run_one(condition, seed=0):
     return final_reward
 
 if __name__ == "__main__":
-    print("Đang chạy Bước 0 - Kiểm tra độ nhạy cấu trúc môi trường...")
+    print("Running Step 0 — environment structural-sensitivity check...")
     # Pass exactly the two condition labels required by diagnostics.py.
     res = structure_sensitivity_test(
         run_fn=run_one,
@@ -55,13 +55,13 @@ if __name__ == "__main__":
     )
 
     print("\n" + "="*50)
-    print("KẾT QUẢ STEP 0 (baseline-vs-baseline, KHÔNG phải Exp-0 oracle):")
+    print("STEP 0 RESULTS (baseline comparison; not the Experiment 0 oracle):")
     print(f"  baseline  : {res['baseline_condition']}")
     print(f"  treatment : {res['treatment_condition']}")
     print(f"  Structure Value : {res['structure_value']:.4f}")
     print(f"  CI95            : [{res['ci95'][0]:.4f}, {res['ci95'][1]:.4f}]"
           f"  significant={res['significant']}")
-    print("Phán quyết (Verdict):", res["verdict"])
-    print("\n[LƯU Ý] " + res["note"])
-    print("Để lấy Exp-0 THẬT (oracle-core zero-cost), chạy: python run_oracle.py")
+    print("Verdict:", res["verdict"])
+    print("\n[NOTE] " + res["note"])
+    print("For the true zero-cost oracle-core Experiment 0, run: python run_oracle.py")
     print("="*50)
