@@ -247,11 +247,6 @@ def _matched_single_mean_dimensions(cfg, action_dim):
     }
     _MATCHED_DIMENSION_CACHE[cache_key] = dict(result)
     return result
-    state_stats = runner.pair_rel_module.get_debug_stats()
-    pair_state_bytes = int(
-        state_stats["full_state_bytes"] + state_stats["shadow_state_bytes"]
-    )
-    return int(periph_bytes + pair_state_bytes)
 
 
 def _atomic_json(path, payload):

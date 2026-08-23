@@ -36,7 +36,10 @@ CIG_DEVICE="${CIG_DEVICE:-cpu}"
 # oracle states that are disjoint from the confirmatory seed set.
 CIG_H1_THRESHOLD_CALIBRATION="${CIG_H1_THRESHOLD_CALIBRATION:-}"
 # H1 support and CUSUM calibration are independent development-only artifacts.
-# They are required before any confirmatory estimator/tracking claim.
+# Build H1 rows with collect_h1_oracle_support.py, certify them with
+# validate_h1_oracle_support.py, then freeze thresholds with
+# calibrate_h1_oracle_thresholds.py.  They are required before any
+# confirmatory estimator/tracking claim.
 CIG_H1_ORACLE_SUPPORT="${CIG_H1_ORACLE_SUPPORT:-}"
 CIG_CUSUM_CALIBRATION="${CIG_CUSUM_CALIBRATION:-}"
 

@@ -440,7 +440,10 @@ class DriftDetector:
         self.cusum_stat = max(
             0.0, self.cusum_stat + z - self.cusum_allowance
         )
-        return float(self.cusum_stat)
+        # Keep the raw standardized residual and the Page-CUSUM statistic
+        # separate.  Calibration consumes z-trajectories; the scheduler
+        # consumes the accumulated CUSUM statistic.
+        return float(z)
 
     @staticmethod
     def page_cusum_maxima(z_sequences, allowance: float):
@@ -553,7 +556,11 @@ class DriftDetector:
                 float(self.residual_history[-1])
                 if self.residual_history else None
             ),
-            "latest_z": float(self.cusum_stat),
+            "latest_standardized_residual": float(
+                self.latest_standardized_residual
+            ),
+            "latest_z": float(self.latest_standardized_residual),
+            "latest_cusum": float(self.cusum_stat),
             "frozen_ready": bool(self.frozen is not None),
             "monitoring_ready": self.is_monitoring_ready(),
             "reference_mean": self.reference_mean,

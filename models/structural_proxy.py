@@ -493,14 +493,15 @@ class LocalCounterfactualProxyEnsemble:
         self.use_vmap_ensemble = bool(use_vmap_ensemble) and _HAS_TORCH_FUNC
         self._compile_ensemble_flag = bool(compile_ensemble)
 
+        # Retained for the grouped ContextBlock training path.  The vmap
+        # optimizer remains authoritative normally; these optimizers are used
+        # only after explicit stack/model synchronization.
+        self.optims = [
+            torch.optim.Adam(model.parameters(), lr=self.lr) for model in self.models
+        ]
+
         if self.use_vmap_ensemble:
             self._setup_vmap_ensemble()
-        else:
-            # torch <2.0 fallback: numerically correct legacy loop without full
-            # GPU utilization.
-            self.optims = [
-                torch.optim.Adam(m.parameters(), lr=self.lr) for m in self.models
-            ]
 
         # Independent RNG per member for independent weighted oversampling.
         self._member_rngs = [
@@ -959,7 +960,7 @@ class LocalCounterfactualProxyEnsemble:
     # Train
     # =====================================================================
 
-    def _batch_to_tensors(self, batch):
+    def _batch_to_tensors(self, batch, include_context=True):
         """batch: list[dict] length B -> tuple tensors"""
         obs = np.stack([b["obs_i"] for b in batch], axis=0)          # [B, obs_dim]
         action_i = np.asarray([b["action_i"] for b in batch], np.int64)      # [B]
@@ -991,7 +992,7 @@ class LocalCounterfactualProxyEnsemble:
 
         context_items_t = None
         context_mask_t = None
-        if self.context_item_dim > 0:
+        if self.context_item_dim > 0 and include_context:
             item_rows = []
             item_masks = []
             for b in batch:
@@ -1036,6 +1037,48 @@ class LocalCounterfactualProxyEnsemble:
             context_items_t,
             context_mask_t,
         )
+
+    def _grouped_context_embeddings(self, model, batch):
+        """Encode every replay ContextBlock once, then subtract each target.
+
+        Pair replay records refer to a shared per-ego block.  Materialising
+        and encoding an exclusion set for every target reintroduced O(N^3)
+        work during training.  This routine keeps the literal DeepSets
+        ``phi(X_i)`` / ``sum - phi(x_ij)`` construction for each model.
+        """
+        if self.context_item_dim <= 0:
+            return None
+        output = [None] * len(batch)
+        grouped = {}
+        for index, sample in enumerate(batch):
+            block = sample.get("context_block")
+            if block is None:
+                grouped[("legacy", index)] = [index]
+            else:
+                grouped.setdefault(("block", id(block)), []).append(index)
+        for key, indices in grouped.items():
+            sample = batch[indices[0]]
+            block = sample.get("context_block")
+            if block is None:
+                items = np.asarray(sample["context_items"], dtype=np.float32)
+                encoded = model.context_item_encoder(torch.as_tensor(
+                    items, dtype=torch.float32, device=self.device
+                )).sum(dim=0)
+                output[indices[0]] = encoded
+                continue
+            raw = np.asarray(block["items"], dtype=np.float32)
+            ids = np.asarray(block["neighbor_ids"], dtype=np.int64)
+            encoded = model.context_item_encoder(torch.as_tensor(
+                raw, dtype=torch.float32, device=self.device
+            ))
+            total = encoded.sum(dim=0)
+            positions = {int(agent): pos for pos, agent in enumerate(ids.tolist())}
+            for index in indices:
+                target = int(batch[index]["context_target_id"])
+                if target not in positions:
+                    raise ValueError("ContextBlock does not contain its target neighbor")
+                output[index] = total - encoded[positions[target]]
+        return torch.stack(output, dim=0)
 
     def _discounted_return_residual(self, prediction, target, valid_mask=None):
         """Absolute error of the discounted H-step return for each row."""
@@ -1148,6 +1191,17 @@ class LocalCounterfactualProxyEnsemble:
             self.latest_loss = 0.0
             return 0.0
 
+        # ContextBlock replay is grouped by block identity so each member
+        # encodes phi(X_i) once and derives all target exclusions by
+        # subtraction. Synchronize explicitly around the compatibility update
+        # rather than letting the vmap path repeat nonlinear set encodes.
+        if self.use_vmap_ensemble and any(
+            "context_block" in sample for sample in self.buffer
+        ):
+            self._sync_stacked_to_models()
+            value = self._train_step_fallback(n_steps, batch_size, holdout_size)
+            self._sync_models_to_stacked()
+            return value
         if not self.use_vmap_ensemble:
             return self._train_step_fallback(n_steps, batch_size, holdout_size)
 
@@ -1393,8 +1447,9 @@ class LocalCounterfactualProxyEnsemble:
 
                 (obs_t, a_i_oh, a_j_idx, z_t, m_t, belief_t, target_multi_t,
                  target_valid_t, pf_t, _bobs_t, context_items_t, context_mask_t) = (
-                    self._batch_to_tensors(batch)
+                    self._batch_to_tensors(batch, include_context=False)
                 )
+                context_embedding_t = self._grouped_context_embeddings(model, batch)
 
                 model.train()
 
@@ -1407,6 +1462,7 @@ class LocalCounterfactualProxyEnsemble:
                     pair_feat=pf_t,
                     context_items=context_items_t,
                     context_mask=context_mask_t,
+                    context_embedding=context_embedding_t,
                 )
 
                 B_, A_, H_ = pred_all.shape
@@ -1426,7 +1482,9 @@ class LocalCounterfactualProxyEnsemble:
 
                 with torch.no_grad():
                     res = torch.mean(
-                    self._discounted_return_residual(pred, target_multi_t, target_valid_t)
+                        self._discounted_return_residual(
+                            pred, target_multi_t, target_valid_t
+                        )
                     )
                 train_residuals.append(res)
 
@@ -1438,18 +1496,22 @@ class LocalCounterfactualProxyEnsemble:
             ho_batch = random.sample(list(self.buffer), int(holdout_size))
             (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target, ho_valid, ho_pf,
              _ho_bobs2, ho_ctx, ho_ctx_mask) = (
-                self._batch_to_tensors(ho_batch)
+                self._batch_to_tensors(ho_batch, include_context=False)
             )
 
             with torch.no_grad():
                 preds = []
                 for model in self.models:
                     model.eval()
+                    ho_context_embedding = self._grouped_context_embeddings(
+                        model, ho_batch
+                    )
                     pred_all = model(
                         obs_i=ho_obs, action_i_onehot=ho_ai,
                         z_core_excl_j=ho_z, m_periph_excl_j=ho_m,
                         belief_summary=ho_b, pair_feat=ho_pf,
                         context_items=ho_ctx, context_mask=ho_ctx_mask,
+                        context_embedding=ho_context_embedding,
                     )
                     B_, A_, H_ = pred_all.shape
                     idx = ho_aj.view(B_, 1, 1).expand(B_, 1, H_)
@@ -1574,6 +1636,20 @@ class LocalCounterfactualProxyEnsemble:
                 for name, p in self._stacked_params.items():
                     if name in sd:
                         sd[name].copy_(p[k])
+
+    def _sync_models_to_stacked(self):
+        """Publish grouped per-model updates back to the vmap parameter stack."""
+        if not self.use_vmap_ensemble:
+            return
+        params, buffers = stack_module_state(self.models)
+        with torch.no_grad():
+            for name, value in params.items():
+                self._stacked_params[name].copy_(value)
+            for name, value in buffers.items():
+                self._stacked_buffers[name].copy_(value)
+        # Moment estimates belong to the prior stacked trajectory and cannot
+        # be safely reused after a separately optimized grouped update.
+        self.optim.state.clear()
 
     def _predict_all_actions_reference(
         self, obs, action_i, z, m, belief, pair_feat=None,

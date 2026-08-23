@@ -615,7 +615,11 @@ def _restore_frozen_learning_checkpoint(runner, checkpoint):
 def _apply_cusum_calibration(cfg, calibration):
     if calibration is None:
         return
-    required = ("no_change_only", "cusum_allowance", "cusum_threshold", "target_false_alarm_rate")
+    required = (
+        "no_change_only", "cusum_allowance", "cusum_threshold",
+        "target_false_alarm_rate", "observed_false_alarm_rate",
+        "development_seeds", "reference_config_hash",
+    )
     missing = [key for key in required if key not in calibration]
     if missing or calibration.get("no_change_only") is not True:
         raise ValueError(
@@ -623,8 +627,14 @@ def _apply_cusum_calibration(cfg, calibration):
             + ", ".join(required)
         )
     cfg["drift_cusum_allowance"] = float(calibration["cusum_allowance"])
+    cfg["drift_cusum_threshold"] = float(calibration["cusum_threshold"])
+    # Compatibility for components that have not yet consumed the explicit
+    # CUSUM configuration name.
     cfg["z_threshold"] = float(calibration["cusum_threshold"])
     cfg["cusum_false_alarm_target"] = float(calibration["target_false_alarm_rate"])
+    cfg["cusum_calibration_reference_config_hash"] = str(
+        calibration["reference_config_hash"]
+    )
 
 
 def _pretrain_common_checkpoint(model, seed, episodes, device, cusum_calibration=None):
@@ -1285,7 +1295,9 @@ def run_one(
             cfg.get("cusum_false_alarm_target", float("nan"))
         ),
         "cusum_allowance": float(cfg.get("drift_cusum_allowance", float("nan"))),
-        "cusum_threshold": float(cfg.get("z_threshold", float("nan"))),
+        "cusum_threshold": float(cfg.get(
+            "drift_cusum_threshold", cfg.get("z_threshold", float("nan"))
+        )),
     }
     summary.update(recovery)
     _atomic_write_json(os.path.join(out_dir, "summary.json"), summary)
@@ -1451,6 +1463,14 @@ def main(argv=None):
         with open(args.cusum_calibration, encoding="utf-8") as handle:
             cusum_calibration = json.load(handle)
         _apply_cusum_calibration(RE.default_cfg(), cusum_calibration)
+        overlap = set(int(seed) for seed in args.seeds).intersection(
+            int(seed) for seed in cusum_calibration["development_seeds"]
+        )
+        if overlap:
+            parser.error(
+                "H2/H3 seeds overlap CUSUM no-change development seeds: "
+                + ", ".join(str(seed) for seed in sorted(overlap))
+            )
 
     out_root = ensure_dir(_resolve_out_root(args.out_root))
     runs_root = ensure_dir(os.path.join(out_root, "runs"))
@@ -1474,7 +1494,8 @@ def main(argv=None):
             key: cusum_calibration[key] for key in (
                 "calibration_protocol", "cusum_allowance", "cusum_threshold",
                 "target_false_alarm_rate", "observed_false_alarm_rate",
-                "monitoring_horizon",
+                "monitoring_horizon", "development_seeds",
+                "reference_config_hash",
             ) if key in cusum_calibration
         },
         "evaluation_ego_roles": list(H2_EVALUATION_EGO_ROLES),

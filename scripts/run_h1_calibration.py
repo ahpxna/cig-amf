@@ -78,7 +78,7 @@ KEEP_KEYS = (
     "direction_uncertainty_error_spearman", "direction_risk_at_50pct_coverage",
 )
 
-PROTOCOL_VERSION = "h1_qcd_crossfit_v5_identifiable_tiny_adapter"
+PROTOCOL_VERSION = "h1_qcd_crossfit_v6_identifiable_pi_eval_contract"
 MIN_CONFIRMATORY_SEEDS = 8
 BOOTSTRAP_REPLICATES = 20000
 BOOTSTRAP_SEED = 1729
@@ -150,6 +150,8 @@ def _load_threshold_calibration(path):
         "capacity_prediction_threshold",
         "direction_active_threshold",
         "direction_prediction_threshold",
+        "h1_target_policy_mode",
+        "h1_eval_uniform_mass",
     )
     missing = [key for key in required if key not in payload]
     if missing:
@@ -157,9 +159,19 @@ def _load_threshold_calibration(path):
             "H1 threshold calibration is incomplete; missing "
             + ", ".join(missing)
         )
-    values = {key: float(payload[key]) for key in required}
+    values = {
+        key: float(payload[key])
+        for key in required
+        if key not in ("h1_target_policy_mode",)
+    }
     if any(not math.isfinite(value) or value < 0.0 for value in values.values()):
         raise ValueError("H1 threshold calibration contains invalid thresholds")
+    if payload["h1_target_policy_mode"] != "scripted_uniform_mixture":
+        raise ValueError("H1 threshold artifact uses an incompatible target policy")
+    if not 0.0 < float(payload["h1_eval_uniform_mass"]) < 1.0:
+        raise ValueError("H1 threshold artifact has invalid target-policy support")
+    values["h1_target_policy_mode"] = str(payload["h1_target_policy_mode"])
+    values["h1_eval_uniform_mass"] = float(payload["h1_eval_uniform_mass"])
     return values, _fingerprint(payload)
 
 
@@ -171,6 +183,13 @@ def _load_oracle_support(path):
             "H1 oracle-support artifact must be oracle-only and certify "
             "BENCHMARK_NOT_IDENTIFIABLE is false"
         )
+    if payload.get("h1_target_policy_mode") != "scripted_uniform_mixture":
+        raise ValueError("H1 oracle support uses an incompatible target policy")
+    mass = float(payload.get("h1_eval_uniform_mass", float("nan")))
+    if not 0.0 < mass < 1.0:
+        raise ValueError("H1 oracle support has invalid target-policy support")
+    if not payload.get("development_seeds"):
+        raise ValueError("H1 oracle support omits its development seed set")
     return payload, _fingerprint(payload)
 
 
@@ -203,6 +222,12 @@ def build_h1_config(cfg_override, seed, threshold_calibration=None):
         )
         cfg["h1_direction_prediction_threshold"] = float(
             threshold_calibration["direction_prediction_threshold"]
+        )
+        cfg["h1_target_policy_mode"] = str(
+            threshold_calibration["h1_target_policy_mode"]
+        )
+        cfg["h1_eval_uniform_mass"] = float(
+            threshold_calibration["h1_eval_uniform_mass"]
         )
     return cfg
 
@@ -703,6 +728,14 @@ def main(argv=None):
         oracle_support_payload, oracle_support_fingerprint = _load_oracle_support(
             os.path.abspath(args_cli.oracle_support)
         )
+        support_overlap = set(int(seed) for seed in args_cli.seeds).intersection(
+            int(seed) for seed in oracle_support_payload["development_seeds"]
+        )
+        if support_overlap and not args_cli.allow_development_thresholds:
+            ap.error(
+                "confirmatory H1 seeds overlap oracle-support development seeds: "
+                + ", ".join(map(str, sorted(support_overlap)))
+            )
     if args_cli.threshold_calibration:
         threshold_path = os.path.abspath(args_cli.threshold_calibration)
         threshold_values, threshold_fingerprint = _load_threshold_calibration(
@@ -718,6 +751,41 @@ def main(argv=None):
             ap.error(
                 "confirmatory H1 seeds overlap oracle-threshold development seeds: "
                 + ", ".join(map(str, sorted(overlap)))
+            )
+    if oracle_support_payload is not None and threshold_values is not None:
+        support_thresholds = oracle_support_payload.get("thresholds", {})
+        for artifact_key, config_key in (
+            ("capacity", "capacity_active_threshold"),
+            ("direction", "direction_active_threshold"),
+        ):
+            if artifact_key not in support_thresholds:
+                ap.error(
+                    "H1 oracle-support artifact omits its "
+                    f"{artifact_key} threshold"
+                )
+            if not math.isclose(
+                float(support_thresholds[artifact_key]),
+                float(threshold_values[config_key]),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                ap.error(
+                    "H1 threshold and oracle-support artifacts certify "
+                    f"different {artifact_key} estimands"
+                )
+        if (
+            oracle_support_payload["h1_target_policy_mode"]
+            != threshold_values["h1_target_policy_mode"]
+            or not math.isclose(
+                float(oracle_support_payload["h1_eval_uniform_mass"]),
+                float(threshold_values["h1_eval_uniform_mass"]),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            ap.error(
+                "H1 threshold and oracle-support artifacts certify different "
+                "evaluation policies"
             )
 
     run_id = args_cli.run_id or (

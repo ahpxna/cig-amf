@@ -157,7 +157,11 @@ def default_cfg():
         # See TwoTimescaleScheduler for require_both/inflation_t_reset. The
         # original defaults in training/scheduler.py are False and 1.
         "require_both": False,
+        # ``z_threshold`` is retained only as a legacy alias.  The active
+        # detector compares the Page-CUSUM statistic with this calibrated
+        # threshold, not a single residual z-score.
         "z_threshold": 8.0,
+        "drift_cusum_threshold": 8.0,
         "drift_cusum_allowance": 0.5,
         "inflation_t_reset": 1,
 
@@ -183,7 +187,11 @@ def default_cfg():
         "h1_max_q_normalized_rmse": 1.0,
         "h1_max_capacity_normalized_mae": 1.0,
         "h1_max_direction_normalized_mae": 1.0,
-        "h1_support_poor_threshold": 0.15,
+        # Support quality is distributional, not the probability of one
+        # factual action. Uniform 13-action policies have low per-action mass
+        # but maximal support. Values below this normalized entropy indicate
+        # genuine action concentration.
+        "h1_min_policy_support_entropy": 0.50,
         # A 4-of-5 overlap has a random F1 floor of .8, so H1 uses a small,
         # fixed top-k rather than reusing the modelling core budget.
         "h1_selector_top_k": 1,
@@ -2288,6 +2296,16 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
             aggregate_rows.append(aggregate_row)
 
             for j in neighbor_ids:
+                valid_mask_j = np.asarray(
+                    step["valid_action_masks"][j], dtype=bool
+                )
+                target_pi_j = np.asarray(
+                    target_policy_rows[j], dtype=np.float64
+                )
+                valid_count_j = int(np.count_nonzero(valid_mask_j))
+                uniform_valid_j = np.zeros_like(target_pi_j)
+                if valid_count_j > 0:
+                    uniform_valid_j[valid_mask_j] = 1.0 / float(valid_count_j)
                 rows.append({
                     "seed": int(args.seed),
                     "state_idx": int(state_idx),
@@ -2308,8 +2326,20 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                     "oracle_q_distinct_levels": int(np.unique(np.round(
                         np.asarray(oracle_scores["q"][j], dtype=np.float64), 12
                     )).size),
-                    "natural_action_support": float(
-                        target_policy_rows[j][int(step["actions"][j])]
+                    "observed_action_probability": float(
+                        target_pi_j[int(step["actions"][j])]
+                    ),
+                    "policy_support_entropy": float(
+                        -np.sum(
+                            target_pi_j[valid_mask_j]
+                            * np.log(np.clip(
+                                target_pi_j[valid_mask_j], 1e-12, 1.0
+                            ))
+                        ) / np.log(max(2, valid_count_j))
+                    ),
+                    "valid_action_count": valid_count_j,
+                    "target_policy_l1_to_uniform": float(
+                        np.sum(np.abs(target_pi_j - uniform_valid_j))
                     ),
                     "abs_error": float(abs(
                         learned_scores["capacity"][j]
@@ -2352,10 +2382,10 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
     q_normalized_rmse = float(
         math.sqrt(q_sq_error / max(q_sq_oracle, 1e-12))
     ) if q_value_count > 0 else float("nan")
-    support_poor_threshold = float(tiny_cfg.get("h1_support_poor_threshold", 0.15))
+    support_poor_threshold = float(tiny_cfg.get("h1_min_policy_support_entropy", 0.50))
     support_poor_rows = [
         row for row in rows
-        if float(row.get("natural_action_support", 1.0)) < support_poor_threshold
+        if float(row.get("policy_support_entropy", 1.0)) < support_poor_threshold
     ]
 
     dr_requested = bool(runner.proxy.use_doubly_robust)
@@ -2369,7 +2399,8 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
         "proxy_n_horizons": int(tiny_cfg.get("proxy_n_horizons", 1)),
         "h1_selector_top_k": int(tiny_cfg.get("h1_selector_top_k", 1)),
         "h1_min_active_pairs": int(tiny_cfg.get("h1_min_active_pairs", 30)),
-        "h1_support_poor_threshold": support_poor_threshold,
+        "h1_min_policy_support_entropy": support_poor_threshold,
+        "support_quality_definition": "normalized_target_policy_entropy",
         "h1_capacity_active_threshold": float(
             tiny_cfg.get("h1_capacity_active_threshold", 0.01)
         ),

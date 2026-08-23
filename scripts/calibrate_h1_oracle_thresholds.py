@@ -57,13 +57,18 @@ def _read_oracle_values(paths):
         with open(path, newline="", encoding="utf-8") as handle:
             rows = csv.DictReader(handle)
             fields = set(rows.fieldnames or ())
-            required = {"oracle_score", "oracle_signed", "seed"}
+            required = {"oracle_score", "oracle_signed", "seed", "oracle_only"}
             if not required.issubset(fields):
                 raise ValueError(
                     f"{path} lacks oracle-only H1 columns: "
                     f"expected {sorted(required)}, got {sorted(fields)}"
                 )
             for row in rows:
+                if int(row["oracle_only"]) != 1:
+                    raise ValueError(
+                        f"{path} contains a non-oracle-only row; threshold "
+                        "calibration must not consume estimator-sweep artifacts"
+                    )
                 c = float(row["oracle_score"])
                 d = float(row["oracle_signed"])
                 if not (math.isfinite(c) and math.isfinite(d)):
@@ -94,12 +99,19 @@ def main(argv=None):
     )
     parser.add_argument("--capacity-min-effect", type=float, required=True)
     parser.add_argument("--direction-min-effect", type=float, required=True)
+    parser.add_argument(
+        "--h1-target-policy-mode", required=True,
+        choices=("scripted_uniform_mixture",),
+    )
+    parser.add_argument("--h1-eval-uniform-mass", type=float, required=True)
     parser.add_argument("--min-active-count", type=int, default=30)
     parser.add_argument("--min-active-fraction", type=float, default=0.05)
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     if args.capacity_min_effect < 0 or args.direction_min_effect < 0:
         parser.error("minimum effects must be non-negative")
+    if not 0.0 < args.h1_eval_uniform_mass < 1.0:
+        parser.error("--h1-eval-uniform-mass must be in (0, 1)")
     if args.min_active_count < 2 or not 0.0 < args.min_active_fraction < 1.0:
         parser.error("invalid active-support requirements")
 
@@ -119,7 +131,7 @@ def main(argv=None):
             )
 
     payload = {
-        "calibration_protocol": "h1_oracle_only_thresholds_v1",
+        "calibration_protocol": "h1_oracle_only_thresholds_v2_fixed_pi_eval",
         "oracle_only": True,
         "development_seeds": seeds,
         "sources": sources,
@@ -127,6 +139,8 @@ def main(argv=None):
         "capacity_prediction_threshold": float(args.capacity_min_effect),
         "direction_active_threshold": float(args.direction_min_effect),
         "direction_prediction_threshold": float(args.direction_min_effect),
+        "h1_target_policy_mode": str(args.h1_target_policy_mode),
+        "h1_eval_uniform_mass": float(args.h1_eval_uniform_mass),
         "support": {"capacity": capacity_support, "direction": direction_support},
         "rule": (
             "Thresholds equal prespecified physically meaningful minimum effects; "

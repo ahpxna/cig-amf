@@ -226,7 +226,9 @@ class FinalCIGAMFRunner:
             alpha_slow_ratio=cfg.get("slow_ratio", 0.05),
             accel_factor=cfg.get("accel_factor", 4.0),
             accel_duration=cfg.get("accel_duration", 8),
-            z_threshold=cfg.get("z_threshold", 3.0),
+            z_threshold=cfg.get(
+                "drift_cusum_threshold", cfg.get("z_threshold", 3.0)
+            ),
             require_both=cfg.get("require_both", False),
             refractory=cfg.get("refractory", 10),
             inflation_factor=cfg.get("inflation_factor", 2.5),
@@ -265,7 +267,9 @@ class FinalCIGAMFRunner:
             seed=cfg.get("seed", 0),
             device=self.device,
             cusum_allowance=cfg.get("drift_cusum_allowance", 0.5),
-            cusum_threshold=cfg.get("z_threshold", 8.0),
+            cusum_threshold=cfg.get(
+                "drift_cusum_threshold", cfg.get("z_threshold", 8.0)
+            ),
         )
         self.matdet = MatrixDriftDetector(window=cfg.get("matdet_window", 20))
         self.recip = ReciprocityTracker(
@@ -337,6 +341,8 @@ class FinalCIGAMFRunner:
             "proxy_holdout_residual": [],
             "scheduler_residual_ewma": [],
             "scheduler_cusum_score": [],
+            "drift_monitoring_ready": [],
+            "drift_phase": [],
             "scheduler_accel_remaining": [],
             "proxy_loss": [],
             "bc_loss": [],
@@ -1986,6 +1992,7 @@ class FinalCIGAMFRunner:
             n_train_batches=self.cfg.get("drift_train_batches", 5),
         )
         probe_z = float(drift_info.get("z", 0.0) or 0.0)
+        probe_cusum = float(drift_info.get("cusum", 0.0) or 0.0)
 
         # Trigger 2: jump in the signed influence matrix.
         matrix_z = 0.0
@@ -1996,18 +2003,22 @@ class FinalCIGAMFRunner:
         if bool(self.cfg.get("disable_drift_detector", False)):
             fire_info = {
                 "fired": False, "reason": "detector_disabled",
-                "n_inflated": 0, "probe_z": probe_z, "matrix_z": matrix_z,
+                "n_inflated": 0, "probe_z": probe_z,
+                "probe_cusum": probe_cusum, "matrix_z": matrix_z,
             }
         else:
             fire_info = self.scheduler.evaluate_drift(
                 probe_z=probe_z,
+                probe_cusum=probe_cusum,
                 matrix_z=matrix_z,
                 belief_modules=self.belief_modules,
                 drift_detector=self.drift,
             )
         if fire_info["fired"]:
             print(f"[DRIFT-FIRE] ep={self.scheduler.episode} reason={fire_info['reason']} n_inflated={fire_info['n_inflated']} "
-                  f"probe_z={fire_info['probe_z']:.2f} matrix_z={fire_info['matrix_z']:.2f}")
+                  f"probe_z={fire_info['probe_z']:.2f} "
+                  f"probe_cusum={fire_info.get('probe_cusum', 0.0):.2f} "
+                  f"matrix_z={fire_info['matrix_z']:.2f}")
         triggered = int(fire_info["fired"])
 
         return {
@@ -2020,6 +2031,9 @@ class FinalCIGAMFRunner:
             ),
             "triggered": int(triggered),
             "probe_z": float(probe_z),
+            "probe_cusum": float(probe_cusum),
+            "drift_phase": str(drift_info.get("phase", "unknown")),
+            "drift_monitoring_ready": bool(self.drift.is_monitoring_ready()),
             "matrix_z": float(matrix_z),
             "promoted": int(promoted),
             "demoted": int(demoted),
@@ -2517,14 +2531,21 @@ class FinalCIGAMFRunner:
                     float(graph_info.get("proxy_holdout_residual", 0.0))
                 )
                 sched_status = self.scheduler.get_status()
-                # v2 removed internal EWMA/CUSUM in favor of evaluate_drift
-                # with probe_z/matrix_z. Preserve history columns using the
-                # latest z-scores for storage-format compatibility.
+                # Preserve the legacy storage keys while retaining their
+                # literal Page-CUSUM semantics: raw frozen-probe z and the
+                # accumulated calibrated statistic. Matrix movement remains
+                # a separate diagnostic and never substitutes for CUSUM.
                 self.history["scheduler_residual_ewma"].append(
                     float(graph_info.get("probe_z", 0.0) or 0.0)
                 )
                 self.history["scheduler_cusum_score"].append(
-                    float(graph_info.get("matrix_z", 0.0) or 0.0)
+                    float(graph_info.get("probe_cusum", 0.0) or 0.0)
+                )
+                self.history["drift_monitoring_ready"].append(
+                    int(bool(graph_info.get("drift_monitoring_ready", False)))
+                )
+                self.history["drift_phase"].append(
+                    str(graph_info.get("drift_phase", "unknown"))
                 )
                 self.history["scheduler_accel_remaining"].append(
                     int(sched_status.get("accel_remaining", 0))

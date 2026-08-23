@@ -25,8 +25,8 @@ class TwoTimescaleScheduler:
         k0_warmup: Number of Stage 0 episodes.
         alpha_slow_ratio: 0.05 schedules a structure update about every 20 episodes.
         accel_factor / accel_duration: Magnitude and duration of acceleration.
-        z_threshold: Shift threshold. Values from 2.5 to 3.0 are reasonable;
-            z=3 means three standard deviations from recent behavior.
+        z_threshold: Frozen Page-CUSUM threshold calibrated from no-change
+            standardized-residual trajectories.
         require_both: Deprecated compatibility field; matrix movement is not
             part of the final trigger.
         refractory: Number of refractory episodes after each trigger.
@@ -140,6 +140,7 @@ class TwoTimescaleScheduler:
     def evaluate_drift(
         self,
         probe_z: float = 0.0,
+        probe_cusum: Optional[float] = None,
         matrix_z: float = 0.0,
         belief_modules: Optional[Dict] = None,
         drift_detector=None,
@@ -147,7 +148,10 @@ class TwoTimescaleScheduler:
         """Evaluate the frozen-witness Page-CUSUM trigger.
 
         Args:
-            probe_z: Z-score from ``DriftDetector.residual_z_score()``.
+            probe_z: Raw standardized frozen-probe residual.
+            probe_cusum: Page-CUSUM statistic accumulated from ``probe_z``.
+                Legacy callers may omit it, in which case ``probe_z`` is
+                treated as the pre-accumulated statistic.
             matrix_z: Z-score from ``MatrixDriftDetector.z_score()``.
             belief_modules: ``{ego_id: BayesLightBeliefState}`` to inflate.
             drift_detector: Detector notified to resnapshot after adaptation.
@@ -158,6 +162,7 @@ class TwoTimescaleScheduler:
         out = {
             "episode": int(self.episode),
             "probe_z": float(probe_z),
+            "probe_cusum": float(probe_z if probe_cusum is None else probe_cusum),
             "matrix_z": float(matrix_z),
             "fired": False,
             "reason": None,
@@ -172,7 +177,8 @@ class TwoTimescaleScheduler:
             out["reason"] = "refractory"
             return out
 
-        hit_probe = float(probe_z) > self.z_threshold
+        statistic = float(probe_z if probe_cusum is None else probe_cusum)
+        hit_probe = statistic > self.z_threshold
         # Matrix movement remains a plotted diagnostic/ablation. It is not
         # combined with the prespecified frozen-witness trigger.
         fired = hit_probe
@@ -262,7 +268,7 @@ class TwoTimescaleScheduler:
             True when the trigger fires, equivalent to v1 ``triggered``.
         """
         z = self._residual_z_score(residual)
-        out = self.evaluate_drift(probe_z=z, matrix_z=0.0)
+        out = self.evaluate_drift(probe_z=z, probe_cusum=z, matrix_z=0.0)
 
         return bool(out["fired"])
 
@@ -279,4 +285,5 @@ class TwoTimescaleScheduler:
             "last_trigger_episode": self.last_trigger_episode,
             "in_refractory": bool(self._in_refractory()),
             "z_threshold": float(self.z_threshold),
+            "cusum_threshold": float(self.z_threshold),
         }

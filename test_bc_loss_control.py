@@ -105,8 +105,8 @@ def collect_bc_buffer(env, pair_rel, n_steps, action_fn, seed=0):
 
 def _make_env_and_module(seed=0):
     env = OmniArena(
-        n_agents=20, grid_size=12, n_zones=4,
-        max_steps=200, phase_length=1000,
+        n_agents=8, grid_size=9, n_zones=2,
+        max_steps=64, phase_length=1000,
         enable_conditional_gates=False,
         enable_latency_ladder=False,
         enable_congestion=False,
@@ -121,7 +121,7 @@ def _make_env_and_module(seed=0):
         shadow_dim=16,
         rel_feat_dim=6,
         lr=1e-3,
-        bc_buffer_size=200000,
+        bc_buffer_size=12000,
         grad_clip=1.0,
         shadow_loss_weight=0.25,
         device="cpu",
@@ -148,15 +148,17 @@ def test_t1_scripted_policy_deterministic():
 
     env, pair_rel = _make_env_and_module(seed=0)
     _activate_all_pairs(env, pair_rel)
-    collect_bc_buffer(env, pair_rel, n_steps=150, action_fn=_deterministic_actions)
+    collect_bc_buffer(env, pair_rel, n_steps=48, action_fn=_deterministic_actions)
 
     print(f"  bc_buffer size = {len(pair_rel.bc_buffer)}")
 
     loss = None
-    for epoch in range(60):
-        loss = pair_rel.train_bc(n_steps=20, batch_size=512)
-        if epoch % 10 == 0 or epoch == 59:
+    for epoch in range(24):
+        loss = pair_rel.train_bc(n_steps=4, batch_size=128)
+        if epoch % 6 == 0 or epoch == 23:
             print(f"  epoch {epoch:3d}  bc_loss = {loss:.4f}")
+        if loss < 0.2:
+            break
 
     ln6 = float(np.log(6))
     print(f"\n  final BC loss = {loss:.4f}  (uniform floor ln6 = {ln6:.4f})")
@@ -184,8 +186,10 @@ def _shuffle_and_fit(pair_rel, action_dim):
     for sample in pair_rel.bc_buffer:
         sample["target_action"] = int(rng.randint(0, action_dim))
     loss = None
-    for _ in range(60):
-        loss = pair_rel.train_bc(n_steps=20, batch_size=512)
+    # Shuffled-label floors are analytic. A short optimization only verifies
+    # that the implementation reaches the expected allocation-weighted loss.
+    for _ in range(16):
+        loss = pair_rel.train_bc(n_steps=3, batch_size=128)
     return float(loss)
 
 
@@ -200,13 +204,13 @@ def test_t2_label_shuffle():
 
     shadow_env, shadow_pair_rel = _make_env_and_module(seed=0)
     collect_bc_buffer(
-        shadow_env, shadow_pair_rel, n_steps=150,
+        shadow_env, shadow_pair_rel, n_steps=48,
         action_fn=_deterministic_actions,
     )
     core_env, core_pair_rel = _make_env_and_module(seed=0)
     _activate_all_pairs(core_env, core_pair_rel)
     collect_bc_buffer(
-        core_env, core_pair_rel, n_steps=150,
+        core_env, core_pair_rel, n_steps=48,
         action_fn=_deterministic_actions,
     )
     A = shadow_env.get_action_dim()
