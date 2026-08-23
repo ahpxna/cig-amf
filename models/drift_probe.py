@@ -53,8 +53,9 @@ class StructuralDriftProbe(nn.Module):
     Small network predicting ego return only from (o_i,a_i,a_j).
 
     It is deliberately weak and blinded to anything partition-dependent. It
-    need not predict exceptionally well; its error only needs to change when
-    the environment law changes. obs_dim/action_dim match the main proxy,
+    need not predict exceptionally well; its error is treated as a regime-
+    change witness and is explicitly checked for behavioural false alarms.
+    obs_dim/action_dim match the main proxy,
     hidden should remain small (64) because larger models overfit and make the
     residual noisy, and n_horizons matches the main proxy.
     """
@@ -65,12 +66,14 @@ class StructuralDriftProbe(nn.Module):
         action_dim: int,
         hidden: int = 64,
         n_horizons: int = 3,
+        discount: float = 0.97,
     ):
         super().__init__()
 
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
         self.n_horizons = int(n_horizons)
+        self.discount = float(discount)
 
         in_dim = self.obs_dim + 2 * self.action_dim
 
@@ -119,6 +122,7 @@ class DriftDetector:
         batch_size: int = 256,
         recalibrate_after: int = 15,
         window: int = 20,
+        discount: float = 0.97,
         cusum_allowance: float = 0.5,
         cusum_threshold: float = 8.0,
         seed: int = 0,
@@ -128,6 +132,7 @@ class DriftDetector:
         self.device = device
         self.action_dim = int(action_dim)
         self.n_horizons = int(n_horizons)
+        self.discount = float(discount)
         self.batch_size = int(batch_size)
         self.warmup_batches = int(warmup_batches)
         self.recalibrate_after = int(recalibrate_after)
@@ -144,6 +149,7 @@ class DriftDetector:
             action_dim=action_dim,
             hidden=hidden,
             n_horizons=n_horizons,
+            discount=discount,
         ).to(device)
 
         self.optim = torch.optim.Adam(self.live.parameters(), lr=float(lr))
@@ -158,6 +164,7 @@ class DriftDetector:
         self.last_snapshot_episode = None
         self.pending_recalibration_at = None
         self.n_snapshots = 0
+        self.reference_sample_count = 0
 
     # ------------------------------------------------------------------
 
@@ -187,14 +194,61 @@ class DriftDetector:
             [b["observed_action_j"] for b in batch]
         )                                                    # [B, A]
         tgt = torch.tensor(
-            np.stack(
-                [b.get("target_lag_rewards", b.get("target_returns_multi")) for b in batch],
-                axis=0,
-            ),
+            np.stack([self._target_lag_rewards(b) for b in batch], axis=0),
             dtype=torch.float32, device=self.device,
         )                                                    # [B, H]
 
         return obs, a_i, a_j, tgt
+
+    def _target_lag_rewards(self, sample) -> np.ndarray:
+        """Return direct-lag rewards and convert legacy cumulative targets."""
+        direct = sample.get("target_lag_rewards")
+        if direct is not None:
+            values = np.asarray(direct, dtype=np.float32).reshape(-1)
+        else:
+            cumulative = sample.get("target_returns_multi")
+            if cumulative is None:
+                raise KeyError("drift replay sample has no lag or cumulative target")
+            cumulative = np.asarray(cumulative, dtype=np.float32).reshape(-1)
+            values = np.empty_like(cumulative)
+            if cumulative.size:
+                values[0] = cumulative[0]
+                for lag in range(1, cumulative.size):
+                    scale = self.discount ** lag
+                    values[lag] = (
+                        cumulative[lag] - cumulative[lag - 1]
+                    ) / max(scale, 1e-12)
+        if values.size != self.n_horizons:
+            raise ValueError(
+                "drift target horizon mismatch: "
+                f"expected {self.n_horizons}, received {values.size}"
+            )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("drift target contains NaN or infinity")
+        return values
+
+    def _discounted_return_residual(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-row absolute error of the reconstructed discounted H-return."""
+        expected = (pred.shape[0], self.n_horizons)
+        if tuple(pred.shape) != expected or tuple(target.shape) != expected:
+            raise ValueError(
+                "drift prediction/target shape mismatch: "
+                f"pred={tuple(pred.shape)}, target={tuple(target.shape)}, "
+                f"expected={expected}"
+            )
+        weights = torch.pow(
+            torch.as_tensor(
+                self.discount, dtype=pred.dtype, device=pred.device
+            ),
+            torch.arange(
+                self.n_horizons, dtype=pred.dtype, device=pred.device
+            ),
+        )
+        pred_return = torch.sum(pred * weights.view(1, -1), dim=1)
+        target_return = torch.sum(target * weights.view(1, -1), dim=1)
+        return torch.abs(pred_return - target_return)
 
     # ------------------------------------------------------------------
 
@@ -212,6 +266,11 @@ class DriftDetector:
 
             self.live.train()
             pred = self.live(obs, a_i, a_j)          # [B, H]
+            if pred.shape != tgt.shape:
+                raise ValueError(
+                    "drift training horizon mismatch: "
+                    f"pred={tuple(pred.shape)}, target={tuple(tgt.shape)}"
+                )
             loss = F.mse_loss(pred, tgt)
 
             self.optim.zero_grad()
@@ -243,6 +302,7 @@ class DriftDetector:
         self.residual_history.clear()
         self.reference_mean = None
         self.reference_std = None
+        self.reference_sample_count = 0
         self.cusum_stat = 0.0
         self.latest_standardized_residual = 0.0
 
@@ -251,8 +311,8 @@ class DriftDetector:
         Evaluate the frozen model on the newest data.
 
         Draw from the end of the buffer rather than randomly because the
-        question is whether the world changed recently. Return mean absolute
-        error at the final horizon, or None.
+        question is whether the world changed recently. Return the mean
+        absolute error of the reconstructed discounted H-step return.
         """
         if self.frozen is None or buffer is None or len(buffer) == 0:
             return None
@@ -266,16 +326,13 @@ class DriftDetector:
         a_i = self._one_hot([b["action_i"] for b in buf])
         a_j = self._one_hot([b["observed_action_j"] for b in buf])
         tgt = torch.tensor(
-            np.stack(
-                [b.get("target_lag_rewards", b.get("target_returns_multi")) for b in buf],
-                axis=0,
-            ),
+            np.stack([self._target_lag_rewards(b) for b in buf], axis=0),
             dtype=torch.float32, device=self.device,
         )
 
         with torch.no_grad():
             pred = self.frozen(obs, a_i, a_j)                  # [B, H]
-            res = torch.mean(torch.abs(pred[:, -1] - tgt[:, -1]))
+            res = torch.mean(self._discounted_return_residual(pred, tgt))
 
         val = float(res.cpu().item())
         self.residual_history.append(val)
@@ -284,6 +341,76 @@ class DriftDetector:
             del self.residual_history[:-500]
 
         return val
+
+    def calibrate_reference(
+        self, buffer, n_batches: Optional[int] = None, batch_size: Optional[int] = None
+    ) -> Dict:
+        """Calibrate the fixed Page-CUSUM reference on stable replay only."""
+        if self.frozen is None:
+            raise RuntimeError("cannot calibrate drift reference before snapshot")
+        if buffer is None or len(buffer) == 0:
+            raise RuntimeError("cannot calibrate drift reference from empty replay")
+        count = int(self.window if n_batches is None else n_batches)
+        size = int(self.batch_size if batch_size is None else batch_size)
+        if count < max(5, self.window):
+            raise ValueError(
+                f"reference calibration needs at least {max(5, self.window)} batches"
+            )
+        values = []
+        for _ in range(count):
+            got = self._batch(buffer, size)
+            if got is None:
+                break
+            obs, a_i, a_j, target = got
+            with torch.no_grad():
+                pred = self.frozen(obs, a_i, a_j)
+                residual = torch.mean(
+                    self._discounted_return_residual(pred, target)
+                )
+            values.append(float(residual.detach().cpu().item()))
+        if len(values) < max(5, self.window):
+            raise RuntimeError("insufficient stable residual batches for calibration")
+        reference = np.asarray(values, dtype=np.float64)
+        self.reference_mean = float(np.mean(reference))
+        self.reference_std = float(max(np.std(reference), 1e-9))
+        self.reference_sample_count = int(reference.size)
+        self.residual_history.clear()
+        self.cusum_stat = 0.0
+        self.latest_standardized_residual = 0.0
+        return {
+            "reference_mean": self.reference_mean,
+            "reference_std": self.reference_std,
+            "reference_sample_count": self.reference_sample_count,
+        }
+
+    def prepare_for_monitoring(
+        self, buffer, episode: Optional[int] = None, reference_batches: Optional[int] = None
+    ) -> Dict:
+        """Train, freeze, and calibrate entirely on a stable pre-change replay."""
+        remaining = max(0, self.warmup_batches - self.n_batches_trained)
+        if remaining:
+            self.train_batches(buffer, remaining)
+        if self.n_batches_trained < self.warmup_batches:
+            raise RuntimeError(
+                "drift witness did not reach its required training budget"
+            )
+        self.snapshot(episode)
+        calibration = self.calibrate_reference(
+            buffer, n_batches=reference_batches
+        )
+        return {
+            "frozen_ready": True,
+            "n_batches_trained": int(self.n_batches_trained),
+            **calibration,
+        }
+
+    def is_monitoring_ready(self) -> bool:
+        return bool(
+            self.frozen is not None
+            and self.reference_mean is not None
+            and self.reference_std is not None
+            and self.reference_sample_count >= max(5, self.window)
+        )
 
     def residual_z_score(self) -> float:
         """
@@ -373,27 +500,23 @@ class DriftDetector:
                 float(self.residual_history[-1])
                 if self.residual_history else None
             ),
-            "latest_z": float(self.residual_z_score()),
+            "latest_z": float(self.cusum_stat),
             "frozen_ready": bool(self.frozen is not None),
+            "monitoring_ready": self.is_monitoring_ready(),
+            "reference_mean": self.reference_mean,
+            "reference_std": self.reference_std,
+            "reference_sample_count": int(self.reference_sample_count),
         }
 
 
 class MatrixDriftDetector:
     """
-    Independent second trigger that tracks the influence matrix.
+    Diagnostic tracker for movement in the learned influence matrix.
 
-    THEORY (Pieroth, ICML 2024, Theorem 5.11): influence measures are
-    continuous in policy parameters. Gradual behavioural policy drift can
-    therefore change the influence matrix only gradually. A discontinuous
-    matrix jump cannot be behavioural drift and must indicate structural
-    change. This is a mathematical basis for the two-tier separation rather
-    than an intuition.
-
-    Compared with the residual probe, the matrix trigger need not wait H steps
-    for return and can respond earlier. Its disadvantage is that the matrix
-    comes from a proxy trained on H-step returns, so delay remains indirectly.
-    Use both: the probe detects changes in environment law, while the matrix
-    detects changes in influence structure; these events need not coincide.
+    Finite-sample matrix movement can arise from estimator noise, support
+    changes, policy drift, or a structural shift. It helps characterize an
+    event but is not sufficient causal evidence and is not part of the final
+    scheduler trigger.
     """
 
     def __init__(self, window: int = 20, eps: float = 1e-8):

@@ -15,11 +15,17 @@ try:
         _capture_frozen_learning_checkpoint,
         _restore_frozen_learning_checkpoint,
     )
+    from run_paper_b_allocation import (
+        _mean_oracle_capacity, _oracle_capacity_for_state,
+    )
 except ModuleNotFoundError:
     from scripts.exp_common import ROOT, ensure_dir
     from scripts.run_h2_selectivity import (
         _capture_frozen_learning_checkpoint,
         _restore_frozen_learning_checkpoint,
+    )
+    from scripts.run_paper_b_allocation import (
+        _mean_oracle_capacity, _oracle_capacity_for_state,
     )
 
 import run_experiment as RE
@@ -116,12 +122,60 @@ def _cd_retrieval_mae(runner):
     return float(np.mean(np.abs(prediction - target_norm)))
 
 
-def _run_variant(name, seed, episodes, core_budget, device, checkpoint):
+def _latent_profile_geometry(runner):
+    latents, profiles = [], []
+    for ego, belief in runner.belief_modules.items():
+        for neighbor in belief.neighbor_ids:
+            latents.append(runner.pair_rel_module.get_pair_latent(ego, neighbor))
+            profiles.append([
+                belief.debiased_mu(neighbor),
+                runner.sig_tracker.get_signature(ego, neighbor)[1],
+            ])
+    if len(latents) < 3:
+        return float("nan")
+    z = np.asarray(latents, dtype=np.float64)
+    p = np.asarray(profiles, dtype=np.float64)
+    p = (p - runner.pair_rel_module.cd_norm_mean.reshape(1, 2)) / (
+        runner.pair_rel_module.cd_norm_std.reshape(1, 2) + 1e-8
+    )
+    upper = np.triu_indices(len(z), k=1)
+    dz = np.linalg.norm(z[:, None, :] - z[None, :, :], axis=-1)[upper]
+    dp = np.linalg.norm(p[:, None, :] - p[None, :, :], axis=-1)[upper]
+    return float(RE.safe_spearman(dz, dp)[0])
+
+
+def _oracle_capacity_table(seed, checkpoint, core_budget, device, n_states=2):
+    runner = RE.make_runner(
+        "Final-CIGAMF", _env(seed), _base_cfg(seed, core_budget), device
+    )
+    _restore_frozen_learning_checkpoint(runner, checkpoint)
+    runner.env.set_behaviour_override("cooperative")
+    bank_seed = int(seed) + 91001
+    bank = runner.env.sample_state_bank(
+        n_states=int(n_states), burn_in=3, bank_seed=bank_seed
+    )
+    oracle_bank = [
+        _oracle_capacity_for_state(
+            runner.env, state,
+            horizon=int(runner.cfg["causal_horizon"]),
+            discount=float(runner.cfg["discount"]),
+            trials=1,
+            seed=bank_seed + index * 100003,
+        )
+        for index, state in enumerate(bank)
+    ]
+    return _mean_oracle_capacity(oracle_bank)
+
+
+def _run_variant(
+    name, seed, episodes, core_budget, device, checkpoint, oracle_capacity
+):
     RE.set_global_seed(seed)
     cfg = _base_cfg(seed, core_budget)
     cfg.update(VARIANTS[name])
     runner = RE.make_runner("Final-CIGAMF", _env(seed), cfg, device)
     _restore_frozen_learning_checkpoint(runner, checkpoint)
+    runner.oracle_capacity_scores_by_ego = oracle_capacity
     runner.pair_rel_module.state_mode = cfg["pair_state_mode"]
     history = runner.run(n_episodes=int(episodes), eval_every=10)
     specificity = pair_specificity_score(runner.pair_rel_module, runner.n_agents)
@@ -146,6 +200,7 @@ def _run_variant(name, seed, episodes, core_budget, device, checkpoint):
             history.get("throughput_total_agent_steps_per_sec", [])
         ),
         "pair_specificity_ratio": float(specificity["specificity_ratio"]),
+        "latent_profile_distance_spearman": _latent_profile_geometry(runner),
         "cd_retrieval_mae": _cd_retrieval_mae(runner),
     }
 
@@ -170,10 +225,13 @@ def main(argv=None):
     selected_variants = args.variants or list(VARIANTS)
     for seed in args.seeds:
         checkpoint = _initial_checkpoint(seed, args.core_budget, args.device)
+        oracle_capacity = _oracle_capacity_table(
+            seed, checkpoint, args.core_budget, args.device
+        )
         for name in selected_variants:
             rows.append(_run_variant(
                 name, seed, args.episodes, args.core_budget, args.device,
-                checkpoint,
+                checkpoint, oracle_capacity,
             ))
     summary_path = os.path.join(out_root, "summary_paper_b_pair_latent.csv")
     with open(summary_path, "w", newline="", encoding="utf-8") as handle:

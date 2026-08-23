@@ -386,6 +386,49 @@ class EpsilonForcedActionController:
             "eps_max_agent": float(np.max(self.get_eps_per_agent())),
         }
 
+    def state_dict(self) -> Dict:
+        """Serialize the complete intervention stream for exact branching."""
+        return {
+            "n_agents": int(self.n_agents),
+            "action_dim": int(self.action_dim),
+            "eps_initial": float(self.eps_initial),
+            "eps": float(self.eps),
+            "max_forced_per_step": self.max_forced_per_step,
+            "anneal_to": self.anneal_to,
+            "anneal_episodes": int(self.anneal_episodes),
+            "episode": int(self.episode),
+            "eps_per_agent": (
+                None if self._eps_per_agent is None
+                else self._eps_per_agent.copy()
+            ),
+            "total_steps": int(self.total_steps),
+            "total_forced": int(self.total_forced),
+            "rng_state": self.rng.get_state(),
+            "cap_warned": bool(getattr(self, "_cap_warned", False)),
+        }
+
+    def load_state_dict(self, state: Dict):
+        """Restore a serialized intervention stream with contract checks."""
+        if int(state["n_agents"]) != self.n_agents:
+            raise ValueError("forcer checkpoint n_agents mismatch")
+        if int(state["action_dim"]) != self.action_dim:
+            raise ValueError("forcer checkpoint action_dim mismatch")
+        self.eps_initial = float(state["eps_initial"])
+        self.eps = float(state["eps"])
+        self.max_forced_per_step = state["max_forced_per_step"]
+        self.anneal_to = state["anneal_to"]
+        self.anneal_episodes = int(state["anneal_episodes"])
+        self.episode = int(state["episode"])
+        values = state.get("eps_per_agent")
+        self._eps_per_agent = (
+            None if values is None
+            else np.asarray(values, dtype=np.float64).copy()
+        )
+        self.total_steps = int(state["total_steps"])
+        self.total_forced = int(state["total_forced"])
+        self.rng.set_state(state["rng_state"])
+        self._cap_warned = bool(state.get("cap_warned", False))
+
 
 class OracleInterventionSampler:
     """

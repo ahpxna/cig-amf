@@ -246,7 +246,8 @@ class FinalCIGAMFRunner:
         self.drift = DriftDetector(
             obs_dim=self.obs_dim,
             action_dim=self.action_dim,
-            n_horizons=cfg.get("drift_n_horizons", 3),
+            n_horizons=causal_horizon,
+            discount=cfg["discount"],
             warmup_batches=cfg.get("drift_warmup_batches", 200),
             recalibrate_after=cfg.get("drift_recalibrate_after", 15),
             seed=cfg.get("seed", 0),
@@ -262,8 +263,17 @@ class FinalCIGAMFRunner:
 
         self.replay_builder = MultiEgoReplayBuilder(
             discount=cfg["discount"],
-            horizon=cfg["causal_horizon"],
+            horizon=causal_horizon,
         )
+        if not (
+            self.proxy.n_horizons
+            == self.drift.n_horizons
+            == self.replay_builder.horizon
+            == causal_horizon
+        ):
+            raise RuntimeError(
+                "causal horizon contract violated across proxy, drift, and replay"
+            )
 
         self.belief_modules = {
             ego: BayesLightBeliefState(
@@ -1677,14 +1687,16 @@ class FinalCIGAMFRunner:
             c_sigma_arr = out.get("c_sigma", out["sigma"])
             d_mu_arr = out.get("d_mu", out["mu"])
 
-            # [InfluenceSignatureTracker] Previously instantiated without any
-            # update call, leaving signature/get_role empty. context_key is j's
-            # current zone and supports context_std for conditional influence.
+            # Contextuality uses a coarse pre-treatment interaction category,
+            # not target zone alone. Support validity still requires repeated
+            # observations in at least two categories.
             self.sig_tracker.update_from_proxy_output(
                 ego_id=ego,
                 neighbor_ids=neighbor_ids,
                 proxy_out=out,
-                context_keys=[int(self.env.agent_zone[j]) for j in neighbor_ids],
+                context_keys=[
+                    self._signature_context_key(ego, j) for j in neighbor_ids
+                ],
             )
 
             mu_sigma = {
@@ -1802,10 +1814,8 @@ class FinalCIGAMFRunner:
 
         residual = self.proxy.get_latest_residual()
 
-        # Two independent evaluate_drift triggers replace v1's self-
-        # contaminated record_structural_residual signal.
-
-        # Trigger 1: frozen blinded probe reading proxy.buffer directly.
+        # The frozen blinded probe is the prespecified trigger. Matrix
+        # movement is retained below only as a diagnostic covariate.
         drift_info = self.drift.step(
             episode=int(self.scheduler.episode),
             buffer=self.proxy.buffer,
@@ -1957,12 +1967,50 @@ class FinalCIGAMFRunner:
             rng = np.random.RandomState(seed)
             return {int(j): float(rng.uniform()) for j in neighbor_ids}
         if mode == "oracle_capacity":
-            table = getattr(self.env, "gt_influence_by_ego", {})
-            row = table.get(int(ego), {}) if isinstance(table, dict) else {}
-            return {int(j): abs(float(row.get(int(j), 0.0))) for j in neighbor_ids}
+            table = getattr(self, "oracle_capacity_scores_by_ego", None)
+            if not isinstance(table, dict) or int(ego) not in table:
+                raise RuntimeError(
+                    "oracle_capacity selector requires clone-state C* scores; "
+                    "mechanism coefficients are not an Oracle-C substitute"
+                )
+            row = table[int(ego)]
+            return {
+                int(j): max(0.0, float(row.get(int(j), 0.0)))
+                for j in neighbor_ids
+            }
         if mode == "full_explicit":
             return {int(j): 1.0 for j in neighbor_ids}
         raise ValueError(f"unknown external core selector {mode!r}")
+
+    def _signature_context_key(self, ego, neighbor):
+        """Return a coarse, pre-treatment interaction-context category."""
+        ego = int(ego)
+        neighbor = int(neighbor)
+        zi = int(self.env.agent_zone[ego])
+        zj = int(self.env.agent_zone[neighbor])
+        pi = self.env.positions[ego]
+        pj = self.env.positions[neighbor]
+        distance = abs(int(pi[0]) - int(pj[0])) + abs(int(pi[1]) - int(pj[1]))
+        distance_bin = 0 if distance <= 2 else (1 if distance <= 5 else 2)
+        role_table = getattr(self.env, "agent_role", {})
+        try:
+            role = str(role_table[neighbor])
+        except (KeyError, IndexError, TypeError):
+            role = "unknown"
+        gate_open = int(bool(getattr(self.env, "gate_open", {}).get(zj, False)))
+        unavailable = int(
+            not bool(getattr(self.env, "resource_available", {}).get(zj, True))
+        )
+        carrying = int(bool(getattr(self.env, "carrying", {}).get(zj, False)))
+        lane_b = int(
+            str(getattr(self.env, "active_lane", {}).get(zj, "A")) == "B"
+        )
+        mechanism_state = (
+            gate_open | (unavailable << 1) | (carrying << 2) | (lane_b << 3)
+        )
+        return (
+            int(zi == zj), int(distance_bin), zi, role, int(mechanism_state)
+        )
 
     def evaluate_episode_snapshot(
         self,
@@ -2205,8 +2253,12 @@ class FinalCIGAMFRunner:
             structural_shift_magnitude = float(
                 last_info.get("delta_phi_frobenius_structural", 0.0) or 0.0
             )
+            controlled_structural_shift = int(
+                last_info.get("controlled_structural_shift", 0) or 0
+            )
             behavioral_phase = _current_behavioral_phase(getattr(self, "env", None))
             behavioral_shift = int(
+                last_info.get("controlled_behavioral_shift", 0) or
                 getattr(self, "_last_behavioral_phase", None) is not None
                 and behavioral_phase != self._last_behavioral_phase
             )
@@ -2216,7 +2268,10 @@ class FinalCIGAMFRunner:
                 "episode": episode_number,
                 "triggered": int(graph_info["triggered"]),
                 "trigger_count": int(trigger_count_now),
-                "structural_shift": int(structural_shift_magnitude > 0.0),
+                "structural_shift": int(
+                    controlled_structural_shift
+                    or structural_shift_magnitude > 0.0
+                ),
                 "structural_shift_magnitude": structural_shift_magnitude,
                 "behavioral_phase": behavioral_phase,
                 "behavioral_shift": behavioral_shift,

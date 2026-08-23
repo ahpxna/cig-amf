@@ -1,8 +1,8 @@
 """Two-timescale scheduling, shift detection, and uncertainty inflation.
 
 Version 2 differs from version 1 in three ways:
-  1. It consumes TWO independent triggers (a frozen probe and an influence
-     matrix) instead of one self-contaminating residual.
+  1. It uses a frozen-probe Page-CUSUM trigger and records influence-matrix
+     movement as a diagnostic.
   2. A trigger both accelerates updates and INFLATES belief uncertainty. The
      core then contracts, keeping the system conservative while the new regime
      remains poorly understood.
@@ -27,8 +27,8 @@ class TwoTimescaleScheduler:
         accel_factor / accel_duration: Magnitude and duration of acceleration.
         z_threshold: Shift threshold. Values from 2.5 to 3.0 are reasonable;
             z=3 means three standard deviations from recent behavior.
-        require_both: Require both triggers for fewer false alarms but slower
-            detection. If False, either trigger is sufficient.
+        require_both: Deprecated compatibility field; matrix movement is not
+            part of the final trigger.
         refractory: Number of refractory episodes after each trigger.
         inflation_factor: Multiplicative sigma inflation at a trigger.
     """
@@ -173,7 +173,6 @@ class TwoTimescaleScheduler:
             return out
 
         hit_probe = float(probe_z) > self.z_threshold
-        hit_matrix = float(matrix_z) > self.z_threshold
         # Matrix movement remains a plotted diagnostic/ablation. It is not
         # combined with the prespecified frozen-witness trigger.
         fired = hit_probe

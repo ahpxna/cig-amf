@@ -425,8 +425,12 @@ class PureMeanFieldRunner:
             structural_shift_magnitude = float(
                 last_info.get("delta_phi_frobenius_structural", 0.0) or 0.0
             )
+            controlled_structural_shift = int(
+                last_info.get("controlled_structural_shift", 0) or 0
+            )
             behavioral_phase = _current_behavioral_phase(getattr(self, "env", None))
             behavioral_shift = int(
+                last_info.get("controlled_behavioral_shift", 0) or
                 getattr(self, "_last_behavioral_phase", None) is not None
                 and behavioral_phase != self._last_behavioral_phase
             )
@@ -436,7 +440,10 @@ class PureMeanFieldRunner:
                 "episode": episode_number,
                 "triggered": 0,
                 "trigger_count": 0,
-                "structural_shift": int(structural_shift_magnitude > 0.0),
+                "structural_shift": int(
+                    controlled_structural_shift
+                    or structural_shift_magnitude > 0.0
+                ),
                 "structural_shift_magnitude": structural_shift_magnitude,
                 "behavioral_phase": behavioral_phase,
                 "behavioral_shift": behavioral_shift,

@@ -50,6 +50,12 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
             )
         with open(learned_path, encoding="utf-8") as handle:
             learned_latency = json.load(handle)
+        learned_seeds = {int(seed) for seed in learned_latency.get("seeds", [])}
+        if protocol_mode == "confirmatory" and learned_seeds != set(h2_seeds):
+            raise CR.ResultValidationError(
+                "learned latency seed matrix does not match the confirmatory "
+                f"Paper-A seeds: {sorted(learned_seeds)} != {sorted(h2_seeds)}"
+            )
     learned_pass = bool(learned_latency and learned_latency.get("gate_pass"))
     latency_status = {
         "status": "SUPPORTED" if learned_pass else "GATED_OUT",
@@ -71,6 +77,10 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
                 "learned_delay_rank_correlation",
                 "learned_delay_mae",
                 "learned_oracle_center_rank_correlation",
+                "zero_lag_baseline_mae",
+                "terminal_lag_baseline_mae",
+                "n_seeds",
+                "per_seed_gate_pass_fraction",
                 "n_valid",
             )
         },

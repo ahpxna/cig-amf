@@ -160,7 +160,16 @@ def _mean_finite(values):
     return float(np.mean(finite)) if finite else float("nan")
 
 
-def _fixed_estimand_panel(env, structural_factor, behavioral_factor, seed, n_states=2):
+def _fixed_estimand_panel(
+    env,
+    structural_factor,
+    behavioral_factor,
+    seed,
+    n_states=2,
+    horizon=8,
+    discount=0.97,
+    n_trials=2,
+):
     """Evaluate C and D on matched cloned states with fixed continuation."""
     if not all(
         callable(getattr(env, name, None))
@@ -170,6 +179,7 @@ def _fixed_estimand_panel(env, structural_factor, behavioral_factor, seed, n_sta
     outer = env.clone_state()
     saved_override = getattr(env, "_behaviour_override", None)
     rows_c, rows_d = [], []
+    capacity_by_ego = {}
     try:
         env.set_behaviour_override("cooperative")
         bank = env.sample_state_bank(
@@ -203,20 +213,56 @@ def _fixed_estimand_panel(env, structural_factor, behavioral_factor, seed, n_sta
                     for action in range(env.get_action_dim()):
                         env.restore_state(state)
                         env.set_behaviour_override("cooperative")
-                        actions = [env.scripted_policy(agent) for agent in range(env.n_agents)]
-                        actions[target] = int(action)
-                        _, rewards, _, _ = env.step(actions)
-                        q_values.append(float(rewards[ego]))
+                        response = env.compute_oracle_lag_response_from_current_state(
+                            ego_id=int(ego),
+                            agent_j=int(target),
+                            intervention_action=int(action),
+                            horizon=int(horizon),
+                            n_trials=int(n_trials),
+                            forced_step=0,
+                            continuation_policy=env.scripted_policy,
+                            crn_seed=(int(seed) + 1) * 1000003
+                            + len(rows_c) * 101,
+                            discount=float(discount),
+                        )
+                        # Responses are relative to one shared reference
+                        # rollout. The additive reference cancels in both C
+                        # and D because the D contrast weights sum to zero.
+                        q_values.append(float(response["discounted_response"]))
                     q_values = np.asarray(q_values, dtype=np.float64)
                     uniform = np.full(q_values.size, 1.0 / q_values.size)
                     rows_c.append(float(np.max(q_values) - np.min(q_values)))
                     rows_d.append(float(np.dot(pi - uniform, q_values)))
+                    capacity_by_ego.setdefault(int(ego), {}).setdefault(
+                        int(target), []
+                    ).append(rows_c[-1])
+        capacity_mean_by_ego = {
+            int(ego): {
+                int(target): _mean_finite(values)
+                for target, values in targets.items()
+            }
+            for ego, targets in capacity_by_ego.items()
+        }
+        oracle_core_by_ego = {
+            int(ego): [
+                int(target)
+                for target, _ in sorted(
+                    targets.items(), key=lambda item: item[1], reverse=True
+                )[:3]
+            ]
+            for ego, targets in capacity_mean_by_ego.items()
+        }
         return {
             "applicable": bool(rows_c),
             "n_pair_states": int(len(rows_c)),
             "capacity_mean": _mean_finite(rows_c),
             "direction_abs_mean": _mean_finite(np.abs(rows_d)),
             "continuation_regime": "cooperative_fixed_after_intervention",
+            "horizon": int(horizon),
+            "discount": float(discount),
+            "n_trials": int(n_trials),
+            "capacity_mean_by_ego": capacity_mean_by_ego,
+            "oracle_core_by_ego": oracle_core_by_ego,
         }
     finally:
         env.set_behaviour_override(saved_override)
@@ -248,6 +294,25 @@ def _runner_direction_matrix(runner, n_agents, ego_ids=None):
             f"runner direction matrix has shape {matrix.shape}; expected {expected}"
         )
     return matrix.copy() if ego_ids is None else matrix[np.asarray(ego_ids, dtype=int)].copy()
+
+
+def _oracle_capacity_core_f1(runner, oracle_core_by_ego, ego_ids):
+    """Score the learned core against all-action capacity C*, not role/Phi."""
+    beliefs = getattr(runner, "belief_modules", None)
+    if beliefs is None:
+        return float("nan")
+    scores = []
+    for ego in ego_ids:
+        truth = oracle_core_by_ego.get(int(ego), [])
+        if not truth or int(ego) not in beliefs:
+            continue
+        predicted = set(beliefs[int(ego)].get_core_set())
+        truth = set(int(agent) for agent in truth)
+        denominator = len(predicted) + len(truth)
+        scores.append(
+            2.0 * len(predicted & truth) / denominator if denominator else 0.0
+        )
+    return _mean_finite(scores)
 
 
 def _agents_with_roles(env, roles):
@@ -390,6 +455,9 @@ def _capture_frozen_learning_checkpoint(runner):
             "total_dr_applied_rows": int(proxy.total_dr_applied_rows),
             "total_dr_clipped_rows": int(proxy.total_dr_clipped_rows),
         }
+    forcer = getattr(runner, "forcer", None)
+    if forcer is not None and callable(getattr(forcer, "state_dict", None)):
+        runtime_state["forcer_state"] = copy.deepcopy(forcer.state_dict())
     env_state = (
         copy.deepcopy(runner.env.clone_state())
         if callable(getattr(runner.env, "clone_state", None))
@@ -487,6 +555,9 @@ def _restore_frozen_learning_checkpoint(runner, checkpoint):
         proxy.buffer = copy.deepcopy(runtime["proxy_buffer"])
         for key, value in runtime.get("proxy_counters", {}).items():
             setattr(proxy, key, int(value))
+    forcer = getattr(runner, "forcer", None)
+    if forcer is not None and "forcer_state" in runtime:
+        forcer.load_state_dict(copy.deepcopy(runtime["forcer_state"]))
     if checkpoint.get("env_state") is not None:
         runner.env.restore_state(copy.deepcopy(checkpoint["env_state"]))
     rng = checkpoint.get("rng_state")
@@ -515,6 +586,18 @@ def _pretrain_common_checkpoint(model, seed, episodes, device):
     )
     runner = RE.make_runner(model, env, cfg, device)
     runner.run(n_episodes=int(episodes), eval_every=max(1, int(episodes)))
+    drift = getattr(runner, "drift", None)
+    proxy = getattr(runner, "proxy", None)
+    if drift is not None:
+        if proxy is None:
+            raise RuntimeError("H2 drift witness requires proxy replay")
+        drift.prepare_for_monitoring(
+            proxy.buffer,
+            episode=int(episodes),
+            reference_batches=max(20, int(getattr(drift, "window", 20))),
+        )
+        if not drift.is_monitoring_ready():
+            raise RuntimeError("H2 drift witness is not monitoring-ready")
     if hasattr(runner, "pair_rel_module"):
         runner.pair_rel_module.fit_cd_normalization(min_samples=1)
     checkpoint = _capture_frozen_learning_checkpoint(runner)
@@ -553,9 +636,10 @@ def _recovery_statistics(
     for index, shift_ep in enumerate(shifts):
         next_shift = shifts[index + 1] if index + 1 < len(shifts) else None
         pre = [
-            float(row["f1"])
+            float(row.get("oracle_capacity_f1", float("nan")))
             for row in eval_records
-            if int(row["episode"]) < shift_ep and np.isfinite(row["f1"])
+            if int(row["episode"]) < shift_ep
+            and np.isfinite(row.get("oracle_capacity_f1", float("nan")))
         ]
         baseline = float(np.mean(pre[-3:])) if pre else float("nan")
         baseline_valid = bool(
@@ -572,12 +656,12 @@ def _recovery_statistics(
             for row in eval_records
             if int(row["episode"]) >= shift_ep
             and (next_shift is None or int(row["episode"]) < next_shift)
-            and np.isfinite(row["f1"])
+            and np.isfinite(row.get("oracle_capacity_f1", float("nan")))
         ]
         recovered_ep = None
         if np.isfinite(target):
             for row in post:
-                if float(row["f1"]) >= target:
+                if float(row["oracle_capacity_f1"]) >= target:
                     recovered_ep = int(row["episode"])
                     break
 
@@ -706,7 +790,9 @@ def run_one(
     # learned runner continued sampling its own policy.  This intervention is
     # the executed policy: pi_tilde=(1-lambda)pi+lambda*pi_scripted.  It is
     # disabled in the structural arm so the two perturbations remain separate.
-    cfg["behavioral_adapter_lambda"] = 1.0 if behavioral_factor else 0.0
+    # The adapter is activated only at the common exogenous intervention;
+    # all four branches are identical before that point.
+    cfg["behavioral_adapter_lambda"] = 0.0
     cfg["behavioral_adapter_only_in_behavioral_drift"] = False
     cfg["behavioral_adapter_target_roles"] = list(H2_MANIPULATED_NEIGHBOR_ROLES)
     cfg["freeze_policy_learning"] = True
@@ -721,20 +807,39 @@ def run_one(
         max_steps=max_steps,
         phase_length=phase_length,
         seed=seed,
-        structural_factor=structural_factor,
-        behavioral_factor=behavioral_factor,
+        structural_factor=False,
+        behavioral_factor=False,
     )
     runner = RE.make_runner(model, env, cfg, device)
     if frozen_checkpoint is None:
         raise RuntimeError("H2 requires a common pretraining checkpoint")
     _restore_frozen_learning_checkpoint(runner, frozen_checkpoint)
+    if hasattr(runner, "drift") and not runner.drift.is_monitoring_ready():
+        raise RuntimeError(
+            f"{model}/{mode}/seed{seed}: drift witness is not monitoring-ready"
+        )
     frozen_representation_sha256_before = _frozen_representation_digest(runner)
 
+    env.set_behaviour_override("cooperative")
+    intervention_after_episodes = int(
+        min(40, max(0, int(episodes) // 2))
+    )
+    intervention_episode = intervention_after_episodes + 1
+    pre_estimand_panel = _fixed_estimand_panel(
+        env,
+        structural_factor=False,
+        behavioral_factor=False,
+        seed=seed,
+        horizon=int(cfg["causal_horizon"]),
+        discount=float(cfg["discount"]),
+    )
     estimand_panel = _fixed_estimand_panel(
         env,
         structural_factor=structural_factor,
         behavioral_factor=behavioral_factor,
         seed=seed,
+        horizon=int(cfg["causal_horizon"]),
+        discount=float(cfg["discount"]),
     )
 
     evaluation_egos = _agents_with_roles(env, H2_EVALUATION_EGO_ROLES)
@@ -754,10 +859,31 @@ def run_one(
     behavioral_shift_episodes = []
     trigger_episodes = []
     event_cursor = 0
+    intervention_scheduled = False
 
     while int(getattr(runner, "episodes_completed", 0)) < episodes:
         completed_before = int(getattr(runner, "episodes_completed", 0))
-        chunk_size = min(eval_every, episodes - completed_before)
+        if (
+            not intervention_scheduled
+            and completed_before == intervention_after_episodes
+        ):
+            env.schedule_factorial_intervention(
+                structural=structural_factor,
+                behavioral=behavioral_factor,
+                behavior_mode="selfish",
+            )
+            runner.cfg["behavioral_adapter_lambda"] = (
+                1.0 if behavioral_factor else 0.0
+            )
+            intervention_scheduled = True
+        if completed_before < intervention_after_episodes:
+            chunk_size = min(
+                eval_every,
+                intervention_after_episodes - completed_before,
+                episodes - completed_before,
+            )
+        else:
+            chunk_size = min(eval_every, episodes - completed_before)
         runner.run(n_episodes=chunk_size, eval_every=eval_every)
         completed = int(getattr(runner, "episodes_completed", 0))
         if completed != completed_before + chunk_size:
@@ -839,6 +965,15 @@ def run_one(
             previous_d = current_d
 
         history = getattr(runner, "history", {})
+        oracle_core_panel = (
+            estimand_panel if completed >= intervention_episode
+            else pre_estimand_panel
+        )
+        oracle_capacity_f1 = _oracle_capacity_core_f1(
+            runner,
+            oracle_core_panel.get("oracle_core_by_ego", {}),
+            evaluation_egos,
+        )
         row = {
             "run_id": run_id,
             "episode": completed,
@@ -862,6 +997,7 @@ def run_one(
             "behavioral_adapter_non_target_tv": adapter_non_target_tv,
             "behavioral_adapter_target_count": adapter_target_count,
             "f1": last(history, "mean_f1"),
+            "oracle_capacity_f1": oracle_capacity_f1,
             "reward": last(history, "mean_reward"),
             "core_size": last(history, "mean_core_size"),
             "tier_separation_ratio": float(
@@ -880,7 +1016,7 @@ def run_one(
         previous_delta_episode = completed
         print(
             f"[H2 {model}/{mode} s{seed}] ep={completed} delta={delta:.4f} "
-            f"f1={row['f1']:.3f} structural={chunk_shifts} "
+            f"C*f1={row['oracle_capacity_f1']:.3f} structural={chunk_shifts} "
             f"behavioral={chunk_behavioral_shifts} triggers={chunk_triggers}"
         )
 
@@ -917,6 +1053,9 @@ def run_one(
     direction_values = np.asarray(
         [delta for _, _, delta in finite_direction_rows], dtype=np.float64
     )
+    common_mask, common_windows = _matched_change_interval_mask(
+        finite_rows, [intervention_episode], CHANGE_WINDOW_EVAL_INTERVALS
+    )
     delta_struct = (
         float(np.mean(delta_values[structural_mask]))
         if structural_mask.any()
@@ -945,8 +1084,7 @@ def run_one(
         if len(direction_values) == len(delta_values) and behavioral_mask.any()
         else float("nan")
     )
-    event_mask = structural_mask | behavioral_mask
-    analysis_mask = event_mask if event_mask.any() else background_mask
+    analysis_mask = common_mask
     capacity_factorial_outcome = (
         float(np.mean(delta_values[analysis_mask]))
         if analysis_mask.any()
@@ -1013,7 +1151,14 @@ def run_one(
         "direction_mean_behav": direction_behav,
         "capacity_factorial_outcome": capacity_factorial_outcome,
         "direction_factorial_outcome": direction_factorial_outcome,
+        "intervention_episode": int(intervention_episode),
+        "common_response_windows": common_windows,
+        "n_complete_common_windows": sum(
+            int(window["complete"]) for window in common_windows
+        ),
         "estimand_panel": estimand_panel,
+        "pre_intervention_estimand_panel": pre_estimand_panel,
+        "recovery_ground_truth": "fixed_state_bank_all_action_capacity_C_star",
         "estimand_capacity_mean": estimand_panel["capacity_mean"],
         "estimand_direction_abs_mean": estimand_panel["direction_abs_mean"],
         "background_drift_ratio": background_drift_ratio,
@@ -1277,9 +1422,25 @@ def main(argv=None):
                     all(per_mode[cell]["metric_applicable"] for cell in FACTORIAL_CELLS)
                     and structural["n_shift_events"] > 0
                     and behavioral["n_behavioral_shift_events"] > 0
-                    and structural["n_complete_structural_windows"]
-                    == behavioral["n_complete_behavioral_windows"]
-                    and structural["n_complete_structural_windows"] > 0
+                    and combined["n_shift_events"] > 0
+                    and combined["n_behavioral_shift_events"] > 0
+                    and control["n_shift_events"] == 0
+                    and control["n_behavioral_shift_events"] == 0
+                    and len({
+                        int(per_mode[cell]["intervention_episode"])
+                        for cell in FACTORIAL_CELLS
+                    }) == 1
+                    and all(
+                        per_mode[cell]["n_complete_common_windows"] > 0
+                        for cell in FACTORIAL_CELLS
+                    )
+                    and len({
+                        json.dumps(
+                            per_mode[cell]["common_response_windows"],
+                            sort_keys=True,
+                        )
+                        for cell in FACTORIAL_CELLS
+                    }) == 1
                     and np.isfinite(sr_cross)
                     and behavioral["behavioral_adapter_event_count"] > 0
                     and np.isfinite(behavioral["behavioral_adapter_kl"])
@@ -1369,6 +1530,7 @@ def main(argv=None):
                     ],
                     "recovery_latency": structural["recovery_latency_intervals"],
                     "recovery_latency_raw": structural["recovery_latency_raw_intervals"],
+                    "recovery_ground_truth": structural["recovery_ground_truth"],
                     "trigger_delay_intervals": structural["trigger_delay_intervals"],
                     "n_shift_events": structural["n_shift_events"],
                     "n_behavioral_shift_events": behavioral[

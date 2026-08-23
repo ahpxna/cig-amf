@@ -90,6 +90,7 @@ if [ "$CIG_QUICK" -eq 1 ]; then
   CIG_H2_EPISODES="${CIG_H2_EPISODES:-60}"
   CIG_H3_EPISODES="${CIG_H3_EPISODES:-60}"
   CIG_LATENCY_TRAIN_EPISODES="${CIG_LATENCY_TRAIN_EPISODES:-2}"
+  CIG_PAPER_B_SELECTOR_STATES="${CIG_PAPER_B_SELECTOR_STATES:-2}"
   CIG_MODE="quick"
 else
   CIG_DEFAULT_H1_SEEDS="0 1 2 3 4 5 6 7"
@@ -97,6 +98,7 @@ else
   CIG_H2_EPISODES="${CIG_H2_EPISODES:-400}"
   CIG_H3_EPISODES="${CIG_H3_EPISODES:-200}"
   CIG_LATENCY_TRAIN_EPISODES="${CIG_LATENCY_TRAIN_EPISODES:-200}"
+  CIG_PAPER_B_SELECTOR_STATES="${CIG_PAPER_B_SELECTOR_STATES:-8}"
   CIG_MODE="confirmatory"
 fi
 
@@ -151,6 +153,12 @@ for CIG_EPISODE_BUDGET in "$CIG_H2_EPISODES" "$CIG_H2_PRETRAIN_EPISODES" "$CIG_H
       ;;
   esac
 done
+case "$CIG_PAPER_B_SELECTOR_STATES" in
+  *[!0-9]*|""|0)
+    echo "CIG_PAPER_B_SELECTOR_STATES must be a positive integer." >&2
+    exit 2
+    ;;
+esac
 
 if [ "$CIG_QUICK" -eq 0 ]; then
   if [ "${#CIG_H1_SEED_ARRAY[@]}" -lt 8 ]; then
@@ -199,6 +207,7 @@ printf 'category\tlabel\texit_code\telapsed_seconds\tlog\n' > "$CIG_STATUS_TSV"
   printf 'latency_oracle_states=%s\n' "$CIG_LATENCY_ORACLE_STATES"
   printf 'latency_oracle_trials=%s\n' "$CIG_LATENCY_ORACLE_TRIALS"
   printf 'latency_train_episodes=%s\n' "$CIG_LATENCY_TRAIN_EPISODES"
+  printf 'paper_b_selector_states=%s\n' "$CIG_PAPER_B_SELECTOR_STATES"
   printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || printf unknown)"
   git status --porcelain --untracked-files=normal 2>/dev/null > "$CIG_RUN_DIR/git_status_porcelain.txt"
   if [ ! -s "$CIG_RUN_DIR/git_status_porcelain.txt" ]; then
@@ -381,6 +390,7 @@ if "$CIG_PYTHON" -c \
   "$CIG_RUN_DIR/latency_oracle.json"; then
   run_logged "diagnostic" "Learned direct-lag latency calibration" "23_latency_learned.log" \
     "$CIG_PYTHON" scripts/run_latency_calibration.py \
+    --seeds "${CIG_H23_SEED_ARRAY[@]}" \
     --train-episodes "$CIG_LATENCY_TRAIN_EPISODES" \
     --states "$CIG_LATENCY_ORACLE_STATES" \
     --trials "$CIG_LATENCY_ORACLE_TRIALS" \
@@ -492,6 +502,7 @@ run_logged "allocation" "Paper-B selector isolation and end-to-end allocation" "
   --seeds "${CIG_H23_SEED_ARRAY[@]}" \
   --episodes "$CIG_H3_EPISODES" \
   --pretrain-episodes "$CIG_H2_PRETRAIN_EPISODES" \
+  --selector-states "$CIG_PAPER_B_SELECTOR_STATES" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/paper_b_allocation"
 run_logged "representation" "Paper-B pair-latent ablations under fixed core" "64_paper_b_pair_latent.log" \

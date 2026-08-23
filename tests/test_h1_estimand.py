@@ -269,11 +269,18 @@ class H1ClaimGateTests(unittest.TestCase):
                     "capacity_rank_correlation_mean": 0.85,
                     "capacity_mae_mean": 0.10,
                     "capacity_bias_mean": 0.02,
+                    "capacity_active_mae_mean": 0.08,
+                    "capacity_active_spearman_mean": 0.75,
+                    "capacity_null_fpr_mean": 0.05,
                     "oracle_core_f1_mean": 0.80,
                     "direction_spearman_mean": signed_rank,
                     "direction_mae_mean": abs(epsilon_bias[variant]),
                     "direction_bias_mean": epsilon_bias[variant],
                     "direction_sign_agreement_mean": 0.90,
+                    "direction_active_mae_mean": 0.08,
+                    "direction_active_spearman_mean": 0.72,
+                    "direction_active_sign_agreement_mean": 0.90,
+                    "direction_null_fpr_mean": 0.05,
                     "direction_row_aipw_signed_spearman_mean": (
                         0.80 + 0.002 * seed
                     ),
@@ -317,7 +324,7 @@ class H1ClaimGateTests(unittest.TestCase):
         rows = self._supporting_rows()
         for row in rows:
             if row["variant"] == "plugin_eps005":
-                row["capacity_rank_correlation_mean"] = 0.10
+                row["capacity_active_spearman_mean"] = 0.10
         claim = h1_calibration._claim_gate(rows)
         self.assertFalse(claim["h1_claim_gate_pass"])
         self.assertFalse(claim["h1b_capacity_recovery_pass"])

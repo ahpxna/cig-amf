@@ -34,8 +34,20 @@ def _rank_correlation(x, y):
     y = np.asarray(y, dtype=np.float64)
     if x.size < 3 or np.std(x) <= 1e-12 or np.std(y) <= 1e-12:
         return 0.0
-    rank_x = np.argsort(np.argsort(x)).astype(np.float64)
-    rank_y = np.argsort(np.argsort(y)).astype(np.float64)
+    def average_ranks(values):
+        order = np.argsort(values, kind="mergesort")
+        ranks = np.empty(values.size, dtype=np.float64)
+        start = 0
+        while start < values.size:
+            end = start + 1
+            while end < values.size and values[order[end]] == values[order[start]]:
+                end += 1
+            ranks[order[start:end]] = 0.5 * (start + end - 1)
+            start = end
+        return ranks
+
+    rank_x = average_ranks(x)
+    rank_y = average_ranks(y)
     return float(np.corrcoef(rank_x, rank_y)[0, 1])
 
 
@@ -180,7 +192,7 @@ def run_gate(
                     horizon=int(horizon),
                     n_trials=int(n_trials),
                     forced_step=0,
-                    crn_seed=(int(seed) + 1) * 1000003 + state_index * 97 + source * 11 + action,
+                    crn_seed=(int(seed) + 1) * 1000003 + state_index * 97 + source * 11,
                 )
                 action_profiles.append(
                     np.asarray(profile["per_lag_response"], dtype=np.float64)

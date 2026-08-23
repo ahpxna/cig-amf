@@ -287,12 +287,12 @@ class H2ProtocolTests(unittest.TestCase):
 
     def test_recovery_aggregates_every_shift_and_matched_trigger(self):
         records = [
-            {"episode": 10, "f1": 0.8},
-            {"episode": 20, "f1": 0.8},
-            {"episode": 30, "f1": 0.4},
-            {"episode": 40, "f1": 0.8},
-            {"episode": 50, "f1": 0.4},
-            {"episode": 60, "f1": 0.8},
+            {"episode": 10, "oracle_capacity_f1": 0.8},
+            {"episode": 20, "oracle_capacity_f1": 0.8},
+            {"episode": 30, "oracle_capacity_f1": 0.4},
+            {"episode": 40, "oracle_capacity_f1": 0.8},
+            {"episode": 50, "oracle_capacity_f1": 0.4},
+            {"episode": 60, "oracle_capacity_f1": 0.8},
         ]
         result = _recovery_statistics(
             records,
@@ -309,10 +309,10 @@ class H2ProtocolTests(unittest.TestCase):
 
     def test_recovery_delay_uses_step_units_and_never_goes_negative(self):
         records = [
-            {"episode": 10, "f1": 0.8},
-            {"episode": 20, "f1": 0.8},
-            {"episode": 30, "f1": 0.8},
-            {"episode": 40, "f1": 0.8},
+            {"episode": 10, "oracle_capacity_f1": 0.8},
+            {"episode": 20, "oracle_capacity_f1": 0.8},
+            {"episode": 30, "oracle_capacity_f1": 0.8},
+            {"episode": 40, "oracle_capacity_f1": 0.8},
         ]
         result = _recovery_statistics(
             records,

@@ -294,7 +294,6 @@ def default_cfg():
         "heads_w_contrastive": 1,
         "heads_w_influence": 1.0,
 
-        "drift_n_horizons": 3,
         "drift_warmup_batches": 200,
         "drift_recalibrate_after": 15,
         "drift_train_batches": 5,

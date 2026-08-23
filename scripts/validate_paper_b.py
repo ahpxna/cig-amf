@@ -105,6 +105,14 @@ def validate(run_root, expected_seeds, protocol_mode):
         allocation, "C-Core", "AbsD-Core", "selector_oracle_f1",
         panel="selector_isolation",
     )
+    c_vs_d_disagreement = _paired(
+        allocation, "C-Core", "AbsD-Core",
+        "disagreement_selector_oracle_f1", panel="selector_isolation",
+    )
+    c_vs_d_ndcg = _paired(
+        allocation, "C-Core", "AbsD-Core", "selector_oracle_ndcg_at_k",
+        panel="selector_isolation",
+    )
     oracle_vs_random = _paired(
         allocation, "Oracle-C-Core", "Random-Core", "selector_oracle_f1",
         panel="selector_isolation",
@@ -118,14 +126,21 @@ def validate(run_root, expected_seeds, protocol_mode):
             "cd_retrieval_mae",
         )
     ]
+    pair_geometry = _paired(
+        pair_rows, "Recurrent-BC-CD-Contrastive", "Recurrent-BC",
+        "latent_profile_distance_spearman",
+    )
     periphery_reward = _paired(
         periphery_rows, "Semantic-Free", "Single-Mean", "mean_reward"
     )
     metrics = {
         "c_core_minus_absd_selector_f1": c_vs_d,
+        "c_core_minus_absd_disagreement_f1": c_vs_d_disagreement,
+        "c_core_minus_absd_selector_ndcg": c_vs_d_ndcg,
         "oracle_minus_random_selector_f1": oracle_vs_random,
         "c_core_minus_absd_reward": c_reward_vs_d,
         "bc_minus_full_cd_retrieval_mae": pair_retrieval,
+        "full_cd_minus_bc_latent_profile_geometry": pair_geometry,
         "semantic_free_minus_single_mean_reward": periphery_reward,
     }
     cis = {
@@ -136,6 +151,9 @@ def validate(run_root, expected_seeds, protocol_mode):
         "C_selector_beats_absD_at_equal_budget": cis[
             "c_core_minus_absd_selector_f1"
         ][0] > 0.0,
+        "C_selector_beats_absD_when_profiles_disagree": cis[
+            "c_core_minus_absd_disagreement_f1"
+        ][0] > 0.0,
         "oracle_selector_beats_random_at_equal_budget": cis[
             "oracle_minus_random_selector_f1"
         ][0] > 0.0,
@@ -144,6 +162,9 @@ def validate(run_root, expected_seeds, protocol_mode):
         ][0] > 0.0,
         "CD_contrastive_latent_improves_profile_retrieval": cis[
             "bc_minus_full_cd_retrieval_mae"
+        ][0] > 0.0,
+        "CD_contrastive_latent_aligns_with_profile_distance": cis[
+            "full_cd_minus_bc_latent_profile_geometry"
         ][0] > 0.0,
         "semantic_free_memory_improves_reward_over_single_mean": cis[
             "semantic_free_minus_single_mean_reward"

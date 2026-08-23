@@ -5,10 +5,21 @@ import unittest
 import numpy as np
 
 from envs.omni_arena import OmniArena
-from scripts.run_latency_oracle import run_gate
+from scripts.run_latency_oracle import _rank_correlation, run_gate
 
 
 class LatencyOracleTests(unittest.TestCase):
+    def test_rank_correlation_uses_average_ranks_for_tied_delays(self):
+        truth = [0, 0, 2, 2, 4, 4]
+        estimate = [0.1, 0.2, 2.1, 2.2, 4.1, 4.2]
+        base = _rank_correlation(truth, estimate)
+        permutation = [1, 0, 3, 2, 5, 4]
+        permuted = _rank_correlation(
+            [truth[index] for index in permutation],
+            [estimate[index] for index in permutation],
+        )
+        self.assertAlmostEqual(base, permuted)
+
     def _env(self):
         return OmniArena(
             n_agents=24,

@@ -52,7 +52,7 @@ def _oracle_spectrum(env, state, ego, source, horizon, trials, seed):
         env.restore_state(state)
         result = env.compute_oracle_lag_response_from_current_state(
             ego_id=int(ego), agent_j=int(source), intervention_action=int(action),
-            horizon=int(horizon), n_trials=int(trials), crn_seed=int(seed) + action,
+            horizon=int(horizon), n_trials=int(trials), crn_seed=int(seed),
         )
         profiles.append(np.asarray(result["per_lag_response"], dtype=np.float64))
     surface = np.stack(profiles, axis=0)
@@ -124,6 +124,7 @@ def run(seed, train_episodes, states, horizon, trials, device):
                 )
                 learned = np.asarray(out["c_lag_mu"][source_index], dtype=np.float64)
                 rows.append({
+                    "seed": int(seed),
                     "state_index": int(state_index),
                     "ego": ego,
                     "source": source,
@@ -149,29 +150,137 @@ def run(seed, train_episodes, states, horizon, trials, device):
         if valid else float("nan")
     )
     oracle_alignment = _rank_correlation(oracle_centres, learned_centres)
+    zero_baseline_mae = (
+        float(np.mean(np.abs(np.asarray(truth, dtype=np.float64))))
+        if valid else float("nan")
+    )
+    terminal_baseline_mae = (
+        float(np.mean(np.abs(
+            np.asarray(truth, dtype=np.float64) - float(horizon - 1)
+        )))
+        if valid else float("nan")
+    )
     gate_pass = bool(
         len(valid) >= 8 and delay_rank >= 0.50 and delay_mae <= 2.0
         and oracle_alignment >= 0.50
     )
     return {
-        "protocol_version": "learned_latency_capacity_spectrum_v1",
+        "protocol_version": "learned_latency_capacity_spectrum_v2",
         "gate_pass": gate_pass,
         "seed": int(seed),
         "train_episodes": int(train_episodes),
         "n_states": int(states),
         "horizon": int(horizon),
         "n_trials": int(trials),
+        "evaluation_bank_seed": int(seed) + 9901,
+        "evaluation_split": "held_out_state_bank",
         "n_valid": len(valid),
         "learned_delay_rank_correlation": delay_rank,
         "learned_delay_mae": delay_mae,
         "learned_oracle_center_rank_correlation": oracle_alignment,
+        "zero_lag_baseline_mae": zero_baseline_mae,
+        "terminal_lag_baseline_mae": terminal_baseline_mae,
+        "learned_beats_zero_lag_baseline": bool(
+            np.isfinite(delay_mae) and delay_mae < zero_baseline_mae
+        ),
+        "learned_beats_terminal_lag_baseline": bool(
+            np.isfinite(delay_mae) and delay_mae < terminal_baseline_mae
+        ),
+        "rows": rows,
+    }
+
+
+def _bootstrap_mean_ci(values, seed=7193, n_bootstrap=10000):
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return [float("nan"), float("nan"), float("nan")]
+    if values.size == 1:
+        value = float(values[0])
+        return [value, value, value]
+    rng = np.random.RandomState(int(seed))
+    draws = rng.choice(values, size=(int(n_bootstrap), values.size), replace=True)
+    means = draws.mean(axis=1)
+    return [
+        float(np.mean(values)),
+        float(np.quantile(means, 0.025)),
+        float(np.quantile(means, 0.975)),
+    ]
+
+
+def run_many(seeds, train_episodes, states, horizon, trials, device):
+    seeds = [int(seed) for seed in seeds]
+    if not seeds or len(set(seeds)) != len(seeds):
+        raise ValueError("latency seeds must be a non-empty unique list")
+    per_seed = [
+        run(seed, train_episodes, states, horizon, trials, device)
+        for seed in seeds
+    ]
+    metrics = {
+        "learned_delay_rank_correlation": [
+            result["learned_delay_rank_correlation"] for result in per_seed
+        ],
+        "learned_delay_mae": [result["learned_delay_mae"] for result in per_seed],
+        "learned_oracle_center_rank_correlation": [
+            result["learned_oracle_center_rank_correlation"] for result in per_seed
+        ],
+        "zero_lag_baseline_mae": [
+            result["zero_lag_baseline_mae"] for result in per_seed
+        ],
+        "terminal_lag_baseline_mae": [
+            result["terminal_lag_baseline_mae"] for result in per_seed
+        ],
+    }
+    aggregate = {
+        key: _bootstrap_mean_ci(values, seed=7193 + index)
+        for index, (key, values) in enumerate(metrics.items())
+    }
+    pass_fraction = float(np.mean([result["gate_pass"] for result in per_seed]))
+    learned_mae = aggregate["learned_delay_mae"][0]
+    gate_pass = bool(
+        len(seeds) >= 5
+        and pass_fraction >= 0.8
+        and aggregate["learned_delay_rank_correlation"][0] >= 0.50
+        and aggregate["learned_oracle_center_rank_correlation"][0] >= 0.50
+        and learned_mae <= 2.0
+        and learned_mae < aggregate["zero_lag_baseline_mae"][0]
+        and learned_mae < aggregate["terminal_lag_baseline_mae"][0]
+    )
+    rows = [row for result in per_seed for row in result["rows"]]
+    return {
+        "protocol_version": "learned_latency_capacity_spectrum_multiseed_v1",
+        "gate_pass": gate_pass,
+        "seeds": seeds,
+        "n_seeds": len(seeds),
+        "minimum_confirmatory_seeds": 5,
+        "per_seed_gate_pass_fraction": pass_fraction,
+        "train_episodes_per_seed": int(train_episodes),
+        "n_states_per_seed": int(states),
+        "horizon": int(horizon),
+        "n_trials": int(trials),
+        "n_valid": int(sum(result["n_valid"] for result in per_seed)),
+        "evaluation_split": "independent_held_out_state_bank_per_seed",
+        "learned_delay_rank_correlation": aggregate[
+            "learned_delay_rank_correlation"
+        ][0],
+        "learned_delay_mae": learned_mae,
+        "learned_oracle_center_rank_correlation": aggregate[
+            "learned_oracle_center_rank_correlation"
+        ][0],
+        "zero_lag_baseline_mae": aggregate["zero_lag_baseline_mae"][0],
+        "terminal_lag_baseline_mae": aggregate["terminal_lag_baseline_mae"][0],
+        "bootstrap_mean_ci95": aggregate,
+        "per_seed": [
+            {key: value for key, value in result.items() if key != "rows"}
+            for result in per_seed
+        ],
         "rows": rows,
     }
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     parser.add_argument("--train-episodes", type=int, default=200)
     parser.add_argument("--states", type=int, default=12)
     parser.add_argument("--horizon", type=int, default=8)
@@ -181,8 +290,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if min(args.train_episodes, args.states, args.horizon, args.trials) <= 0:
         parser.error("all budgets must be positive")
-    result = run(
-        args.seed, args.train_episodes, args.states, args.horizon,
+    result = run_many(
+        args.seeds, args.train_episodes, args.states, args.horizon,
         args.trials, args.device,
     )
     _atomic_json(os.path.abspath(args.json_out), result)

@@ -3,8 +3,12 @@ import unittest
 import numpy as np
 import torch
 
+import run_experiment as RE
+from envs.omni_arena import OmniArena
 from models.crossfit_aipw import CrossFittedConditionalAIPW
+from models.drift_probe import DriftDetector
 from models.influence_signature import InfluenceSignatureTracker
+from models.intervention import EpsilonForcedActionController
 from models.peripheral_memory import (
     FULL_ITEM_DIM,
     ITEM_DIRECTION,
@@ -16,11 +20,111 @@ from models.peripheral_memory import (
     ROLE_NEUTRAL,
 )
 from models.structural_proxy import LocalCounterfactualProxyEnsemble
-from scripts.run_h2_selectivity import FACTORIAL_CELLS
+from scripts.run_h2_selectivity import FACTORIAL_CELLS, _fixed_estimand_panel
+from scripts.run_paper_b_allocation import _oracle_capacity_for_state
 from training.replay_builder import MultiEgoReplayBuilder
 
 
 class RevisedScientificContractTests(unittest.TestCase):
+    def test_default_runner_shares_one_causal_horizon_contract(self):
+        cfg = RE.default_cfg()
+        env = OmniArena(n_agents=6, n_zones=1, max_steps=4, seed=19)
+        runner = RE.make_runner("Final-CIGAMF", env, cfg, "cpu")
+        expected = int(cfg["causal_horizon"])
+        self.assertEqual(runner.proxy.n_horizons, expected)
+        self.assertEqual(runner.drift.n_horizons, expected)
+        self.assertEqual(runner.replay_builder.horizon, expected)
+
+    def test_drift_residual_is_discounted_full_horizon_return(self):
+        detector = DriftDetector(
+            obs_dim=1, action_dim=2, n_horizons=3, discount=0.5,
+            warmup_batches=1, batch_size=1,
+        )
+        pred = torch.tensor([[1.0, 2.0, 3.0]])
+        target = torch.tensor([[0.0, 2.0, 7.0]])
+        residual = detector._discounted_return_residual(pred, target)
+        # |(1 + 1 + .75) - (0 + 1 + 1.75)| = 0.
+        self.assertAlmostEqual(float(residual.item()), 0.0)
+        with self.assertRaises(ValueError):
+            detector._target_lag_rewards({"target_lag_rewards": [1.0, 2.0]})
+
+    def test_forcer_checkpoint_restores_exact_next_random_draw(self):
+        controller = EpsilonForcedActionController(
+            n_agents=4, action_dim=3, eps=0.7,
+            rng=np.random.RandomState(123),
+        )
+        probabilities = np.full((4, 3), 1.0 / 3.0, dtype=np.float32)
+        controller.apply([0, 0, 0, 0], probabilities)
+        checkpoint = controller.state_dict()
+        expected_actions = [0, 0, 0, 0]
+        expected_mask, expected_probs = controller.apply(
+            expected_actions, probabilities
+        )
+        restored = EpsilonForcedActionController(
+            n_agents=4, action_dim=3, eps=0.1,
+            rng=np.random.RandomState(999),
+        )
+        restored.load_state_dict(checkpoint)
+        actual_actions = [0, 0, 0, 0]
+        actual_mask, actual_probs = restored.apply(actual_actions, probabilities)
+        np.testing.assert_array_equal(actual_mask, expected_mask)
+        np.testing.assert_allclose(actual_probs, expected_probs)
+        self.assertEqual(actual_actions, expected_actions)
+
+    def test_controlled_factorial_event_occurs_on_scheduled_reset(self):
+        env = OmniArena(
+            n_agents=6, n_zones=1, max_steps=4, phase_length=1000,
+            seed=23, enable_structural_shift=False,
+        )
+        lanes_before = dict(env.active_lane)
+        env.schedule_factorial_intervention(True, True, "selfish")
+        env.reset()
+        actions = [env.scripted_policy(agent) for agent in range(env.n_agents)]
+        _, _, _, info = env.step(actions)
+        self.assertEqual(info["controlled_structural_shift"], 1)
+        self.assertEqual(info["controlled_behavioral_shift"], 1)
+        self.assertNotEqual(env.active_lane, lanes_before)
+        self.assertEqual(env._behaviour_override, "selfish")
+
+    def test_h2_fixed_estimand_panel_uses_requested_horizon(self):
+        env = OmniArena(
+            n_agents=6, n_zones=1, max_steps=12, phase_length=1000,
+            causal_horizon=2, seed=29,
+        )
+        panel = _fixed_estimand_panel(
+            env, False, False, seed=29, n_states=1, horizon=2,
+            discount=0.9, n_trials=1,
+        )
+        self.assertTrue(panel["applicable"])
+        self.assertEqual(panel["horizon"], 2)
+        self.assertEqual(panel["continuation_regime"],
+                         "cooperative_fixed_after_intervention")
+        self.assertTrue(panel["oracle_core_by_ego"])
+
+    def test_paper_b_oracle_selector_uses_all_action_capacity(self):
+        env = OmniArena(
+            n_agents=6, n_zones=1, max_steps=8, phase_length=1000,
+            causal_horizon=1, seed=31,
+        )
+        state = env.clone_state()
+        capacity = _oracle_capacity_for_state(
+            env, state, horizon=1, discount=0.9, trials=1, seed=31,
+        )
+        self.assertEqual(set(capacity), set(range(env.n_agents)))
+        self.assertTrue(all(
+            len(row) == env.n_agents - 1 for row in capacity.values()
+        ))
+        self.assertTrue(all(
+            value >= 0.0 for row in capacity.values() for value in row.values()
+        ))
+        # C* is a response range and is not the signed static Phi table.
+        self.assertTrue(any(
+            abs(float(capacity[ego][source]) - abs(float(
+                env.gt_influence_by_ego.get(ego, {}).get(source, 0.0)
+            ))) > 1e-8
+            for ego in capacity for source in capacity[ego]
+        ))
+
     def test_direct_lag_targets_derive_cumulative_h_returns(self):
         trajectory = [
             {"rewards": [1.0]},

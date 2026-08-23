@@ -221,10 +221,21 @@ def _h1_status(rows):
                 main["capacity_rank_correlation_mean"]
             ),
             "capacity_core_f1": float(main["oracle_core_f1_mean"]),
+            "capacity_active_spearman": float(
+                main["capacity_active_spearman_mean"]
+            ),
+            "capacity_null_fpr": float(main["capacity_null_fpr_mean"]),
             "direction_spearman": float(main["direction_spearman_mean"]),
             "direction_sign_agreement": float(
                 main["direction_sign_agreement_mean"]
             ),
+            "direction_active_spearman": float(
+                main["direction_active_spearman_mean"]
+            ),
+            "direction_active_sign_agreement": float(
+                main["direction_active_sign_agreement_mean"]
+            ),
+            "direction_null_fpr": float(main["direction_null_fpr_mean"]),
             "estimator_ablation": claim["h1_estimator_ablation"],
             "forcing_reporting": forcing,
         },

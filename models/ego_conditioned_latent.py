@@ -17,10 +17,10 @@ reduce this loss. z_ij therefore converges to the same global opponent model
 for every ego. Pair specificity was invalidated by the loss itself and the
 paper's second contribution had no enforcing mechanism.
 
-The direct diagnostic is cosine similarity between z_ij and z_i'j for i!=i'
-with the same j. A value near 1.0 means the latent is a global opponent model,
-not pair-specific. pair_specificity_score() at the end of this file implements
-that test; the pre-correction result should be retained as paper evidence.
+Raw same-neighbour cosine separation is retained as a secondary diagnostic.
+The causal diagnostic compares pairwise latent distance with pairwise [C,D]
+profile distance: similar causal profiles may correctly share representations,
+even when they belong to different egos.
 
 THREE LOSS TERMS
 
@@ -241,7 +241,7 @@ def pair_specificity_score(
     sample_neighbors: Optional[List[int]] = None,
 ) -> Dict[str, float]:
     """
-    Measure whether z_ij is genuinely pair-specific.
+    Measure raw ego/neighbour separation as a secondary diagnostic.
 
     Run this function before and after the correction. The paired measurements
     directly demonstrate whether the paper's second contribution has actually
@@ -251,9 +251,8 @@ def pair_specificity_score(
         For each neighbour j, collect {z_ij for every ego i != j} and compute
         mean cosine similarity across egos.
 
-        ~1.0 means every ego represents j identically, so z is a global
-        opponent model rather than pair-specific. A low value means egos
-        represent j differently and supports the claimed ego-centric property.
+        This geometry is not a causal success criterion: two egos with the
+        same [C,D] profile may correctly have similar representations.
 
     Compare against similarity among different neighbours under the same ego.
     If cross_ego_similarity is approximately cross_neighbor_similarity, the
@@ -321,9 +320,7 @@ def pair_specificity_score(
     return {
         "cross_ego_similarity": ce,
         "cross_neighbor_similarity": cn,
-        # A value below one means same-j/different-ego representations separate
-        # more strongly than different-j/same-ego representations, evidence of
-        # genuine ego-centricity.
+        # Retained for backward-compatible exploratory reporting only.
         "specificity_ratio": float(ce / (cn + 1e-8)),
         "n_cross_ego_pairs": int(len(cross_ego)),
         "n_cross_neighbor_pairs": int(len(cross_nb)),

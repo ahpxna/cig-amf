@@ -350,6 +350,9 @@ class OmniArena:
         # behavior from episode phase; otherwise both axes differ between
         # measurements and the change cannot be attributed.
         self._behaviour_override = None
+        self._pending_factorial_intervention = None
+        self._controlled_structural_event_active = False
+        self._controlled_behavioral_event_active = False
 
         # [Guard A -- P2<->P4 trap] True only during reset(). This is the
         # correct guard for _do_structural_shift(): self.t/self.done describe
@@ -1210,6 +1213,16 @@ class OmniArena:
             "delta_phi_frobenius_structural_last": self.delta_phi_frobenius_structural_last,
             "delta_phi_frobenius_behavioural_last": self.delta_phi_frobenius_behavioural_last,
             "sgtp_delay_queues": copy.deepcopy(self._sgtp_delay_queues),
+            "behaviour_override": self._behaviour_override,
+            "pending_factorial_intervention": copy.deepcopy(
+                self._pending_factorial_intervention
+            ),
+            "controlled_structural_event_active": bool(
+                self._controlled_structural_event_active
+            ),
+            "controlled_behavioral_event_active": bool(
+                self._controlled_behavioral_event_active
+            ),
         }
 
     def restore_state(self, state):
@@ -1232,6 +1245,33 @@ class OmniArena:
         self.delta_phi_frobenius_structural_last = state["delta_phi_frobenius_structural_last"]
         self.delta_phi_frobenius_behavioural_last = state["delta_phi_frobenius_behavioural_last"]
         self._sgtp_delay_queues = copy.deepcopy(state.get("sgtp_delay_queues", {}))
+        self._behaviour_override = state.get("behaviour_override")
+        self._pending_factorial_intervention = copy.deepcopy(
+            state.get("pending_factorial_intervention")
+        )
+        self._controlled_structural_event_active = bool(
+            state.get("controlled_structural_event_active", False)
+        )
+        self._controlled_behavioral_event_active = bool(
+            state.get("controlled_behavioral_event_active", False)
+        )
+
+    def schedule_factorial_intervention(
+        self, structural: bool, behavioral: bool, behavior_mode: str = "selfish"
+    ):
+        """Schedule one controlled S/B intervention for the next reset.
+
+        The H2 harness uses this for all four factorial cells, including the
+        sham cell. Passive phase schedules are disabled in that protocol, so
+        both interventions share one exogenous event time.
+        """
+        if self._pending_factorial_intervention is not None:
+            raise RuntimeError("a factorial intervention is already pending")
+        self._pending_factorial_intervention = {
+            "structural": bool(structural),
+            "behavioral": bool(behavioral),
+            "behavior_mode": str(behavior_mode),
+        }
 
     def _apply_sgtp_delays(self, instantaneous):
         """Apply cloneable pair-specific transport delays to SGTP effects."""
@@ -1741,9 +1781,24 @@ class OmniArena:
         self.t = 0
         self.done = False
 
+        self.delta_phi_frobenius_structural_last = 0.0
+        self.delta_phi_frobenius_behavioural_last = 0.0
+        self._controlled_structural_event_active = False
+        self._controlled_behavioral_event_active = False
+
         self._in_reset = True
         try:
-            self._maybe_structural_shift()
+            intervention = self._pending_factorial_intervention
+            if intervention is None:
+                self._maybe_structural_shift()
+            else:
+                if intervention["structural"]:
+                    self._do_structural_shift()
+                    self._controlled_structural_event_active = True
+                if intervention["behavioral"]:
+                    self._behaviour_override = intervention["behavior_mode"]
+                    self._controlled_behavioral_event_active = True
+                self._pending_factorial_intervention = None
         finally:
             self._in_reset = False
 
@@ -2122,6 +2177,12 @@ class OmniArena:
                 "tier_separation_ratio": self.tier_separation_ratio(),
                 "delta_phi_frobenius_structural": self.delta_phi_frobenius_structural_last,
                 "delta_phi_frobenius_behavioural": self.delta_phi_frobenius_behavioural_last,
+                "controlled_structural_shift": int(
+                    self._controlled_structural_event_active
+                ),
+                "controlled_behavioral_shift": int(
+                    self._controlled_behavioral_event_active
+                ),
                 "evaluation_scope": "omni_arena_multi_ego",
             }
 
@@ -2250,6 +2311,7 @@ class OmniArena:
         forced_step=0,
         continuation_policy=None,
         crn_seed=None,
+        discount=0.95,
     ):
         """Measure the lag-specific causal response under fixed policy ``rho``.
 
@@ -2323,10 +2385,12 @@ class OmniArena:
                 np.dot(np.arange(horizon, dtype=np.float64), mass) / total_mass
             )
 
-        discount = 0.95 ** np.arange(horizon, dtype=np.float64)
+        discount_weights = float(discount) ** np.arange(
+            horizon, dtype=np.float64
+        )
         return {
             "per_lag_response": response.astype(np.float64),
-            "discounted_response": float(np.dot(discount, response)),
+            "discounted_response": float(np.dot(discount_weights, response)),
             "onset_lag": onset_lag,
             "peak_lag": peak_lag,
             "centre_of_mass_lag": centre_of_mass_lag,

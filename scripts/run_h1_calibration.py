@@ -82,6 +82,8 @@ MIN_CAPACITY_RANK = 0.30
 MIN_CAPACITY_CORE_F1 = 0.35
 MIN_DIRECTION_SPEARMAN = 0.30
 MIN_DIRECTION_SIGN_AGREEMENT = 0.60
+MAX_CAPACITY_NULL_FPR = 0.20
+MAX_DIRECTION_NULL_FPR = 0.20
 
 
 def _utc_now():
@@ -145,6 +147,10 @@ def _variant_means(rows, variant):
         "capacity_bias_mean", "oracle_core_f1_mean",
         "direction_spearman_mean", "direction_mae_mean",
         "direction_bias_mean", "direction_sign_agreement_mean",
+        "capacity_active_mae_mean", "capacity_active_spearman_mean",
+        "capacity_null_fpr_mean", "direction_active_mae_mean",
+        "direction_active_spearman_mean",
+        "direction_active_sign_agreement_mean", "direction_null_fpr_mean",
         "direction_row_aipw_signed_spearman_mean",
         "direction_row_aipw_signed_mae_mean",
         "direction_row_aipw_sign_agreement_mean",
@@ -420,12 +426,20 @@ def _claim_gate(rows):
     forcing_reporting = _forcing_reporting(rows)
     q_recovery = bool(plugin["q_spearman_mean"] >= MIN_Q_SPEARMAN)
     capacity_recovery = bool(
-        plugin["capacity_rank_correlation_mean"] >= MIN_CAPACITY_RANK
+        math.isfinite(plugin["capacity_active_spearman_mean"])
+        and plugin["capacity_active_spearman_mean"] >= MIN_CAPACITY_RANK
         and plugin["oracle_core_f1_mean"] >= MIN_CAPACITY_CORE_F1
+        and math.isfinite(plugin["capacity_null_fpr_mean"])
+        and plugin["capacity_null_fpr_mean"] <= MAX_CAPACITY_NULL_FPR
     )
     direction_recovery = bool(
-        plugin["direction_spearman_mean"] >= MIN_DIRECTION_SPEARMAN
-        and plugin["direction_sign_agreement_mean"] >= MIN_DIRECTION_SIGN_AGREEMENT
+        math.isfinite(plugin["direction_active_spearman_mean"])
+        and plugin["direction_active_spearman_mean"] >= MIN_DIRECTION_SPEARMAN
+        and math.isfinite(plugin["direction_active_sign_agreement_mean"])
+        and plugin["direction_active_sign_agreement_mean"]
+        >= MIN_DIRECTION_SIGN_AGREEMENT
+        and math.isfinite(plugin["direction_null_fpr_mean"])
+        and plugin["direction_null_fpr_mean"] <= MAX_DIRECTION_NULL_FPR
     )
     support_integrity = bool(
         plugin["action_coverage_all_seeds"]
@@ -461,10 +475,12 @@ def _claim_gate(rows):
         "h1_main_dr_clipping_absent": True,
         "h1_min_confirmatory_seeds": MIN_CONFIRMATORY_SEEDS,
         "h1_gate_definition": (
-            f"Q Spearman>={MIN_Q_SPEARMAN}; C rank>={MIN_CAPACITY_RANK} and "
-            f"C top-k F1>={MIN_CAPACITY_CORE_F1}; D Spearman>="
-            f"{MIN_DIRECTION_SPEARMAN} and D sign agreement>="
-            f"{MIN_DIRECTION_SIGN_AGREEMENT}; every main-arm seed has action "
+            f"centered Q Spearman>={MIN_Q_SPEARMAN}; active-C rank>="
+            f"{MIN_CAPACITY_RANK}, C top-k F1>={MIN_CAPACITY_CORE_F1}, and "
+            f"C null FPR<={MAX_CAPACITY_NULL_FPR}; active-D Spearman>="
+            f"{MIN_DIRECTION_SPEARMAN}, active-D sign agreement>="
+            f"{MIN_DIRECTION_SIGN_AGREEMENT}, and D null FPR<="
+            f"{MAX_DIRECTION_NULL_FPR}; every main-arm seed has action "
             "support and active epsilon forcing. Row-AIPW and cross-fitted AIPW versus "
             "plug-in and the epsilon sweep are reported estimator/manipulation "
             "ablations, not recovery gates."
