@@ -5,6 +5,7 @@ import unittest
 import numpy as np
 
 from envs.omni_arena import OmniArena
+from scripts.run_latency_oracle import run_gate
 
 
 class LatencyOracleTests(unittest.TestCase):
@@ -52,6 +53,17 @@ class LatencyOracleTests(unittest.TestCase):
                 agent_j=roles[env.ROLE_BLOCKER],
                 intervention_action=env.STAY,
                 horizon=4,
+            )
+
+    def test_all_action_capacity_spectrum_recovers_randomized_delay(self):
+        result = run_gate(seed=0, n_states=3, horizon=8, n_trials=1)
+        self.assertTrue(result["gate_pass"])
+        self.assertGreaterEqual(result["randomized_delay_rank_correlation"], 0.70)
+        self.assertLessEqual(result["randomized_delay_mae"], 1.5)
+        for row in result["rows"]:
+            self.assertEqual(len(row["capacity_lag_spectrum"]), 8)
+            self.assertEqual(
+                len(row["action_lag_response"]), result["action_count"]
             )
 
 

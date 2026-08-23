@@ -80,10 +80,10 @@ class PolicyValueNet(nn.Module):
         for name, t in zip(names, inputs):
             if t.dim() > 1 and t.shape[0] == 1 and B > 1:
                 raise ValueError(
-                    f"PolicyValueNet.forward: '{name}' có batch=1 trong khi "
-                    f"obs có batch={B}. Đây gần như luôn là lỗi wiring "
-                    f"(một summary bị tính cho 1 ego rồi dùng cho tất cả), "
-                    f"không phải broadcast hợp lệ."
+                    f"PolicyValueNet.forward: {name!r} has batch size 1 while "
+                    f"obs has batch size {B}. This almost always indicates a "
+                    "wiring error where one ego summary is reused for all "
+                    "egos, not a valid broadcast."
                 )
             expanded_inputs.append(t)
 

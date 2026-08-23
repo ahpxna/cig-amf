@@ -26,7 +26,9 @@ FOUR V1 DEFECTS CORRECTED HERE
      operation without a Python loop over models.
 
 [L4] A SINGLE HORIZON PROVIDED NO LATENCY DIMENSION.
-     A multi-horizon head predicts R^(1), ..., R^(H) jointly.
+     A per-lag head predicts g^[0], ..., g^[H-1] jointly. Cumulative Q^(h)
+     values are derived with the configured discount rather than learned as
+     mutually unconstrained cumulative heads.
 
 GPU OPTIMIZATION (torch.func.vmap ensemble)
 
@@ -87,7 +89,7 @@ class LocalCounterfactualProxyNet(nn.Module):
         obs_i, a_i, a_j, Z_i^{-j}, M_i^{-j}, B_i
 
     Output:
-        [B, n_horizons] predictions of R_i^(1), ..., R_i^(H)
+        [B, n_horizons] predictions of direct rewards at lags 0, ..., H-1
 
     Multi-horizon rationale:
         Neighbour influence can be delayed. A blocker acts immediately at
@@ -105,6 +107,7 @@ class LocalCounterfactualProxyNet(nn.Module):
         belief_dim: int,
         hidden: int = 160,
         n_horizons: int = 8,
+        discount: float = 0.97,
         use_belief_input: bool = False,
         dropout: float = 0.0,
         pair_feat_dim: int = 0,
@@ -118,6 +121,7 @@ class LocalCounterfactualProxyNet(nn.Module):
         self.belief_dim = int(belief_dim)
         self.hidden = int(hidden)
         self.n_horizons = int(n_horizons)
+        self.discount = float(discount)
 
         # ---------------------------------------------------------------
         # [H6] Break the belief -> proxy -> belief feedback loop.
@@ -127,6 +131,17 @@ class LocalCounterfactualProxyNet(nn.Module):
         # input is disabled by default.
         # ---------------------------------------------------------------
         self.use_belief_input = bool(use_belief_input)
+        self.context_input_dim = self.core_dim + self.periph_dim
+        self.context_embed_dim = max(16, self.hidden // 2)
+        # The runner supplies leave-one-out sums of augmented per-neighbour
+        # features [x, x^2, 1]. An affine per-item phi commutes with this sum;
+        # the learned MLP below is the permutation-invariant set readout.
+        self.context_set_encoder = nn.Sequential(
+            nn.Linear(self.context_input_dim, self.context_embed_dim),
+            nn.ReLU(),
+            nn.Linear(self.context_embed_dim, self.context_embed_dim),
+            nn.ReLU(),
+        )
 
         # -------------------------------------------------------------------
         # [FIX-X1] x_ij completes the Eq. 7 -> Eq. 8 refactor.
@@ -149,8 +164,7 @@ class LocalCounterfactualProxyNet(nn.Module):
             + self.action_dim   # a_i one-hot
             # a_j is no longer an input; see the multi-head output below.
             + self.pair_feat_dim   # x_ij (Eq 8)
-            + self.core_dim
-            + self.periph_dim
+            + self.context_embed_dim
             + (self.belief_dim if self.use_belief_input else 0)
         )
 
@@ -198,17 +212,17 @@ class LocalCounterfactualProxyNet(nn.Module):
         if self.pair_feat_dim > 0:
             if pair_feat is None:
                 raise ValueError(
-                    "StructuralProxyNet được khởi tạo với pair_feat_dim="
-                    f"{self.pair_feat_dim} nhưng forward() không nhận pair_feat. "
-                    "Thiếu x_ij thì f_theta không phân biệt được neighbour j "
-                    "(xem FIX-X1) — không cho phép im lặng bỏ qua."
+                    "StructuralProxyNet was initialized with pair_feat_dim="
+                    f"{self.pair_feat_dim}, but forward() received no pair_feat. "
+                    "Without x_ij, f_theta cannot distinguish neighbour j; "
+                    "silently omitting it is not allowed."
                 )
             parts.append(pair_feat)
 
-        parts += [
-            z_core_excl_j,
-            m_periph_excl_j,
-        ]
+        raw_set_summary = torch.cat(
+            [z_core_excl_j, m_periph_excl_j], dim=-1
+        )
+        parts.append(self.context_set_encoder(raw_set_summary))
 
         if self.use_belief_input:
             parts.append(belief_summary)
@@ -346,6 +360,7 @@ class LocalCounterfactualProxyEnsemble:
         grad_clip: float = 1.0,
         eps: float = 1e-8,
         n_horizons: int = 8,
+        discount: float = 0.97,
         effect_mode: str = "signed_aristocrat",
         use_doubly_robust: bool = True,
         iw_clip: float = 10.0,
@@ -374,11 +389,12 @@ class LocalCounterfactualProxyEnsemble:
         self.eps = float(eps)
 
         self.n_horizons = int(n_horizons)
+        self.discount = float(discount)
 
         effect_mode = self.MODE_ALIASES.get(str(effect_mode), str(effect_mode))
         if effect_mode not in self.MODES:
             raise ValueError(
-                f"effect_mode phải thuộc {self.MODES}, nhận '{effect_mode}'"
+                f"effect_mode must be one of {self.MODES}; got {effect_mode!r}"
             )
         self.effect_mode = str(effect_mode)
 
@@ -414,6 +430,7 @@ class LocalCounterfactualProxyEnsemble:
                     pair_feat_dim=self.pair_feat_dim,   # [FIX-X1]
                     hidden=self.hidden,
                     n_horizons=self.n_horizons,
+                    discount=self.discount,
                     use_belief_input=self.use_belief_input,
                     dropout=float(ensemble_dropout),
                 ).to(self.device)
@@ -660,19 +677,23 @@ class LocalCounterfactualProxyEnsemble:
         target_return_h,
         pair_feat=None,
         target_returns_multi=None,
+        target_lag_rewards=None,
         behaviour_prob_j=None,
         was_forced=False,
         state_key=None,
+        policy_probs_j=None,
+        episode_id=None,
+        timestep=None,
     ):
         """
         Add one supervised sample.
 
         Args:
-            target_returns_multi:
-                list/array length n_horizons = [R^(1), R^(2), ..., R^(H)].
-                If None, broadcast target_return_h across horizons. This is
-                less accurate and retained only for compatibility; callers
-                should provide the vector.
+            target_lag_rewards:
+                Direct rewards ``[r_t, ..., r_(t+H-1)]``. New collection code
+                must provide this vector. ``target_returns_multi`` remains a
+                compatibility alias for older callers and is interpreted as
+                the already-migrated per-lag vector, not cumulative returns.
             behaviour_prob_j:
                 b_j(a_j_obs | s) at collection time, required for DR. None
                 disables DR for this sample and falls back to plug-in.
@@ -682,17 +703,26 @@ class LocalCounterfactualProxyEnsemble:
             state_key:
                 Context identifier such as zone ID or coarse position hash.
         """
-        if target_returns_multi is None:
+        if target_lag_rewards is not None and target_returns_multi is not None:
+            raise ValueError(
+                "Provide target_lag_rewards or target_returns_multi, not both"
+            )
+        lag_values = (
+            target_lag_rewards
+            if target_lag_rewards is not None
+            else target_returns_multi
+        )
+        if lag_values is None:
             multi = np.full(
                 (self.n_horizons,), float(target_return_h), dtype=np.float32
             )
         else:
-            multi = np.asarray(target_returns_multi, dtype=np.float32).reshape(-1)
+            multi = np.asarray(lag_values, dtype=np.float32).reshape(-1)
 
             if multi.shape[0] != self.n_horizons:
                 raise ValueError(
-                    f"target_returns_multi phải có length {self.n_horizons}, "
-                    f"nhận {multi.shape[0]}"
+                    f"target_lag_rewards must have length {self.n_horizons}, "
+                    f"got {multi.shape[0]}"
                 )
 
         sample = {
@@ -716,12 +746,19 @@ class LocalCounterfactualProxyEnsemble:
                 else self._normalise_vector(pair_feat, self.pair_feat_dim)
             ),
             "target_return_h": float(target_return_h),
-            "target_returns_multi": multi,                      # [n_horizons]
+            "target_lag_rewards": multi,                        # [n_horizons]
             "behaviour_prob_j": (
                 None if behaviour_prob_j is None else float(behaviour_prob_j)
             ),
             "was_forced": bool(was_forced),
             "state_key": state_key,
+            "policy_probs_j": (
+                None
+                if policy_probs_j is None
+                else self._normalise_vector(policy_probs_j, self.action_dim)
+            ),
+            "episode_id": episode_id,
+            "timestep": timestep,
         }
 
         self.buffer.append(sample)
@@ -825,7 +862,8 @@ class LocalCounterfactualProxyEnsemble:
             dtype=np.float32,
         )                                                                # [B]
         target_multi = np.stack(
-            [b["target_returns_multi"] for b in batch], axis=0
+            [b.get("target_lag_rewards", b.get("target_returns_multi")) for b in batch],
+            axis=0,
         )                                                            # [B, n_horizons]
 
         return (
@@ -1106,7 +1144,7 @@ class LocalCounterfactualProxyEnsemble:
                     )  # One synchronization for the complete holdout evaluation.
 
         if len(per_step_losses) == 0:
-            print("[TRAIN-DEBUG] ALL n_steps SKIPPED — per_step_losses rỗng")
+            print("[TRAIN-DEBUG] all n_steps were skipped; per_step_losses is empty")
             self.latest_loss = 0.0
             self.latest_residual = 0.0
             self.latest_train_residual = 0.0
@@ -1356,13 +1394,13 @@ class LocalCounterfactualProxyEnsemble:
             return None
         if pair_feat is None:
             raise ValueError(
-                f"pair_feat_dim={self.pair_feat_dim} nhưng call site không "
-                "truyền x_ij. Xem FIX-X1."
+                f"pair_feat_dim={self.pair_feat_dim}, but the call site did "
+                "not provide x_ij"
             )
         arr = np.asarray(pair_feat, dtype=np.float32).reshape(B, -1)
         if arr.shape[1] != self.pair_feat_dim:
             raise ValueError(
-                f"x_ij phải có {self.pair_feat_dim} chiều, nhận {arr.shape[1]}"
+                f"x_ij must have {self.pair_feat_dim} dimensions; got {arr.shape[1]}"
             )
         return torch.tensor(arr, dtype=torch.float32, device=self.device)
 
@@ -1514,7 +1552,7 @@ class LocalCounterfactualProxyEnsemble:
             )  # [E, B, H]
 
         else:
-            raise ValueError(f"mode không hợp lệ: {mode}")
+            raise ValueError(f"invalid effect mode: {mode}")
 
         # ---------------------------------------------------------------
         # AIPW applies only to the fixed stochastic-policy contrast. The two
@@ -1619,6 +1657,23 @@ class LocalCounterfactualProxyEnsemble:
             "dr_raw_inverse_max": float(dr_raw_inverse_max),
         }
 
+    def _cumulative_from_lag(self, lag_predictions: torch.Tensor) -> torch.Tensor:
+        """Convert direct lag responses into discounted cumulative Q heads."""
+        horizon = int(lag_predictions.shape[-1])
+        discounts = torch.pow(
+            torch.as_tensor(
+                self.discount,
+                dtype=lag_predictions.dtype,
+                device=lag_predictions.device,
+            ),
+            torch.arange(
+                horizon,
+                dtype=lag_predictions.dtype,
+                device=lag_predictions.device,
+            ),
+        )
+        return torch.cumsum(lag_predictions * discounts, dim=-1)
+
     # =====================================================================
     # API scoring
     # =====================================================================
@@ -1694,6 +1749,20 @@ class LocalCounterfactualProxyEnsemble:
                 "c_mu": z,
                 "c_sigma": z,
                 "mu_per_h": np.zeros((0, self.n_horizons), dtype=np.float32),
+                "q_mu": np.zeros((0, self.action_dim), dtype=np.float32),
+                "q_sigma": np.zeros((0, self.action_dim), dtype=np.float32),
+                "g_lag_mu": np.zeros(
+                    (0, self.action_dim, self.n_horizons), dtype=np.float32
+                ),
+                "g_lag_sigma": np.zeros(
+                    (0, self.action_dim, self.n_horizons), dtype=np.float32
+                ),
+                "c_lag_mu": np.zeros((0, self.n_horizons), dtype=np.float32),
+                "c_lag_sigma": np.zeros((0, self.n_horizons), dtype=np.float32),
+                "latency_center": z,
+                "latency_onset": np.zeros((0,), dtype=np.int64),
+                "latency_peak": np.zeros((0,), dtype=np.int64),
+                "latency_valid": z,
                 "mu_range": z,
                 "dr_correction": z,
                 "dr_weight": z,
@@ -1711,12 +1780,13 @@ class LocalCounterfactualProxyEnsemble:
         a_j = np.asarray(observed_action_j_batch, dtype=np.int64).reshape(-1)
 
         # One forward pass over both alternative actions and ensemble members.
-        preds_all = self._predict_all_actions(
+        lag_preds_all = self._predict_all_actions(
             obs=obs, action_i=a_i, z=z_arr, m=m_arr, belief=belief,
             pair_feat=pair_feat_batch,   # [FIX-X1]
-        )  # [E, B, A, H]
+        )  # [E, B, A, H] direct lag rewards
+        preds_all = self._cumulative_from_lag(lag_preds_all)
 
-        res = self._compute_effects(
+        diagnostic_res = self._compute_effects(
             preds_all=preds_all,
             action_j_obs=a_j,
             policy_probs_j=policy_probs_j_batch,
@@ -1724,9 +1794,19 @@ class LocalCounterfactualProxyEnsemble:
             behaviour_probs_obs=behaviour_probs_obs_batch,
             mode=self.effect_mode,
         )
+        # The online directional signal is deliberately the lower-variance
+        # plug-in estimate. Row-level AIPW is exported as a diagnostic and is
+        # never silently routed into signatures, memory, or pair supervision.
+        plugin_res = self._compute_effects(
+            preds_all=preds_all,
+            action_j_obs=a_j,
+            policy_probs_j=policy_probs_j_batch,
+            mode=self.effect_mode,
+        )
 
-        effect = res["effect"]              # [E, B]
-        effect_per_h = res["effect_per_h"]  # [E, B, H]
+        effect = plugin_res["effect"]              # [E, B]
+        effect_per_h = plugin_res["effect_per_h"]  # [E, B, H]
+        diagnostic_effect = diagnostic_res["effect"]
 
         mu = torch.mean(effect, dim=0)      # [B]
 
@@ -1738,6 +1818,15 @@ class LocalCounterfactualProxyEnsemble:
             )  # [B]
 
         mu_per_h = torch.mean(effect_per_h, dim=0)  # [B, H]
+
+        diagnostic_mu = torch.mean(diagnostic_effect, dim=0)
+        diagnostic_sigma = (
+            torch.zeros_like(diagnostic_mu)
+            if diagnostic_effect.shape[0] <= 1
+            else torch.sqrt(
+                torch.var(diagnostic_effect, dim=0, unbiased=True) + self.eps
+            )
+        )
 
         # [SIG-5D] The latency component was removed, reducing the signature to
         # R^5; see influence_signature.py. mu_per_h remains only as a raw
@@ -1769,13 +1858,57 @@ class LocalCounterfactualProxyEnsemble:
             else torch.sqrt(torch.var(q_terminal, dim=0, unbiased=True) + self.eps)
         )
 
-        self.latest_dr_correction_magnitude = float(
-            torch.mean(res["dr_correction"]).item()
+        # Direct lag-response and capacity spectra support the gated latency
+        # experiment without selecting one action for all lags.
+        g_mu = torch.mean(lag_preds_all, dim=0)  # [B,A,H]
+        g_sigma = (
+            torch.zeros_like(g_mu)
+            if lag_preds_all.shape[0] <= 1
+            else torch.sqrt(
+                torch.var(lag_preds_all, dim=0, unbiased=True) + self.eps
+            )
         )
-        self.latest_dr_applied = bool(res["dr_applied"])
-        self.latest_dr_applied_rows = int(res["dr_applied_rows"])
-        self.latest_dr_clipped_rows = int(res["dr_clipped_rows"])
-        self.latest_dr_raw_inverse_max = float(res["dr_raw_inverse_max"])
+        c_lag_members = (
+            lag_preds_all.max(dim=2).values - lag_preds_all.min(dim=2).values
+        )  # [E,B,H]
+        c_lag_mu = torch.mean(c_lag_members, dim=0)
+        c_lag_sigma = (
+            torch.zeros_like(c_lag_mu)
+            if c_lag_members.shape[0] <= 1
+            else torch.sqrt(
+                torch.var(c_lag_members, dim=0, unbiased=True) + self.eps
+            )
+        )
+        lag_mass = torch.clamp(c_lag_mu, min=0.0)
+        lag_total = lag_mass.sum(dim=1)
+        lag_axis = torch.arange(
+            self.n_horizons, dtype=lag_mass.dtype, device=lag_mass.device
+        ).view(1, -1)
+        latency_center = (
+            (lag_mass * lag_axis).sum(dim=1)
+            / torch.clamp(lag_total, min=self.eps)
+        )
+        latency_valid = lag_total > self.eps
+        latency_center = torch.where(
+            latency_valid, latency_center, torch.full_like(latency_center, -1.0)
+        )
+        peak_value, latency_peak = lag_mass.max(dim=1)
+        latency_peak = torch.where(
+            latency_valid, latency_peak, torch.full_like(latency_peak, -1)
+        )
+        onset_mask = lag_mass >= (0.05 * peak_value).unsqueeze(1)
+        latency_onset = torch.argmax(onset_mask.to(torch.int64), dim=1)
+        latency_onset = torch.where(
+            latency_valid, latency_onset, torch.full_like(latency_onset, -1)
+        )
+
+        self.latest_dr_correction_magnitude = float(
+            torch.mean(diagnostic_res["dr_correction"]).item()
+        )
+        self.latest_dr_applied = bool(diagnostic_res["dr_applied"])
+        self.latest_dr_applied_rows = int(diagnostic_res["dr_applied_rows"])
+        self.latest_dr_clipped_rows = int(diagnostic_res["dr_clipped_rows"])
+        self.latest_dr_raw_inverse_max = float(diagnostic_res["dr_raw_inverse_max"])
         if self.latest_dr_applied:
             self.total_dr_applied_calls += 1
             self.total_dr_applied_rows += self.latest_dr_applied_rows
@@ -1792,18 +1925,30 @@ class LocalCounterfactualProxyEnsemble:
             "sigma": to_np(sigma),
             "d_mu": to_np(mu),
             "d_sigma": to_np(sigma),
+            "d_plugin_mu": to_np(mu),
+            "d_plugin_sigma": to_np(sigma),
+            "d_row_aipw_mu": to_np(diagnostic_mu),
+            "d_row_aipw_sigma": to_np(diagnostic_sigma),
             "c_mu": to_np(c_mu),
             "c_sigma": to_np(c_sigma),
             "mu_per_h": to_np(mu_per_h),
             "mu_range": to_np(c_mu),
             "q_mu": to_np(q_mu),
             "q_sigma": to_np(q_sigma),
-            "dr_correction": to_np(res["dr_correction"]),
-            "dr_weight": to_np(res["dr_weight"]),
-            "dr_applied": bool(res["dr_applied"]),
-            "dr_applied_rows": int(res["dr_applied_rows"]),
-            "dr_clipped_rows": int(res["dr_clipped_rows"]),
-            "dr_raw_inverse_max": float(res["dr_raw_inverse_max"]),
+            "g_lag_mu": to_np(g_mu),
+            "g_lag_sigma": to_np(g_sigma),
+            "c_lag_mu": to_np(c_lag_mu),
+            "c_lag_sigma": to_np(c_lag_sigma),
+            "latency_center": to_np(latency_center),
+            "latency_onset": to_np(latency_onset),
+            "latency_peak": to_np(latency_peak),
+            "latency_valid": to_np(latency_valid.to(torch.float32)),
+            "dr_correction": to_np(diagnostic_res["dr_correction"]),
+            "dr_weight": to_np(diagnostic_res["dr_weight"]),
+            "dr_applied": bool(diagnostic_res["dr_applied"]),
+            "dr_applied_rows": int(diagnostic_res["dr_applied_rows"]),
+            "dr_clipped_rows": int(diagnostic_res["dr_clipped_rows"]),
+            "dr_raw_inverse_max": float(diagnostic_res["dr_raw_inverse_max"]),
         }
 
     def score_pair(
@@ -1882,7 +2027,10 @@ class LocalCounterfactualProxyEnsemble:
 # [FIX-X1] x_ij — pair features for Equation 8
 # =========================================================================
 
-PAIR_FEAT_DIM = 6
+PUBLIC_ROLES = (
+    "collector", "gatekeeper", "relay", "blocker", "controller", "drifter"
+)
+PAIR_FEAT_DIM = 5 + len(PUBLIC_ROLES)
 
 
 def build_pair_feat(
@@ -1896,8 +2044,8 @@ def build_pair_feat(
 ):
     """Build ``x_ij`` from pre-treatment observable pair state.
 
-    The six channels are relative row, relative column, L1 distance,
-    same-zone, normalized zone difference, and the target's public role code.
+    The channels are relative row, relative column, L1 distance, same-zone,
+    normalized zone difference, and a one-hot target public role vector.
     OmniArena exposes role in every observed neighbour record; it is a task
     identity available before the intervention, not the oracle influence label.
     Environments without public roles receive a neutral zero role feature.
@@ -1925,17 +2073,19 @@ def build_pair_feat(
     same_zone = 1.0 if zi == zj else 0.0
     zone_diff = (zj - zi) / float(max(1, int(n_zones) - 1))
 
-    role_code = 0.0
+    role_onehot = _np.zeros((len(PUBLIC_ROLES),), dtype=_np.float32)
     if agent_role is not None:
         try:
             raw_role = agent_role[int(j)]
-            role_order = (
-                "collector", "gatekeeper", "relay", "blocker", "controller", "drifter"
-            )
-            role_code = float(role_order.index(str(raw_role))) / float(len(role_order) - 1)
+            role_onehot[PUBLIC_ROLES.index(str(raw_role))] = 1.0
         except (KeyError, IndexError, TypeError, ValueError):
-            role_code = 0.0
+            pass
 
-    return _np.asarray(
-        [drow, dcol, dist, same_zone, zone_diff, role_code], dtype=_np.float32
+    return _np.concatenate(
+        [
+            _np.asarray(
+                [drow, dcol, dist, same_zone, zone_diff], dtype=_np.float32
+            ),
+            role_onehot,
+        ]
     )

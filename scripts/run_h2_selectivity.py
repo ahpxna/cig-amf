@@ -1,10 +1,7 @@
 """Run H2/RQ2 selectivity and structural-recovery experiments.
 
-Each model/seed is evaluated in two matched environments:
-
-* ``behavioral_drift`` changes policy execution while keeping the structural
-  influence mechanism fixed.
-* ``structural_shift`` changes the influence mechanism at phase boundaries.
+Each model/seed is evaluated in four matched factorial cells crossing a
+structural mechanism change with a neighbour-policy change.
 
 For runners with an explicit influence matrix, Eq. 33 is measured as
 ``||W_t - W_(t-1)||_F / ||W_(t-1)||_F``. ``CorrelationMeanField`` is the
@@ -28,6 +25,8 @@ import csv
 import hashlib
 import json
 import os
+import pickle
+import random
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -56,9 +55,16 @@ import run_experiment as RE
 # PureMeanField may still be requested explicitly as a reward control, but it
 # cannot define Eq. 33.
 MODELS = ["Final-CIGAMF", "CorrelationMeanField", "NoTwoTimescale"]
-MODES = ["behavioral_drift", "structural_shift"]
-PROTOCOL_VERSION = "h2_frozen_policy_subset_adapter_v4"
+FACTORIAL_CELLS = {
+    "S0B0": (False, False),
+    "S0B1": (False, True),
+    "S1B0": (True, False),
+    "S1B1": (True, True),
+}
+MODES = list(FACTORIAL_CELLS)
+PROTOCOL_VERSION = "h2_factorial_frozen_policy_v5"
 CHANGE_WINDOW_EVAL_INTERVALS = 2
+RECOVERY_F1_VALID_FLOOR = 0.50
 H2_EVALUATION_EGO_ROLES = ("collector",)
 H2_MANIPULATED_NEIGHBOR_ROLES = (
     "gatekeeper", "relay", "blocker", "controller", "drifter",
@@ -154,6 +160,69 @@ def _mean_finite(values):
     return float(np.mean(finite)) if finite else float("nan")
 
 
+def _fixed_estimand_panel(env, structural_factor, behavioral_factor, seed, n_states=2):
+    """Evaluate C and D on matched cloned states with fixed continuation."""
+    if not all(
+        callable(getattr(env, name, None))
+        for name in ("clone_state", "restore_state", "sample_state_bank")
+    ):
+        return {"applicable": False, "capacity_mean": float("nan"), "direction_abs_mean": float("nan")}
+    outer = env.clone_state()
+    saved_override = getattr(env, "_behaviour_override", None)
+    rows_c, rows_d = [], []
+    try:
+        env.set_behaviour_override("cooperative")
+        bank = env.sample_state_bank(
+            n_states=int(n_states), burn_in=2, bank_seed=int(seed) + 3401
+        )
+        for raw_state in bank:
+            state = copy.deepcopy(raw_state)
+            if structural_factor:
+                state["active_lane"] = {
+                    zone: ("B" if lane == "A" else "A")
+                    for zone, lane in state["active_lane"].items()
+                }
+            env.restore_state(state)
+            egos = _agents_with_roles(env, H2_EVALUATION_EGO_ROLES)
+            targets = _agents_with_roles(env, H2_MANIPULATED_NEIGHBOR_ROLES)
+            for ego in egos:
+                same_zone_targets = [
+                    target for target in targets
+                    if target != ego and env.agent_zone[target] == env.agent_zone[ego]
+                ]
+                for target in same_zone_targets:
+                    q_values = []
+                    env.restore_state(state)
+                    env.set_behaviour_override(
+                        "selfish" if behavioral_factor else "cooperative"
+                    )
+                    pi = np.asarray(
+                        env.scripted_policy_distribution(target), dtype=np.float64
+                    )
+                    pi = pi / np.clip(pi.sum(), 1e-12, None)
+                    for action in range(env.get_action_dim()):
+                        env.restore_state(state)
+                        env.set_behaviour_override("cooperative")
+                        actions = [env.scripted_policy(agent) for agent in range(env.n_agents)]
+                        actions[target] = int(action)
+                        _, rewards, _, _ = env.step(actions)
+                        q_values.append(float(rewards[ego]))
+                    q_values = np.asarray(q_values, dtype=np.float64)
+                    uniform = np.full(q_values.size, 1.0 / q_values.size)
+                    rows_c.append(float(np.max(q_values) - np.min(q_values)))
+                    rows_d.append(float(np.dot(pi - uniform, q_values)))
+        return {
+            "applicable": bool(rows_c),
+            "n_pair_states": int(len(rows_c)),
+            "capacity_mean": _mean_finite(rows_c),
+            "direction_abs_mean": _mean_finite(np.abs(rows_d)),
+            "continuation_regime": "cooperative_fixed_after_intervention",
+        }
+    finally:
+        env.set_behaviour_override(saved_override)
+        env.restore_state(outer)
+
+
 def _runner_influence_matrix(runner, n_agents, ego_ids=None):
     if hasattr(runner, "get_influence_matrix"):
         matrix = np.asarray(runner.get_influence_matrix(), dtype=np.float64)
@@ -214,14 +283,29 @@ def _resolve_component(root, path):
     return value
 
 
-def _capture_frozen_learning_checkpoint(runner):
-    """Capture a common trained checkpoint while keeping proxy learning live.
+def _frozen_representation_digest(runner):
+    """Hash only policy and downstream representation parameters."""
+    digest = hashlib.sha256()
+    found = 0
+    for path in _FROZEN_COMPONENT_PATHS:
+        module = _resolve_component(runner, path)
+        if module is None or not callable(getattr(module, "state_dict", None)):
+            continue
+        found += 1
+        digest.update(path.encode("utf-8"))
+        # The scientific freeze contract concerns trainable parameters.
+        # Diagnostic EMA buffers (for example slot-usage counters) may update
+        # during read-only forward passes and must not be mistaken for learning.
+        for key, value in sorted(module.named_parameters()):
+            digest.update(key.encode("utf-8"))
+            digest.update(np.asarray(value.detach().cpu()).tobytes())
+    if found == 0:
+        raise RuntimeError("H2 found no policy or representation parameters to freeze")
+    return digest.hexdigest()
 
-    The proxy is copied as an initial response-surface checkpoint, then keeps
-    training independently in each arm. Optimizer/replay state and pair hidden
-    states are intentionally not copied: only parameters and persistent module
-    buffers define the common starting point.
-    """
+
+def _capture_frozen_learning_checkpoint(runner):
+    """Capture the scientific branch point, not only neural weights."""
     state = {}
     for path in _FROZEN_COMPONENT_PATHS:
         module = _resolve_component(runner, path)
@@ -265,7 +349,82 @@ def _capture_frozen_learning_checkpoint(runner):
                 for key, value in sorted(model_state.items()):
                     digest.update(key.encode("utf-8"))
                     digest.update(np.asarray(value.detach().cpu()).tobytes())
-    return {"state": state, "proxy_state": proxy_state, "sha256": digest.hexdigest()}
+    optimizer_state = {}
+    for path in ("policy_optim", "heads_optim", "pair_rel_module.optim"):
+        optimizer = _resolve_component(runner, path)
+        if optimizer is not None:
+            optimizer_state[path] = copy.deepcopy(optimizer.state_dict())
+    if proxy is not None:
+        if hasattr(proxy, "optim"):
+            optimizer_state["proxy.optim"] = copy.deepcopy(proxy.optim.state_dict())
+        elif hasattr(proxy, "optims"):
+            optimizer_state["proxy.optims"] = [
+                copy.deepcopy(optim.state_dict()) for optim in proxy.optims
+            ]
+
+    runtime_state = {}
+    for name in (
+        "belief_modules", "sig_tracker", "scheduler", "drift", "matdet", "recip"
+    ):
+        if hasattr(runner, name):
+            runtime_state[name] = copy.deepcopy(getattr(runner, name))
+    pair_module = getattr(runner, "pair_rel_module", None)
+    if pair_module is not None:
+        runtime_state["pair_full_states"] = {
+            key: value.detach().clone() for key, value in pair_module.full_states.items()
+        }
+        runtime_state["pair_shadow_states"] = {
+            key: value.detach().clone() for key, value in pair_module.shadow_states.items()
+        }
+        runtime_state["pair_bc_buffer"] = copy.deepcopy(pair_module.bc_buffer)
+        runtime_state["pair_cd_norm_mean"] = pair_module.cd_norm_mean.copy()
+        runtime_state["pair_cd_norm_std"] = pair_module.cd_norm_std.copy()
+        runtime_state["pair_cd_normalization_frozen"] = bool(
+            pair_module.cd_normalization_frozen
+        )
+    if proxy is not None:
+        runtime_state["proxy_buffer"] = copy.deepcopy(proxy.buffer)
+        runtime_state["proxy_counters"] = {
+            "n_interventional_samples": int(proxy.n_interventional_samples),
+            "total_dr_applied_calls": int(proxy.total_dr_applied_calls),
+            "total_dr_applied_rows": int(proxy.total_dr_applied_rows),
+            "total_dr_clipped_rows": int(proxy.total_dr_clipped_rows),
+        }
+    env_state = (
+        copy.deepcopy(runner.env.clone_state())
+        if callable(getattr(runner.env, "clone_state", None))
+        else None
+    )
+    rng_state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state().clone(),
+        "torch_cuda": (
+            [state.clone() for state in torch.cuda.get_rng_state_all()]
+            if torch.cuda.is_available()
+            else None
+        ),
+    }
+    digest.update(
+        pickle.dumps(
+            {
+                "optimizer_state": optimizer_state,
+                "runtime_state": runtime_state,
+                "env_state": env_state,
+                "rng_state": rng_state,
+            },
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    )
+    return {
+        "state": state,
+        "proxy_state": proxy_state,
+        "optimizer_state": optimizer_state,
+        "runtime_state": runtime_state,
+        "env_state": env_state,
+        "rng_state": rng_state,
+        "sha256": digest.hexdigest(),
+    }
 
 
 def _restore_frozen_learning_checkpoint(runner, checkpoint):
@@ -276,23 +435,67 @@ def _restore_frozen_learning_checkpoint(runner, checkpoint):
         module.load_state_dict(state)
     proxy_state = checkpoint.get("proxy_state")
     proxy = getattr(runner, "proxy", None)
-    if proxy_state is None:
-        return
-    if proxy is None:
+    if proxy_state is not None and proxy is None:
         raise RuntimeError("H2 checkpoint has a proxy but the runner does not")
-    if proxy_state["kind"] == "vmap":
+    if proxy_state is not None and proxy_state["kind"] == "vmap":
         with torch.no_grad():
             for key, value in proxy_state["params"].items():
                 proxy._stacked_params[key].copy_(value)
             for key, value in proxy_state["buffers"].items():
                 proxy._stacked_buffers[key].copy_(value)
-    elif proxy_state["kind"] == "models":
+    elif proxy_state is not None and proxy_state["kind"] == "models":
         if len(proxy.models) != len(proxy_state["models"]):
             raise RuntimeError("H2 proxy ensemble cardinality differs from checkpoint")
         for model, state in zip(proxy.models, proxy_state["models"]):
             model.load_state_dict(state)
-    else:
+    elif proxy_state is not None:
         raise RuntimeError(f"unknown H2 proxy checkpoint kind: {proxy_state['kind']}")
+
+    for path, state in checkpoint.get("optimizer_state", {}).items():
+        if path == "proxy.optims":
+            for optim, optim_state in zip(proxy.optims, state):
+                optim.load_state_dict(optim_state)
+            continue
+        optimizer = _resolve_component(runner, path)
+        if optimizer is None:
+            raise RuntimeError(f"H2 optimizer component is missing: {path}")
+        optimizer.load_state_dict(state)
+
+    runtime = checkpoint.get("runtime_state", {})
+    for name in (
+        "belief_modules", "sig_tracker", "scheduler", "drift", "matdet", "recip"
+    ):
+        if name in runtime:
+            setattr(runner, name, copy.deepcopy(runtime[name]))
+    pair_module = getattr(runner, "pair_rel_module", None)
+    if pair_module is not None and "pair_full_states" in runtime:
+        pair_module.full_states = {
+            key: value.detach().clone().to(runner.device)
+            for key, value in runtime["pair_full_states"].items()
+        }
+        pair_module.shadow_states = {
+            key: value.detach().clone().to(runner.device)
+            for key, value in runtime["pair_shadow_states"].items()
+        }
+        pair_module.bc_buffer = copy.deepcopy(runtime["pair_bc_buffer"])
+        pair_module.cd_norm_mean = runtime["pair_cd_norm_mean"].copy()
+        pair_module.cd_norm_std = runtime["pair_cd_norm_std"].copy()
+        pair_module.cd_normalization_frozen = bool(
+            runtime["pair_cd_normalization_frozen"]
+        )
+    if proxy is not None and "proxy_buffer" in runtime:
+        proxy.buffer = copy.deepcopy(runtime["proxy_buffer"])
+        for key, value in runtime.get("proxy_counters", {}).items():
+            setattr(proxy, key, int(value))
+    if checkpoint.get("env_state") is not None:
+        runner.env.restore_state(copy.deepcopy(checkpoint["env_state"]))
+    rng = checkpoint.get("rng_state")
+    if rng:
+        random.setstate(rng["python"])
+        np.random.set_state(rng["numpy"])
+        torch.set_rng_state(rng["torch"])
+        if torch.cuda.is_available() and rng.get("torch_cuda") is not None:
+            torch.cuda.set_rng_state_all(rng["torch_cuda"])
 
 
 def _pretrain_common_checkpoint(model, seed, episodes, device):
@@ -312,6 +515,8 @@ def _pretrain_common_checkpoint(model, seed, episodes, device):
     )
     runner = RE.make_runner(model, env, cfg, device)
     runner.run(n_episodes=int(episodes), eval_every=max(1, int(episodes)))
+    if hasattr(runner, "pair_rel_module"):
+        runner.pair_rel_module.fit_cd_normalization(min_samples=1)
     checkpoint = _capture_frozen_learning_checkpoint(runner)
     return {
         **checkpoint,
@@ -328,6 +533,7 @@ def _recovery_statistics(
     causal_horizon_steps,
     max_steps,
     eval_every,
+    valid_f1_floor=RECOVERY_F1_VALID_FLOOR,
 ):
     """Compute non-negative, unit-consistent recovery latency per shift.
 
@@ -352,7 +558,14 @@ def _recovery_statistics(
             if int(row["episode"]) < shift_ep and np.isfinite(row["f1"])
         ]
         baseline = float(np.mean(pre[-3:])) if pre else float("nan")
-        target = 0.9 * baseline if np.isfinite(baseline) else float("nan")
+        baseline_valid = bool(
+            np.isfinite(baseline) and baseline >= float(valid_f1_floor)
+        )
+        target = (
+            max(0.9 * baseline, float(valid_f1_floor))
+            if baseline_valid
+            else float("nan")
+        )
 
         post = [
             row
@@ -385,6 +598,8 @@ def _recovery_statistics(
             "shift_episode": shift_ep,
             "pre_shift_f1": baseline,
             "target_f1": target,
+            "pre_shift_valid": int(baseline_valid),
+            "invalid_reason": "" if baseline_valid else "invalid_pre_shift_structure",
             "recovered_episode": recovered_ep,
             "trigger_episode": trigger_ep,
             "raw_latency_intervals": raw,
@@ -409,6 +624,7 @@ def _recovery_statistics(
         "n_recovered_shifts": sum(
             int(np.isfinite(item["corrected_latency_intervals"])) for item in details
         ),
+        "recovery_f1_valid_floor": float(valid_f1_floor),
         "n_shift_with_trigger": sum(item["trigger_episode"] is not None for item in details),
         "recovery_by_shift": details,
     }
@@ -483,14 +699,18 @@ def run_one(
     RE.set_global_seed(seed)
     cfg = RE.default_cfg()
     cfg["seed"] = seed
+    if mode not in FACTORIAL_CELLS:
+        raise ValueError(f"Unknown H2 factorial cell: {mode!r}")
+    structural_factor, behavioral_factor = FACTORIAL_CELLS[mode]
     # The old behavioural arm changed only environment metadata while every
     # learned runner continued sampling its own policy.  This intervention is
     # the executed policy: pi_tilde=(1-lambda)pi+lambda*pi_scripted.  It is
     # disabled in the structural arm so the two perturbations remain separate.
-    cfg["behavioral_adapter_lambda"] = 1.0 if mode == "behavioral_drift" else 0.0
-    cfg["behavioral_adapter_only_in_behavioral_drift"] = True
+    cfg["behavioral_adapter_lambda"] = 1.0 if behavioral_factor else 0.0
+    cfg["behavioral_adapter_only_in_behavioral_drift"] = False
     cfg["behavioral_adapter_target_roles"] = list(H2_MANIPULATED_NEIGHBOR_ROLES)
     cfg["freeze_policy_learning"] = True
+    cfg["freeze_representation_state"] = True
     make_args(seed=seed, device=device)  # Validate the shared CLI defaults.
 
     max_steps = 30
@@ -501,11 +721,21 @@ def run_one(
         max_steps=max_steps,
         phase_length=phase_length,
         seed=seed,
+        structural_factor=structural_factor,
+        behavioral_factor=behavioral_factor,
     )
     runner = RE.make_runner(model, env, cfg, device)
     if frozen_checkpoint is None:
         raise RuntimeError("H2 requires a common pretraining checkpoint")
     _restore_frozen_learning_checkpoint(runner, frozen_checkpoint)
+    frozen_representation_sha256_before = _frozen_representation_digest(runner)
+
+    estimand_panel = _fixed_estimand_panel(
+        env,
+        structural_factor=structural_factor,
+        behavioral_factor=behavioral_factor,
+        seed=seed,
+    )
 
     evaluation_egos = _agents_with_roles(env, H2_EVALUATION_EGO_ROLES)
     manipulated_agents = _agents_with_roles(env, H2_MANIPULATED_NEIGHBOR_ROLES)
@@ -659,6 +889,11 @@ def run_one(
         _validate_episode_events(events, episodes)
     if not eval_records or int(eval_records[-1]["episode"]) != episodes:
         raise RuntimeError(f"{model}/{mode}/seed{seed}: missing terminal evaluation")
+    frozen_representation_sha256_after = _frozen_representation_digest(runner)
+    if frozen_representation_sha256_after != frozen_representation_sha256_before:
+        raise RuntimeError(
+            f"{model}/{mode}/seed{seed}: frozen policy/representation state changed"
+        )
 
     finite_rows = [
         (start_ep, end_ep, delta)
@@ -710,6 +945,18 @@ def run_one(
         if len(direction_values) == len(delta_values) and behavioral_mask.any()
         else float("nan")
     )
+    event_mask = structural_mask | behavioral_mask
+    analysis_mask = event_mask if event_mask.any() else background_mask
+    capacity_factorial_outcome = (
+        float(np.mean(delta_values[analysis_mask]))
+        if analysis_mask.any()
+        else float("nan")
+    )
+    direction_factorial_outcome = (
+        float(np.mean(direction_values[analysis_mask]))
+        if len(direction_values) == len(delta_values) and analysis_mask.any()
+        else float("nan")
+    )
     # This is a within-run background-drift diagnostic.  It is deliberately
     # not the paper's selectivity ratio: the latter compares the same C
     # estimator across the matched structural and behavioural interventions.
@@ -738,11 +985,16 @@ def run_one(
         "runner_class": type(runner).__name__,
         "ablation_contract": getattr(runner, "ablation_contract", ""),
         "mode": mode,
+        "structural_factor": int(structural_factor),
+        "behavioral_factor": int(behavioral_factor),
         "seed": seed,
         "episodes": episodes,
         "pretrain_episodes": int(frozen_checkpoint["episodes"]),
         "frozen_checkpoint_sha256": str(frozen_checkpoint["sha256"]),
         "policy_learning_frozen": True,
+        "representation_learning_frozen": True,
+        "frozen_representation_sha256_before": frozen_representation_sha256_before,
+        "frozen_representation_sha256_after": frozen_representation_sha256_after,
         "evaluation_ego_roles": list(H2_EVALUATION_EGO_ROLES),
         "evaluation_ego_count": len(evaluation_egos),
         "manipulated_neighbor_roles": list(H2_MANIPULATED_NEIGHBOR_ROLES),
@@ -759,6 +1011,11 @@ def run_one(
         "direction_metric_applicable": bool(has_direction_matrix),
         "direction_mean_struct": direction_struct,
         "direction_mean_behav": direction_behav,
+        "capacity_factorial_outcome": capacity_factorial_outcome,
+        "direction_factorial_outcome": direction_factorial_outcome,
+        "estimand_panel": estimand_panel,
+        "estimand_capacity_mean": estimand_panel["capacity_mean"],
+        "estimand_direction_abs_mean": estimand_panel["direction_abs_mean"],
         "background_drift_ratio": background_drift_ratio,
         "change_window_eval_intervals": CHANGE_WINDOW_EVAL_INTERVALS,
         "structural_change_windows": structural_windows,
@@ -773,7 +1030,7 @@ def run_one(
         "shift_episodes": sorted(set(shift_episodes)),
         "n_behavioral_shift_events": len(set(behavioral_shift_episodes)),
         "behavioral_shift_episodes": sorted(set(behavioral_shift_episodes)),
-        "behavioral_adapter_required": int(mode == "behavioral_drift"),
+        "behavioral_adapter_required": int(behavioral_factor),
         "behavioral_adapter_event_count": int(sum(
             int(row["n_behavioral_adapter_events"]) for row in eval_records
         )),
@@ -951,10 +1208,64 @@ def main(argv=None):
                     })
                     _atomic_write_json(latest_attempt_path, attempt)
 
-                structural = per_mode["structural_shift"]
-                behavioral = per_mode["behavioral_drift"]
-                delta_struct = structural["delta_mean_struct"]
-                delta_behav = behavioral["delta_mean_behav"]
+                control = per_mode["S0B0"]
+                behavioral = per_mode["S0B1"]
+                structural = per_mode["S1B0"]
+                combined = per_mode["S1B1"]
+                y_c = {
+                    cell: per_mode[cell]["capacity_factorial_outcome"]
+                    for cell in FACTORIAL_CELLS
+                }
+                y_d = {
+                    cell: per_mode[cell]["direction_factorial_outcome"]
+                    for cell in FACTORIAL_CELLS
+                }
+                y_ce = {
+                    cell: per_mode[cell]["estimand_capacity_mean"]
+                    for cell in FACTORIAL_CELLS
+                }
+                y_de = {
+                    cell: per_mode[cell]["estimand_direction_abs_mean"]
+                    for cell in FACTORIAL_CELLS
+                }
+                capacity_beta_structural = 0.5 * (
+                    (y_c["S1B0"] - y_c["S0B0"])
+                    + (y_c["S1B1"] - y_c["S0B1"])
+                )
+                capacity_beta_behavioral = 0.5 * (
+                    (y_c["S0B1"] - y_c["S0B0"])
+                    + (y_c["S1B1"] - y_c["S1B0"])
+                )
+                capacity_beta_interaction = (
+                    y_c["S1B1"] - y_c["S1B0"]
+                    - y_c["S0B1"] + y_c["S0B0"]
+                )
+                direction_beta_structural = 0.5 * (
+                    (y_d["S1B0"] - y_d["S0B0"])
+                    + (y_d["S1B1"] - y_d["S0B1"])
+                )
+                direction_beta_behavioral = 0.5 * (
+                    (y_d["S0B1"] - y_d["S0B0"])
+                    + (y_d["S1B1"] - y_d["S1B0"])
+                )
+                direction_beta_interaction = (
+                    y_d["S1B1"] - y_d["S1B0"]
+                    - y_d["S0B1"] + y_d["S0B0"]
+                )
+                estimand_capacity_beta_structural = 0.5 * (
+                    (y_ce["S1B0"] - y_ce["S0B0"])
+                    + (y_ce["S1B1"] - y_ce["S0B1"])
+                )
+                estimand_capacity_beta_behavioral = 0.5 * (
+                    (y_ce["S0B1"] - y_ce["S0B0"])
+                    + (y_ce["S1B1"] - y_ce["S1B0"])
+                )
+                estimand_direction_beta_behavioral = 0.5 * (
+                    (y_de["S0B1"] - y_de["S0B0"])
+                    + (y_de["S1B1"] - y_de["S1B0"])
+                )
+                delta_struct = y_c["S1B0"] - y_c["S0B0"]
+                delta_behav = y_c["S0B1"] - y_c["S0B0"]
                 sr_cross = (
                     float(delta_struct / delta_behav)
                     if np.isfinite(delta_struct)
@@ -963,8 +1274,7 @@ def main(argv=None):
                     else float("nan")
                 )
                 claim_evaluable = bool(
-                    structural["metric_applicable"]
-                    and behavioral["metric_applicable"]
+                    all(per_mode[cell]["metric_applicable"] for cell in FACTORIAL_CELLS)
                     and structural["n_shift_events"] > 0
                     and behavioral["n_behavioral_shift_events"] > 0
                     and structural["n_complete_structural_windows"]
@@ -980,6 +1290,8 @@ def main(argv=None):
                     and behavioral["behavioral_adapter_target_tv"] > 1e-6
                     and np.isfinite(behavioral["behavioral_adapter_non_target_tv"])
                     and behavioral["behavioral_adapter_non_target_tv"] <= 1e-9
+                    and all(np.isfinite(value) for value in y_ce.values())
+                    and all(np.isfinite(value) for value in y_de.values())
                 )
                 rows.append({
                     "run_id": run_id,
@@ -994,6 +1306,12 @@ def main(argv=None):
                     "pretrain_episodes": checkpoint["episodes"],
                     "frozen_checkpoint_sha256": checkpoint["sha256"],
                     "policy_learning_frozen": 1,
+                    "representation_learning_frozen": 1,
+                    "frozen_representation_unchanged": int(all(
+                        per_mode[cell]["frozen_representation_sha256_before"]
+                        == per_mode[cell]["frozen_representation_sha256_after"]
+                        for cell in FACTORIAL_CELLS
+                    )),
                     "evaluation_ego_roles": ";".join(H2_EVALUATION_EGO_ROLES),
                     "evaluation_ego_count": structural["evaluation_ego_count"],
                     "manipulated_neighbor_roles": ";".join(H2_MANIPULATED_NEIGHBOR_ROLES),
@@ -1009,6 +1327,23 @@ def main(argv=None):
                     ),
                     "delta_struct": delta_struct,
                     "delta_behav": delta_behav,
+                    "capacity_beta_structural": capacity_beta_structural,
+                    "capacity_beta_behavioral": capacity_beta_behavioral,
+                    "capacity_beta_interaction": capacity_beta_interaction,
+                    "direction_beta_structural": direction_beta_structural,
+                    "direction_beta_behavioral": direction_beta_behavioral,
+                    "direction_beta_interaction": direction_beta_interaction,
+                    "estimand_capacity_beta_structural": estimand_capacity_beta_structural,
+                    "estimand_capacity_beta_behavioral": estimand_capacity_beta_behavioral,
+                    "estimand_direction_beta_behavioral": estimand_direction_beta_behavioral,
+                    "capacity_control_floor": y_c["S0B0"],
+                    "capacity_s0b1": y_c["S0B1"],
+                    "capacity_s1b0": y_c["S1B0"],
+                    "capacity_s1b1": y_c["S1B1"],
+                    "direction_s0b0": y_d["S0B0"],
+                    "direction_s0b1": y_d["S0B1"],
+                    "direction_s1b0": y_d["S1B0"],
+                    "direction_s1b1": y_d["S1B1"],
                     "delta_background_structural_run": structural[
                         "delta_mean_background"
                     ],
@@ -1065,6 +1400,12 @@ def main(argv=None):
                     "n_recovered_shifts": structural["n_recovered_shifts"],
                     "n_shift_with_trigger": structural["n_shift_with_trigger"],
                     "n_triggers": structural["n_triggers"],
+                    "n_triggers_behavioral": behavioral["n_triggers"],
+                    "n_triggers_control": control["n_triggers"],
+                    "n_triggers_combined": combined["n_triggers"],
+                    "behavioral_false_trigger_rate": float(
+                        behavioral["n_triggers"] / max(1, args.episodes)
+                    ),
                     "final_f1_struct": structural["final_f1"],
                     "association_window_steps": structural[
                         "association_window_steps"

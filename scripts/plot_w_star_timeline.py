@@ -65,7 +65,7 @@ def collect(env, horizon, n_steps, max_declared, max_control, seed):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-sgtp", action="store_true",
-                    help="dùng bảng tra phi cũ (bản 'trước')")
+                    help="use the legacy Phi lookup table")
     ap.add_argument("--tag", type=str, default=None)
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--horizon", type=int, default=8)
@@ -107,7 +107,7 @@ def main():
     ax.set_ylabel("$W^*_{ij}(t)$  (signed)")
     ax.set_title(
         f"Signed oracle influence over one episode — {tag}"
-        f"  (đậm = declared, nhạt = control)")
+        "  (dark = declared, light = control)")
     ax.legend(fontsize=7, ncol=2, loc="upper right")
 
     # annotate phase boundary (behavioural drift) — following SGTP Fig. 4 model

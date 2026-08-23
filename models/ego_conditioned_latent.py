@@ -129,6 +129,7 @@ class EgoConditionedHeads(nn.Module):
         neighbor_ids: torch.Tensor,    # [B] long
         cd_targets: Optional[torch.Tensor] = None,  # [B, 2]
         profile_distance_threshold: float = 0.05,
+        profile_temperature: float = 0.05,
     ) -> torch.Tensor:
         """
         InfoNCE with signal-aware same-neighbour/different-ego hard negatives.
@@ -154,16 +155,26 @@ class EgoConditionedHeads(nn.Module):
 
         pos_mask = same_ego & same_nb & (~eye)     # Same pair, different time point
         neg_mask = (~same_ego) & same_nb           # Same j, different ego
+        neg_weight = neg_mask.to(dtype=z.dtype)
         if cd_targets is not None:
             if cd_targets.dim() != 2 or cd_targets.shape != (B, 2):
                 raise ValueError("cd_targets must have shape [batch, 2]")
-            profile_distance = torch.abs(
-                cd_targets.unsqueeze(1) - cd_targets.unsqueeze(0)
-            ).sum(dim=-1)
-            neg_mask = neg_mask & (profile_distance > float(profile_distance_threshold))
+            profile_distance = torch.linalg.vector_norm(
+                cd_targets.unsqueeze(1) - cd_targets.unsqueeze(0), dim=-1
+            )
+            # Same-ID samples are positives only within a stable causal
+            # profile. Same-neighbour/different-ego negatives receive graded
+            # weight according to how different their causal profiles are.
+            pos_mask = pos_mask & (
+                profile_distance <= float(profile_distance_threshold)
+            )
+            neg_weight = neg_mask.to(dtype=z.dtype) * torch.sigmoid(
+                (profile_distance - float(profile_distance_threshold))
+                / max(float(profile_temperature), 1e-6)
+            )
 
         # Only for anchors with both positive and negative labels.
-        valid = pos_mask.any(dim=1) & neg_mask.any(dim=1)  # [B]
+        valid = pos_mask.any(dim=1) & (neg_weight > 1e-8).any(dim=1)  # [B]
 
         if not bool(valid.any()):
             return torch.zeros((), dtype=torch.float32, device=z.device)
@@ -171,8 +182,14 @@ class EgoConditionedHeads(nn.Module):
         neg_inf = torch.finfo(sim.dtype).min
 
         pos_sim = sim.masked_fill(~pos_mask, neg_inf)  # [B, B]
-        cand_mask = pos_mask | neg_mask                 # [B, B]
-        all_sim = sim.masked_fill(~cand_mask, neg_inf)  # [B, B]
+        cand_mask = pos_mask | (neg_weight > 1e-8)      # [B, B]
+        log_weight = torch.zeros_like(sim)
+        log_weight = torch.where(
+            neg_mask,
+            torch.log(torch.clamp(neg_weight, min=1e-8)),
+            log_weight,
+        )
+        all_sim = (sim + log_weight).masked_fill(~cand_mask, neg_inf)
 
         # InfoNCE: -log( sum exp(pos) / sum exp(pos + neg) )
         log_num = torch.logsumexp(pos_sim[valid], dim=1)   # [n_valid]

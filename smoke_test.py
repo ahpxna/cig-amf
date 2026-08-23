@@ -80,7 +80,10 @@ try:
     print(f"       stable direction : C={s1[0]:.3f} D={s1[1]:+.3f} sigma_D={s1[3]:.3f}")
     print(f"       reversing D      : C={s2[0]:.3f} D={s2[1]:+.3f} sigma_D={s2[3]:.3f}")
 
-    check("reversing direction averages to D≈0", abs(s2[1]) < 0.1)
+    # The revised tracker deliberately uses an odd, short direction window
+    # so D reacts faster than C. An alternating signal therefore retains at
+    # most one unmatched sample in its current window.
+    check("reversing direction remains near D=0", abs(s2[1]) <= 0.11)
     check("capacity remains high despite direction cancellation", s2[0] > 0.4)
 except Exception:
     traceback.print_exc(); FAIL.append("signature")
@@ -349,7 +352,8 @@ try:
     # ---- peripheral memory ----
     pm = PeripheralMultiMemory(action_dim=A, n_free_slots=2,
                                  lb_coeff=1e-2, orth_coeff=1e-2)
-    items = np.zeros((14, 12), dtype=np.float32)
+    from models.peripheral_memory import FULL_ITEM_DIM
+    items = np.zeros((14, FULL_ITEM_DIM), dtype=np.float32)
     items[:, 0] = rr.randint(0, A, 14)
     items[:, 1] = rr.uniform(0.1, 0.5, 14)  # C
     items[:, 2] = np.concatenate([
@@ -358,9 +362,8 @@ try:
     items[:, 3] = 0.1  # sigma_C
     items[:, 4] = np.concatenate([np.full(11, 0.1), np.full(3, 0.9)])  # sigma_D
     items[:, 5] = rr.uniform(0, 1, 14)  # v_ctx
-    items[:, 6] = rr.uniform(0, 1, 14)  # p_core diagnostic
-    items[:, 7] = rr.uniform(0, 1, 14)  # previous-core flag
-    items[:, 8:] = rr.randn(14, 4)      # geometry features
+    items[:, 6] = 1.0                   # context-validity mask
+    items[:, 7:] = rr.randn(14, 4)      # geometry features
 
     res = pm.forward_full(items)
     print(f"       memory shape={tuple(res['memory'].shape)} "
@@ -370,7 +373,7 @@ try:
 
     check("memory shape [out_dim]", res["memory"].shape == (pm.out_dim,))
     check("six slots (four semantic plus two free)", res["slot_probs"].shape[1] == 6)
-    check("aux_loss > 0", float(res["aux_loss"]) > 0)
+    check("aux_loss > 0", float(res["aux_loss"].detach()) > 0)
     check("no slot is dead", float(usage.min()) > 1e-4,
           f"min usage={usage.min():.4f}")
 
@@ -382,7 +385,21 @@ try:
     z = torch.randn(24, 32)
     ego = torch.tensor(np.repeat([0, 1, 2], 8))
     nbr = torch.tensor(np.tile([1, 1, 2, 2, 3, 3, 4, 4], 3))
-    lo = hd.compute_loss(z, ego, nbr, cd_target=torch.randn(24, 2))
+    # Keep repeated observations of a pair profile-stable while assigning
+    # different profiles to the same neighbour under different egos. This is
+    # the signal-aware positive/negative contract used by the revised loss.
+    cd_by_pair = {}
+    cd_rows = []
+    for ego_id, neighbour_id in zip(ego.tolist(), nbr.tolist()):
+        pair = (int(ego_id), int(neighbour_id))
+        if pair not in cd_by_pair:
+            cd_by_pair[pair] = torch.tensor(
+                [0.2 + 0.25 * ego_id, -0.3 + 0.2 * ego_id],
+                dtype=torch.float32,
+            )
+        cd_rows.append(cd_by_pair[pair])
+    cd_target = torch.stack(cd_rows)
+    lo = hd.compute_loss(z, ego, nbr, cd_target=cd_target)
     print(f"       L_influence={float(lo['influence']):.4f} "
           f"L_contrastive={float(lo['contrastive']):.4f}")
     check("influence loss is finite", np.isfinite(float(lo["influence"])))

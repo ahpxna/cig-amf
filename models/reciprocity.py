@@ -134,7 +134,8 @@ QUAD_OBSTACLE = 2       # inert object
 QUAD_STRATEGIC = 3      # strategic pair
 
 QUAD_NAMES = ("irrelevant", "follower", "obstacle", "strategic")
-QUAD_NAMES_VI = ("vô can", "bám đuôi", "vật cản vô tri", "ghép chiến lược")
+# Compatibility alias retained for older result readers; labels are English.
+QUAD_NAMES_VI = ("unrelated", "follower", "passive obstacle", "strategic coupling")
 
 
 if _HAS_TORCH:

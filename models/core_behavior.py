@@ -130,6 +130,7 @@ class PairRelationalModule:
         max_bc_buffer=None,
         grad_clip=1.0,
         shadow_loss_weight=0.35,
+        state_mode="recurrent",
     ):
         self.n_agents = int(n_agents)
         self.obs_dim = int(obs_dim)
@@ -141,6 +142,11 @@ class PairRelationalModule:
         self.device = device
         self.grad_clip = float(grad_clip)
         self.shadow_loss_weight = float(shadow_loss_weight)
+        self.state_mode = str(state_mode).strip().lower()
+        if self.state_mode not in {"recurrent", "feedforward", "aggregate"}:
+            raise ValueError(
+                "state_mode must be recurrent, feedforward, or aggregate"
+            )
 
         # Backward compatibility: some older versions use max_bc_buffer.
         if max_bc_buffer is not None:
@@ -214,6 +220,25 @@ class PairRelationalModule:
         self.last_full_bc_loss = 0.0
         self.last_shadow_bc_loss = 0.0
         self.last_bc_batch_count = 0
+        self.cd_norm_mean = np.zeros(2, dtype=np.float32)
+        self.cd_norm_std = np.ones(2, dtype=np.float32)
+        self.cd_normalization_frozen = False
+
+    def fit_cd_normalization(self, min_samples=32):
+        """Fit and freeze C/D scaling from the pre-confirmatory replay."""
+        values = [
+            np.asarray(sample["cd_target"], dtype=np.float32)
+            for sample in self.bc_buffer
+            if sample.get("cd_target") is not None
+        ]
+        if len(values) < int(min_samples):
+            return False
+        table = np.stack(values, axis=0)
+        self.cd_norm_mean = np.mean(table, axis=0).astype(np.float32)
+        std = np.std(table, axis=0).astype(np.float32)
+        self.cd_norm_std = np.where(std > 1e-6, std, 1.0).astype(np.float32)
+        self.cd_normalization_frozen = True
+        return True
 
     # ============================================================
     # Basic tensor helpers
@@ -319,13 +344,12 @@ class PairRelationalModule:
             except Exception:
                 same_role = 0.0
 
-        # [P-8 FINAL DEBUG] Valid identity feature: normalized agent ID, an
-        # arbitrary label carrying no structural information. The seventh
-        # feature is active only with rel_feat_dim=7; the default value 6
-        # truncates it to a no-op, preserving old checkpoints and tests. Never
-        # add the neighbour's true ROLE ID: role is the paper's diagnostic
-        # ground truth (Exp. 4 scores recovered-role accuracy). Feeding it as
-        # input leaks labels, invalidates the H3/RQ3 claim, and contaminates H1.
+        # Optional identity feature: normalized agent ID, an arbitrary label
+        # carrying no structural information. The seventh feature is active
+        # only with rel_feat_dim=7; the default value 6 truncates it to a no-op.
+        # The public role is already present in OmniArena's neighbour
+        # observation, so it is not duplicated as a separate relational
+        # channel here.
         agent_id_norm = float(neighbor_id) / float(max(1, getattr(env, "n_agents", 1)))
 
         feats = [
@@ -509,6 +533,8 @@ class PairRelationalModule:
                     )
 
                     h_prev = self.full_states[pair]
+                    if self.state_mode == "feedforward":
+                        h_prev = torch.zeros_like(h_prev)
                     s_prev = self.shadow_states[pair]
 
                     h_next = self.full_encoder(x_full, h_prev)
@@ -516,6 +542,23 @@ class PairRelationalModule:
 
                     self.full_states[pair] = h_next.detach()
                     self.shadow_states[pair] = s_next.detach()
+
+            if self.state_mode == "aggregate":
+                # Remove ego identity from the relational state while
+                # retaining a neighbour-specific aggregate baseline.
+                for neighbor in range(self.n_agents):
+                    pairs = [
+                        (ego, neighbor)
+                        for ego in range(self.n_agents)
+                        if ego != neighbor
+                    ]
+                    shared = torch.mean(
+                        torch.cat([self.full_states[pair] for pair in pairs], dim=0),
+                        dim=0,
+                        keepdim=True,
+                    )
+                    for pair in pairs:
+                        self.full_states[pair] = shared.detach().clone()
 
     # ============================================================
     # Warm-start and summaries
@@ -695,6 +738,7 @@ class PairRelationalModule:
         env,
         h_prev_snapshot=None,
         s_prev_snapshot=None,
+        cd_target_fn=None,
     ):
         """
         Add supervised one-step behavioural prediction samples.
@@ -802,6 +846,13 @@ class PairRelationalModule:
                         "h_prev": h_prev.astype(np.float32),
                         "s_prev": s_prev.astype(np.float32),
                         "target_action": int(target_action_j),
+                        "cd_target": (
+                            None
+                            if cd_target_fn is None
+                            else np.asarray(
+                                cd_target_fn(int(ego), int(j)), dtype=np.float32
+                            ).reshape(2)
+                        ),
                     }
                 )
 
@@ -966,7 +1017,12 @@ class PairRelationalModule:
                 target_t,
             ) = self._bc_batch_to_tensors(batch)
 
-            z_next = self.full_encoder(x_full_t, h_prev_t)
+            recurrent_state = (
+                torch.zeros_like(h_prev_t)
+                if self.state_mode == "feedforward"
+                else h_prev_t
+            )
+            z_next = self.full_encoder(x_full_t, recurrent_state)
             logits_full = self.bc_head(z_next)
             full_loss = F.cross_entropy(logits_full, target_t)
 
@@ -991,18 +1047,24 @@ class PairRelationalModule:
 
                 # [E2] Use z_next with gradients intact so full_encoder must
                 # encode ego information in z_ij; see this method's docstring.
-                if cd_target_fn is not None:
-                    cd_vals = [
-                        cd_target_fn(ego_ids_batch[k], nb_ids_batch[k])
-                        for k in range(len(batch))
-                    ]
+                labelled = [sample.get("cd_target") is not None for sample in batch]
+                if any(labelled):
+                    labelled_idx = [index for index, valid in enumerate(labelled) if valid]
+                    cd_vals = [batch[index]["cd_target"] for index in labelled_idx]
+                    cd_vals = (
+                        np.asarray(cd_vals, dtype=np.float32)
+                        - self.cd_norm_mean.reshape(1, 2)
+                    ) / self.cd_norm_std.reshape(1, 2)
                     cd_t = torch.tensor(
                         np.asarray(cd_vals, dtype=np.float32),
                         dtype=torch.float32, device=self.device,
                     )
-                    inf_loss = heads.influence_loss(z_next, cd_t)
+                    selected_z = z_next[labelled_idx]
+                    selected_ego = ego_t[labelled_idx]
+                    selected_nb = nb_t[labelled_idx]
+                    inf_loss = heads.influence_loss(selected_z, cd_t)
                     con_loss = heads.contrastive_loss(
-                        z_next, ego_t, nb_t, cd_targets=cd_t
+                        selected_z, selected_ego, selected_nb, cd_targets=cd_t
                     )
                 else:
                     inf_loss = torch.zeros(

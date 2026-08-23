@@ -110,6 +110,14 @@ class FinalCIGAMFRunner:
         self.periph_dim = int(cfg["periph_dim"])
         self.belief_dim = int(cfg["belief_dim"])
 
+        causal_horizon = int(cfg["causal_horizon"])
+        proxy_horizon = int(cfg.get("proxy_n_horizons", causal_horizon))
+        if proxy_horizon != causal_horizon:
+            raise ValueError(
+                "causal_horizon and proxy_n_horizons must be identical: "
+                f"received {causal_horizon} and {proxy_horizon}"
+            )
+
         self.proxy = LocalCounterfactualProxyEnsemble(
             obs_dim=self.obs_dim,
             action_dim=self.action_dim,
@@ -123,7 +131,8 @@ class FinalCIGAMFRunner:
             device=device,
             # v2 defaults match structural_proxy.py and preserve behaviour
             # when the configuration omits them.
-            n_horizons=cfg.get("proxy_n_horizons", 3),
+            n_horizons=proxy_horizon,
+            discount=cfg["discount"],
             effect_mode=cfg.get(
                 "proxy_effect_mode", "signed_policy_contrast"
             ),
@@ -149,6 +158,7 @@ class FinalCIGAMFRunner:
             bc_buffer_size=cfg.get("bc_buffer_size", 200000),
             grad_clip=cfg.get("bc_grad_clip", 1.0),
             shadow_loss_weight=cfg.get("shadow_loss_weight", 0.35),
+            state_mode=cfg.get("pair_state_mode", "recurrent"),
             device=device,
         )
 
@@ -159,6 +169,7 @@ class FinalCIGAMFRunner:
             out_dim=self.periph_dim,
             mu_floor=cfg.get("periph_mu_floor", 0.02),
             beta_floor=cfg.get("periph_beta_floor", 0.05),
+            semantic_mass=cfg.get("periph_semantic_mass", 0.5),
             use_uniform_mix=cfg.get("periph_use_uniform_mix", True),
             uniform_mix=cfg.get("periph_uniform_mix", 0.25),
             lb_coeff=cfg.get("periph_lb_coeff", 0.5),
@@ -212,6 +223,7 @@ class FinalCIGAMFRunner:
         self.sig_tracker = InfluenceSignatureTracker(
             n_agents=self.n_agents,
             window=cfg.get("sig_tracker_window", 30),
+            direction_window=cfg.get("sig_tracker_direction_window", 5),
         )
         self.forcer = EpsilonForcedActionController(
             n_agents=self.n_agents,
@@ -239,6 +251,8 @@ class FinalCIGAMFRunner:
             recalibrate_after=cfg.get("drift_recalibrate_after", 15),
             seed=cfg.get("seed", 0),
             device=self.device,
+            cusum_allowance=cfg.get("drift_cusum_allowance", 0.5),
+            cusum_threshold=cfg.get("z_threshold", 8.0),
         )
         self.matdet = MatrixDriftDetector(window=cfg.get("matdet_window", 20))
         self.recip = ReciprocityTracker(
@@ -493,6 +507,10 @@ class FinalCIGAMFRunner:
                 int(j): self.sig_tracker.get_signature(ego, j)
                 for j in periph_ids
             },
+            context_validity={
+                int(j): self.sig_tracker.get_context_validity(ego, j)
+                for j in periph_ids
+            },
         )
 
     def _periph_summary_tensor_from_inputs(self, inputs):
@@ -576,6 +594,10 @@ class FinalCIGAMFRunner:
                         int(j): self.sig_tracker.get_signature(ego, j)
                         for j in periph_ids
                     },
+                    context_validity={
+                        int(j): self.sig_tracker.get_context_validity(ego, j)
+                        for j in periph_ids
+                    },
                 )
                 raw = self.periph_module.forward_excluding_all(inputs, periph_ids)
                 if raw:
@@ -612,6 +634,10 @@ class FinalCIGAMFRunner:
                 int(j): self.sig_tracker.get_signature(ego, j)
                 for j in periph_ids_reduced
             },
+            context_validity={
+                int(j): self.sig_tracker.get_context_validity(ego, j)
+                for j in periph_ids_reduced
+            },
         )
         return self._periph_summary_np_from_inputs(inputs)
 
@@ -623,11 +649,19 @@ class FinalCIGAMFRunner:
         out[:min(out.size, source.size)] = source[:out.size]
         return out
 
-    def _raw_proxy_context_excluding(self, ego, exclude_j):
+    def _split_raw_context(self, values):
+        """Pack a raw set summary across both legacy context tensors."""
+        packed = self._fit_raw_context(
+            values,
+            int(self.core_dim) + int(self.periph_dim),
+        )
+        return packed[:self.core_dim], packed[self.core_dim:]
+
+    def _raw_proxy_context_excluding(self, ego, exclude_j, current_actions=None):
         """Build a partition-independent leave-one-neighbour context.
 
         This measurement input is derived only from current observable
-        geometry, zones, and previous actions.  It deliberately does not use
+        geometry, zones, and current executed actions. It deliberately does not use
         the learned core, peripheral memory, pair latent, or belief state, so
         the path is ``proxy -> partition -> policy`` rather than a feedback
         loop from an earlier partition into the proxy target.
@@ -638,7 +672,11 @@ class FinalCIGAMFRunner:
         zone_i = int(self.env.agent_zone[ego])
         grid = max(1.0, float(getattr(self.env, "grid_size", 1)))
         zones = max(1.0, float(getattr(self.env, "n_zones", 1) - 1))
-        last_actions = getattr(self.env, "last_actions", {})
+        action_source = (
+            current_actions
+            if current_actions is not None
+            else getattr(self.env, "last_actions", {})
+        )
         rows = []
         for other in range(self.n_agents):
             if other in (ego, exclude_j):
@@ -650,24 +688,24 @@ class FinalCIGAMFRunner:
             zone_delta = (float(self.env.agent_zone[other]) - zone_i) / zones
             same_zone = float(int(self.env.agent_zone[other]) == zone_i)
             try:
-                action = float(last_actions[other]) / max(1.0, self.action_dim - 1.0)
+                action_index = int(action_source[other])
             except (KeyError, IndexError, TypeError):
-                action = 0.0
-            rows.append([drow, dcol, distance, same_zone, zone_delta, action])
+                action_index = 0
+            action_onehot = np.zeros(self.action_dim, dtype=np.float32)
+            action_onehot[int(np.clip(action_index, 0, self.action_dim - 1))] = 1.0
+            rows.append(
+                [drow, dcol, distance, same_zone, zone_delta, *action_onehot.tolist()]
+            )
 
         table = np.asarray(rows, dtype=np.float32)
         if table.size == 0:
-            summary = np.zeros(18, dtype=np.float32)
+            summary = np.zeros(2 * (5 + self.action_dim) + 1, dtype=np.float32)
         else:
             summary = np.concatenate(
-                [table.mean(axis=0), table.std(axis=0), table.max(axis=0)], axis=0
+                [table.sum(axis=0), np.square(table).sum(axis=0), [len(table)]],
+                axis=0,
             ).astype(np.float32)
-        # Two independent fixed views avoid giving a semantic interpretation to
-        # the historical Z/M labels while preserving the proxy's public shape.
-        return (
-            self._fit_raw_context(summary, self.core_dim),
-            self._fit_raw_context(np.concatenate([summary[6:12], summary[:6], summary[12:]]), self.periph_dim),
-        )
+        return self._split_raw_context(summary)
 
     # ============================================================
     # Action selection
@@ -975,6 +1013,18 @@ class FinalCIGAMFRunner:
             actions[ego] = int(actions_list[ego])
             cache["value_cache"][ego] = float(values_np[ego])
 
+        # Causal contexts must condition on the executed co-action vector at
+        # the intervention step. Rebuild after the behavioural adapter and
+        # epsilon forcing, while still before env.step().
+        for ego in range(self.n_agents):
+            for j in range(self.n_agents):
+                if j != ego:
+                    cache["proxy_context_excluding"][ego][j] = (
+                        self._raw_proxy_context_excluding(
+                            ego, j, current_actions=actions_list
+                        )
+                    )
+
         cache["forced_mask"] = forced_mask
         cache["behaviour_probs"] = effective_probs
         # Save raw policy probabilities (π_j(a|s)) as well; useful for
@@ -1085,7 +1135,12 @@ class FinalCIGAMFRunner:
                 }
             )
 
+            representation_frozen = bool(
+                self.cfg.get("freeze_representation_state", False)
+            )
             if (
+                not representation_frozen
+                and
                 prev_obs_all is not None
                 and prev_actions is not None
                 and prev_env_snapshot_before_step is not None
@@ -1098,6 +1153,13 @@ class FinalCIGAMFRunner:
                     next_actions={a: actions_list[a] for a in range(self.n_agents)},
                     env=self.env,
                     h_prev_snapshot=prev_h_snapshot,
+                    cd_target_fn=lambda ego_id, nb_id: np.asarray(
+                        [
+                            self.belief_modules[ego_id].debiased_mu(nb_id),
+                            self.sig_tracker.get_signature(ego_id, nb_id)[1],
+                        ],
+                        dtype=np.float32,
+                    ),
                 )
 
                 self.env.restore_state(env_snapshot_after_step)
@@ -1117,11 +1179,12 @@ class FinalCIGAMFRunner:
 
             self.env.restore_state(env_snapshot_before_step)
 
-            self.pair_rel_module.step_population(
-                obs_all=obs_all,
-                actions=actions_list,
-                env=self.env,
-            )
+            if not representation_frozen:
+                self.pair_rel_module.step_population(
+                    obs_all=obs_all,
+                    actions=actions_list,
+                    env=self.env,
+                )
 
             self.env.restore_state(env_snapshot_after_step)
 
@@ -1188,8 +1251,8 @@ class FinalCIGAMFRunner:
                 f"[VERIFY-F1] forced_seen={self._vf1_n_forced} "
                 f"actually_changed={self._vf1_n_changed} "
                 f"({100.0*self._vf1_n_changed/max(1,self._vf1_n_forced):.1f}%; "
-                f"kỳ vọng ~{100.0*(1-1.0/self.action_dim):.0f}% vì ép trùng "
-                f"action cũ với xác suất 1/|A|) "
+                f"expected ~{100.0*(1-1.0/self.action_dim):.0f}% because a "
+                f"forced action matches the old action with probability 1/|A|) "
                 f"hist_action_forced={np.round(h, 3).tolist()}"
             )
             self._vf1_n_forced = 0
@@ -1453,6 +1516,9 @@ class FinalCIGAMFRunner:
         Stage 0 performs no graph update but must still collect the proxy
         buffer. Pushing only when should_update_graph() would omit warm-up data.
         """
+        for timestep, step in enumerate(trajectory):
+            step.setdefault("episode_id", int(self.episodes_completed))
+            step.setdefault("timestep", int(timestep))
         pushed = self.replay_builder.push_trajectory_to_proxy(
             trajectory=trajectory,
             proxy_ensemble=self.proxy,
@@ -1488,6 +1554,23 @@ class FinalCIGAMFRunner:
         # behaviour changes should not by themselves trigger structural reset.
         influence_matrix = np.zeros((self.n_agents, self.n_agents), dtype=np.float64)
         direction_matrix = np.zeros((self.n_agents, self.n_agents), dtype=np.float64)
+        allocation_mode = str(
+            self.cfg.get("core_selection_mode", "structural_capacity")
+        ).strip().lower()
+        external_modes = {
+            "behavioral_direction",
+            "observational_correlation",
+            "random",
+            "oracle_capacity",
+            "full_explicit",
+        }
+        if allocation_mode not in {"structural_capacity", *external_modes}:
+            raise ValueError(f"unknown core_selection_mode {allocation_mode!r}")
+        association_matrix = (
+            self._observational_association_matrix()
+            if allocation_mode == "observational_correlation"
+            else None
+        )
 
         for ego in range(self.n_agents):
             obs_i = self.env.get_obs_of_ego(obs_all, ego)
@@ -1511,7 +1594,9 @@ class FinalCIGAMFRunner:
                 obs_i_batch.append(obs_i)
                 action_i_batch.append(action_i)
                 action_j_batch.append(int(actions[j]))
-                raw_core, raw_periph = self._raw_proxy_context_excluding(ego, j)
+                raw_core, raw_periph = self._raw_proxy_context_excluding(
+                    ego, j, current_actions=actions
+                )
                 z_batch.append(raw_core)
                 m_batch.append(raw_periph)
                 b_batch.append(belief_summary)
@@ -1611,7 +1696,11 @@ class FinalCIGAMFRunner:
                 influence_matrix[ego, j] = float(c_mu_arr[k])
                 direction_matrix[ego, j] = float(d_mu_arr[k])
 
-            update_result = self.belief_modules[ego].update_batch(mu_sigma)
+            if allocation_mode in external_modes:
+                self.belief_modules[ego].update_evidence(mu_sigma)
+                update_result = (set(), set())
+            else:
+                update_result = self.belief_modules[ego].update_batch(mu_sigma)
 
             if update_result is None:
                 promoted = set()
@@ -1619,27 +1708,24 @@ class FinalCIGAMFRunner:
             else:
                 promoted, demoted = update_result
 
-            allocation_mode = str(
-                self.cfg.get("core_selection_mode", "structural_capacity")
-            ).strip().lower()
-            if allocation_mode == "behavioral_direction":
-                # Paper-B allocation ablation only: preserve the capacity
-                # budget selected from C, but substitute |D| for the ranking.
-                # C remains the sole structural-belief update signal.
-                direction_scores = {
-                    int(j): abs(float(d_mu_arr[k]))
-                    for k, j in enumerate(neighbor_ids)
-                }
+            if allocation_mode in external_modes:
+                selector_scores = self._external_selector_scores(
+                    allocation_mode,
+                    ego,
+                    neighbor_ids,
+                    d_mu_arr,
+                    association_matrix,
+                )
+                target_size = (
+                    len(neighbor_ids)
+                    if allocation_mode == "full_explicit"
+                    else self.belief_modules[ego]._effective_max_k()
+                )
                 promoted, demoted = self.belief_modules[
                     ego
                 ].select_core_from_external_scores(
-                    direction_scores,
-                    target_size=len(self.belief_modules[ego].get_core_set()),
-                )
-            elif allocation_mode != "structural_capacity":
-                raise ValueError(
-                    "core_selection_mode must be 'structural_capacity' or "
-                    f"'behavioral_direction', got {allocation_mode!r}"
+                    selector_scores,
+                    target_size=target_size,
                 )
 
             self.pair_rel_module.warm_start_if_promoted(ego, promoted)
@@ -1816,6 +1902,68 @@ class FinalCIGAMFRunner:
             dtype=np.float64,
         ).copy()
 
+    def _observational_association_matrix(self):
+        """Estimate action/reward association without interventional labels."""
+        grouped = {}
+        discount = float(self.cfg.get("discount", 1.0))
+        for sample in self.proxy.buffer:
+            key = (int(sample["ego_id"]), int(sample["neighbor_id"]))
+            lag = np.asarray(
+                sample.get("target_lag_rewards", []), dtype=np.float64
+            ).reshape(-1)
+            if lag.size == 0:
+                continue
+            weights = discount ** np.arange(lag.size, dtype=np.float64)
+            grouped.setdefault(key, []).append((
+                int(sample["observed_action_j"]),
+                float(np.dot(weights, lag)),
+            ))
+        matrix = np.zeros((self.n_agents, self.n_agents), dtype=np.float64)
+        min_support = int(self.cfg.get("selector_correlation_min_support", 5))
+        for (ego, neighbor), records in grouped.items():
+            actions = np.asarray([item[0] for item in records], dtype=np.int64)
+            outcomes = np.asarray([item[1] for item in records], dtype=np.float64)
+            if outcomes.size < 2 * min_support or float(np.std(outcomes)) <= 1e-12:
+                continue
+            best = 0.0
+            for action in range(self.action_dim):
+                indicator = (actions == action).astype(np.float64)
+                support = int(indicator.sum())
+                if support < min_support or outcomes.size - support < min_support:
+                    continue
+                corr = np.corrcoef(indicator, outcomes)[0, 1]
+                if np.isfinite(corr):
+                    best = max(best, abs(float(corr)))
+            matrix[ego, neighbor] = best
+        return matrix
+
+    def _external_selector_scores(
+        self, mode, ego, neighbor_ids, direction_values, association_matrix
+    ):
+        """Return scores for a non-C Paper-B selector ablation."""
+        mode = str(mode).strip().lower()
+        if mode == "behavioral_direction":
+            return {
+                int(j): abs(float(direction_values[index]))
+                for index, j in enumerate(neighbor_ids)
+            }
+        if mode == "observational_correlation":
+            return {
+                int(j): float(association_matrix[int(ego), int(j)])
+                for j in neighbor_ids
+            }
+        if mode == "random":
+            seed = int(self.cfg.get("seed", 0)) + 104729 * (int(ego) + 1)
+            rng = np.random.RandomState(seed)
+            return {int(j): float(rng.uniform()) for j in neighbor_ids}
+        if mode == "oracle_capacity":
+            table = getattr(self.env, "gt_influence_by_ego", {})
+            row = table.get(int(ego), {}) if isinstance(table, dict) else {}
+            return {int(j): abs(float(row.get(int(j), 0.0))) for j in neighbor_ids}
+        if mode == "full_explicit":
+            return {int(j): 1.0 for j in neighbor_ids}
+        raise ValueError(f"unknown external core selector {mode!r}")
+
     def evaluate_episode_snapshot(
         self,
         trajectory,
@@ -1979,13 +2127,7 @@ class FinalCIGAMFRunner:
                 heads_optim=self.heads_optim,
                 w_contrastive=self.cfg.get("heads_w_contrastive", 0.3),
                 w_influence=self.cfg.get("heads_w_influence", 1.0),
-                cd_target_fn=lambda ego_id, nb_id: np.asarray(
-                    [
-                        self.belief_modules[ego_id].debiased_mu(nb_id),
-                        self.sig_tracker.get_signature(ego_id, nb_id)[1],
-                    ],
-                    dtype=np.float32,
-                ),
+                cd_target_fn=None,
             )
             bc_runtime = time.time() - t_bc
 
@@ -2024,7 +2166,7 @@ class FinalCIGAMFRunner:
             # Semantic thresholds may be calibrated after warm-up because D's
             # reward scale is environment-dependent.  Structural C selection
             # remains fixed: reactive tau/sigma/kappa changes would turn the
-            # stated LCB rule into a hidden threshold controller.
+            # stated uncertainty-penalized rule into a hidden threshold controller.
             is_stage_transition = (stage_before_episode_step == 0 and stage_after_episode_step == 1)
             is_periodic_calib = (
                 stage_after_episode_step == 1
@@ -2035,6 +2177,9 @@ class FinalCIGAMFRunner:
 
             if is_stage_transition:
                 self._reset_switch_counters_if_available()
+                self.pair_rel_module.fit_cd_normalization(
+                    min_samples=self.cfg.get("cd_normalization_min_samples", 32)
+                )
 
             if is_stage_transition or is_periodic_calib:
                 calib_reason = "stage transition" if is_stage_transition else "periodic"
@@ -2051,7 +2196,7 @@ class FinalCIGAMFRunner:
                         )
                     print(
                         f"[SEMANTIC-CALIBRATION] tau_D={tau_role:.6f} "
-                        f"sigma_D_hi={sigma_hi:.6f}; C-LCB unchanged"
+                        f"sigma_D_hi={sigma_hi:.6f}; C priority rule unchanged"
                     )
                 except Exception as e:
                     print(f"[SEMANTIC-CALIBRATION][ERROR] {type(e).__name__}: {e}")

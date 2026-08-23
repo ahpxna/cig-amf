@@ -232,9 +232,9 @@ class SelectiveResponsivenessTracker:
             "mean_change_structural": s,
             "selectivity_ratio": ratio,
             "interpretation": (
-                "GOOD: phân biệt được hai tầng" if (np.isfinite(ratio) and ratio > 1.5)
-                else "WEAK: chưa phân biệt rõ" if (np.isfinite(ratio) and ratio > 1.0)
-                else "FAIL: không phân biệt được / phản ứng ngược"
+                "GOOD: the two tiers are separated" if (np.isfinite(ratio) and ratio > 1.5)
+                else "WEAK: tier separation is unclear" if (np.isfinite(ratio) and ratio > 1.0)
+                else "FAIL: no tier separation or reversed response"
             ),
         }
 
@@ -337,21 +337,21 @@ def structure_sensitivity_test(
             significant = bool(ci_lo > 0.0 or ci_hi < 0.0)
 
     if not np.isfinite(val):
-        verdict = "KHÔNG ĐO ĐƯỢC — thiếu condition hợp lệ."
+        verdict = "NOT MEASURABLE: no valid condition is available."
     elif not significant:
         verdict = (
-            f"INCONCLUSIVE: CI95 = [{ci_lo:.3f}, {ci_hi:.3f}] CHỨA 0 — chưa đủ "
-            f"bằng chứng kết luận môi trường có/không nhạy cấu trúc. Tăng seed "
-            f"trước khi sửa môi trường."
+            f"INCONCLUSIVE: CI95 = [{ci_lo:.3f}, {ci_hi:.3f}] contains zero; "
+            "there is insufficient evidence to determine structural sensitivity. "
+            "Increase the seed count before changing the environment."
         )
     elif val > 0:
         verdict = (
-            f"Môi trường NHẠY cấu trúc (CI95 = [{ci_lo:.3f}, {ci_hi:.3f}]) — "
-            f"tiếp tục cải tiến thuật toán."
+            f"The environment is structurally sensitive "
+            f"(CI95 = [{ci_lo:.3f}, {ci_hi:.3f}]); continue algorithm development."
         )
     else:
         verdict = (
-            f"CẢNH BÁO: treatment TỆ HƠN baseline có ý nghĩa "
+            "WARNING: the treatment is significantly worse than the baseline "
             f"(CI95 = [{ci_lo:.3f}, {ci_hi:.3f}])."
         )
 
@@ -366,10 +366,9 @@ def structure_sensitivity_test(
         # This is not Experiment 0's zero-cost oracle core unless run_fn
         # actually supplies that treatment.
         "note": (
-            "structure_value chỉ đúng nghĩa Experiment 0 khi treatment là "
-            "oracle-core ZERO-COST (được cho sẵn core đúng, không huấn luyện). "
-            "Nếu treatment là một baseline PHẢI HỌC (vd. FullExplicitLocal) "
-            "thì đây là so sánh baseline-vs-baseline, không phải trần lợi ích."
+            "structure_value is Experiment 0 only when the treatment is a "
+            "zero-cost oracle core with no training. A learned treatment such "
+            "as FullExplicitLocal is a baseline comparison, not an upper bound."
         ),
     }
 
@@ -444,7 +443,7 @@ def proxy_calibration_report(
     n = int(min(p.size, o.size))
 
     if n < 2:
-        return {"n": n, "error": "không đủ mẫu"}
+        return {"n": n, "error": "insufficient samples"}
 
     p, o = p[:n], o[:n]
 
@@ -489,11 +488,11 @@ def proxy_calibration_report(
         )
 
     out["verdict"] = (
-        "PASS: proxy đủ tốt cho xếp hạng cấu trúc"
+        "PASS: proxy quality is sufficient for structural ranking"
         if np.isfinite(spearman) and spearman > 0.3
-        else "WEAK: tương quan yếu, cần thêm mẫu can thiệp"
+        else "WEAK: correlation is low; more intervention samples are needed"
         if np.isfinite(spearman) and spearman > 0.1
-        else "FAIL: proxy không tương quan với can thiệp thật"
+        else "FAIL: proxy is not correlated with true interventions"
     )
 
     return out
@@ -554,7 +553,7 @@ def compare_two_methods(
     b = np.asarray(values_b, dtype=np.float64).reshape(-1)
 
     if a.size == 0 or b.size == 0:
-        return {"error": "mảng rỗng"}
+        return {"error": "empty array"}
 
     rng = np.random.RandomState(int(seed))
 

@@ -236,79 +236,98 @@ def _h1_status(rows):
 
 
 def _h2_status(rows, h1_supported):
+    """Validate the revised 2x2 structural/behavioural factorial."""
     grouped = _by_group(rows, "model")
     final = grouped["Final-CIGAMF"]
     correlation = grouped["CorrelationMeanField"]
     no_two = grouped["NoTwoTimescale"]
 
-    sr_difference = _paired_difference(final, correlation, "SR_C")
-    sr_ci = _bootstrap_mean_ci(sr_difference, seed=2201)
-    final_sr = _mean(final, "SR_C")
-    correlation_sr = _mean(correlation, "SR_C")
-    no_two_sr = _mean(no_two, "SR_C")
-
     required_rows = final + correlation + no_two
     evaluable = all(
         _boolean(row.get("claim_evaluable", False))
-        and int(float(row.get("n_shift_events", 0))) > 0
         and int(float(row.get("episodes", 0))) >= MIN_H2_CONFIRMATORY_EPISODES
+        and _boolean(row.get("policy_learning_frozen", False))
+        and _boolean(row.get("representation_learning_frozen", False))
+        and _boolean(row.get("frozen_representation_unchanged", False))
         for row in required_rows
     )
-    matched_windows = all(
-        int(float(row.get("n_complete_structural_windows", 0)))
-        == int(float(row.get("n_complete_behavioral_windows", -1)))
-        and int(float(row.get("n_complete_structural_windows", 0))) > 0
-        for row in required_rows
-    )
-    full_recovery_coverage = all(
-        _h2_joint_recovery_trigger_coverage(row) == 1.0
-        for row in final
-    )
-    directional_manipulation = all(
-        _boolean(row.get("direction_manipulation_pass", False))
-        for row in final
-    )
-    no_two_coverage_delta = _paired_derived_difference(
-        final, no_two, _h2_joint_recovery_trigger_coverage
-    )
-    no_two_coverage_ci = _bootstrap_mean_ci(no_two_coverage_delta, seed=2202)
-    paired_latency_differences = []
-    final_by_seed = {int(row["seed"]): row for row in final}
-    no_two_by_seed = {int(row["seed"]): row for row in no_two}
-    for seed in sorted(final_by_seed):
-        final_row = final_by_seed[seed]
-        no_two_row = no_two_by_seed[seed]
-        if (
-            _h2_joint_recovery_trigger_coverage(final_row) == 1.0
-            and _h2_joint_recovery_trigger_coverage(no_two_row) == 1.0
-        ):
-            no_two_latency = _number(no_two_row.get("recovery_latency"))
-            final_latency = _number(final_row.get("recovery_latency"))
-            if no_two_latency is None or final_latency is None:
-                raise CR.ResultValidationError(
-                    "H2 scheduler latency is non-finite on a fully recovered pair"
-                )
-            paired_latency_differences.append(no_two_latency - final_latency)
-    no_two_latency_ci = _bootstrap_mean_ci(
-        paired_latency_differences, seed=2203
-    )
-    scheduler_effect = bool(
-        no_two_coverage_ci[0] > 0.0
-        or (
-            len(paired_latency_differences) == len(final)
-            and no_two_latency_ci[0] > 0.0
+
+    def values(source, key):
+        result = [_number(row.get(key)) for row in source]
+        if any(value is None for value in result):
+            raise CR.ResultValidationError(f"H2 has non-finite {key}")
+        return [float(value) for value in result]
+
+    capacity_struct = values(final, "capacity_beta_structural")
+    capacity_behav = values(final, "capacity_beta_behavioral")
+    direction_struct = values(final, "direction_beta_structural")
+    direction_behav = values(final, "direction_beta_behavioral")
+    capacity_selectivity = [
+        structural - abs(behavioural)
+        for structural, behavioural in zip(capacity_struct, capacity_behav)
+    ]
+    direction_selectivity = [
+        behavioural - abs(structural)
+        for behavioural, structural in zip(direction_behav, direction_struct)
+    ]
+    capacity_struct_ci = _bootstrap_mean_ci(capacity_struct, seed=2201)
+    capacity_selectivity_ci = _bootstrap_mean_ci(capacity_selectivity, seed=2202)
+    direction_selectivity_ci = _bootstrap_mean_ci(direction_selectivity, seed=2203)
+
+    estimand_capacity_struct = values(final, "estimand_capacity_beta_structural")
+    estimand_capacity_behav = values(final, "estimand_capacity_beta_behavioral")
+    estimand_direction_behav = values(final, "estimand_direction_beta_behavioral")
+    estimand_capacity_selectivity = [
+        structural - abs(behavioural)
+        for structural, behavioural in zip(
+            estimand_capacity_struct, estimand_capacity_behav
         )
+    ]
+    estimand_capacity_selectivity_ci = _bootstrap_mean_ci(
+        estimand_capacity_selectivity, seed=2204
     )
-    low, high = H2_CORRELATION_SR_RANGE
+    estimand_direction_behav_ci = _bootstrap_mean_ci(
+        estimand_direction_behav, seed=2205
+    )
+
+    final_recovery = [
+        _h2_joint_recovery_trigger_coverage(row) for row in final
+    ]
+    no_two_recovery = [
+        _h2_joint_recovery_trigger_coverage(row) for row in no_two
+    ]
+    scheduler_delta = [
+        final_value - control_value
+        for final_value, control_value in zip(final_recovery, no_two_recovery)
+    ]
+    scheduler_ci = _bootstrap_mean_ci(scheduler_delta, seed=2206)
+    behavioral_false_trigger_rate = values(final, "behavioral_false_trigger_rate")
+
     mechanism_conditions = {
-        "all_matrix_runs_evaluable": evaluable,
-        "matched_windows_complete": matched_windows,
-        "final_sr_at_least_3": final_sr >= H2_MIN_FINAL_SR,
-        "correlation_baseline_sr_near_one": low <= correlation_sr <= high,
-        "paired_final_minus_correlation_sr_ci_above_zero": sr_ci[0] > 0.0,
-        "final_recovers_and_triggers_for_every_structural_shift": full_recovery_coverage,
-        "two_timescale_scheduler_beats_every_episode_control": scheduler_effect,
-        "executed_behavioral_policy_moves_direction_D": directional_manipulation,
+        "factorial_protocol_evaluable_and_frozen": evaluable,
+        "capacity_structural_main_effect_positive": capacity_struct_ci[0] > 0.0,
+        "capacity_prefers_structural_over_behavioral_change": (
+            capacity_selectivity_ci[0] > 0.0
+        ),
+        "direction_prefers_behavioral_over_structural_change": (
+            direction_selectivity_ci[0] > 0.0
+        ),
+        "fixed_estimand_capacity_is_structurally_selective": (
+            estimand_capacity_selectivity_ci[0] > 0.0
+        ),
+        "fixed_estimand_direction_moves_under_behavioral_intervention": (
+            estimand_direction_behav_ci[0] > 0.0
+        ),
+        "executed_behavioral_policy_moves_direction_D": all(
+            _boolean(row.get("direction_manipulation_pass", False))
+            for row in final
+        ),
+        "behavioral_only_false_trigger_rate_reported": all(
+            rate >= 0.0 for rate in behavioral_false_trigger_rate
+        ),
+        "two_timescale_scheduler_improves_recovery_coverage": (
+            scheduler_ci[0] > 0.0
+        ),
     }
     mechanism_supported = all(mechanism_conditions.values())
     supported = bool(mechanism_supported and h1_supported)
@@ -326,22 +345,24 @@ def _h2_status(rows, h1_supported):
             "validated_structural_input_from_h1": bool(h1_supported),
         },
         "metrics": {
-            "final_sr_mean": final_sr,
-            "correlation_sr_mean": correlation_sr,
-            "no_two_timescale_sr_mean": no_two_sr,
-            "paired_final_minus_correlation_sr": sr_difference,
-            "paired_final_minus_correlation_sr_ci95": sr_ci,
-            "final_recovery_latency_mean": _mean(final, "recovery_latency"),
-            "final_joint_recovery_trigger_coverage": [
-                _h2_joint_recovery_trigger_coverage(row) for row in final
-            ],
-            "paired_final_minus_no_two_coverage": no_two_coverage_delta,
-            "paired_final_minus_no_two_coverage_ci95": no_two_coverage_ci,
-            "paired_no_two_minus_final_recovery_latency": (
-                paired_latency_differences
+            "capacity_beta_structural": capacity_struct,
+            "capacity_beta_structural_ci95": capacity_struct_ci,
+            "capacity_structural_minus_abs_behavioral": capacity_selectivity,
+            "capacity_selectivity_ci95": capacity_selectivity_ci,
+            "direction_behavioral_minus_abs_structural": direction_selectivity,
+            "direction_selectivity_ci95": direction_selectivity_ci,
+            "fixed_estimand_capacity_selectivity_ci95": (
+                estimand_capacity_selectivity_ci
             ),
-            "paired_no_two_minus_final_recovery_latency_ci95": no_two_latency_ci,
-            "final_direction_behavioral_delta_mean": _mean(final, "direction_behav"),
+            "fixed_estimand_direction_behavioral_ci95": estimand_direction_behav_ci,
+            "behavioral_only_false_trigger_rate": behavioral_false_trigger_rate,
+            "final_recovery_latency_mean": _mean(final, "recovery_latency"),
+            "final_joint_recovery_trigger_coverage": final_recovery,
+            "no_two_timescale_joint_recovery_trigger_coverage": no_two_recovery,
+            "paired_final_minus_no_two_recovery_coverage_ci95": scheduler_ci,
+            "correlation_capacity_beta_structural_mean": _mean(
+                correlation, "capacity_beta_structural"
+            ),
         },
     }
 

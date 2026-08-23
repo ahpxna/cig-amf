@@ -100,7 +100,8 @@ ROLE_NEUTRAL = 2      # Influence near zero.
 ROLE_ANOMALOUS = 3    # High uncertainty; not yet understood.
 
 ROLE_NAMES = ("beneficial", "harmful", "neutral", "anomalous")
-ROLE_NAMES_VI = ("Thiện", "Ác", "Trung tính", "Dị biệt")
+# Compatibility alias retained for older result readers; labels are English.
+ROLE_NAMES_VI = ("beneficial", "harmful", "neutral", "anomalous")
 
 N_SEMANTIC_ROLES = 4
 
@@ -142,6 +143,7 @@ class InfluenceSignatureTracker:
         self,
         n_agents: int,
         window: int = 30,
+        direction_window: int = 5,
         tau_role: float = 0.05,
         sigma_hi: float = 0.5,
         normalise: bool = True,
@@ -149,6 +151,7 @@ class InfluenceSignatureTracker:
     ):
         self.n_agents = int(n_agents)
         self.window = int(window)
+        self.direction_window = int(max(1, direction_window))
         self.tau_role = float(tau_role)
         self.sigma_hi = float(sigma_hi)
         self.normalise = bool(normalise)
@@ -208,9 +211,9 @@ class InfluenceSignatureTracker:
 
         if key not in self._capacity_hist:
             self._capacity_hist[key] = deque(maxlen=self.window)
-            self._direction_hist[key] = deque(maxlen=self.window)
+            self._direction_hist[key] = deque(maxlen=self.direction_window)
             self._sigma_capacity_hist[key] = deque(maxlen=self.window)
-            self._sigma_direction_hist[key] = deque(maxlen=self.window)
+            self._sigma_direction_hist[key] = deque(maxlen=self.direction_window)
             self._context_capacity[key] = {}
             self._n_obs[key] = 0
 
@@ -307,6 +310,22 @@ class InfluenceSignatureTracker:
             [capacity, direction, sigma_capacity, sigma_direction, context_std],
             dtype=np.float32,
         )
+
+    def get_context_validity(
+        self,
+        ego_id: int,
+        neighbor_id: int,
+        min_contexts: int = 2,
+        min_samples_per_context: int = 2,
+    ) -> float:
+        """Return one only when contextuality has sufficient support."""
+        key = (int(ego_id), int(neighbor_id))
+        supported = [
+            values
+            for values in self._context_capacity.get(key, {}).values()
+            if len(values) >= int(min_samples_per_context)
+        ]
+        return float(len(supported) >= int(min_contexts))
 
     def get_signature_matrix(
         self,

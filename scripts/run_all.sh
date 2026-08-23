@@ -89,12 +89,14 @@ if [ "$CIG_QUICK" -eq 1 ]; then
   CIG_DEFAULT_H23_SEEDS="0"
   CIG_H2_EPISODES="${CIG_H2_EPISODES:-60}"
   CIG_H3_EPISODES="${CIG_H3_EPISODES:-60}"
+  CIG_LATENCY_TRAIN_EPISODES="${CIG_LATENCY_TRAIN_EPISODES:-2}"
   CIG_MODE="quick"
 else
   CIG_DEFAULT_H1_SEEDS="0 1 2 3 4 5 6 7"
   CIG_DEFAULT_H23_SEEDS="0 1 2 3 4"
   CIG_H2_EPISODES="${CIG_H2_EPISODES:-400}"
   CIG_H3_EPISODES="${CIG_H3_EPISODES:-200}"
+  CIG_LATENCY_TRAIN_EPISODES="${CIG_LATENCY_TRAIN_EPISODES:-200}"
   CIG_MODE="confirmatory"
 fi
 
@@ -140,7 +142,8 @@ for CIG_SEED in "${CIG_H23_SEED_ARRAY[@]}"; do
 done
 
 for CIG_EPISODE_BUDGET in "$CIG_H2_EPISODES" "$CIG_H2_PRETRAIN_EPISODES" "$CIG_H3_EPISODES" \
-  "$CIG_LATENCY_ORACLE_STATES" "$CIG_LATENCY_ORACLE_TRIALS"; do
+  "$CIG_LATENCY_ORACLE_STATES" "$CIG_LATENCY_ORACLE_TRIALS" \
+  "$CIG_LATENCY_TRAIN_EPISODES"; do
   case "$CIG_EPISODE_BUDGET" in
     *[!0-9]*|""|0)
       echo "Episode budgets must be positive integers." >&2
@@ -161,6 +164,10 @@ if [ "$CIG_QUICK" -eq 0 ]; then
   if [ "$CIG_H2_EPISODES" -lt 400 ] || [ "$CIG_H3_EPISODES" -lt 200 ]; then
     echo "Confirmatory budgets require H2>=400 and H3>=200 episodes." >&2
     echo "Use --quick for reduced protocol-path checks." >&2
+    exit 2
+  fi
+  if [ "$CIG_LATENCY_TRAIN_EPISODES" -lt 200 ]; then
+    echo "Confirmatory latency calibration requires at least 200 training episodes." >&2
     exit 2
   fi
 fi
@@ -191,6 +198,7 @@ printf 'category\tlabel\texit_code\telapsed_seconds\tlog\n' > "$CIG_STATUS_TSV"
   printf 'h3_episodes=%s\n' "$CIG_H3_EPISODES"
   printf 'latency_oracle_states=%s\n' "$CIG_LATENCY_ORACLE_STATES"
   printf 'latency_oracle_trials=%s\n' "$CIG_LATENCY_ORACLE_TRIALS"
+  printf 'latency_train_episodes=%s\n' "$CIG_LATENCY_TRAIN_EPISODES"
   printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || printf unknown)"
   git status --porcelain --untracked-files=normal 2>/dev/null > "$CIG_RUN_DIR/git_status_porcelain.txt"
   if [ ! -s "$CIG_RUN_DIR/git_status_porcelain.txt" ]; then
@@ -238,47 +246,30 @@ run_logged() {
   return 0
 }
 
-run_claim_validation() {
-  local log_name="72_validate_claims.log"
+run_paper_validation() {
+  local label="$1"
+  local log_name="$2"
+  shift 2
   local command_started=$SECONDS
-
-  echo
-  echo "======================================================================"
-  echo "RUN: Validate H1/H2/H3 scientific claims"
-  echo "CATEGORY: claim"
-  echo "LOG: $CIG_LOG_DIR/$log_name"
-  echo "======================================================================"
-
-  "$CIG_PYTHON" scripts/validate_claims.py \
-    --run-root "$CIG_RUN_DIR" \
-    --expected-h1-seeds "${CIG_H1_SEED_ARRAY[@]}" \
-    --expected-h2-seeds "${CIG_H23_SEED_ARRAY[@]}" \
-    --expected-h3-seeds "${CIG_H23_SEED_ARRAY[@]}" \
-    --protocol-mode "$CIG_MODE" \
-    2>&1 | tee "$CIG_LOG_DIR/$log_name"
+  "$@" 2>&1 | tee "$CIG_LOG_DIR/$log_name"
   local command_status=${PIPESTATUS[0]}
   local command_elapsed=$((SECONDS - command_started))
   printf 'claim\t%s\t%s\t%s\t%s\n' \
-    "Validate H1/H2/H3 scientific claims" "$command_status" \
-    "$command_elapsed" "logs/$log_name" >> "$CIG_STATUS_TSV"
-
+    "$label" "$command_status" "$command_elapsed" "logs/$log_name" \
+    >> "$CIG_STATUS_TSV"
   case "$command_status" in
     0)
       CIG_PASSES=$((CIG_PASSES + 1))
-      echo "SUPPORTED: all valid hypothesis gates passed"
       ;;
     10)
-      CIG_CLAIM_FAILURES+=("At least one hypothesis was NOT_SUPPORTED")
-      echo "NOT_SUPPORTED: see claim_status.md" >&2
+      CIG_CLAIM_FAILURES+=("$label was NOT_SUPPORTED")
       ;;
     11)
       CIG_PASSES=$((CIG_PASSES + 1))
       CIG_SMOKE_ONLY=1
-      echo "SMOKE_ONLY: protocol paths completed; claims were not adjudicated"
       ;;
     *)
-      CIG_OPERATIONAL_FAILURES+=("Claim validation invalid (exit $command_status)")
-      echo "INVALID: claim report could not validate a complete protocol" >&2
+      CIG_OPERATIONAL_FAILURES+=("$label invalid (exit $command_status)")
       ;;
   esac
 }
@@ -303,10 +294,13 @@ echo "Device: $CIG_DEVICE"
 echo "H1 seeds: ${CIG_H1_SEED_ARRAY[*]}"
 echo "H2/H3 seeds: ${CIG_H23_SEED_ARRAY[*]}"
 echo "Planned H1 attempts: $((7 * ${#CIG_H1_SEED_ARRAY[@]}))"
-echo "Planned H2 episodes: $((3 * ${#CIG_H23_SEED_ARRAY[@]} * (2 * CIG_H2_EPISODES + CIG_H2_PRETRAIN_EPISODES)))"
+echo "Planned H2 episodes: $((3 * ${#CIG_H23_SEED_ARRAY[@]} * (4 * CIG_H2_EPISODES + CIG_H2_PRETRAIN_EPISODES)))"
 echo "Planned H3 episodes: $((6 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
-echo "Planned Paper-B allocation episodes: $((2 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
+echo "Planned Paper-B allocation episodes: $((6 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
+echo "Planned Paper-B pair-latent episodes: $((5 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
+echo "Planned Paper-B periphery episodes: $((5 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
 echo "Latency oracle: ${CIG_LATENCY_ORACLE_STATES} states x ${CIG_LATENCY_ORACLE_TRIALS} CRN trials"
+echo "Learned latency training after oracle pass: ${CIG_LATENCY_TRAIN_EPISODES} episodes"
 
 # ---------------------------------------------------------------------------
 # 0. Preflight: failures here invalidate the code path before long experiments.
@@ -372,15 +366,29 @@ if [ "${#CIG_OPERATIONAL_FAILURES[@]}" -gt 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2b. Optional latency contribution: environment/oracle gate only.
-# A non-passing gate is a valid scientific outcome recorded in JSON; it does
-# not invalidate Q/C/D or start a learned latency-head experiment.
+# 2b. Optional latency contribution. The learned direct-lag calibration runs
+# only after the all-action oracle establishes an identifiable mechanism.
+# Neither gate invalidates the primary Q/C/D contribution.
 # ---------------------------------------------------------------------------
 run_logged "diagnostic" "Lag-specific oracle latency gate" "22_latency_oracle.log" \
   "$CIG_PYTHON" scripts/run_latency_oracle.py \
   --states "$CIG_LATENCY_ORACLE_STATES" \
   --trials "$CIG_LATENCY_ORACLE_TRIALS" \
   --json-out "$CIG_RUN_DIR/latency_oracle.json"
+
+if "$CIG_PYTHON" -c \
+  'import json,sys; sys.exit(0 if json.load(open(sys.argv[1], encoding="utf-8")).get("gate_pass") else 1)' \
+  "$CIG_RUN_DIR/latency_oracle.json"; then
+  run_logged "diagnostic" "Learned direct-lag latency calibration" "23_latency_learned.log" \
+    "$CIG_PYTHON" scripts/run_latency_calibration.py \
+    --train-episodes "$CIG_LATENCY_TRAIN_EPISODES" \
+    --states "$CIG_LATENCY_ORACLE_STATES" \
+    --trials "$CIG_LATENCY_ORACLE_TRIALS" \
+    --device "$CIG_DEVICE" \
+    --json-out "$CIG_RUN_DIR/latency_calibration.json"
+else
+  echo "GATED OUT: learned latency calibration (oracle gate did not pass)."
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Structure-value experiments.
@@ -466,25 +474,38 @@ run_logged "hypothesis" "H1 one-step causal identification and calibration" "60_
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/h1" \
   --quiet
-run_logged "hypothesis" "H2 structural selectivity and recovery" "61_h2.log" \
+run_logged "hypothesis" "Paper-A H2 factorial structural/behavioural selectivity" "61_h2.log" \
   "$CIG_PYTHON" scripts/run_h2_selectivity.py \
     --seeds "${CIG_H23_SEED_ARRAY[@]}" \
     --episodes "$CIG_H2_EPISODES" \
     --pretrain-episodes "$CIG_H2_PRETRAIN_EPISODES" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/h2"
-run_logged "hypothesis" "H3 specialization, capacity, and no-memory controls" "62_h3.log" \
+run_logged "ablation" "Legacy end-to-end slot-system ablations" "62_h3.log" \
   "$CIG_PYTHON" scripts/run_h3_slots.py \
   --seeds "${CIG_H23_SEED_ARRAY[@]}" \
   --episodes "$CIG_H3_EPISODES" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/h3"
-run_logged "allocation" "Paper-B C-core versus |D|-core allocation" "63_paper_b_allocation.log" \
+run_logged "allocation" "Paper-B selector isolation and end-to-end allocation" "63_paper_b_allocation.log" \
   "$CIG_PYTHON" scripts/run_paper_b_allocation.py \
   --seeds "${CIG_H23_SEED_ARRAY[@]}" \
   --episodes "$CIG_H3_EPISODES" \
+  --pretrain-episodes "$CIG_H2_PRETRAIN_EPISODES" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/paper_b_allocation"
+run_logged "representation" "Paper-B pair-latent ablations under fixed core" "64_paper_b_pair_latent.log" \
+  "$CIG_PYTHON" scripts/run_paper_b_pair_latent.py \
+  --seeds "${CIG_H23_SEED_ARRAY[@]}" \
+  --episodes "$CIG_H3_EPISODES" \
+  --device "$CIG_DEVICE" \
+  --out-root "$CIG_RUN_DIR/paper_b_pair_latent"
+run_logged "representation" "Paper-B peripheral encoders under fixed core" "65_paper_b_periphery.log" \
+  "$CIG_PYTHON" scripts/run_paper_b_periphery.py \
+  --seeds "${CIG_H23_SEED_ARRAY[@]}" \
+  --episodes "$CIG_H3_EPISODES" \
+  --device "$CIG_DEVICE" \
+  --out-root "$CIG_RUN_DIR/paper_b_periphery"
 
 # ---------------------------------------------------------------------------
 # 7. Diagnostic figure.
@@ -512,7 +533,17 @@ run_logged "report" "Aggregate experiment results" "71_collect_results.log" \
   --expected-h1-seeds "${CIG_H1_SEED_ARRAY[@]}" \
   --expected-h2-seeds "${CIG_H23_SEED_ARRAY[@]}" \
   --expected-h3-seeds "${CIG_H23_SEED_ARRAY[@]}"
-run_claim_validation
+run_paper_validation "Validate Paper A" "72_validate_paper_a.log" \
+  "$CIG_PYTHON" scripts/validate_paper_a.py \
+  --run-root "$CIG_RUN_DIR" \
+  --expected-h1-seeds "${CIG_H1_SEED_ARRAY[@]}" \
+  --expected-h2-seeds "${CIG_H23_SEED_ARRAY[@]}" \
+  --protocol-mode "$CIG_MODE"
+run_paper_validation "Validate Paper B" "73_validate_paper_b.log" \
+  "$CIG_PYTHON" scripts/validate_paper_b.py \
+  --run-root "$CIG_RUN_DIR" \
+  --expected-seeds "${CIG_H23_SEED_ARRAY[@]}" \
+  --protocol-mode "$CIG_MODE"
 
 # ---------------------------------------------------------------------------
 # 9. Final manifest summary.
@@ -526,7 +557,8 @@ echo "Elapsed seconds: $((SECONDS - CIG_STARTED_AT))"
 echo "Run artifacts: $CIG_RUN_DIR"
 echo "Command manifest: $CIG_STATUS_TSV"
 echo "Summary table: $CIG_RUN_DIR/summary_tables.md"
-echo "Claim report: $CIG_RUN_DIR/claim_status.md"
+echo "Paper-A claim report: $CIG_RUN_DIR/paper_a_claim_status.json"
+echo "Paper-B claim report: $CIG_RUN_DIR/paper_b_claim_status.json"
 
 if [ "${#CIG_OPERATIONAL_FAILURES[@]}" -gt 0 ]; then
   printf '  - %s\n' "${CIG_OPERATIONAL_FAILURES[@]}"

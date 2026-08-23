@@ -144,7 +144,7 @@ class TwoTimescaleScheduler:
         belief_modules: Optional[Dict] = None,
         drift_detector=None,
     ) -> Dict:
-        """Evaluate the two triggers once per episode after measurement.
+        """Evaluate the frozen-witness Page-CUSUM trigger.
 
         Args:
             probe_z: Z-score from ``DriftDetector.residual_z_score()``.
@@ -174,11 +174,9 @@ class TwoTimescaleScheduler:
 
         hit_probe = float(probe_z) > self.z_threshold
         hit_matrix = float(matrix_z) > self.z_threshold
-
-        fired = (
-            (hit_probe and hit_matrix) if self.require_both
-            else (hit_probe or hit_matrix)
-        )
+        # Matrix movement remains a plotted diagnostic/ablation. It is not
+        # combined with the prespecified frozen-witness trigger.
+        fired = hit_probe
 
         if not fired:
             out["reason"] = "below_threshold"
@@ -210,10 +208,7 @@ class TwoTimescaleScheduler:
 
         out.update({
             "fired": True,
-            "reason": (
-                "both" if (hit_probe and hit_matrix)
-                else ("probe" if hit_probe else "matrix")
-            ),
+            "reason": "probe_cusum",
             "n_inflated": int(n_inflated),
         })
 
@@ -286,4 +281,3 @@ class TwoTimescaleScheduler:
             "in_refractory": bool(self._in_refractory()),
             "z_threshold": float(self.z_threshold),
         }
-

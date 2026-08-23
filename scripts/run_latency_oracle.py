@@ -29,6 +29,16 @@ def _finite_median(values):
     return float(np.median(valid)) if valid else None
 
 
+def _rank_correlation(x, y):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if x.size < 3 or np.std(x) <= 1e-12 or np.std(y) <= 1e-12:
+        return 0.0
+    rank_x = np.argsort(np.argsort(x)).astype(np.float64)
+    rank_y = np.argsort(np.argsort(y)).astype(np.float64)
+    return float(np.corrcoef(rank_x, rank_y)[0, 1])
+
+
 def _profile_summary(rows, min_response_mass):
     by_role = {role: [] for role in ROLE_ORDER}
     for row in rows:
@@ -77,24 +87,40 @@ def _profile_summary(rows, min_response_mass):
         )
     )
 
-    # The environment declares a blocker -> gatekeeper -> relay -> controller
-    # latency ladder.  A generic three-role spread could pass even when the
-    # declared relay/controller tiers are absent, which would not support that
-    # contribution.  Require measurable responses for every declared tier,
-    # its coarse ordering, and a non-trivial total spread.  This remains an
-    # oracle/environment criterion, not a learned proxy metric.
+    active_rows = [row for row in rows if row["response_mass"] >= min_response_mass]
+    true_delays = [row["true_delay"] for row in active_rows]
+    estimated_delays = [row["centre_of_mass_lag"] for row in active_rows]
+    valid_pairs = [
+        (truth, estimate)
+        for truth, estimate in zip(true_delays, estimated_delays)
+        if estimate is not None and np.isfinite(estimate)
+    ]
+    delay_rank = _rank_correlation(
+        [item[0] for item in valid_pairs], [item[1] for item in valid_pairs]
+    )
+    delay_mae = (
+        float(np.mean([abs(item[0] - item[1]) for item in valid_pairs]))
+        if valid_pairs else float("nan")
+    )
+    active_fraction = float(len(active_rows) / max(1, len(rows)))
+    # The primary gate uses pair-randomized mechanism delay, independent of
+    # role. Role ordering remains an interpretability diagnostic only.
     gate_pass = bool(
-        all_roles_usable
-        and expected_order
-        and (centre_spread >= 0.50 or peak_spread >= 1.0)
+        active_fraction >= 0.5
+        and len(valid_pairs) >= 8
+        and delay_rank >= 0.70
+        and np.isfinite(delay_mae)
+        and delay_mae <= 1.5
     )
     reasons = []
-    if not all_roles_usable:
-        reasons.append("not every declared latency tier has stable response mass")
-    if all_roles_usable and not expected_order:
-        reasons.append("declared blocker-to-controller latency order is not recovered")
-    if centre_spread < 0.50 and peak_spread < 1.0:
-        reasons.append("lag summaries lack the required role separation")
+    if active_fraction < 0.5:
+        reasons.append("fewer than half of randomized-delay pairs have stable response mass")
+    if len(valid_pairs) < 8:
+        reasons.append("too few active pair-state latency estimates")
+    if delay_rank < 0.70:
+        reasons.append("capacity-spectrum latency does not rank randomized delay")
+    if not np.isfinite(delay_mae) or delay_mae > 1.5:
+        reasons.append("capacity-spectrum latency error exceeds the oracle gate")
 
     return {
         "gate_pass": gate_pass,
@@ -105,6 +131,9 @@ def _profile_summary(rows, min_response_mass):
         "centre_of_mass_spread": centre_spread,
         "peak_lag_spread": peak_spread,
         "role_summary": role_summary,
+        "randomized_delay_rank_correlation": delay_rank,
+        "randomized_delay_mae": delay_mae,
+        "active_pair_state_fraction": active_fraction,
     }
 
 
@@ -124,6 +153,7 @@ def run_gate(
         seed=int(seed),
         mode="cooperative",
         enable_latency_ladder=True,
+        enable_sgtp_delays=True,
     )
     # The sampled states are all safely inside the same episode regime.  The
     # oracle itself rejects a boundary-crossing H-step window.
@@ -140,7 +170,7 @@ def run_gate(
     for state_index, state in enumerate(bank):
         for role in ROLE_ORDER:
             source = int(role_agents[role])
-            candidates = []
+            action_profiles = []
             for action in range(env.N_ACTIONS):
                 env.restore_state(state)
                 profile = env.compute_oracle_lag_response_from_current_state(
@@ -152,33 +182,57 @@ def run_gate(
                     forced_step=0,
                     crn_seed=(int(seed) + 1) * 1000003 + state_index * 97 + source * 11 + action,
                 )
-                candidates.append((profile["response_mass"], action, profile))
+                action_profiles.append(
+                    np.asarray(profile["per_lag_response"], dtype=np.float64)
+                )
 
-            _, action, profile = max(candidates, key=lambda item: item[0])
+            response_surface = np.stack(action_profiles, axis=0)  # [A,H]
+            capacity_spectrum = (
+                np.max(response_surface, axis=0)
+                - np.min(response_surface, axis=0)
+            )
+            response_mass = float(np.sum(np.abs(capacity_spectrum)))
+            peak = float(np.max(capacity_spectrum)) if capacity_spectrum.size else 0.0
+            active_threshold = max(1e-8, 0.05 * peak)
+            active_lags = np.flatnonzero(capacity_spectrum > active_threshold)
+            onset_lag = int(active_lags[0]) if active_lags.size else None
+            peak_lag = int(np.argmax(capacity_spectrum)) if peak > 0.0 else None
+            centre_of_mass_lag = (
+                float(
+                    np.dot(
+                        np.arange(capacity_spectrum.size, dtype=np.float64),
+                        capacity_spectrum,
+                    )
+                    / response_mass
+                )
+                if response_mass > 0.0
+                else None
+            )
             rows.append(
                 {
                     "state_index": int(state_index),
                     "role": role,
                     "ego": ego,
                     "source": source,
-                    "selected_action": int(action),
-                    "per_lag_response": [float(x) for x in profile["per_lag_response"]],
-                    "discounted_response": float(profile["discounted_response"]),
-                    "response_mass": float(profile["response_mass"]),
-                    "onset_lag": profile["onset_lag"],
-                    "peak_lag": profile["peak_lag"],
-                    "centre_of_mass_lag": profile["centre_of_mass_lag"],
+                    "true_delay": int(env.sgtp_delay_by_pair.get((source, ego), 0)),
+                    "action_lag_response": response_surface.tolist(),
+                    "capacity_lag_spectrum": capacity_spectrum.tolist(),
+                    "response_mass": response_mass,
+                    "onset_lag": onset_lag,
+                    "peak_lag": peak_lag,
+                    "centre_of_mass_lag": centre_of_mass_lag,
                 }
             )
 
     summary = _profile_summary(rows, min_response_mass=float(min_response_mass))
     return {
-        "protocol_version": "latency_oracle_impulse_v1",
+        "protocol_version": "latency_oracle_capacity_spectrum_v2",
         "continuation_policy": "OmniArena.scripted_policy",
         "seed": int(seed),
         "n_states": int(n_states),
         "horizon": int(horizon),
         "n_trials": int(n_trials),
+        "action_count": int(env.N_ACTIONS),
         "min_response_mass": float(min_response_mass),
         "rows": rows,
         **summary,

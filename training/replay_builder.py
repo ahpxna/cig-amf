@@ -75,17 +75,15 @@ class MultiEgoReplayBuilder:
 
         return out
 
-    def build_h_step_returns_multi(self, trajectory, n_agents, n_horizons=None):
-        """
-        P2 multi-horizon form of ``build_h_step_returns()``. It returns
-        R_i^(1), R_i^(2), ..., R_i^(n_horizons) for each (t, ego). These are
-        real ``target_returns_multi`` values rather than a broadcast scalar for
-        structural_proxy_v2 (n_horizons=8 under Section 2.2).
+    def build_lag_rewards(self, trajectory, n_agents, n_horizons=None):
+        """Build direct reward targets at each post-intervention lag.
 
-        R_i^(h)(t) = sum_{k=0}^{h-1} gamma^k * r_i(t+k)  (h = 1..n_horizons)
-
-        Return:
-            list length T. out[t][ego] = np.ndarray shape [n_horizons].
+        ``out[t][ego][ell]`` is ``r_i(t + ell)``.  The response network learns
+        these direct lag responses; cumulative responses are derived later as
+        ``Q^(h) = sum_{ell<h} gamma**ell * g^[ell]``.  Keeping the primitive
+        target non-cumulative makes the latency spectrum identifiable and
+        guarantees that an H-step residual is compared with Q at the same H.
+        Missing rewards beyond an episode boundary are zero padded.
         """
         if n_horizons is None:
             n_horizons = self.horizon
@@ -96,15 +94,30 @@ class MultiEgoReplayBuilder:
         for t in range(T):
             row = {}
             for ego in range(int(n_agents)):
-                cum = 0.0
-                per_h = np.zeros((int(n_horizons),), dtype=np.float32)
-                for h in range(int(n_horizons)):
-                    if t + h < T:
-                        cum += (self.discount ** h) * float(trajectory[t + h]["rewards"][ego])
-                    per_h[h] = cum
-                row[ego] = per_h
+                per_lag = np.zeros((int(n_horizons),), dtype=np.float32)
+                for lag in range(int(n_horizons)):
+                    if t + lag < T:
+                        per_lag[lag] = float(trajectory[t + lag]["rewards"][ego])
+                row[ego] = per_lag
             out.append(row)
 
+        return out
+
+    def build_h_step_returns_multi(self, trajectory, n_agents, n_horizons=None):
+        """Compatibility helper returning cumulative responses at every H."""
+        lag_rewards = self.build_lag_rewards(
+            trajectory, n_agents, n_horizons=n_horizons
+        )
+        out = []
+        for row in lag_rewards:
+            cumulative_row = {}
+            for ego, values in row.items():
+                values = np.asarray(values, dtype=np.float32)
+                discounts = np.power(
+                    self.discount, np.arange(values.size, dtype=np.float32)
+                )
+                cumulative_row[ego] = np.cumsum(values * discounts).astype(np.float32)
+            out.append(cumulative_row)
         return out
 
     def _require_step_fields(self, step):
@@ -152,11 +165,9 @@ class MultiEgoReplayBuilder:
 
         n_agents = int(env.n_agents)
         h_returns = self.build_h_step_returns(trajectory, n_agents)
-        # P2: read real n_horizons-element targets (default 8) from the
-        # trajectory instead of letting add_sample() broadcast one scalar to
-        # every horizon, which was the less accurate legacy fallback.
+        # The network predicts direct lag rewards, not cumulative returns.
         n_horizons_for_push = getattr(proxy_ensemble, "n_horizons", self.horizon)
-        h_returns_multi = self.build_h_step_returns_multi(
+        lag_rewards = self.build_lag_rewards(
             trajectory, n_agents, n_horizons=n_horizons_for_push
         )
 
@@ -206,7 +217,7 @@ class MultiEgoReplayBuilder:
                         )
                     belief_summary = step["belief_summary_cache"][ego]
                     target_h = h_returns[t][ego]
-                    target_multi = h_returns_multi[t][ego]
+                    target_lags = lag_rewards[t][ego]
 
                     was_forced = False
                     behaviour_prob_j = None
@@ -245,10 +256,17 @@ class MultiEgoReplayBuilder:
                         m_periph_excl_j=m_ex,
                         belief_summary=belief_summary,
                         target_return_h=float(target_h),
-                        target_returns_multi=target_multi,
+                        target_lag_rewards=target_lags,
                         behaviour_prob_j=behaviour_prob_j,
                         was_forced=was_forced,
                         pair_feat=pair_feat,   # [FIX-X1]
+                        policy_probs_j=(
+                            None
+                            if step.get("policy_probs") is None
+                            else step["policy_probs"][j]
+                        ),
+                        episode_id=step.get("episode_id"),
+                        timestep=step.get("timestep", t),
                     )
 
                     pushed += 1

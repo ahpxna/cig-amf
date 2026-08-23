@@ -1,6 +1,6 @@
 """Single-aggregate peripheral encoder for the H3 one-module ablation.
 
-The class deliberately implements the same 12-dimensional item protocol as
+The class deliberately implements the same 11-dimensional item protocol as
 ``PeripheralMultiMemory`` and differs only at aggregation: all peripheral
 items are compressed into one confidence-weighted mean.  Keeping the input
 features, signature source, optimizer path, output width, and leave-one-out
@@ -21,8 +21,7 @@ from models.peripheral_memory import (
     ITEM_ABS_MU,
     ITEM_ACTION,
     ITEM_CONTEXT_STD,
-    ITEM_P_CORE,
-    ITEM_SIGMA,
+    ITEM_SIGMA_CAPACITY,
     LEGACY_ITEM_DIM,
 )
 
@@ -127,9 +126,8 @@ class SingleMeanPeripheral(nn.Module):
             upgraded[:, 1] = legacy[:, 1]
             upgraded[:, 2] = torch.abs(legacy[:, 1])
             upgraded[:, 3] = legacy[:, 2]
-            upgraded[:, 6] = legacy[:, 3]
-            upgraded[:, 7] = legacy[:, 4]
-            upgraded[:, 8:] = legacy[:, 5:]
+            upgraded[:, 6] = 0.0
+            upgraded[:, 7:] = legacy[:, 5:]
             items = upgraded
         if items.shape[-1] != self.item_dim:
             raise ValueError(
@@ -151,12 +149,10 @@ class SingleMeanPeripheral(nn.Module):
         sigma = (
             torch.zeros_like(mu)
             if self.signature_mode == "scalar"
-            else torch.clamp(items[:, ITEM_SIGMA], min=0.0)
+            else torch.clamp(items[:, ITEM_SIGMA_CAPACITY], min=0.0)
         )
-        p_core = torch.clamp(items[:, ITEM_P_CORE], min=0.0, max=1.0)
         beta = (
-            (self.beta_floor + p_core)
-            * (torch.abs(mu) + self.mu_floor)
+            (torch.abs(mu) + self.mu_floor)
             / (1.0 + sigma + self.eps)
         )
         return torch.clamp(beta, min=self.eps)
@@ -229,9 +225,10 @@ class SingleMeanPeripheral(nn.Module):
         influence_signatures: Optional[
             Mapping[int, Sequence[float]]
         ] = None,
+        context_validity: Optional[Mapping[int, float]] = None,
         require_full_signature: Optional[bool] = None,
     ) -> np.ndarray:
-        """Build the same full 12D rows used by the multi-slot encoder."""
+        """Build the same full 11D rows used by the multi-slot encoder."""
         ego_id = int(ego_id)
         prev_core_set = set() if prev_core_set is None else set(prev_core_set)
         require_full = (
@@ -269,7 +266,7 @@ class SingleMeanPeripheral(nn.Module):
                     )
                 mu = float(belief["mu_bar"])
                 signature = np.asarray(
-                    [mu, abs(mu), float(belief["sigma_bar"]), 0.0, 0.0],
+                    [abs(mu), mu, float(belief["sigma_bar"]), float(belief["sigma_bar"]), 0.0],
                     dtype=np.float32,
                 )
                 legacy_count += 1
@@ -287,8 +284,11 @@ class SingleMeanPeripheral(nn.Module):
             rows.append([
                 float(np.clip(last_actions[neighbor_id], 0, self.action_dim - 1)),
                 *[float(value) for value in signature],
-                float(belief["p_core"]),
-                float(neighbor_id in prev_core_set),
+                float(
+                    0.0
+                    if context_validity is None
+                    else context_validity.get(neighbor_id, 0.0)
+                ),
                 float((neighbor_pos[0] - ego_pos[0]) / grid_den),
                 float((neighbor_pos[1] - ego_pos[1]) / grid_den),
                 float(

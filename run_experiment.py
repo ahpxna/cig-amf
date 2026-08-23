@@ -41,6 +41,7 @@ except ModuleNotFoundError:
     )
 
 from models.structural_proxy import build_pair_feat  # [FIX-X1]
+from models.crossfit_aipw import CrossFittedConditionalAIPW
 
 try:
     from runners.final_runner import FinalCIGAMFRunner, NoTwoTimescaleRunner
@@ -154,6 +155,8 @@ def default_cfg():
         # See TwoTimescaleScheduler for require_both/inflation_t_reset. The
         # original defaults in training/scheduler.py are False and 1.
         "require_both": False,
+        "z_threshold": 8.0,
+        "drift_cusum_allowance": 0.5,
         "inflation_t_reset": 1,
 
         "belief_lambda_0": 0.08,
@@ -165,6 +168,14 @@ def default_cfg():
         # Fixed oracle truth cardinality.  Evaluation never adapts the target
         # core size to a model's predicted core, which would inflate F1.
         "ground_truth_core_k": 3,
+        # Prespecified oracle-active/null thresholds for H1 diagnostics.
+        "h1_capacity_active_threshold": 0.05,
+        "h1_capacity_prediction_threshold": 0.05,
+        "h1_direction_active_threshold": 0.02,
+        "h1_direction_prediction_threshold": 0.02,
+        "h1_crossfit_folds": 5,
+        "h1_crossfit_ridge": 1e-3,
+        "h1_crossfit_iw_clip": None,
         "min_core_size": 2,
         "max_core_size": 4,
         "sigma_floor": 0.08,
@@ -189,6 +200,9 @@ def default_cfg():
 
         "periph_mu_floor": 0.015,
         "periph_beta_floor": 0.05,
+        "periph_semantic_mass": 0.5,
+        "sig_tracker_window": 30,
+        "sig_tracker_direction_window": 5,
         # Uniform mixing recreates the global mean inside every slot and is
         # therefore reserved for a legacy-collapse ablation, never Full.
         "periph_uniform_mix": 0.0,
@@ -211,23 +225,28 @@ def default_cfg():
         "periph_orth_coeff": 1e-2,
         "belief_priority_mu_floor": 0.01,
         "shadow_loss_weight": 0.25,
+        "pair_state_mode": "recurrent",
+        "cd_normalization_min_samples": 32,
         "graph_score_steps": 8,
 
         # structural_proxy v2 defaults match structural_proxy.py.
-        "proxy_n_horizons": 3,
+        # One horizon contract: proxy heads and replay outcomes always share H.
+        "proxy_n_horizons": 8,
         # Stable H1 estimand: value of the logged neighbour policy relative to
         # a uniform reference policy. The former realised-action/range target
         # changed with the sampled action and could not be ranked consistently.
         "proxy_effect_mode": "signed_policy_contrast",
-        "proxy_use_doubly_robust": True,
+        # Online D uses the plug-in estimate. Row-level AIPW remains an
+        # explicitly named diagnostic; confirmatory DR is fitted offline.
+        "proxy_use_doubly_robust": False,
         "proxy_iw_clip": 10.0,
         "proxy_bootstrap_ratio": 0.8,
         "proxy_use_belief_input": False,
-        # x_ij includes drow, dcol, distance, same_zone, zone_diff, and the
-        # target's public role code. Set this to zero
+        # x_ij includes five geometric channels and a six-way public-role
+        # one-hot vector. Set this to zero
         # to reproduce the old configuration, where f_theta is blind to
         # neighbour identity, for the H1 ablation.
-        "proxy_pair_feat_dim": 6,
+        "proxy_pair_feat_dim": 11,
         "proxy_ensemble_dropout": 0.0,
         # Controlled H2 behavioural manipulation.  The active policy becomes
         # (1-lambda)*pi_learned + lambda*pi_scripted before epsilon forcing.
@@ -237,6 +256,7 @@ def default_cfg():
         "behavioral_adapter_only_in_behavioral_drift": True,
         "behavioral_adapter_target_roles": None,
         "freeze_policy_learning": False,
+        "freeze_representation_state": False,
         "seed": 0,
 
         # final_runner.py sig_tracker/forcer/heads/drift/matdet/recip defaults
@@ -682,7 +702,15 @@ def _validate_tiny_env(env):
     return env
 
 
-def make_main_env(task_mode, n_agents, max_steps, phase_length, seed):
+def make_main_env(
+    task_mode,
+    n_agents,
+    max_steps,
+    phase_length,
+    seed,
+    structural_factor=None,
+    behavioral_factor=None,
+):
     EnvCls = _resolve_main_env_class()
 
     # ------------------------------------------------------------------
@@ -715,6 +743,8 @@ def make_main_env(task_mode, n_agents, max_steps, phase_length, seed):
         "episode_length": int(max_steps),
         "phase_length": int(phase_length),
         "seed": int(seed),
+        "structural_factor": structural_factor,
+        "behavioral_factor": behavioral_factor,
         "diagnostic_core_k": 4,
         "max_core_size": 4,
         "resample_agent_layout_each_reset": False,
@@ -1337,13 +1367,10 @@ def _signed_calibration(proxy_signed, oracle_signed, neighbor_ids):
 
 
 def _response_surface_calibration(proxy_q, oracle_q, neighbor_ids):
-    """Calibrate the primitive action-response surface Q before C/D.
-
-    The flattened comparison keeps every (neighbour, candidate-action) value;
-    reporting only C or D can hide an action-head failure whose aggregation
-    happens to look plausible.
-    """
-    learned, oracle = [], []
+    """Calibrate centred Q contrasts and retain raw calibration secondarily."""
+    learned_raw, oracle_raw = [], []
+    learned_centered, oracle_centered = [], []
+    within_state_ranks = []
     for neighbor in neighbor_ids:
         p = np.asarray(proxy_q.get(int(neighbor), []), dtype=np.float64).reshape(-1)
         q = np.asarray(oracle_q.get(int(neighbor), []), dtype=np.float64).reshape(-1)
@@ -1352,20 +1379,87 @@ def _response_surface_calibration(proxy_q, oracle_q, neighbor_ids):
                 f"Q calibration action support mismatch for neighbor={neighbor}: "
                 f"{p.shape} vs {q.shape}"
             )
-        learned.extend(p.tolist())
-        oracle.extend(q.tolist())
-    if not learned:
+        p_centered = p - np.mean(p)
+        q_centered = q - np.mean(q)
+        learned_raw.extend(p.tolist())
+        oracle_raw.extend(q.tolist())
+        learned_centered.extend(p_centered.tolist())
+        oracle_centered.extend(q_centered.tolist())
+        rank, _p, _constant = safe_spearman(p, q)
+        within_state_ranks.append(float(rank))
+    if not learned_raw:
         return {"q_mae": 0.0, "q_rmse": 0.0, "q_spearman": 0.0, "q_constant_case": 1}
-    learned = np.asarray(learned, dtype=np.float64)
-    oracle = np.asarray(oracle, dtype=np.float64)
-    rho, _p, constant = safe_spearman(learned, oracle)
-    diff = learned - oracle
+    learned_raw = np.asarray(learned_raw, dtype=np.float64)
+    oracle_raw = np.asarray(oracle_raw, dtype=np.float64)
+    learned_centered = np.asarray(learned_centered, dtype=np.float64)
+    oracle_centered = np.asarray(oracle_centered, dtype=np.float64)
+    rho, _p, constant = safe_spearman(learned_centered, oracle_centered)
+    centered_diff = learned_centered - oracle_centered
+    raw_diff = learned_raw - oracle_raw
     return {
-        "q_mae": float(np.mean(np.abs(diff))),
-        "q_rmse": float(np.sqrt(np.mean(diff ** 2))),
+        # Historical q_* names now denote the prespecified centred primary.
+        "q_mae": float(np.mean(np.abs(centered_diff))),
+        "q_rmse": float(np.sqrt(np.mean(centered_diff ** 2))),
         "q_spearman": float(rho),
         "q_constant_case": int(constant),
+        "q_centered_mae": float(np.mean(np.abs(centered_diff))),
+        "q_centered_rmse": float(np.sqrt(np.mean(centered_diff ** 2))),
+        "q_within_state_action_spearman": float(np.mean(within_state_ranks)),
+        "q_raw_mae": float(np.mean(np.abs(raw_diff))),
+        "q_raw_rmse": float(np.sqrt(np.mean(raw_diff ** 2))),
     }
+
+
+def _active_null_calibration(
+    learned_scores,
+    oracle_scores,
+    neighbor_ids,
+    oracle_threshold,
+    prediction_threshold,
+    signed=False,
+):
+    """Report active-subset recovery and null false-positive rate."""
+    learned = np.asarray(
+        [float(learned_scores.get(j, 0.0)) for j in neighbor_ids],
+        dtype=np.float64,
+    )
+    oracle = np.asarray(
+        [float(oracle_scores.get(j, 0.0)) for j in neighbor_ids],
+        dtype=np.float64,
+    )
+    oracle_magnitude = np.abs(oracle) if signed else oracle
+    learned_magnitude = np.abs(learned) if signed else learned
+    active = oracle_magnitude > float(oracle_threshold)
+    null = ~active
+    active_mae = (
+        float(np.mean(np.abs(learned[active] - oracle[active])))
+        if np.any(active)
+        else float("nan")
+    )
+    active_rank = (
+        float(safe_spearman(learned[active], oracle[active])[0])
+        if np.count_nonzero(active) >= 2
+        else float("nan")
+    )
+    null_fpr = (
+        float(np.mean(learned_magnitude[null] > float(prediction_threshold)))
+        if np.any(null)
+        else float("nan")
+    )
+    result = {
+        "active_count": int(np.count_nonzero(active)),
+        "null_count": int(np.count_nonzero(null)),
+        "active_mae": active_mae,
+        "active_spearman": active_rank,
+        "null_fpr": null_fpr,
+    }
+    if signed:
+        result["active_sign_agreement"] = (
+            float(np.mean(np.sign(learned[active]) == np.sign(oracle[active])))
+            if np.any(active)
+            else float("nan")
+        )
+    return result
 
 
 def _tiny_train_cfg_from_base(cfg):
@@ -1561,7 +1655,9 @@ def _score_learned_proxy_for_state(runner, tiny_env, state, ego, neighbor_ids):
 
     if hasattr(runner, "_raw_proxy_context_excluding"):
         raw_excluding = {
-            int(j): runner._raw_proxy_context_excluding(int(ego), int(j))
+            int(j): runner._raw_proxy_context_excluding(
+                int(ego), int(j), current_actions=current_actions
+            )
             for j in neighbor_ids if int(j) != int(ego)
         }
         z_excluding = {j: raw_excluding[j][0] for j in raw_excluding}
@@ -1696,6 +1792,10 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
         j: float(out.get("d_mu", out["mu"])[k])
         for k, j in enumerate(neighbor_ids)
     }
+    row_aipw_signed = {
+        j: float(out.get("d_row_aipw_mu", out.get("d_mu", out["mu"]))[k])
+        for k, j in enumerate(neighbor_ids)
+    }
     capacity = {
         j: float(out.get("c_mu", out["mu_range"])[k])
         for k, j in enumerate(neighbor_ids)
@@ -1706,6 +1806,7 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
     }
     learned = {
         "direction": signed,
+        "direction_row_aipw": row_aipw_signed,
         "capacity": capacity,
         "q": response_surface,
         "signed": signed,
@@ -1860,6 +1961,17 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
     eval_steps, policy_return_metadata = _collect_h1_eval_steps(
         runner, int(args.tiny_states)
     )
+    crossfit = None
+    crossfit_error = ""
+    try:
+        crossfit = CrossFittedConditionalAIPW(
+            action_dim=runner.action_dim,
+            n_folds=tiny_cfg.get("h1_crossfit_folds", 5),
+            ridge=tiny_cfg.get("h1_crossfit_ridge", 1e-3),
+            iw_clip=tiny_cfg.get("h1_crossfit_iw_clip", None),
+        ).fit(list(runner.proxy.buffer))
+    except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+        crossfit_error = f"{type(exc).__name__}: {exc}"
 
     rows = []
     aggregate_rows = []
@@ -1886,6 +1998,27 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
             learned_scores, sigmas, score_meta = _score_h1_logged_step(
                 runner, tiny_env, step, ego, neighbor_ids,
             )
+            if crossfit is not None:
+                geom = step["geom_snapshot"]
+                prediction_samples = []
+                for j in neighbor_ids:
+                    prediction_samples.append({
+                        "obs_i": tiny_env.get_obs_of_ego(step["obs_all"], ego),
+                        "action_i": int(step["actions"][ego]),
+                        "pair_feat": build_pair_feat(
+                            geom["positions"], geom["agent_zone"],
+                            geom["grid_size"], geom["n_zones"], ego, j,
+                            agent_role=geom.get("agent_role"),
+                        ),
+                        "z_core_excl_j": step["proxy_context_excluding"][ego][j][0],
+                        "m_periph_excl_j": step["proxy_context_excluding"][ego][j][1],
+                    })
+                learned_scores["direction_crossfit_aipw"] = {
+                    int(j): float(value)
+                    for j, value in zip(
+                        neighbor_ids, crossfit.predict(prediction_samples)
+                    )
+                }
             oracle_scores, replay_error = _h1_one_step_oracle_scores(
                 tiny_env, step, ego, neighbor_ids, candidate_actions,
             )
@@ -1908,8 +2041,45 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                 oracle_signed=oracle_scores["direction"],
                 neighbor_ids=neighbor_ids,
             )
+            row_aipw_cal = _signed_calibration(
+                proxy_signed=learned_scores["direction_row_aipw"],
+                oracle_signed=oracle_scores["direction"],
+                neighbor_ids=neighbor_ids,
+            )
+            crossfit_cal = (
+                _signed_calibration(
+                    learned_scores["direction_crossfit_aipw"],
+                    oracle_scores["direction"],
+                    neighbor_ids,
+                )
+                if "direction_crossfit_aipw" in learned_scores
+                else None
+            )
             q_cal = _response_surface_calibration(
                 learned_scores["q"], oracle_scores["q"], neighbor_ids,
+            )
+            capacity_subsets = _active_null_calibration(
+                learned_scores["capacity"],
+                oracle_scores["capacity"],
+                neighbor_ids,
+                oracle_threshold=tiny_cfg.get(
+                    "h1_capacity_active_threshold", 0.05
+                ),
+                prediction_threshold=tiny_cfg.get(
+                    "h1_capacity_prediction_threshold", 0.05
+                ),
+            )
+            direction_subsets = _active_null_calibration(
+                learned_scores["direction"],
+                oracle_scores["direction"],
+                neighbor_ids,
+                oracle_threshold=tiny_cfg.get(
+                    "h1_direction_active_threshold", 0.02
+                ),
+                prediction_threshold=tiny_cfg.get(
+                    "h1_direction_prediction_threshold", 0.02
+                ),
+                signed=True,
             )
             top_k = int(max(
                 1, min(tiny_cfg.get("max_core_size", 4), len(neighbor_ids))
@@ -1936,7 +2106,22 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
             }
             aggregate_row.update(cal)
             aggregate_row.update(signed_cal)
+            aggregate_row.update({
+                f"direction_row_aipw_{key}": value
+                for key, value in row_aipw_cal.items()
+            })
+            if crossfit_cal is not None:
+                aggregate_row.update({
+                    f"direction_crossfit_aipw_{key}": value
+                    for key, value in crossfit_cal.items()
+                })
             aggregate_row.update(q_cal)
+            aggregate_row.update(
+                {f"capacity_{key}": value for key, value in capacity_subsets.items()}
+            )
+            aggregate_row.update(
+                {f"direction_{key}": value for key, value in direction_subsets.items()}
+            )
             # Explicit Paper-A names.  The historical fields above remain for
             # compatibility, but H1a/H1b/H1c must not require readers to infer
             # which scalar is Q, C, or D.
@@ -1964,6 +2149,9 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                     "learned_score": float(learned_scores["capacity"][j]),
                     "oracle_score": float(oracle_scores["capacity"][j]),
                     "learned_signed": float(learned_scores["direction"][j]),
+                    "learned_direction_row_aipw": float(
+                        learned_scores["direction_row_aipw"][j]
+                    ),
                     "oracle_signed": float(oracle_scores["direction"][j]),
                     "learned_range": float(learned_scores["capacity"][j]),
                     "oracle_range": float(oracle_scores["capacity"][j]),
@@ -2021,6 +2209,11 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
         ),
         "n_forced_proxy_samples": int(coverage["n_forced_samples"]),
         "forcing_stats": forcing_stats,
+        "crossfit_aipw_fitted": bool(crossfit is not None),
+        "crossfit_aipw_error": crossfit_error,
+        "crossfit_aipw_diagnostics": (
+            {} if crossfit is None else crossfit.diagnostics
+        ),
         "realised_forcing_rate": float(
             forcing_stats["realised_forcing_rate"]
         ),
@@ -2239,6 +2432,11 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
         "q_mae",
         "q_rmse",
         "q_spearman",
+        "q_centered_mae",
+        "q_centered_rmse",
+        "q_within_state_action_spearman",
+        "q_raw_mae",
+        "q_raw_rmse",
         "capacity_rank_correlation",
         "capacity_mae",
         "capacity_bias",
@@ -2246,6 +2444,19 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
         "direction_mae",
         "direction_bias",
         "direction_sign_agreement",
+        "capacity_active_mae",
+        "capacity_active_spearman",
+        "capacity_null_fpr",
+        "direction_active_mae",
+        "direction_active_spearman",
+        "direction_active_sign_agreement",
+        "direction_null_fpr",
+        "direction_crossfit_aipw_signed_mae",
+        "direction_crossfit_aipw_signed_spearman",
+        "direction_crossfit_aipw_sign_agreement",
+        "direction_row_aipw_signed_mae",
+        "direction_row_aipw_signed_spearman",
+        "direction_row_aipw_sign_agreement",
     ]
 
     for key in numeric_keys:

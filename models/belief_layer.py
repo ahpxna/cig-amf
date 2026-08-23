@@ -27,7 +27,7 @@ V1 DEFECTS, DIAGNOSED USING THE PAPER'S OWN RESULTS
      denominator in Eq. 14, which caused saturation. The effects compounded.
 
      v2 SEPARATES THE TWO ROLES. sigma regulates only learning speed. Core
-     selection uses the lower confidence bound:
+     selection uses an uncertainty-penalized capacity score:
          score_lcb = |mu_bar| - kappa * sigma_bar
      High uncertainty is SUBTRACTED, making core entry conservatively harder,
      but cannot saturate the score because sigma is additive rather than a
@@ -138,7 +138,7 @@ class BayesLightBeliefState:
         self.min_core_size = min(self.min_core_size, self.max_core_size)
 
         if core_rule not in ("lcb", "p_core", "signed"):
-            raise ValueError(f"core_rule không hợp lệ: {core_rule}")
+            raise ValueError(f"invalid core_rule: {core_rule}")
 
         self.core_rule = str(core_rule)
         self.kappa = float(kappa)
@@ -472,7 +472,9 @@ class BayesLightBeliefState:
         """Update one pair through the single-item vectorized batch path."""
         self.update_batch({int(j): (mu, sigma)})
 
-    def update_batch(self, mu_sigma_dict) -> Tuple[Set[int], Set[int]]:
+    def update_batch(
+        self, mu_sigma_dict, *, select_core: bool = True
+    ) -> Tuple[Set[int], Set[int]]:
         """
         Preserve the v1 signature: accept {j:(mu,sigma)} and return promoted/demoted.
 
@@ -525,8 +527,9 @@ class BayesLightBeliefState:
             # Adam-style bias correction; formula unchanged.
             self._bias_corr_arr[idx] = self._bias_corr_arr[idx] * (1.0 - alpha)
 
-            # p_core is a calibrated diagnostic of the exact same structural
-            # score used for membership.  It is not a separate control signal.
+            # p_core is a probability-like visualization of the structural
+            # priority score. It is not statistically calibrated and is not a
+            # separate control signal.
             mu_deb, sig_deb = self._debiased_arr(idx)
             effective_sigma = np.maximum(sig_deb, self.sigma_floor)
 
@@ -574,7 +577,13 @@ class BayesLightBeliefState:
                 if len(self.p_history[jj]) > 500:
                     del self.p_history[jj][:-500]
 
+        if not bool(select_core):
+            return set(), set()
         return self._update_core_set()
+
+    def update_evidence(self, mu_sigma_dict) -> None:
+        """Update C evidence without executing an allocation rule."""
+        self.update_batch(mu_sigma_dict, select_core=False)
 
     # =====================================================================
     # Core selection.

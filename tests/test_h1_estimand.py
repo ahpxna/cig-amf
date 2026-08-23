@@ -227,18 +227,18 @@ class H1ClaimGateTests(unittest.TestCase):
     @staticmethod
     def _supporting_rows():
         epsilon_bias = {
-            "dr_eps000": 0.60,
-            "dr_eps001": 0.50,
-            "dr_eps003": 0.30,
-            "dr_eps005": 0.10,
-            "dr_eps008": 0.08,
-            "dr_eps012": 0.05,
+            "plugin_eps000": 0.60,
+            "plugin_eps001": 0.50,
+            "plugin_eps003": 0.30,
             "plugin_eps005": 0.30,
+            "row_aipw_diag_eps005": 0.10,
+            "plugin_eps008": 0.08,
+            "plugin_eps012": 0.05,
         }
         rows = []
         for seed in range(8):
             for variant, _ in h1_calibration.VARIANTS:
-                if variant == "dr_eps005":
+                if variant == "row_aipw_diag_eps005":
                     signed_rank = 0.80 + 0.002 * seed
                     forcing_rate = 0.05
                     heldout_return = 9.0 + 0.01 * seed
@@ -246,7 +246,7 @@ class H1ClaimGateTests(unittest.TestCase):
                     signed_rank = 0.40 + 0.002 * seed
                     forcing_rate = 0.05
                     heldout_return = 9.0 + 0.01 * seed
-                elif variant == "dr_eps000":
+                elif variant == "plugin_eps000":
                     signed_rank = 0.20 + 0.002 * seed
                     forcing_rate = 0.0
                     heldout_return = 10.0 + 0.01 * seed
@@ -274,9 +274,14 @@ class H1ClaimGateTests(unittest.TestCase):
                     "direction_mae_mean": abs(epsilon_bias[variant]),
                     "direction_bias_mean": epsilon_bias[variant],
                     "direction_sign_agreement_mean": 0.90,
+                    "direction_row_aipw_signed_spearman_mean": (
+                        0.80 + 0.002 * seed
+                    ),
+                    "direction_row_aipw_signed_mae_mean": 0.10,
+                    "direction_row_aipw_sign_agreement_mean": 0.90,
                     # Missing eps=0 coverage is an intended control outcome;
                     # only the main arm enters the scientific coverage gate.
-                    "action_coverage_gate_pass": variant == "dr_eps005",
+                    "action_coverage_gate_pass": variant == "plugin_eps005",
                     "dr_clipping_absent": True,
                     "realised_forcing_rate": forcing_rate,
                     "heldout_policy_return_mean_per_agent": heldout_return,
@@ -297,7 +302,7 @@ class H1ClaimGateTests(unittest.TestCase):
             claim[
                 "h1_estimator_ablation"
             ][
-                "direction_rank_dr_minus_plugin_paired_bootstrap"
+                "direction_rank_row_aipw_minus_plugin_paired_bootstrap"
             ]["ci95_low"],
             0.0,
         )
@@ -311,7 +316,7 @@ class H1ClaimGateTests(unittest.TestCase):
     def test_failed_capacity_recovery_blocks_h1(self):
         rows = self._supporting_rows()
         for row in rows:
-            if row["variant"] == "dr_eps005":
+            if row["variant"] == "plugin_eps005":
                 row["capacity_rank_correlation_mean"] = 0.10
         claim = h1_calibration._claim_gate(rows)
         self.assertFalse(claim["h1_claim_gate_pass"])
@@ -320,7 +325,7 @@ class H1ClaimGateTests(unittest.TestCase):
     def test_missing_forcing_return_endpoint_is_reported_separately(self):
         rows = self._supporting_rows()
         for row in rows:
-            if row["variant"] == "dr_eps000":
+            if row["variant"] == "plugin_eps000":
                 row["policy_return_endpoint_measured"] = False
         claim = h1_calibration._claim_gate(rows)
         self.assertFalse(claim["h1_exp1_reporting_complete"])

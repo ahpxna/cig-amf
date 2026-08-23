@@ -19,10 +19,23 @@ def _h2_rows():
                     "seed": seed,
                     "claim_evaluable": True,
                     "episodes": 400,
+                    "policy_learning_frozen": True,
+                    "representation_learning_frozen": True,
+                    "frozen_representation_unchanged": True,
                     "SR_C": sr,
+                    "capacity_beta_structural": 0.40,
+                    "capacity_beta_behavioral": 0.05,
+                    "direction_beta_structural": 0.02,
+                    "direction_beta_behavioral": 0.30,
+                    "estimand_capacity_beta_structural": 0.50,
+                    "estimand_capacity_beta_behavioral": 0.02,
+                    "estimand_direction_beta_behavioral": 0.40,
+                    "behavioral_false_trigger_rate": 0.01,
                     "recovery_latency": latency,
                     "n_shift_events": 2,
-                    "n_recovered_shifts": 2,
+                    "n_recovered_shifts": (
+                        2 if model == "Final-CIGAMF" else 1
+                    ),
                     "n_shift_with_trigger": 2,
                     "n_complete_structural_windows": 2,
                     "n_complete_behavioral_windows": 2,
@@ -39,20 +52,20 @@ class H2ClaimGateTests(unittest.TestCase):
         self.assertTrue(report["supported"])
         self.assertTrue(
             report["conditions"][
-                "two_timescale_scheduler_beats_every_episode_control"
+                "two_timescale_scheduler_improves_recovery_coverage"
             ]
         )
 
-    def test_one_unrecovered_shift_prevents_support(self):
+    def test_missing_capacity_selectivity_prevents_support(self):
         rows = _h2_rows()
         for row in rows:
-            if row["model"] == "Final-CIGAMF" and row["seed"] == 0:
-                row["n_recovered_shifts"] = 1
+            if row["model"] == "Final-CIGAMF":
+                row["capacity_beta_behavioral"] = 0.60
         report = claims._h2_status(rows, h1_supported=True)
         self.assertFalse(report["supported"])
         self.assertFalse(
             report["conditions"][
-                "final_recovers_and_triggers_for_every_structural_shift"
+                "capacity_prefers_structural_over_behavioral_change"
             ]
         )
 

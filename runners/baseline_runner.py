@@ -1279,6 +1279,14 @@ class SharedAblationBase:
         self.periph_dim = int(cfg["periph_dim"])
         self.belief_dim = int(cfg["belief_dim"])
 
+        causal_horizon = int(cfg["causal_horizon"])
+        proxy_horizon = int(cfg.get("proxy_n_horizons", causal_horizon))
+        if proxy_horizon != causal_horizon:
+            raise ValueError(
+                "causal_horizon and proxy_n_horizons must be identical: "
+                f"received {causal_horizon} and {proxy_horizon}"
+            )
+
         self.proxy = LocalCounterfactualProxyEnsemble(
             obs_dim=self.obs_dim,
             action_dim=self.action_dim,
@@ -1293,7 +1301,8 @@ class SharedAblationBase:
             device=device,
             # v2 defaults match structural_proxy.py and therefore do not
             # change behaviour when the configuration omits these fields.
-            n_horizons=cfg.get("proxy_n_horizons", 3),
+            n_horizons=proxy_horizon,
+            discount=cfg["discount"],
             effect_mode=cfg.get("proxy_effect_mode", "signed_aristocrat"),
             use_doubly_robust=cfg.get("proxy_use_doubly_robust", True),
             iw_clip=cfg.get("proxy_iw_clip", 10.0),
@@ -1324,6 +1333,7 @@ class SharedAblationBase:
             out_dim=self.periph_dim,
             mu_floor=cfg.get("periph_mu_floor", 0.02),
             beta_floor=cfg.get("periph_beta_floor", 0.05),
+            semantic_mass=cfg.get("periph_semantic_mass", 0.5),
             use_uniform_mix=cfg.get("periph_use_uniform_mix", True),
             uniform_mix=cfg.get("periph_uniform_mix", 0.25),
             lb_coeff=cfg.get("periph_lb_coeff", 0.5),
@@ -1652,7 +1662,15 @@ class SharedAblationBase:
         out[:min(out.size, source.size)] = source[:out.size]
         return out
 
-    def _raw_proxy_context_excluding(self, ego, exclude_j):
+    def _split_raw_context(self, values):
+        """Pack a raw set summary across both legacy context tensors."""
+        packed = self._fit_raw_context(
+            values,
+            int(self.core_dim) + int(self.periph_dim),
+        )
+        return packed[:self.core_dim], packed[self.core_dim:]
+
+    def _raw_proxy_context_excluding(self, ego, exclude_j, current_actions=None):
         """Build the proxy's partition-independent leave-one-out context.
 
         The shared ablations retain the same causal measurement contract as
@@ -1667,7 +1685,11 @@ class SharedAblationBase:
         zone_i = int(self.env.agent_zone[ego])
         grid = max(1.0, float(getattr(self.env, "grid_size", 1)))
         zones = max(1.0, float(getattr(self.env, "n_zones", 1) - 1))
-        last_actions = getattr(self.env, "last_actions", {})
+        action_source = (
+            current_actions
+            if current_actions is not None
+            else getattr(self.env, "last_actions", {})
+        )
         rows = []
 
         for other in range(self.n_agents):
@@ -1680,26 +1702,25 @@ class SharedAblationBase:
             zone_delta = (float(self.env.agent_zone[other]) - zone_i) / zones
             same_zone = float(int(self.env.agent_zone[other]) == zone_i)
             try:
-                action = float(last_actions[other]) / max(1.0, self.action_dim - 1.0)
+                action_index = int(action_source[other])
             except (KeyError, IndexError, TypeError):
-                action = 0.0
-            rows.append([drow, dcol, distance, same_zone, zone_delta, action])
+                action_index = 0
+            action_onehot = np.zeros(self.action_dim, dtype=np.float32)
+            action_onehot[int(np.clip(action_index, 0, self.action_dim - 1))] = 1.0
+            rows.append(
+                [drow, dcol, distance, same_zone, zone_delta, *action_onehot.tolist()]
+            )
 
         table = np.asarray(rows, dtype=np.float32)
         if table.size == 0:
-            summary = np.zeros(18, dtype=np.float32)
+            summary = np.zeros(2 * (5 + self.action_dim) + 1, dtype=np.float32)
         else:
             summary = np.concatenate(
-                [table.mean(axis=0), table.std(axis=0), table.max(axis=0)], axis=0
+                [table.sum(axis=0), np.square(table).sum(axis=0), [len(table)]],
+                axis=0,
             ).astype(np.float32)
 
-        return (
-            self._fit_raw_context(summary, self.core_dim),
-            self._fit_raw_context(
-                np.concatenate([summary[6:12], summary[:6], summary[12:]]),
-                self.periph_dim,
-            ),
-        )
+        return self._split_raw_context(summary)
 
     def _periph_context_excluding(self, ego, exclude_j):
         if not self.use_multi_memory:
@@ -1809,6 +1830,16 @@ class SharedAblationBase:
         for ego in range(self.n_agents):
             actions[ego] = int(sampled[ego])
             cache["value_cache"][ego] = float(values[ego].item())
+
+        actions_list = [actions[agent] for agent in range(self.n_agents)]
+        for ego in range(self.n_agents):
+            for j in range(self.n_agents):
+                if j != ego:
+                    cache["proxy_context_excluding"][ego][j] = (
+                        self._raw_proxy_context_excluding(
+                            ego, j, current_actions=actions_list
+                        )
+                    )
 
         return actions, cache
 
@@ -2001,6 +2032,9 @@ class SharedAblationBase:
         if not self.use_belief:
             return 0
 
+        for timestep, step in enumerate(trajectory):
+            step.setdefault("episode_id", int(self.episodes_completed))
+            step.setdefault("timestep", int(timestep))
         pushed = self.replay_builder.push_trajectory_to_proxy(
             trajectory=trajectory,
             proxy_ensemble=self.proxy,
@@ -2038,7 +2072,9 @@ class SharedAblationBase:
                 obs_i_batch.append(obs_i)
                 action_i_batch.append(action_i)
                 action_j_batch.append(int(actions[j]))
-                raw_core, raw_periph = self._raw_proxy_context_excluding(ego, j)
+                raw_core, raw_periph = self._raw_proxy_context_excluding(
+                    ego, j, current_actions=actions
+                )
                 z_batch.append(raw_core)
                 m_batch.append(raw_periph)
                 b_batch.append(belief_summary)

@@ -119,6 +119,8 @@ class DriftDetector:
         batch_size: int = 256,
         recalibrate_after: int = 15,
         window: int = 20,
+        cusum_allowance: float = 0.5,
+        cusum_threshold: float = 8.0,
         seed: int = 0,
     ):
         torch.manual_seed(int(seed))
@@ -130,6 +132,12 @@ class DriftDetector:
         self.warmup_batches = int(warmup_batches)
         self.recalibrate_after = int(recalibrate_after)
         self.window = int(window)
+        self.cusum_allowance = float(cusum_allowance)
+        self.cusum_threshold = float(cusum_threshold)
+        self.reference_mean = None
+        self.reference_std = None
+        self.cusum_stat = 0.0
+        self.latest_standardized_residual = 0.0
 
         self.live = StructuralDriftProbe(
             obs_dim=obs_dim,
@@ -179,7 +187,10 @@ class DriftDetector:
             [b["observed_action_j"] for b in batch]
         )                                                    # [B, A]
         tgt = torch.tensor(
-            np.stack([b["target_returns_multi"] for b in batch], axis=0),
+            np.stack(
+                [b.get("target_lag_rewards", b.get("target_returns_multi")) for b in batch],
+                axis=0,
+            ),
             dtype=torch.float32, device=self.device,
         )                                                    # [B, H]
 
@@ -230,6 +241,10 @@ class DriftDetector:
 
         # A new witness invalidates the old residual scale.
         self.residual_history.clear()
+        self.reference_mean = None
+        self.reference_std = None
+        self.cusum_stat = 0.0
+        self.latest_standardized_residual = 0.0
 
     def measure(self, buffer, n: int = 512) -> Optional[float]:
         """
@@ -251,7 +266,10 @@ class DriftDetector:
         a_i = self._one_hot([b["action_i"] for b in buf])
         a_j = self._one_hot([b["observed_action_j"] for b in buf])
         tgt = torch.tensor(
-            np.stack([b["target_returns_multi"] for b in buf], axis=0),
+            np.stack(
+                [b.get("target_lag_rewards", b.get("target_returns_multi")) for b in buf],
+                axis=0,
+            ),
             dtype=torch.float32, device=self.device,
         )
 
@@ -269,27 +287,25 @@ class DriftDetector:
 
     def residual_z_score(self) -> float:
         """
-        Express the newest residual in standard deviations from the recent
-        window. A z-score is dimensionless and remains usable across reward
-        scales, unlike a raw residual threshold.
+        Standardize against a fixed pre-monitoring reference distribution.
         """
         h = self.residual_history
 
-        if len(h) < 5:
+        if self.reference_mean is None:
+            if len(h) < max(5, self.window):
+                return 0.0
+            reference = np.asarray(h[:self.window], dtype=np.float64)
+            self.reference_mean = float(np.mean(reference))
+            self.reference_std = float(max(np.std(reference), 1e-9))
             return 0.0
-
-        recent = np.asarray(h[-self.window:], dtype=np.float64)
-        base = recent[:-1]
-
-        if base.size < 3:
-            return 0.0
-
-        mu, sd = float(np.mean(base)), float(np.std(base))
-
-        if sd < 1e-9:
-            return 0.0
-
-        return float((h[-1] - mu) / sd)
+        z = float(
+            (h[-1] - self.reference_mean) / self.reference_std
+        )
+        self.latest_standardized_residual = z
+        self.cusum_stat = max(
+            0.0, self.cusum_stat + z - self.cusum_allowance
+        )
+        return float(self.cusum_stat)
 
     # ------------------------------------------------------------------
 
@@ -335,6 +351,9 @@ class DriftDetector:
             "batches": int(self.n_batches_trained),
             "residual": res,
             "z": float(z),
+            "standardized_residual": float(self.latest_standardized_residual),
+            "cusum": float(self.cusum_stat),
+            "cusum_threshold": float(self.cusum_threshold),
         }
 
     def notify_trigger(self, episode: int):

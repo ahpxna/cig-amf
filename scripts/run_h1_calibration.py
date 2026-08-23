@@ -30,17 +30,17 @@ except ModuleNotFoundError:  # Support module imports in focused tests.
 import run_experiment as RE
 
 VARIANTS = [
-    # Estimator ablation. Both variants train the same nuisance response
-    # model; only held-out scoring changes.  This is reported separately from
-    # the Q/C/D recovery hypotheses.
-    ("dr_eps005", {"proxy_use_doubly_robust": True, "eps": 0.05}),
+    # Online D remains plug-in. Enabling row AIPW exposes the same-row
+    # correction only as a held-out diagnostic; it is never routed into the
+    # signature, semantic memory, or core selector.
+    ("row_aipw_diag_eps005", {"proxy_use_doubly_robust": True, "eps": 0.05}),
     ("plugin_eps005", {"proxy_use_doubly_robust": False, "eps": 0.05}),
     # Constant-epsilon identification sweep.
-    ("dr_eps000", {"proxy_use_doubly_robust": True, "eps": 0.0}),
-    ("dr_eps001", {"proxy_use_doubly_robust": True, "eps": 0.01}),
-    ("dr_eps003", {"proxy_use_doubly_robust": True, "eps": 0.03}),
-    ("dr_eps008", {"proxy_use_doubly_robust": True, "eps": 0.08}),
-    ("dr_eps012", {"proxy_use_doubly_robust": True, "eps": 0.12}),
+    ("plugin_eps000", {"proxy_use_doubly_robust": False, "eps": 0.0}),
+    ("plugin_eps001", {"proxy_use_doubly_robust": False, "eps": 0.01}),
+    ("plugin_eps003", {"proxy_use_doubly_robust": False, "eps": 0.03}),
+    ("plugin_eps008", {"proxy_use_doubly_robust": False, "eps": 0.08}),
+    ("plugin_eps012", {"proxy_use_doubly_robust": False, "eps": 0.12}),
 ]
 
 KEEP_KEYS = (
@@ -50,13 +50,25 @@ KEEP_KEYS = (
     "range_rank_correlation_mean",
     "bias_mean", "mae_mean", "pearson_mean", "n_states", "n_pairs",
     "q_mae_mean", "q_rmse_mean", "q_spearman_mean",
+    "q_centered_mae_mean", "q_centered_rmse_mean",
+    "q_within_state_action_spearman_mean", "q_raw_mae_mean", "q_raw_rmse_mean",
     "capacity_rank_correlation_mean", "capacity_mae_mean",
     "capacity_bias_mean", "oracle_core_f1_mean",
     "direction_spearman_mean", "direction_mae_mean",
     "direction_bias_mean", "direction_sign_agreement_mean",
+    "capacity_active_mae_mean", "capacity_active_spearman_mean",
+    "capacity_null_fpr_mean", "direction_active_mae_mean",
+    "direction_active_spearman_mean", "direction_active_sign_agreement_mean",
+    "direction_null_fpr_mean",
+    "direction_crossfit_aipw_signed_mae_mean",
+    "direction_crossfit_aipw_signed_spearman_mean",
+    "direction_crossfit_aipw_sign_agreement_mean",
+    "direction_row_aipw_signed_mae_mean",
+    "direction_row_aipw_signed_spearman_mean",
+    "direction_row_aipw_sign_agreement_mean",
 )
 
-PROTOCOL_VERSION = "h1_qcd_v2"
+PROTOCOL_VERSION = "h1_qcd_crossfit_v3"
 MIN_CONFIRMATORY_SEEDS = 8
 BOOTSTRAP_REPLICATES = 20000
 BOOTSTRAP_SEED = 1729
@@ -133,6 +145,12 @@ def _variant_means(rows, variant):
         "capacity_bias_mean", "oracle_core_f1_mean",
         "direction_spearman_mean", "direction_mae_mean",
         "direction_bias_mean", "direction_sign_agreement_mean",
+        "direction_row_aipw_signed_spearman_mean",
+        "direction_row_aipw_signed_mae_mean",
+        "direction_row_aipw_sign_agreement_mean",
+        "direction_crossfit_aipw_signed_spearman_mean",
+        "direction_crossfit_aipw_signed_mae_mean",
+        "direction_crossfit_aipw_sign_agreement_mean",
         "realised_forcing_rate", "heldout_policy_return_mean_per_agent",
     ):
         fallback = aliases.get(key)
@@ -241,12 +259,12 @@ def _paired_bootstrap_summary(paired_rows, seed_offset=0):
 def _epsilon_bias_trend(rows):
     """Summarize the declared absolute-bias trend over constant epsilon arms."""
     variants = (
-        (0.00, "dr_eps000"),
-        (0.01, "dr_eps001"),
-        (0.03, "dr_eps003"),
-        (0.05, "dr_eps005"),
-        (0.08, "dr_eps008"),
-        (0.12, "dr_eps012"),
+        (0.00, "plugin_eps000"),
+        (0.01, "plugin_eps001"),
+        (0.03, "plugin_eps003"),
+        (0.05, "plugin_eps005"),
+        (0.08, "plugin_eps008"),
+        (0.12, "plugin_eps012"),
     )
     curve = []
     for epsilon, variant in variants:
@@ -334,7 +352,7 @@ def _forcing_reporting(rows):
     }
 
     cost_pairs = _paired_differences(
-        rows, "dr_eps000", "dr_eps005",
+        rows, "plugin_eps000", "plugin_eps005",
         lambda no_forcing, forcing: (
             float(no_forcing["heldout_policy_return_mean_per_agent"])
             - float(forcing["heldout_policy_return_mean_per_agent"])
@@ -343,7 +361,7 @@ def _forcing_reporting(rows):
     cost_summary = _paired_bootstrap_summary(cost_pairs, seed_offset=2)
     endpoints = [
         row for row in rows
-        if row.get("variant") in ("dr_eps000", "dr_eps005")
+        if row.get("variant") in ("plugin_eps000", "plugin_eps005")
     ]
     return_endpoint_complete = bool(
         cost_summary["n_pairs"] >= MIN_CONFIRMATORY_SEEDS
@@ -362,7 +380,7 @@ def _forcing_reporting(rows):
         "realised_forcing_rate_mean_by_variant": realised_rate_by_variant,
         "forcing_return_cost_definition": (
             "paired held-out mean per-agent episode return: "
-            "dr_eps000 minus dr_eps005; positive values are a forcing cost"
+            "plugin_eps000 minus plugin_eps005; positive values are a forcing cost"
         ),
         "forcing_return_cost_paired_bootstrap": cost_summary,
         "forcing_return_cost_measured": return_endpoint_complete,
@@ -373,17 +391,15 @@ def _forcing_reporting(rows):
 
 
 def _claim_gate(rows):
-    """Adjudicate response-surface recovery; report DR only as an ablation."""
-    dr = _variant_means(rows, "dr_eps005")
+    """Adjudicate plug-in Q/C/D recovery; report AIPW only as diagnostics."""
     plugin = _variant_means(rows, "plugin_eps005")
-    observational = _variant_means(rows, "dr_eps000")
+    row_aipw = _variant_means(rows, "row_aipw_diag_eps005")
+    observational = _variant_means(rows, "plugin_eps000")
     direction_rank_paired = _paired_bootstrap_summary(
         _paired_differences(
-            rows, "dr_eps005", "plugin_eps005",
+            rows, "row_aipw_diag_eps005", "plugin_eps005",
             lambda left, right: (
-                float(left.get(
-                    "direction_spearman_mean", left["signed_spearman_mean"]
-                ))
+                float(left["direction_row_aipw_signed_spearman_mean"])
                 - float(right.get(
                     "direction_spearman_mean", right["signed_spearman_mean"]
                 ))
@@ -393,29 +409,28 @@ def _claim_gate(rows):
     )
     direction_mae_paired = _paired_bootstrap_summary(
         _paired_differences(
-            rows, "dr_eps005", "plugin_eps005",
+            rows, "row_aipw_diag_eps005", "plugin_eps005",
             lambda left, right: (
                 float(right.get("direction_mae_mean", right["signed_mae_mean"]))
-                - float(left.get("direction_mae_mean", left["signed_mae_mean"]))
+                - float(left["direction_row_aipw_signed_mae_mean"])
             ),
         ),
         seed_offset=1,
     )
     forcing_reporting = _forcing_reporting(rows)
-    q_recovery = bool(dr["q_spearman_mean"] >= MIN_Q_SPEARMAN)
+    q_recovery = bool(plugin["q_spearman_mean"] >= MIN_Q_SPEARMAN)
     capacity_recovery = bool(
-        dr["capacity_rank_correlation_mean"] >= MIN_CAPACITY_RANK
-        and dr["oracle_core_f1_mean"] >= MIN_CAPACITY_CORE_F1
+        plugin["capacity_rank_correlation_mean"] >= MIN_CAPACITY_RANK
+        and plugin["oracle_core_f1_mean"] >= MIN_CAPACITY_CORE_F1
     )
     direction_recovery = bool(
-        dr["direction_spearman_mean"] >= MIN_DIRECTION_SPEARMAN
-        and dr["direction_sign_agreement_mean"] >= MIN_DIRECTION_SIGN_AGREEMENT
+        plugin["direction_spearman_mean"] >= MIN_DIRECTION_SPEARMAN
+        and plugin["direction_sign_agreement_mean"] >= MIN_DIRECTION_SIGN_AGREEMENT
     )
     support_integrity = bool(
-        dr["action_coverage_all_seeds"]
-        and dr["dr_clipping_absent_all_seeds"]
-        and math.isfinite(dr["realised_forcing_rate"])
-        and dr["realised_forcing_rate"] > 0.0
+        plugin["action_coverage_all_seeds"]
+        and math.isfinite(plugin["realised_forcing_rate"])
+        and plugin["realised_forcing_rate"] > 0.0
     )
     # The full epsilon sweep and paired return endpoint remain reproducibility
     # reporting.  They are not a monotonic-bias theorem and no longer decide
@@ -423,32 +438,34 @@ def _claim_gate(rows):
     passed = bool(q_recovery and capacity_recovery and direction_recovery and support_integrity)
     return {
         "h1_claim_gate_pass": passed,
-        "h1_main": dr,
+        "h1_main": plugin,
         "h1_plugin_control": plugin,
+        "h1_row_aipw_diagnostic": row_aipw,
         "h1_observational_control": observational,
         "h1a_q_recovery_pass": q_recovery,
         "h1b_capacity_recovery_pass": capacity_recovery,
         "h1c_direction_recovery_pass": direction_recovery,
         "h1_support_integrity_pass": support_integrity,
         "h1_estimator_ablation": {
-            "direction_rank_dr_minus_plugin_paired_bootstrap": direction_rank_paired,
-            "direction_mae_plugin_minus_dr_paired_bootstrap": direction_mae_paired,
+            "direction_rank_row_aipw_minus_plugin_paired_bootstrap": direction_rank_paired,
+            "direction_mae_plugin_minus_row_aipw_paired_bootstrap": direction_mae_paired,
             "interpretation": (
-                "AIPW versus plug-in is an estimator ablation. Its sign does not "
+                "Row-AIPW and cross-fitted AIPW versus plug-in are estimator "
+                "diagnostics. Their sign does not "
                 "adjudicate H1a/H1b/H1c."
             ),
         },
         "h1_forcing_reporting": forcing_reporting,
         "h1_exp1_reporting_complete": forcing_reporting["reporting_complete"],
-        "h1_main_action_coverage_gate_pass": dr["action_coverage_all_seeds"],
-        "h1_main_dr_clipping_absent": dr["dr_clipping_absent_all_seeds"],
+        "h1_main_action_coverage_gate_pass": plugin["action_coverage_all_seeds"],
+        "h1_main_dr_clipping_absent": True,
         "h1_min_confirmatory_seeds": MIN_CONFIRMATORY_SEEDS,
         "h1_gate_definition": (
             f"Q Spearman>={MIN_Q_SPEARMAN}; C rank>={MIN_CAPACITY_RANK} and "
             f"C top-k F1>={MIN_CAPACITY_CORE_F1}; D Spearman>="
             f"{MIN_DIRECTION_SPEARMAN} and D sign agreement>="
             f"{MIN_DIRECTION_SIGN_AGREEMENT}; every main-arm seed has action "
-            "support, active epsilon forcing, and no AIPW clipping. AIPW versus "
+            "support and active epsilon forcing. Row-AIPW and cross-fitted AIPW versus "
             "plug-in and the epsilon sweep are reported estimator/manipulation "
             "ablations, not recovery gates."
         ),

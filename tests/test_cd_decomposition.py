@@ -151,9 +151,10 @@ class CDDecompositionTests(unittest.TestCase):
             j=1,
             agent_role=role,
         )
-        self.assertEqual(PAIR_FEAT_DIM, 6)
-        self.assertEqual(feat.shape, (6,))
-        self.assertGreater(feat[-1], 0.0)
+        self.assertEqual(PAIR_FEAT_DIM, 11)
+        self.assertEqual(feat.shape, (11,))
+        self.assertEqual(float(np.sum(feat[5:])), 1.0)
+        self.assertEqual(float(feat[8]), 1.0)  # blocker
 
     def test_tracker_keeps_capacity_direction_and_uncertainties_separate(self):
         tracker = InfluenceSignatureTracker(n_agents=3, window=8)

@@ -25,13 +25,13 @@ except ModuleNotFoundError:  # Support ``import scripts.collect_results`` in tes
 
 
 H1_VARIANTS = {
-    "dr_eps003",
+    "row_aipw_diag_eps005",
     "plugin_eps005",
-    "dr_eps000",
-    "dr_eps001",
-    "dr_eps005",
-    "dr_eps008",
-    "dr_eps012",
+    "plugin_eps000",
+    "plugin_eps001",
+    "plugin_eps003",
+    "plugin_eps008",
+    "plugin_eps012",
 }
 H3_VARIANTS = {
     "Full-CIGAMF",
@@ -41,8 +41,8 @@ H3_VARIANTS = {
     "Fixed-Cardinality",
     "NoMultiMemory-SingleMean",
 }
-H2_PROTOCOL_VERSION = "h2_frozen_policy_subset_adapter_v4"
-H1_PROTOCOL_VERSION = "h1_qcd_v2"
+H2_PROTOCOL_VERSION = "h2_factorial_frozen_policy_v5"
+H1_PROTOCOL_VERSION = "h1_qcd_crossfit_v3"
 
 SPECS = {
     "h1": {

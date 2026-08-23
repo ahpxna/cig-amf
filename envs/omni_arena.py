@@ -272,6 +272,11 @@ class OmniArena:
         enable_congestion=True,          # P3 — collision/lane/queue r_emergent, off => r_emergent EXACTLY 0
         enable_structural_shift=True,    # P4 — bottleneck relocation, off => only behavioural_drift ever runs
         use_sgtp_phi=True,               # [C2] Continuous SGTP Phi; False uses the legacy table ablation.
+        structural_factor=None,
+        behavioral_factor=None,
+        enable_sgtp_delays=False,
+        sgtp_delay_values=(0, 2, 4, 6),
+        sgtp_delay_signal_gain=0.25,
     ):
         assert n_agents >= 5 * n_zones, "At least five agents per zone are required for the five P2 roles."
         self.n_agents = n_agents
@@ -282,6 +287,23 @@ class OmniArena:
         self.phase_length = phase_length
         self.causal_horizon = causal_horizon
         self.mode = mode
+        self.structural_factor = bool(
+            mode == "structural_shift"
+            if structural_factor is None
+            else structural_factor
+        )
+        self.behavioral_factor = bool(
+            mode == "behavioral_drift"
+            if behavioral_factor is None
+            else behavioral_factor
+        )
+        self.enable_sgtp_delays = bool(enable_sgtp_delays)
+        self.sgtp_delay_values = tuple(int(value) for value in sgtp_delay_values)
+        self.sgtp_delay_signal_gain = float(sgtp_delay_signal_gain)
+        if not self.sgtp_delay_values or min(self.sgtp_delay_values) < 0:
+            raise ValueError("sgtp_delay_values must contain non-negative lags")
+        self.sgtp_delay_by_pair = {}
+        self._sgtp_delay_queues = {}
         self.seed = seed
         self.rng = np.random.RandomState(seed)
         self.gate_cycle_length = 8
@@ -887,7 +909,7 @@ class OmniArena:
             self.delta_phi_frobenius_behavioural_last = 0.0
             return
 
-        if self.mode != "structural_shift":
+        if not self.structural_factor:
             return
 
         if self.episode_count > 0 and self.episode_count % self.phase_length == 0:
@@ -1187,6 +1209,7 @@ class OmniArena:
             "gt_influence_by_ego": copy.deepcopy(self.gt_influence_by_ego),
             "delta_phi_frobenius_structural_last": self.delta_phi_frobenius_structural_last,
             "delta_phi_frobenius_behavioural_last": self.delta_phi_frobenius_behavioural_last,
+            "sgtp_delay_queues": copy.deepcopy(self._sgtp_delay_queues),
         }
 
     def restore_state(self, state):
@@ -1208,6 +1231,56 @@ class OmniArena:
         self.gt_influence_by_ego = copy.deepcopy(state["gt_influence_by_ego"])
         self.delta_phi_frobenius_structural_last = state["delta_phi_frobenius_structural_last"]
         self.delta_phi_frobenius_behavioural_last = state["delta_phi_frobenius_behavioural_last"]
+        self._sgtp_delay_queues = copy.deepcopy(state.get("sgtp_delay_queues", {}))
+
+    def _apply_sgtp_delays(self, instantaneous):
+        """Apply cloneable pair-specific transport delays to SGTP effects."""
+        if not self.enable_sgtp_delays:
+            return dict(instantaneous)
+        applied = {}
+        for pair, value in instantaneous.items():
+            pair = (int(pair[0]), int(pair[1]))
+            if pair not in self.sgtp_delay_by_pair:
+                # Mix both directed identifiers. Using source*n_agents+target
+                # modulo four collapsed to one delay whenever n_agents was a
+                # multiple of four and the oracle held the ego fixed.
+                mixed = (
+                    pair[0] * 73856093
+                    ^ pair[1] * 19349663
+                    ^ int(self.seed) * 83492791
+                )
+                index = int(mixed % len(self.sgtp_delay_values))
+                self.sgtp_delay_by_pair[pair] = int(self.sgtp_delay_values[index])
+            delay = self.sgtp_delay_by_pair[pair]
+            if delay <= 0:
+                applied[pair] = float(value)
+                continue
+            queue = self._sgtp_delay_queues.setdefault(pair, [0.0] * delay)
+            queue.append(float(value))
+            applied[pair] = float(queue.pop(0))
+        return applied
+
+    def _add_sgtp_action_transport_signal(self, instantaneous, actions):
+        """Add an action-coded signal that is transported by the SGTP queue.
+
+        The optional latency environment needs an identifiable state-mediated
+        path whose delay is independent of role. The signal is added to the
+        existing same-zone SGTP edges before queueing, so clone/restore and
+        common-random-number intervention rollouts preserve its exact timing.
+        Ordinary experiments never enable this branch.
+        """
+        if not self.enable_sgtp_delays or self.sgtp_delay_signal_gain == 0.0:
+            return dict(instantaneous)
+        output = dict(instantaneous)
+        midpoint = 0.5 * float(max(1, self.N_ACTIONS - 1))
+        scale = max(midpoint, 1.0)
+        for (source, target), value in list(output.items()):
+            action = int(actions[int(source)])
+            action_code = (float(action) - midpoint) / scale
+            output[(source, target)] = float(
+                value + self.sgtp_delay_signal_gain * action_code
+            )
+        return output
 
     def _clip(self, x):
         return max(0, min(self.grid_size - 1, x))
@@ -1696,6 +1769,7 @@ class OmniArena:
         self.carrying = {z: False for z in range(self.n_zones)}
         self.low_priority_active = {z: False for z in range(self.n_zones)}
         self.last_actions = {a: self.STAY for a in range(self.n_agents)}
+        self._sgtp_delay_queues = {}
         self.episode_deliveries = 0
         # self.t/self.done were reset at the start, before the shift check.
         self.episode_count += 1
@@ -1710,7 +1784,7 @@ class OmniArena:
         # isolate behavior from phase and episode_count.
         if self._behaviour_override is not None:
             return self._behaviour_override
-        if self.mode == "behavioral_drift":
+        if self.behavioral_factor:
             phase = (self.episode_count // self.phase_length) % 5
             return ["cooperative", "delayed", "zigzag", "lazy", "selfish"][phase]
         return "cooperative"
@@ -1992,7 +2066,11 @@ class OmniArena:
             # for Core F1 and corr(Phi,W*); they do not compute reward. This
             # removes the T6 tautology because realized Phi now depends on the
             # policy-induced state distribution and changes under behavioral drift.
-            w_by_pair = self._sgtp_influence_matrix()
+            instantaneous_w = self._sgtp_influence_matrix()
+            instantaneous_w = self._add_sgtp_action_transport_signal(
+                instantaneous_w, actions
+            )
+            w_by_pair = self._apply_sgtp_delays(instantaneous_w)
             for (i, j), w in w_by_pair.items():
                 rewards[j] += w
         else:

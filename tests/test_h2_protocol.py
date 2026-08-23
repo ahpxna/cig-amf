@@ -394,7 +394,8 @@ class H2ProtocolTests(unittest.TestCase):
             self.assertEqual(loaded["status"], "complete")
 
     def test_collector_accepts_only_complete_cross_hypothesis_matrix(self):
-        with tempfile.TemporaryDirectory(dir=os.path.join(ROOT_FOR_TESTS, "results")) as root:
+        # Unit tests must not depend on a repository-level results directory.
+        with tempfile.TemporaryDirectory() as root:
             h1_dir = os.path.join(root, "h1")
             h2_dir = os.path.join(root, "h2")
             h3_dir = os.path.join(root, "h3")
@@ -412,7 +413,7 @@ class H2ProtocolTests(unittest.TestCase):
                 {
                     **attempt,
                     "run_id": "h1-run",
-                    "protocol_version": "h1_qcd_v2",
+                    "protocol_version": "h1_qcd_crossfit_v3",
                     "config_fingerprint": "abc123",
                     "attempt_complete": True,
                     "q_spearman_mean": 0.1,
@@ -427,7 +428,7 @@ class H2ProtocolTests(unittest.TestCase):
             self._write_csv(h1_summary, h1_rows)
             h1_manifest = {
                 "run_id": "h1-run",
-                "protocol_version": "h1_qcd_v2",
+                "protocol_version": "h1_qcd_crossfit_v3",
                 "status": "complete",
                 "expected_attempts": h1_attempts,
                 "completed_attempts": h1_attempts,
@@ -441,7 +442,7 @@ class H2ProtocolTests(unittest.TestCase):
             with open(os.path.join(h1_dir, "latest_complete_run.json"), "w", encoding="utf-8") as f:
                 json.dump({
                     "run_id": "h1-run",
-                    "protocol_version": "h1_qcd_v2",
+                    "protocol_version": "h1_qcd_crossfit_v3",
                     "summary_path": h1_summary,
                     "manifest_path": h1_manifest_path,
                 }, f)

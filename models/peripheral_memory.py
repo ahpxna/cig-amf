@@ -105,7 +105,7 @@ from models.influence_signature import (
 # reported as ``legacy_derived`` in diagnostics.  A run that claims to test the
 # full signature must set ``require_full_signature=True``.
 LEGACY_ITEM_DIM = 9
-FULL_ITEM_DIM = 12
+FULL_ITEM_DIM = 11
 
 ITEM_ACTION = 0
 ITEM_CAPACITY = 1
@@ -118,12 +118,11 @@ ITEM_SIGNED_MU = ITEM_DIRECTION
 ITEM_ABS_MU = ITEM_CAPACITY
 ITEM_SIGMA = ITEM_SIGMA_DIRECTION
 ITEM_TEMPORAL_STD = ITEM_SIGMA_CAPACITY
-ITEM_P_CORE = 6
-ITEM_PREV_CORE = 7
-ITEM_REL_ROW = 8
-ITEM_REL_COL = 9
-ITEM_ZONE_DIFF = 10
-ITEM_DISTANCE = 11
+ITEM_CONTEXT_VALID = 6
+ITEM_REL_ROW = 7
+ITEM_REL_COL = 8
+ITEM_ZONE_DIFF = 9
+ITEM_DISTANCE = 10
 
 ROUTING_MODES = ("semantic", "unconstrained")
 SIGNATURE_MODES = ("full", "scalar")
@@ -137,19 +136,18 @@ class PeripheralMultiMemory(nn.Module):
     semantic slots plus n_free_slots learned by the router to capture residual
     structure. Total slots equal 4+n_free_slots.
 
-    Full item format has twelve dimensions:
+    Full item format has eleven dimensions:
         0: action_j
         1: structural capacity C
         2: behavioural direction D
         3: sigma_C
         4: sigma_D
         5: context_std(v_C)
-        6: p_core
-        7: in_prev_core
-        8: rel_row
-        9: rel_col
-       10: zone_diff
-       11: distance_norm
+        6: context_valid
+        7: rel_row
+        8: rel_col
+        9: zone_diff
+       10: distance_norm
 
     Nine-dimensional legacy items are upgraded only for compatibility.  They
     do not provide separate C/D uncertainty and cannot support the redesigned
@@ -209,6 +207,7 @@ class PeripheralMultiMemory(nn.Module):
         allow_legacy_items: bool = False,
         mu_floor: float = 0.02,
         beta_floor: float = 0.05,
+        semantic_mass: float = 0.5,
         eps: float = 1e-6,
     ):
         super().__init__()
@@ -275,6 +274,7 @@ class PeripheralMultiMemory(nn.Module):
         self.uniform_mix = float(uniform_mix)
         self.mu_floor = float(mu_floor)
         self.beta_floor = float(beta_floor)
+        self.semantic_mass = float(np.clip(semantic_mass, 0.0, 1.0))
         self.eps = float(eps)
 
         # Action one-hot plus the remaining item fields.
@@ -413,8 +413,7 @@ class PeripheralMultiMemory(nn.Module):
             upgraded[:, ITEM_ABS_MU] = torch.abs(legacy[:, 1])
             upgraded[:, ITEM_SIGMA] = legacy[:, 2]
             # temporal_std and context_std are unavailable in v1.
-            upgraded[:, ITEM_P_CORE] = legacy[:, 3]
-            upgraded[:, ITEM_PREV_CORE] = legacy[:, 4]
+            upgraded[:, ITEM_CONTEXT_VALID] = 0.0
             upgraded[:, ITEM_REL_ROW:] = legacy[:, 5:]
             x = upgraded
             self.signature_legacy_items_seen += int(legacy.shape[0])
@@ -436,11 +435,6 @@ class PeripheralMultiMemory(nn.Module):
         )
         action_oh = self._one_hot_actions(action_col)  # [N, action_dim]
         rest = items[:, 1:].to(dtype=torch.float32).clone()
-
-        # p_core is a calibrated structural diagnostic, not a peripheral
-        # semantic feature.  Letting it affect routing/pooling reintroduced a
-        # hidden partition -> proxy feedback path through memory values.
-        rest[:, ITEM_P_CORE - 1] = 0.0
 
         if self.signature_mode == "scalar":
             # Keep D only; remove C, both uncertainty channels, and v_ctx.
@@ -492,15 +486,9 @@ class PeripheralMultiMemory(nn.Module):
         Returns:
             [N,4], with each row summing to approximately one.
 
-        Gate structure matching influence_signature.soft_role_assignment:
-            g_anom = sigmoid(k*(sigma-sigma_hi))         unresolved
-            g_sure = 1 - g_anom
-            g_pos  = sigmoid(k*(mu-tau))                 beneficial
-            g_neg  = sigmoid(k*(-mu-tau))                harmful
-            g_neu  = clamp(1-g_pos-g_neg,0,1)            neutral
-
-        Anomalous takes priority because assigning an uncertain item as
-        beneficial or harmful would be arbitrary.
+        The three directional roles use a normalized softmax whose neutral
+        logit dominates at D=0. An independent uncertainty gate then moves
+        mass to the anomalous slot.
         """
         direction = items[:, ITEM_DIRECTION]
         if self.signature_mode == "scalar":
@@ -510,10 +498,9 @@ class PeripheralMultiMemory(nn.Module):
         else:
             sigma = torch.clamp(items[:, ITEM_SIGMA_DIRECTION], min=0.0)
 
-        # Normalize slope by threshold. Otherwise at mu=0 sigmoid has not
-        # saturated and neutral loses to beneficial/harmful. A unit test in
-        # influence_signature.py exposed this defect.
-        k_mu = self.role_sharpness / max(self.tau_role, 1e-8)
+        direction_temperature = max(
+            self.tau_role / max(self.role_sharpness, 1e-6), 1e-4
+        )
         # [B2.3] Scale g_anom by sigma-distribution dispersion rather than its
         # threshold. Threshold normalization is valid for mu because tau_role
         # is a |mu| percentile, but sigma_hi shrinks as beliefs converge while
@@ -534,31 +521,37 @@ class PeripheralMultiMemory(nn.Module):
         # sigmoid(+/-0.6)=0.35/0.65 and therefore retains a soft gate.
         k_sg = float(np.clip(self.role_sharpness / k_sg_denom, 1.0, 12.0))
 
-        if self.signature_mode == "scalar":
-            g_anom = torch.zeros_like(sigma)
-        else:
-            g_anom = torch.sigmoid(k_sg * (sigma - self.sigma_hi))
-        g_sure = 1.0 - g_anom                                   # [N]
-
-        g_pos = torch.sigmoid(k_mu * (direction - self.tau_role))      # [N]
-        g_neg = torch.sigmoid(k_mu * (-direction - self.tau_role))     # [N]
-        g_neu = torch.clamp(1.0 - g_pos - g_neg, min=0.0, max=1.0)  # [N]
+        uncertainty = (
+            torch.zeros_like(sigma)
+            if self.signature_mode == "scalar"
+            else torch.sigmoid(k_sg * (sigma - self.sigma_hi))
+        )
+        directional_logits = torch.stack(
+            [
+                (direction - self.tau_role) / direction_temperature,
+                (-direction - self.tau_role) / direction_temperature,
+                (self.tau_role - torch.abs(direction)) / direction_temperature,
+            ],
+            dim=1,
+        )
+        directional = F.softmax(directional_logits, dim=1)
+        certain = 1.0 - uncertainty
 
         probs = torch.zeros(
             items.shape[0], self.n_semantic_slots,
             dtype=torch.float32, device=items.device,
         )  # [N, 4]
 
-        probs[:, ROLE_BENEFICIAL] = g_sure * g_pos
-        probs[:, ROLE_HARMFUL] = g_sure * g_neg
-        probs[:, ROLE_NEUTRAL] = g_sure * g_neu
-        probs[:, ROLE_ANOMALOUS] = g_anom
+        probs[:, ROLE_BENEFICIAL] = certain * directional[:, 0]
+        probs[:, ROLE_HARMFUL] = certain * directional[:, 1]
+        probs[:, ROLE_NEUTRAL] = certain * directional[:, 2]
+        probs[:, ROLE_ANOMALOUS] = uncertainty
 
         row_sum = torch.clamp(probs.sum(dim=1, keepdim=True), min=self.eps)  # [N,1]
 
         with torch.no_grad():
             self.g_anom_usage_ema.mul_(1.0 - self.g_anom_ema_alpha).add_(
-                self.g_anom_ema_alpha * g_anom.mean()
+                self.g_anom_ema_alpha * uncertainty.mean()
             )
 
         return probs / row_sum  # [N, 4]
@@ -571,7 +564,7 @@ class PeripheralMultiMemory(nn.Module):
         absolute value here after sign has already selected the slot, not in
         the estimator.
 
-        beta = beta_floor * (C + mu_floor) * 1/(1+sigma_C)
+        beta = (C + c0) / (1 + sigma_C)
 
         Returns: [N]
         """
@@ -583,11 +576,7 @@ class PeripheralMultiMemory(nn.Module):
         )
         confidence = 1.0 / (1.0 + sigma + self.eps)  # [N]
 
-        beta = (
-            self.beta_floor
-            * (capacity + self.mu_floor)
-            * confidence
-        )  # [N]
+        beta = (capacity + self.mu_floor) * confidence  # [N]
 
         return torch.clamp(beta, min=self.eps)
 
@@ -615,7 +604,13 @@ class PeripheralMultiMemory(nn.Module):
         free_logits = self.slot_router(router_in)
         free_probs = F.softmax(free_logits, dim=-1)
         return (
-            torch.cat([0.5 * sem_probs, 0.5 * free_probs], dim=1),
+            torch.cat(
+                [
+                    self.semantic_mass * sem_probs,
+                    (1.0 - self.semantic_mass) * free_probs,
+                ],
+                dim=1,
+            ),
             sem_probs,
             free_probs,
         )
@@ -869,9 +864,15 @@ class PeripheralMultiMemory(nn.Module):
             if balance_probs is not None
             else zero
         )
+        if self.routing_mode == "semantic":
+            orth_memories = memories[self.n_semantic_slots:]
+            orth_support = weighted.sum(dim=0)[self.n_semantic_slots:]
+        else:
+            orth_memories = memories
+            orth_support = weighted.sum(dim=0)
         orth_loss = self._orthogonality_loss(
-            memories,
-            slot_support=weighted.sum(dim=0),
+            orth_memories,
+            slot_support=orth_support,
         )
         aux_loss = self.lb_coeff * lb_loss + self.orth_coeff * orth_loss
 
@@ -992,6 +993,7 @@ class PeripheralMultiMemory(nn.Module):
         influence_signatures: Optional[
             Mapping[int, Sequence[float]]
         ] = None,
+        context_validity: Optional[Mapping[int, float]] = None,
         require_full_signature: Optional[bool] = None,
     ) -> np.ndarray:
         """
@@ -1007,7 +1009,7 @@ class PeripheralMultiMemory(nn.Module):
         vectors cannot support a five-dimensional-versus-scalar H3 claim.
 
         Returns:
-            np.ndarray float32 [len(peripheral_ids), 12]
+            np.ndarray float32 [len(peripheral_ids), 11]
         """
         ego_id = int(ego_id)
         prev_core_set = set() if prev_core_set is None else set(prev_core_set)
@@ -1085,8 +1087,11 @@ class PeripheralMultiMemory(nn.Module):
             rows.append([
                 float(action_j),
                 *[float(v) for v in signature],
-                float(b["p_core"]),
-                float(j in prev_core_set),
+                float(
+                    0.0
+                    if context_validity is None
+                    else context_validity.get(int(j), 0.0)
+                ),
                 float((pj[0] - pi[0]) / grid_den),
                 float((pj[1] - pi[1]) / grid_den),
                 float((env.agent_zone[j] - env.agent_zone[ego_id]) / zone_den),
