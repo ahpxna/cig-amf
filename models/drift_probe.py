@@ -442,6 +442,51 @@ class DriftDetector:
         )
         return float(self.cusum_stat)
 
+    @staticmethod
+    def page_cusum_maxima(z_sequences, allowance: float):
+        """Return one run-level Page-CUSUM maximum per no-change sequence.
+
+        This pure helper is used by the development-only calibration tool.  It
+        keeps the false-alarm threshold tied to the exact standardized
+        residual process, rather than treating an arbitrary z threshold as a
+        scientific hyperparameter.
+        """
+        maxima = []
+        allowance = float(allowance)
+        for sequence in z_sequences:
+            statistic = 0.0
+            maximum = 0.0
+            for value in np.asarray(sequence, dtype=np.float64).reshape(-1):
+                if not np.isfinite(value):
+                    raise ValueError("CUSUM calibration contains non-finite z")
+                statistic = max(0.0, statistic + float(value) - allowance)
+                maximum = max(maximum, statistic)
+            maxima.append(maximum)
+        if not maxima:
+            raise ValueError("CUSUM calibration requires at least one trajectory")
+        return np.asarray(maxima, dtype=np.float64)
+
+    @classmethod
+    def calibrate_cusum_from_no_change(
+        cls, z_sequences, allowance: float, false_alarm_target: float
+    ):
+        """Derive a frozen run-level threshold from no-change trajectories."""
+        alpha = float(false_alarm_target)
+        if not 0.0 < alpha < 1.0:
+            raise ValueError("false_alarm_target must lie strictly between zero and one")
+        maxima = cls.page_cusum_maxima(z_sequences, allowance)
+        threshold = float(np.quantile(maxima, 1.0 - alpha, method="higher"))
+        observed = float(np.mean(maxima > threshold))
+        return {
+            "cusum_allowance": float(allowance),
+            "cusum_threshold": threshold,
+            "target_false_alarm_rate": alpha,
+            "observed_false_alarm_rate": observed,
+            "n_no_change_trajectories": int(maxima.size),
+            "monitoring_horizon": int(max(len(np.asarray(v).reshape(-1)) for v in z_sequences)),
+            "maxima": maxima.tolist(),
+        }
+
     # ------------------------------------------------------------------
 
     def step(self, episode: int, buffer, n_train_batches: int = 5) -> Dict:

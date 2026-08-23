@@ -35,6 +35,10 @@ CIG_DEVICE="${CIG_DEVICE:-cpu}"
 # Generate it with scripts/calibrate_h1_oracle_thresholds.py on development
 # oracle states that are disjoint from the confirmatory seed set.
 CIG_H1_THRESHOLD_CALIBRATION="${CIG_H1_THRESHOLD_CALIBRATION:-}"
+# H1 support and CUSUM calibration are independent development-only artifacts.
+# They are required before any confirmatory estimator/tracking claim.
+CIG_H1_ORACLE_SUPPORT="${CIG_H1_ORACLE_SUPPORT:-}"
+CIG_CUSUM_CALIBRATION="${CIG_CUSUM_CALIBRATION:-}"
 
 usage() {
   sed -n '2,18p' "$0"
@@ -199,6 +203,14 @@ if [ "$CIG_QUICK" -eq 0 ]; then
     echo "H1 threshold calibration file does not exist: $CIG_H1_THRESHOLD_CALIBRATION" >&2
     exit 2
   fi
+  if [ -z "$CIG_H1_ORACLE_SUPPORT" ] || [ ! -f "$CIG_H1_ORACLE_SUPPORT" ]; then
+    echo "Confirmatory H1 requires CIG_H1_ORACLE_SUPPORT from validate_h1_oracle_support.py." >&2
+    exit 2
+  fi
+  if [ -z "$CIG_CUSUM_CALIBRATION" ] || [ ! -f "$CIG_CUSUM_CALIBRATION" ]; then
+    echo "Confirmatory H2/H3 requires CIG_CUSUM_CALIBRATION from calibrate_cusum_threshold.py." >&2
+    exit 2
+  fi
   if [ "${#CIG_H1_SEED_ARRAY[@]}" -lt 8 ]; then
     echo "Confirmatory H1 requires at least 8 unique paired seeds." >&2
     exit 2
@@ -248,6 +260,8 @@ printf 'category\tlabel\texit_code\telapsed_seconds\tlog\n' > "$CIG_STATUS_TSV"
   printf 'paper_b_selector_states=%s\n' "$CIG_PAPER_B_SELECTOR_STATES"
   printf 'paper_b_scaling_agents=%s\n' "$CIG_PAPER_B_SCALING_AGENTS"
   printf 'h1_threshold_calibration=%s\n' "$CIG_H1_THRESHOLD_CALIBRATION"
+  printf 'h1_oracle_support=%s\n' "$CIG_H1_ORACLE_SUPPORT"
+  printf 'cusum_calibration=%s\n' "$CIG_CUSUM_CALIBRATION"
   printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || printf unknown)"
   git status --porcelain --untracked-files=normal 2>/dev/null > "$CIG_RUN_DIR/git_status_porcelain.txt"
   if [ ! -s "$CIG_RUN_DIR/git_status_porcelain.txt" ]; then
@@ -522,7 +536,7 @@ CIG_H1_ARGS=(--quiet)
 if [ "$CIG_QUICK" -eq 1 ]; then
   CIG_H1_ARGS+=(--allow-development-thresholds)
 else
-  CIG_H1_ARGS+=(--threshold-calibration "$CIG_H1_THRESHOLD_CALIBRATION")
+  CIG_H1_ARGS+=(--threshold-calibration "$CIG_H1_THRESHOLD_CALIBRATION" --oracle-support "$CIG_H1_ORACLE_SUPPORT")
 fi
 run_logged "hypothesis" "H1 one-step causal identification and calibration" "60_h1.log" \
   "$CIG_PYTHON" scripts/run_h1_calibration.py \
@@ -535,6 +549,7 @@ run_logged "hypothesis" "Paper-A H2 factorial structural/behavioural selectivity
     --seeds "${CIG_H23_SEED_ARRAY[@]}" \
     --episodes "$CIG_H2_EPISODES" \
     --pretrain-episodes "$CIG_H2_PRETRAIN_EPISODES" \
+    --cusum-calibration "$CIG_CUSUM_CALIBRATION" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/h2"
 run_logged "ablation" "Legacy end-to-end slot-system ablations" "62_h3.log" \

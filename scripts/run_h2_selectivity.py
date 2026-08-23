@@ -612,11 +612,27 @@ def _restore_frozen_learning_checkpoint(runner, checkpoint):
             torch.cuda.set_rng_state_all(rng["torch_cuda"])
 
 
-def _pretrain_common_checkpoint(model, seed, episodes, device):
+def _apply_cusum_calibration(cfg, calibration):
+    if calibration is None:
+        return
+    required = ("no_change_only", "cusum_allowance", "cusum_threshold", "target_false_alarm_rate")
+    missing = [key for key in required if key not in calibration]
+    if missing or calibration.get("no_change_only") is not True:
+        raise ValueError(
+            "CUSUM calibration must be a no-change artifact with "
+            + ", ".join(required)
+        )
+    cfg["drift_cusum_allowance"] = float(calibration["cusum_allowance"])
+    cfg["z_threshold"] = float(calibration["cusum_threshold"])
+    cfg["cusum_false_alarm_target"] = float(calibration["target_false_alarm_rate"])
+
+
+def _pretrain_common_checkpoint(model, seed, episodes, device, cusum_calibration=None):
     """Train a neutral common policy checkpoint before both H2 arms."""
     RE.set_global_seed(seed)
     cfg = RE.default_cfg()
     cfg["seed"] = int(seed)
+    _apply_cusum_calibration(cfg, cusum_calibration)
     _apply_tracker_control(model, cfg)
     cfg["behavioral_adapter_lambda"] = 0.0
     cfg["freeze_policy_learning"] = False
@@ -819,6 +835,7 @@ def run_one(
     frozen_checkpoint=None,
     cached_pre_estimand_panel=None,
     cached_estimand_panel=None,
+    cusum_calibration=None,
 ):
     out_dir = os.path.join(out_root, f"{model}_{mode}_seed{seed}")
     os.mkdir(out_dir)
@@ -829,6 +846,7 @@ def run_one(
     RE.set_global_seed(seed)
     cfg = RE.default_cfg()
     cfg["seed"] = seed
+    _apply_cusum_calibration(cfg, cusum_calibration)
     _apply_tracker_control(model, cfg)
     if mode not in FACTORIAL_CELLS:
         raise ValueError(f"Unknown H2 factorial cell: {mode!r}")
@@ -1263,6 +1281,11 @@ def run_one(
         ),
         "association_statistic": getattr(runner, "association_statistic", None),
         "association_signed": getattr(runner, "association_signed", None),
+        "cusum_false_alarm_target": float(
+            cfg.get("cusum_false_alarm_target", float("nan"))
+        ),
+        "cusum_allowance": float(cfg.get("drift_cusum_allowance", float("nan"))),
+        "cusum_threshold": float(cfg.get("z_threshold", float("nan"))),
     }
     summary.update(recovery)
     _atomic_write_json(os.path.join(out_dir, "summary.json"), summary)
@@ -1402,6 +1425,10 @@ def main(argv=None):
     )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument(
+        "--cusum-calibration",
+        help="Frozen no-change Page-CUSUM calibration artifact.",
+    )
+    parser.add_argument(
         "--out-root",
         default=None,
         help="H2 artifact root (absolute or relative to the repository root)",
@@ -1419,6 +1446,11 @@ def main(argv=None):
         parser.error("--seeds must not contain duplicates")
     if len(set(args.models)) != len(args.models):
         parser.error("--models must not contain duplicates")
+    cusum_calibration = None
+    if args.cusum_calibration:
+        with open(args.cusum_calibration, encoding="utf-8") as handle:
+            cusum_calibration = json.load(handle)
+        _apply_cusum_calibration(RE.default_cfg(), cusum_calibration)
 
     out_root = ensure_dir(_resolve_out_root(args.out_root))
     runs_root = ensure_dir(os.path.join(out_root, "runs"))
@@ -1438,6 +1470,13 @@ def main(argv=None):
         "eval_every": args.eval_every,
         "pretrain_episodes": args.pretrain_episodes,
         "policy_learning_frozen_during_arms": True,
+        "cusum_calibration": None if cusum_calibration is None else {
+            key: cusum_calibration[key] for key in (
+                "calibration_protocol", "cusum_allowance", "cusum_threshold",
+                "target_false_alarm_rate", "observed_false_alarm_rate",
+                "monitoring_horizon",
+            ) if key in cusum_calibration
+        },
         "evaluation_ego_roles": list(H2_EVALUATION_EGO_ROLES),
         "manipulated_neighbor_roles": list(H2_MANIPULATED_NEIGHBOR_ROLES),
         "change_window_eval_intervals": CHANGE_WINDOW_EVAL_INTERVALS,
@@ -1472,6 +1511,7 @@ def main(argv=None):
                     seed=seed,
                     episodes=args.pretrain_episodes,
                     device=args.device,
+                    cusum_calibration=cusum_calibration,
                 )
                 per_mode = {}
                 for mode in MODES:
@@ -1487,6 +1527,7 @@ def main(argv=None):
                         frozen_checkpoint=checkpoint,
                         cached_pre_estimand_panel=pre_estimand_panel,
                         cached_estimand_panel=estimand_panels[mode],
+                        cusum_calibration=cusum_calibration,
                     )
                     attempt["completed_attempts"].append({
                         "model": model,
@@ -1710,6 +1751,9 @@ def main(argv=None):
                     "behavioral_false_trigger_rate": float(
                         behavioral["n_triggers"] / max(1, args.episodes)
                     ),
+                    "cusum_false_alarm_target": structural["cusum_false_alarm_target"],
+                    "cusum_allowance": structural["cusum_allowance"],
+                    "cusum_threshold": structural["cusum_threshold"],
                     "final_f1_struct": structural["final_f1"],
                     "association_window_steps": structural[
                         "association_window_steps"

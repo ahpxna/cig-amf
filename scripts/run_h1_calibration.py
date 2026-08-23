@@ -40,7 +40,8 @@ VARIANTS = [
     ("plugin_eps001", {"proxy_use_doubly_robust": False, "eps": 0.01}),
     ("plugin_eps003", {"proxy_use_doubly_robust": False, "eps": 0.03}),
     ("plugin_eps008", {"proxy_use_doubly_robust": False, "eps": 0.08}),
-    ("plugin_eps012", {"proxy_use_doubly_robust": False, "eps": 0.12}),
+    # eps=.12 remains available only through an explicit exploratory override;
+    # it is not part of the prespecified confirmatory sweep.
 ]
 
 KEEP_KEYS = (
@@ -73,9 +74,11 @@ KEEP_KEYS = (
     "direction_row_aipw_sign_agreement_mean",
     "support_poor_pair_count_mean", "support_poor_capacity_mae_mean",
     "support_poor_direction_mae_mean",
+    "capacity_uncertainty_error_spearman", "capacity_risk_at_50pct_coverage",
+    "direction_uncertainty_error_spearman", "direction_risk_at_50pct_coverage",
 )
 
-PROTOCOL_VERSION = "h1_qcd_crossfit_v4"
+PROTOCOL_VERSION = "h1_qcd_crossfit_v5_identifiable_tiny_adapter"
 MIN_CONFIRMATORY_SEEDS = 8
 BOOTSTRAP_REPLICATES = 20000
 BOOTSTRAP_SEED = 1729
@@ -160,6 +163,17 @@ def _load_threshold_calibration(path):
     return values, _fingerprint(payload)
 
 
+def _load_oracle_support(path):
+    with open(path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("oracle_only") is not True or not payload.get("benchmark_identifiable"):
+        raise ValueError(
+            "H1 oracle-support artifact must be oracle-only and certify "
+            "BENCHMARK_NOT_IDENTIFIABLE is false"
+        )
+    return payload, _fingerprint(payload)
+
+
 def build_h1_config(cfg_override, seed, threshold_calibration=None):
     """Build the one-step H1 configuration shared by CLI and contract tests."""
     cfg = RE.default_cfg()
@@ -170,6 +184,12 @@ def build_h1_config(cfg_override, seed, threshold_calibration=None):
     cfg["causal_horizon"] = 1
     cfg["proxy_n_horizons"] = 1
     cfg["proxy_iw_clip"] = 2000.0
+    cfg["h1_target_policy_mode"] = "scripted_uniform_mixture"
+    cfg["h1_eval_uniform_mass"] = 0.10
+    # H1 evaluates response-surface identification for a prespecified pi_eval;
+    # policy learning is a separate MARL question and must not move that
+    # estimand during proxy data collection.
+    cfg["freeze_policy_learning"] = True
     cfg["seed"] = int(seed)
     if threshold_calibration is not None:
         cfg["h1_capacity_active_threshold"] = float(
@@ -636,6 +656,10 @@ def main(argv=None):
         ),
     )
     ap.add_argument(
+        "--oracle-support", type=str, default=None,
+        help="Passed oracle-only H1 support artifact from validate_h1_oracle_support.py.",
+    )
+    ap.add_argument(
         "--quiet", action="store_true",
         help="Suppress per-batch diagnostics; keep one concise line per run.",
     )
@@ -666,8 +690,19 @@ def main(argv=None):
             "--threshold-calibration is required for H1 evidence; use "
             "--allow-development-thresholds only for a non-confirmatory smoke check"
         )
+    if not args_cli.oracle_support and not args_cli.allow_development_thresholds:
+        ap.error(
+            "--oracle-support is required for H1 evidence; benchmark support "
+            "must be certified before estimator evaluation"
+        )
     threshold_values = None
     threshold_fingerprint = None
+    oracle_support_fingerprint = None
+    oracle_support_payload = None
+    if args_cli.oracle_support:
+        oracle_support_payload, oracle_support_fingerprint = _load_oracle_support(
+            os.path.abspath(args_cli.oracle_support)
+        )
     if args_cli.threshold_calibration:
         threshold_path = os.path.abspath(args_cli.threshold_calibration)
         threshold_values, threshold_fingerprint = _load_threshold_calibration(
@@ -718,6 +753,7 @@ def main(argv=None):
             or bool(manifest.get("threshold_calibration", {}).get(
                 "development_defaults", False
             )) != bool(args_cli.allow_development_thresholds)
+            or manifest.get("oracle_support", {}).get("fingerprint") != oracle_support_fingerprint
         ):
             raise RuntimeError(
                 "Run manifest identity or expected attempt matrix does not match"
@@ -738,6 +774,11 @@ def main(argv=None):
                 ),
                 "fingerprint": threshold_fingerprint,
                 "development_defaults": bool(args_cli.allow_development_thresholds),
+            },
+            "oracle_support": {
+                "path": None if args_cli.oracle_support is None else os.path.abspath(args_cli.oracle_support),
+                "fingerprint": oracle_support_fingerprint,
+                "benchmark_identifiable": None if oracle_support_payload is None else True,
             },
         }
         _atomic_json(manifest_path, manifest)
@@ -769,7 +810,11 @@ def main(argv=None):
                     "proxy_iw_clip": 2000.0,
                     "tiny_horizon": 1,
                     "forcer_anneal_to": float(cfg_over["eps"]),
+                    "h1_target_policy_mode": cfg["h1_target_policy_mode"],
+                    "h1_eval_uniform_mass": float(cfg["h1_eval_uniform_mass"]),
+                    "freeze_policy_learning": True,
                     "threshold_calibration_fingerprint": threshold_fingerprint,
+                    "oracle_support_fingerprint": oracle_support_fingerprint,
                     "development_thresholds": bool(
                         args_cli.allow_development_thresholds
                     ),
@@ -807,6 +852,7 @@ def main(argv=None):
                         "protocol_version": PROTOCOL_VERSION,
                         "config_fingerprint": attempt_fingerprint,
                         "threshold_calibration_fingerprint": threshold_fingerprint,
+                        "oracle_support_fingerprint": oracle_support_fingerprint,
                         "development_thresholds": bool(
                             args_cli.allow_development_thresholds
                         ),

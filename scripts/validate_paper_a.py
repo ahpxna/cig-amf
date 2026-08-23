@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -112,37 +113,65 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
                 raise CR.ResultValidationError(
                     f"H3b unpaired recovery rows for {control}"
                 )
-            final_latency = [
-                float(final_by_seed[seed]["recovery_latency"])
-                for seed in sorted(final_by_seed)
+            final_latency = [float(final_by_seed[seed]["recovery_latency"])
+                             for seed in sorted(final_by_seed)]
+            control_latency = [float(control_by_seed[seed]["recovery_latency"])
+                               for seed in sorted(final_by_seed)]
+            # A non-recovering Final arm is unfavorable evidence. A
+            # non-recovering control is right-censored, not malformed: it
+            # supports the intended ordering when Final recovered.
+            if any(value < 0.0 for value in final_latency):
+                tracking_deltas[control] = {
+                    "control_minus_final": [],
+                    "ci95": [float("nan"), float("nan")],
+                    "final_nonrecovery": True,
+                    "control_right_censored_count": int(sum(value < 0.0 for value in control_latency)),
+                }
+                continue
+            censor_horizon = max(
+                1.0,
+                max(float(row.get("episodes", 1)) / max(1.0, float(row.get("eval_every", 1)))
+                    for row in control_by_seed.values()),
+            )
+            deltas = [
+                (censor_horizon if right < 0.0 else right) - left
+                for left, right in zip(final_latency, control_latency)
             ]
-            control_latency = [
-                float(control_by_seed[seed]["recovery_latency"])
-                for seed in sorted(final_by_seed)
-            ]
-            if any(value < 0.0 for value in final_latency + control_latency):
-                raise CR.ResultValidationError(
-                    f"H3b recovery failed or was undefined for {control}"
-                )
-            deltas = [right - left for left, right in zip(final_latency, control_latency)]
             tracking_deltas[control] = {
                 "control_minus_final": deltas,
                 "ci95": VC._bootstrap_mean_ci(
                     deltas, seed=5200 + len(tracking_deltas)
                 ),
+                "final_nonrecovery": False,
+                "control_right_censored_count": int(sum(value < 0.0 for value in control_latency)),
+                "control_censor_horizon_intervals": censor_horizon,
             }
     final_false_alarm = [
         float(row.get("behavioral_false_trigger_rate", float("nan")))
         for row in h2_rows if row.get("model") == "Final-CIGAMF"
     ]
-    false_alarm_reported = bool(
-        final_false_alarm and all(value >= 0.0 for value in final_false_alarm)
+    false_alarm_targets = [
+        float(row.get("cusum_false_alarm_target", float("nan")))
+        for row in h2_rows if row.get("model") == "Final-CIGAMF"
+    ]
+    false_alarm_reported = bool(final_false_alarm and all(
+        value >= 0.0 for value in final_false_alarm
+    ))
+    false_alarm_calibrated = bool(
+        false_alarm_reported
+        and len(false_alarm_targets) == len(final_false_alarm)
+        and all(
+            math.isfinite(target) and target > 0.0
+            for target in false_alarm_targets
+        )
+        and all(value <= target for value, target in zip(final_false_alarm, false_alarm_targets))
     )
     tracking_conditions = {
         f"final_recovers_faster_than_{control}": metrics["ci95"][0] > 0.0
         for control, metrics in tracking_deltas.items()
     }
     tracking_conditions["behavioral_false_alarm_control_reported"] = false_alarm_reported
+    tracking_conditions["behavioral_false_alarm_at_or_below_calibrated_target"] = false_alarm_calibrated
     tracking_supported = bool(
         not missing_tracking_models
         and tracking_conditions
@@ -160,7 +189,8 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
         "paired_recovery_latency": tracking_deltas,
         "rule": (
             "H3b requires faster recovery than matched NoDetector while "
-            "reporting behavioural-only false alarms. Fixed-rate, fast, "
+            "meeting the frozen no-change behavioural false-alarm target. "
+            "Control non-recovery is right-censored; Final non-recovery fails. Fixed-rate, fast, "
             "no-uncertainty, and no-two-timescale arms are diagnostics."
         ),
     }

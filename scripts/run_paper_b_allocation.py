@@ -293,6 +293,12 @@ def _isolation_rows(
                         predicted_ranking, oracle_scores[int(ego)], core_budget
                     ),
                     "core_size": len(predicted),
+                    "logits": np.asarray(cache["policy_logits"], dtype=np.float64),
+                    "values": np.asarray(
+                        [cache["value_cache"][agent] for agent in range(runner.n_agents)],
+                        dtype=np.float64,
+                    ),
+                    "actions": np.asarray(actions, dtype=np.int64),
                 })
 
     disagreement_keys = set()
@@ -304,6 +310,9 @@ def _isolation_rows(
         }
     total_keys = len(records.get("C-Core", next(iter(records.values()), [])))
     rows = []
+    reference_fidelity = {
+        row["key"]: row for row in records.get("Full-Explicit", [])
+    }
     for variant in variants:
         values = records[variant]
         selector = VARIANTS[variant]
@@ -316,6 +325,21 @@ def _isolation_rows(
             )
         disagreement = [
             row["f1"] for row in values if row["key"] in disagreement_keys
+        ]
+        fidelity = [
+            _decision_fidelity(
+                {
+                    "logits": row["logits"][None, ...],
+                    "values": row["values"][None, ...],
+                    "actions": row["actions"][None, ...],
+                },
+                {
+                    "logits": reference_fidelity[row["key"]]["logits"][None, ...],
+                    "values": reference_fidelity[row["key"]]["values"][None, ...],
+                    "actions": reference_fidelity[row["key"]]["actions"][None, ...],
+                },
+            )
+            for row in values if row["key"] in reference_fidelity
         ]
         rows.append({
             "panel": "selector_isolation",
@@ -343,6 +367,17 @@ def _isolation_rows(
             "final_reward": float("nan"),
             "mean_f1": float("nan"),
             "throughput_total": float("nan"),
+            "policy_logit_l2_to_full_explicit": _mean([
+                item["policy_logit_l2_to_full_explicit"] for item in fidelity
+            ]),
+            "value_mae_to_full_explicit": _mean([
+                item["value_mae_to_full_explicit"] for item in fidelity
+            ]),
+            "action_agreement_to_full_explicit": _mean([
+                item["action_agreement_to_full_explicit"] for item in fidelity
+            ]),
+            "decision_fidelity_reference": "Full-Explicit",
+            "decision_fidelity_protocol": "common_checkpoint_frozen_state_bank",
         })
     return rows
 

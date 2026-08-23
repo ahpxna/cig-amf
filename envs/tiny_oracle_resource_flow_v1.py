@@ -4,6 +4,8 @@ from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 
+from envs.causal_adapter import TinyOracleResourceFlowAdapter
+
 
 @dataclass
 class TinyNode:
@@ -124,6 +126,10 @@ Role:
         self.agent_role: List[str] = []
         self.agent_cap: List[np.ndarray] = []
         self.agent_style: List[str] = []
+        # Public, pre-treatment operational capability.  It is assigned
+        # independently of role so the H1 oracle has heterogeneous structural
+        # response magnitudes rather than a role-tied binary capacity tier.
+        self.agent_structural_efficacy: List[float] = []
 
         self.inventory_type: List[int] = []
         self.inventory_qty: List[int] = []
@@ -138,6 +144,7 @@ Role:
         self.station_recipe: Dict[int, Tuple[int, int]] = {}
         self.lane_open: Dict[int, int] = {}
         self.lane_controller: Dict[int, int] = {}
+        self.lane_efficacy: Dict[int, float] = {}
         self.sink_demand: Dict[int, int] = {}
 
         self.recent_interactions: List[List[Tuple[int, int, int]]] = []
@@ -147,6 +154,7 @@ Role:
         self.causal_horizon = 3
 
         self._build_layout()
+        self.causal_adapter = TinyOracleResourceFlowAdapter(self)
         self.reset()
 
     # =========================================================
@@ -204,6 +212,7 @@ Role:
         self.agent_role = []
         self.agent_cap = []
         self.agent_style = []
+        self.agent_structural_efficacy = []
 
         roles = list(self.ROLE_TO_CAP.keys())
         styles = list(self.STYLES)
@@ -216,6 +225,7 @@ Role:
                     continue
                 free_cells.append(pos)
         self.rng.shuffle(free_cells)
+        efficacy_levels = np.asarray((0.50, 0.75, 1.00, 1.25, 1.50), dtype=np.float32)
 
         for a in range(self.n_agents):
             pos = list(free_cells[a])
@@ -228,6 +238,11 @@ Role:
             self.agent_role.append(role)
             self.agent_cap.append(self.ROLE_TO_CAP[role].copy())
             self.agent_style.append(style)
+            # The assignment is shuffled independently of role/style.  It is
+            # a public capability in the Tiny task, not a hidden oracle label.
+            self.agent_structural_efficacy.append(float(
+                efficacy_levels[int(self.rng.randint(0, len(efficacy_levels)))]
+            ))
 
     def _init_dynamic_state(self):
         self.inventory_type = [-1 for _ in range(self.n_agents)]
@@ -243,6 +258,7 @@ Role:
         self.station_recipe = {}
         self.lane_open = {}
         self.lane_controller = {}
+        self.lane_efficacy = {}
         self.sink_demand = {}
 
         self.recent_interactions = [[] for _ in range(self.n_agents)]
@@ -264,6 +280,7 @@ Role:
             elif nd.kind == "lane":
                 self.lane_open[nd.node_id] = 1
                 self.lane_controller[nd.node_id] = -1
+                self.lane_efficacy[nd.node_id] = 1.0
             elif nd.kind == "sink":
                 self.sink_demand[nd.node_id] = nd.zone % 3
 
@@ -275,6 +292,7 @@ Role:
                 nd.hidden_priority = int(self.rng.randint(0, self.n_agents))
                 self.lane_controller[nd.node_id] = nd.hidden_priority
                 self.lane_open[nd.node_id] = 1
+                self.lane_efficacy[nd.node_id] = 1.0
             elif nd.kind == "station":
                 nd.hidden_degraded = int(self.rng.rand() < 0.30)
                 raw_t = int(self.rng.randint(0, 3))
@@ -330,6 +348,7 @@ Role:
         rewards += self._advance_station_processing()
         rewards += self._apply_congestion_penalties()
         rewards += self._throughput_shaping()
+        rewards += self._apply_public_coordination_externalities(actions)
 
         self._update_recent_interactions(actions)
         self._update_pair_traces(actions)
@@ -505,9 +524,11 @@ Role:
         strong_lane = self.agent_cap[agent_id][2] > 0.85
         if privileged:
             self.lane_open[lane.node_id] = 1 - self.lane_open[lane.node_id]
+            self.lane_efficacy[lane.node_id] = self.agent_structural_efficacy[agent_id]
             return 0.05
         if strong_lane:
             self.lane_open[lane.node_id] = 1 - self.lane_open[lane.node_id]
+            self.lane_efficacy[lane.node_id] = self.agent_structural_efficacy[agent_id]
             return 0.02
         return -0.03
 
@@ -560,7 +581,27 @@ Role:
             if self.buffer_stock[buf.node_id] > 0 and self.lane_open[lane.node_id]:
                 for a in range(self.n_agents):
                     if self.agent_zone[a] == z:
-                        rew[a] += 0.002
+                        rew[a] += 0.002 * float(self.lane_efficacy[lane.node_id])
+        return rew
+
+    def _apply_public_coordination_externalities(self, actions: List[int]) -> np.ndarray:
+        """Apply an observable, target-specific resource-flow mechanism.
+
+        Public signal actions coordinate same-zone peers.  Their operational
+        efficacy is assigned independently of semantic role at reset and is
+        visible in the target capability descriptor.  This yields multiple
+        genuine one-step structural-capacity levels for H1 without exposing an
+        oracle influence label or modifying the intervention after the fact.
+        """
+        rew = np.zeros(self.n_agents, dtype=np.float32)
+        for source, action in enumerate(actions):
+            if int(action) not in (self.SIGNAL_A, self.SIGNAL_B):
+                continue
+            sign = 1.0 if int(action) == self.SIGNAL_A else -1.0
+            spillover = 0.012 * sign * float(self.agent_structural_efficacy[source])
+            for ego in range(self.n_agents):
+                if ego != source and self.agent_zone[ego] == self.agent_zone[source]:
+                    rew[ego] += spillover
         return rew
 
     # =========================================================
@@ -744,24 +785,30 @@ Role:
         self,
         n_states: int = 16,
         burn_in: int = 3,
+        bank_seed: Optional[int] = None,
     ) -> List[dict]:
         """Create a bank of "live" states from scripted traffic.
 Each state is taken after some burn-in steps to have more realistic queue / inventory / signal."""
-        bank = []
-        attempts = 0
-        while len(bank) < n_states and attempts < n_states * 10:
-            attempts += 1
-            self.reset()
+        rng_state = self.rng.get_state()
+        if bank_seed is not None:
+            self.rng.seed(int(bank_seed))
+        try:
+            bank = []
+            attempts = 0
+            while len(bank) < n_states and attempts < n_states * 10:
+                attempts += 1
+                self.reset()
 
-            for _ in range(burn_in):
-                acts = self.default_joint_action()
-                _, _, done, _ = self.step(acts)
-                if done:
-                    break
+                for _ in range(burn_in):
+                    acts = self.default_joint_action()
+                    _, _, done, _ = self.step(acts)
+                    if done:
+                        break
 
-            bank.append(self.clone_state())
-
-        return bank
+                bank.append(self.clone_state())
+            return bank
+        finally:
+            self.rng.set_state(rng_state)
 
     def get_supported_egos(self) -> List[int]:
         """Select representative egos; the tiny environment need not use all egos."""
@@ -793,9 +840,11 @@ Each state is taken after some burn-in steps to have more realistic queue / inve
         )[:4]
 
         nearby_feats = []
+        nearby_item_dim = 6 + len(self.ROLE_TO_CAP) + 5
         for j in visible:
             rr = (self.positions[j][0] - r0) / max(1, self.grid_size)
             cc = (self.positions[j][1] - c0) / max(1, self.grid_size)
+            role_onehot = [float(self.agent_role[j] == role) for role in self.ROLE_TO_CAP]
             nearby_feats.extend([
                 rr,
                 cc,
@@ -803,9 +852,12 @@ Each state is taken after some burn-in steps to have more realistic queue / inve
                 float(self.inventory_type[j] + 1) / 3.0,
                 float(self.last_signals[j]) / 2.0,
                 float(self.last_actions[j]) / max(1, self.get_action_dim() - 1),
+                *role_onehot,
+                *self.agent_cap[j].tolist(),
+                float(self.agent_structural_efficacy[j]),
             ])
-        while len(nearby_feats) < 4 * 6:
-            nearby_feats.extend([0.0] * 6)
+        while len(nearby_feats) < 4 * nearby_item_dim:
+            nearby_feats.extend([0.0] * nearby_item_dim)
 
         public = []
         for z in range(self.n_zones):
@@ -827,6 +879,7 @@ Each state is taken after some burn-in steps to have more realistic queue / inve
             float(self.inventory_type[agent_id] + 1) / 3.0,
             float(self.inventory_qty[agent_id]),
             float(self.agent_zone[agent_id]) / max(1, self.n_zones - 1),
+            float(self.agent_structural_efficacy[agent_id]),
         ])
 
         mem = []
@@ -940,9 +993,9 @@ Each state is taken after some burn-in steps to have more realistic queue / inve
     # =========================================================
     def get_obs_dim(self):
         patch_dim = (2 * self.obs_radius + 1) ** 2
-        nearby_dim = 4 * 6
+        nearby_dim = 4 * (6 + len(self.ROLE_TO_CAP) + 5)
         public_dim = self.n_zones * 5
-        private_dim = 7
+        private_dim = 8
         mem_dim = self.n_zones * 5
         pair_dim = 4 * 6
         return patch_dim + nearby_dim + public_dim + private_dim + mem_dim + pair_dim
@@ -960,6 +1013,7 @@ Each state is taken after some burn-in steps to have more realistic queue / inve
             "agent_role": self.agent_role,
             "agent_cap": self.agent_cap,
             "agent_style": self.agent_style,
+            "agent_structural_efficacy": self.agent_structural_efficacy,
             "inventory_type": self.inventory_type,
             "inventory_qty": self.inventory_qty,
             "last_actions": self.last_actions,
@@ -972,6 +1026,7 @@ Each state is taken after some burn-in steps to have more realistic queue / inve
             "station_recipe": self.station_recipe,
             "lane_open": self.lane_open,
             "lane_controller": self.lane_controller,
+            "lane_efficacy": self.lane_efficacy,
             "sink_demand": self.sink_demand,
             "recent_interactions": self.recent_interactions,
             "pair_trace_counts": self.pair_trace_counts,
@@ -986,6 +1041,7 @@ Each state is taken after some burn-in steps to have more realistic queue / inve
         self.agent_role = copy.deepcopy(state["agent_role"])
         self.agent_cap = copy.deepcopy(state["agent_cap"])
         self.agent_style = copy.deepcopy(state["agent_style"])
+        self.agent_structural_efficacy = copy.deepcopy(state["agent_structural_efficacy"])
         self.inventory_type = copy.deepcopy(state["inventory_type"])
         self.inventory_qty = copy.deepcopy(state["inventory_qty"])
         self.last_actions = copy.deepcopy(state["last_actions"])
@@ -998,6 +1054,7 @@ Each state is taken after some burn-in steps to have more realistic queue / inve
         self.station_recipe = copy.deepcopy(state["station_recipe"])
         self.lane_open = copy.deepcopy(state["lane_open"])
         self.lane_controller = copy.deepcopy(state["lane_controller"])
+        self.lane_efficacy = copy.deepcopy(state["lane_efficacy"])
         self.sink_demand = copy.deepcopy(state["sink_demand"])
         self.recent_interactions = copy.deepcopy(state["recent_interactions"])
         self.pair_trace_counts = copy.deepcopy(state["pair_trace_counts"])

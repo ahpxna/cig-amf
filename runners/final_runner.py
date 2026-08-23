@@ -209,6 +209,9 @@ class FinalCIGAMFRunner:
             action_dim=self.action_dim,
             hidden=cfg["policy_hidden"],
         ).to(device)
+        if bool(cfg.get("freeze_downstream_policy_value", False)):
+            for parameter in self.policy_value.parameters():
+                parameter.requires_grad_(False)
 
         self.policy_optim = torch.optim.Adam(
             list(self.policy_value.parameters())
@@ -866,8 +869,26 @@ class FinalCIGAMFRunner:
             # The H2 runner always supplies a non-ego role subset.
             target_mask[:] = True
 
-        executed = learned.copy()
-        if adapter_active:
+        h1_mode = str(self.cfg.get("h1_target_policy_mode", "learned"))
+        h1_active = h1_mode == "scripted_uniform_mixture"
+        if h1_mode not in {"learned", "scripted_uniform_mixture"}:
+            raise ValueError(f"unknown h1_target_policy_mode: {h1_mode}")
+        h1_uniform_mass = float(np.clip(
+            self.cfg.get("h1_eval_uniform_mass", 0.10), 0.0, 1.0
+        ))
+        uniform = np.stack([
+            _masked_distribution(valid[agent].astype(np.float32), valid[agent])
+            for agent in range(self.n_agents)
+        ], axis=0)
+
+        # This is an H1 estimand policy, not an H2 manipulation: it becomes
+        # pi before epsilon forcing, while the exact logged behaviour remains
+        # b=(1-eps)pi+eps*q. It deliberately affects every target agent.
+        executed = (
+            (1.0 - h1_uniform_mass) * scripted + h1_uniform_mass * uniform
+            if h1_active else learned.copy()
+        )
+        if adapter_active and not h1_active:
             executed[target_mask] = (
                 (1.0 - lam) * learned[target_mask]
                 + lam * scripted[target_mask]
@@ -900,6 +921,9 @@ class FinalCIGAMFRunner:
             "behavioral_adapter_scripted_mass": float(
                 np.mean(np.sum(executed * scripted, axis=1))
             ),
+            "h1_target_policy_active": int(h1_active),
+            "h1_target_policy_uniform_mass": h1_uniform_mass if h1_active else 0.0,
+            "h1_target_policy_probs": executed.astype(np.float32),
         }
         return executed.astype(np.float32), scripted.astype(np.float32), diagnostics
 
@@ -1105,6 +1129,9 @@ class FinalCIGAMFRunner:
         # downstream diagnostics and for runners that expect policy_probs
         # in the trajectory. Shape: [n_agents, A]
         cache["policy_probs"] = probs_np
+        cache["h1_target_policy_probs"] = adapter_diagnostics.pop(
+            "h1_target_policy_probs", probs_np
+        )
         cache["learned_policy_probs"] = learned_probs_np
         cache["scripted_policy_probs"] = scripted_probs_np
         cache["policy_logits"] = logits_np
@@ -1190,6 +1217,7 @@ class FinalCIGAMFRunner:
                     "belief_items_cache": cache["belief_items_cache"],
                     "behaviour_probs": cache.get("behaviour_probs"),
                     "policy_probs": cache.get("policy_probs"),
+                    "h1_target_policy_probs": cache.get("h1_target_policy_probs"),
                     "learned_policy_probs": cache.get("learned_policy_probs"),
                     "scripted_policy_probs": cache.get("scripted_policy_probs"),
                     "behavioral_adapter": cache.get("behavioral_adapter", {}),

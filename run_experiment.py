@@ -42,7 +42,6 @@ except ModuleNotFoundError:
         RandomCoreRunner,      # [FIX-O3]
     )
 
-from models.structural_proxy import build_pair_feat  # [FIX-X1]
 from models.crossfit_aipw import CrossFittedConditionalAIPW
 
 try:
@@ -272,7 +271,17 @@ def default_cfg():
         "behavioral_adapter_lambda": 0.0,
         "behavioral_adapter_only_in_behavioral_drift": True,
         "behavioral_adapter_target_roles": None,
+        # H1 identification uses a frozen, non-uniform target policy so the
+        # directional contrast D^pi is identifiable independently of whether
+        # the MARL actor has moved away from its near-uniform initialization.
+        # The H1 launcher alone enables this protocol policy.
+        "h1_target_policy_mode": "learned",
+        "h1_eval_uniform_mass": 0.10,
         "freeze_policy_learning": False,
+        # Representation-isolation panels retain the policy/value mapping from
+        # a common checkpoint while still allowing peripheral modules to learn
+        # from the fixed downstream objective.
+        "freeze_downstream_policy_value": False,
         "freeze_representation_state": False,
         "seed": 0,
 
@@ -1830,7 +1839,9 @@ def _score_learned_proxy_for_state(runner, tiny_env, state, ego, neighbor_ids):
     }, sigmas
 
 
-def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
+def _score_h1_logged_step(
+    runner, tiny_env, step, ego, neighbor_ids, target_policy_rows=None
+):
     """Score one factual action-time cache with all AIPW inputs present.
 
     H1 previously restored only the environment and then constructed
@@ -1865,7 +1876,8 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
     for j in neighbor_ids:
         action_j = actions[j]
         behaviour_obs.append(float(step["behaviour_probs"][j][action_j]))
-        policy_rows.append(np.asarray(step["policy_probs"][j], dtype=np.float32))
+        source = step["policy_probs"][j] if target_policy_rows is None else target_policy_rows[j]
+        policy_rows.append(np.asarray(source, dtype=np.float32))
 
     old_effect_mode = getattr(runner.proxy, "effect_mode", None)
     try:
@@ -1942,6 +1954,10 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
         j: float(out.get("d_sigma", out["sigma"])[k])
         for k, j in enumerate(neighbor_ids)
     }
+    capacity_sigmas = {
+        j: float(out.get("c_sigma", out["sigma"])[k])
+        for k, j in enumerate(neighbor_ids)
+    }
     metadata = {
         "dr_applied": bool(out.get("dr_applied", False)),
         "dr_applied_rows": int(out.get("dr_applied_rows", 0)),
@@ -1952,11 +1968,12 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
         "propensity_min": float(np.min(behaviour_obs)),
         "propensity_max": float(np.max(behaviour_obs)),
     }
-    return learned, sigmas, metadata
+    return learned, sigmas, capacity_sigmas, metadata
 
 
-def _h1_one_step_oracle_scores(tiny_env, step, ego, neighbor_ids,
-                               candidate_actions):
+def _h1_one_step_oracle_scores(
+    tiny_env, step, ego, neighbor_ids, candidate_actions, target_policy_rows=None
+):
     """Exact one-step V_pi minus V_uniform controlled intervention.
 
     All other agents retain their factual action.  The intervention changes
@@ -1996,7 +2013,8 @@ def _h1_one_step_oracle_scores(tiny_env, step, ego, neighbor_ids,
 
         candidate_returns = np.asarray(candidate_returns, dtype=np.float64)
         response_surfaces[int(j)] = candidate_returns.tolist()
-        policy = np.asarray(step["policy_probs"][int(j)], dtype=np.float64)
+        source = step["policy_probs"][int(j)] if target_policy_rows is None else target_policy_rows[int(j)]
+        policy = np.asarray(source, dtype=np.float64)
         policy = policy[valid_actions]
         policy = policy / np.clip(policy.sum(), 1e-12, None)
         signed = float(
@@ -2119,8 +2137,9 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
             neighbor_ids = [
                 j for j in range(int(tiny_env.n_agents)) if j != ego
             ]
-            learned_scores, sigmas, score_meta = _score_h1_logged_step(
-                runner, tiny_env, step, ego, neighbor_ids,
+            target_policy_rows = step.get("h1_target_policy_probs", step["policy_probs"])
+            learned_scores, sigmas, capacity_sigmas, score_meta = _score_h1_logged_step(
+                runner, tiny_env, step, ego, neighbor_ids, target_policy_rows,
             )
             if crossfit is not None:
                 geom = step["geom_snapshot"]
@@ -2129,10 +2148,8 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                     prediction_samples.append({
                         "obs_i": tiny_env.get_obs_of_ego(step["obs_all"], ego),
                         "action_i": int(step["actions"][ego]),
-                        "pair_feat": build_pair_feat(
-                            geom["positions"], geom["agent_zone"],
-                            geom["grid_size"], geom["n_zones"], ego, j,
-                            agent_role=geom.get("agent_role"),
+                        "pair_feat": runner.env_adapter.pair_features_from_snapshot(
+                            geom, ego, j
                         ),
                         "z_core_excl_j": step["proxy_context_excluding"][ego][j][0],
                         "m_periph_excl_j": step["proxy_context_excluding"][ego][j][1],
@@ -2145,6 +2162,7 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                 }
             oracle_scores, replay_error = _h1_one_step_oracle_scores(
                 tiny_env, step, ego, neighbor_ids, candidate_actions,
+                target_policy_rows,
             )
             replay_errors.append(replay_error)
             propensity_mins.append(score_meta["propensity_min"])
@@ -2284,8 +2302,14 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                     "oracle_signed": float(oracle_scores["direction"][j]),
                     "learned_range": float(learned_scores["capacity"][j]),
                     "oracle_range": float(oracle_scores["capacity"][j]),
+                    "oracle_q_nonconstant": int(
+                        np.ptp(np.asarray(oracle_scores["q"][j], dtype=np.float64)) > 1e-12
+                    ),
+                    "oracle_q_distinct_levels": int(np.unique(np.round(
+                        np.asarray(oracle_scores["q"][j], dtype=np.float64), 12
+                    )).size),
                     "natural_action_support": float(
-                        step["policy_probs"][j][int(step["actions"][j])]
+                        target_policy_rows[j][int(step["actions"][j])]
                     ),
                     "abs_error": float(abs(
                         learned_scores["capacity"][j]
@@ -2302,6 +2326,8 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                         learned_scores["direction"][j] - oracle_scores["direction"][j]
                     )),
                     "proxy_sigma": float(sigmas[j]),
+                    "capacity_sigma": float(capacity_sigmas[j]),
+                    "direction_sigma": float(sigmas[j]),
                     "dr_applied": int(score_meta["dr_applied"]),
                 })
 
@@ -2353,7 +2379,13 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
         "exploratory_h3_reported": False,
         "context_source": "action_time_trajectory_cache",
         "oracle_baseline": "uniform_action_policy",
-        "oracle_intervention": "V_pi_minus_V_uniform_current_action",
+        "oracle_intervention": "V_pi_eval_minus_V_uniform_current_action",
+        "h1_target_policy_mode": str(
+            tiny_cfg.get("h1_target_policy_mode", "learned")
+        ),
+        "h1_eval_uniform_mass": float(
+            tiny_cfg.get("h1_eval_uniform_mass", 0.0)
+        ),
         "factual_replay_role": "integrity_check_and_AIPW_observed_outcome",
         "nuisance_training_score_mode": "plugin_fixed_across_ablation",
         "candidate_actions": list(candidate_actions),
@@ -2457,6 +2489,36 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
     metadata["action_coverage_gate_pass"] = bool(
         coverage["actions_seen"] == runner.proxy.action_dim
     )
+    def _uncertainty_diagnostic(sigma_key, error_key):
+        sigma = np.asarray([row.get(sigma_key, np.nan) for row in rows], dtype=np.float64)
+        error = np.asarray([row.get(error_key, np.nan) for row in rows], dtype=np.float64)
+        keep = np.isfinite(sigma) & np.isfinite(error)
+        if int(keep.sum()) < 3:
+            return {"error_correlation": float("nan"), "risk_at_50pct_coverage": float("nan")}
+        sigma, error = sigma[keep], error[keep]
+        corr = float(safe_spearman(sigma, error)[0])
+        cutoff = max(1, int(np.ceil(0.5 * sigma.size)))
+        retained = np.argsort(sigma)[:cutoff]
+        return {
+            "error_correlation": corr,
+            "risk_at_50pct_coverage": float(np.mean(error[retained])),
+        }
+    metadata["uncertainty_calibration"] = {
+        "capacity": _uncertainty_diagnostic("capacity_sigma", "capacity_abs_error"),
+        "direction": _uncertainty_diagnostic("direction_sigma", "direction_abs_error"),
+    }
+    metadata["capacity_uncertainty_error_spearman"] = metadata[
+        "uncertainty_calibration"
+    ]["capacity"]["error_correlation"]
+    metadata["capacity_risk_at_50pct_coverage"] = metadata[
+        "uncertainty_calibration"
+    ]["capacity"]["risk_at_50pct_coverage"]
+    metadata["direction_uncertainty_error_spearman"] = metadata[
+        "uncertainty_calibration"
+    ]["direction"]["error_correlation"]
+    metadata["direction_risk_at_50pct_coverage"] = metadata[
+        "uncertainty_calibration"
+    ]["direction"]["risk_at_50pct_coverage"]
     # Backward-compatible process gate. Empirical coverage is scientific
     # evidence, not a protocol-integrity condition: in particular, eps=0 is
     # intentionally allowed to expose missing action support and must still be

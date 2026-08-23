@@ -16,6 +16,8 @@ PUBLIC_ROLES = (
     "collector", "gatekeeper", "relay", "blocker", "controller", "drifter"
 )
 
+TINY_PUBLIC_ROLES = ("hauler", "processor", "dispatcher", "spoiler")
+
 
 @runtime_checkable
 class CausalMultiAgentEnvAdapter(Protocol):
@@ -282,6 +284,214 @@ class OmniArenaAdapter:
             snapshot["grid_size"], snapshot["n_zones"], ego, target,
             snapshot.get("agent_role"),
         )
+
+    def clone_state(self):
+        return self.env.clone_state()
+
+    def restore_state(self, state):
+        return self.env.restore_state(state)
+
+    def fixed_continuation_policy(self, agent):
+        return int(self.env.scripted_policy(int(agent)))
+
+
+class TinyOracleResourceFlowAdapter:
+    """Causal feature contract for :class:`TinyOracleResourceFlowV1`.
+
+    The tiny oracle environment has a resource-flow ontology rather than the
+    OmniArena role and mechanism ontology.  This adapter deliberately exposes
+    only public, pre-treatment target descriptors.  In particular it never
+    reads hidden station degradation, hidden lane priorities, or any oracle
+    influence label.  Target state is retained in ``x_ij`` because the
+    leave-one-out context intentionally excludes the intervened neighbour.
+    """
+
+    _GEOMETRY_DIM = 5
+    _ROLE_DIM = len(TINY_PUBLIC_ROLES)
+    _CAPABILITY_DIM = 5  # four public role capabilities plus public efficacy
+    _TARGET_STATE_DIM = 11
+
+    def __init__(self, env, action_dim=None):
+        self.env = env
+        self._action_dim = None if action_dim is None else int(action_dim)
+
+    @property
+    def n_agents(self):
+        return int(self.env.n_agents)
+
+    @property
+    def max_action_dim(self):
+        getter = getattr(self.env, "get_action_dim", None)
+        if callable(getter):
+            return int(getter())
+        if self._action_dim is not None:
+            return int(self._action_dim)
+        raise AttributeError("tiny adapter requires get_action_dim()")
+
+    @property
+    def obs_dim(self):
+        return int(self.env.get_obs_dim())
+
+    @property
+    def pair_feature_dim(self):
+        return (
+            self._GEOMETRY_DIM + self._ROLE_DIM + self._CAPABILITY_DIM
+            + self._TARGET_STATE_DIM
+        )
+
+    @property
+    def relation_feature_dim(self):
+        return self.pair_feature_dim
+
+    @property
+    def context_item_dim(self):
+        # The pair descriptor, executed target action, and the target's public
+        # resource-flow state form one observable set item.
+        return self.pair_feature_dim + self.max_action_dim
+
+    def reset(self):
+        return self.env.reset()
+
+    def step(self, actions):
+        return self.env.step(actions)
+
+    def observation(self, observations, agent):
+        return np.asarray(
+            self.env.get_obs_of_ego(observations, int(agent)), dtype=np.float32
+        )
+
+    def valid_action_mask(self, agent):
+        del agent
+        return np.ones((self.max_action_dim,), dtype=bool)
+
+    @staticmethod
+    def _visible(snapshot, ego, target):
+        positions = snapshot["positions"]
+        pi, pj = positions[int(ego)], positions[int(target)]
+        radius = int(snapshot["obs_radius"])
+        if max(abs(int(pi[0]) - int(pj[0])), abs(int(pi[1]) - int(pj[1]))) > radius:
+            return False
+        # Match TinyOracleResourceFlowV1's public occlusion rule without
+        # peeking at latent task state.
+        hidden = tuple(pj) in snapshot["occluders"] or tuple(pi) in snapshot["occluders"]
+        vision = float(snapshot["agent_cap"][int(ego)][3])
+        return not (hidden and vision < 0.95)
+
+    @classmethod
+    def _pair_features_from_tables(cls, snapshot, ego, target):
+        ego, target = int(ego), int(target)
+        grid = float(max(1, int(snapshot["grid_size"])))
+        pi, pj = snapshot["positions"][ego], snapshot["positions"][target]
+        zi, zj = int(snapshot["agent_zone"][ego]), int(snapshot["agent_zone"][target])
+        visible = cls._visible(snapshot, ego, target)
+        geometry = np.asarray([
+            (float(pj[0]) - float(pi[0])) / grid if visible else 0.0,
+            (float(pj[1]) - float(pi[1])) / grid if visible else 0.0,
+            (abs(float(pj[0]) - float(pi[0])) + abs(float(pj[1]) - float(pi[1]))) / grid if visible else 0.0,
+            float(zi == zj),
+            (zj - zi) / float(max(1, int(snapshot["n_zones"]) - 1)),
+        ], dtype=np.float32)
+        role = np.zeros((cls._ROLE_DIM,), dtype=np.float32)
+        try:
+            role[TINY_PUBLIC_ROLES.index(str(snapshot["agent_role"][target]))] = 1.0
+        except (ValueError, IndexError, KeyError, TypeError):
+            pass
+        cap = np.asarray(snapshot["agent_cap"][target], dtype=np.float32).reshape(-1)
+        efficacy = float(snapshot["agent_structural_efficacy"][target])
+        capability = np.zeros((cls._CAPABILITY_DIM,), dtype=np.float32)
+        capability[:min(4, cap.size)] = cap[:4]
+        capability[4] = efficacy
+        # Dynamic target state is visible-only except public zone aggregates.
+        zone_state = snapshot["zone_state"][zj]
+        known_controller = float(snapshot["known_lane_controller"][ego][zj] == target)
+        dynamic = np.asarray([
+            float(visible),
+            float(snapshot["inventory_type"][target]) / 2.0 if visible else 0.0,
+            float(snapshot["inventory_qty"][target]) if visible else 0.0,
+            float(snapshot["last_actions"][target]) / max(1.0, snapshot["action_dim"] - 1.0) if visible else 0.0,
+            float(snapshot["last_signals"][target]) / 2.0 if visible else 0.0,
+            float(zone_state[0]),  # lane open is public in Tiny observations
+            float(zone_state[1]),  # normalized buffer stock
+            float(zone_state[2]),  # normalized station progress
+            float(zone_state[3]),  # station occupied
+            float(zone_state[4]),  # normalized queue length
+            known_controller,
+        ], dtype=np.float32)
+        return np.concatenate((geometry, role, capability, dynamic)).astype(np.float32)
+
+    def pair_features(self, ego, target):
+        return self._pair_features_from_tables(self.feature_snapshot(), ego, target)
+
+    def pair_features_from_snapshot(self, snapshot, ego, target):
+        return self._pair_features_from_tables(snapshot, ego, target)
+
+    def relation_features(self, ego, target):
+        return self.pair_features(ego, target)
+
+    def compact_relation_features(self, ego, target, width):
+        raw = self.pair_features(ego, target)
+        out = np.zeros((int(width),), dtype=np.float32)
+        out[:min(out.size, raw.size)] = raw[:min(out.size, raw.size)]
+        return out
+
+    def neighbour_features(self, ego, neighbour, action):
+        onehot = np.zeros((self.max_action_dim,), dtype=np.float32)
+        onehot[int(np.clip(action, 0, self.max_action_dim - 1))] = 1.0
+        return np.concatenate((self.pair_features(ego, neighbour), onehot)).astype(np.float32)
+
+    def context_key(self, ego, neighbour):
+        pair = self.pair_features(ego, neighbour)
+        return (
+            int(pair[3] > 0.5),
+            int(np.clip(pair[2] * self.env.grid_size, 0, 4)),
+            str(self.env.agent_role[int(neighbour)]),
+            int(pair[-11] > 0.5),
+        )
+
+    def weak_prior_score(self, ego, neighbour):
+        pair = self.pair_features(ego, neighbour)
+        return float(1.0 / (1.0 + pair[2] * self.env.grid_size) + 0.2 * pair[3])
+
+    def feature_snapshot(self):
+        zone_state = []
+        known = []
+        for ego in range(self.n_agents):
+            ego_known = []
+            for zone in range(int(self.env.n_zones)):
+                value = self.env.inspect_memory[ego].get(f"lane_controller_zone_{zone}")
+                ego_known.append(
+                    -1 if value is None else int(round(value * max(1, self.n_agents - 1)))
+                )
+            known.append(ego_known)
+        for zone in range(int(self.env.n_zones)):
+            buffer_node = self.env._get_zone_buffer(zone)
+            lane_node = self.env._get_zone_lane(zone)
+            station_node = self.env._get_zone_station(zone)
+            zone_state.append([
+                float(self.env.lane_open[lane_node.node_id]),
+                float(self.env.buffer_stock[buffer_node.node_id]) / max(1.0, buffer_node.capacity),
+                float(self.env.station_progress[station_node.node_id]) / 2.0,
+                float(self.env.station_active_agent[station_node.node_id] != -1),
+                float(len(self.env.station_queue[station_node.node_id])) / max(1.0, station_node.queue_limit),
+            ])
+        return {
+            "positions": [list(value) for value in self.env.positions],
+            "agent_zone": [int(value) for value in self.env.agent_zone],
+            "agent_role": [str(value) for value in self.env.agent_role],
+            "agent_cap": [np.asarray(value, dtype=np.float32).tolist() for value in self.env.agent_cap],
+            "agent_structural_efficacy": [float(value) for value in self.env.agent_structural_efficacy],
+            "inventory_type": [int(value) for value in self.env.inventory_type],
+            "inventory_qty": [int(value) for value in self.env.inventory_qty],
+            "last_actions": [int(value) for value in self.env.last_actions],
+            "last_signals": [int(value) for value in self.env.last_signals],
+            "zone_state": zone_state,
+            "known_lane_controller": known,
+            "grid_size": int(self.env.grid_size),
+            "n_zones": int(self.env.n_zones),
+            "obs_radius": int(self.env.obs_radius),
+            "occluders": [tuple(value) for value in self.env.occluders],
+            "action_dim": float(self.max_action_dim),
+        }
 
     def clone_state(self):
         return self.env.clone_state()

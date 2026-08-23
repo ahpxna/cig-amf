@@ -31,6 +31,14 @@ except ModuleNotFoundError:
 
 import run_experiment as RE
 from models.ego_conditioned_latent import pair_specificity_score
+try:
+    from representation_isolation import (
+        collect_teacher_trajectory, replay_pair_history, terminal_states,
+    )
+except ModuleNotFoundError:
+    from scripts.representation_isolation import (
+        collect_teacher_trajectory, replay_pair_history, terminal_states,
+    )
 
 
 VARIANTS = {
@@ -106,19 +114,24 @@ def _env(seed):
     )
 
 
-def _initial_checkpoint(seed, core_budget, device):
+def _initial_checkpoint(seed, core_budget, device, pretrain_episodes=60):
     RE.set_global_seed(seed)
     runner = RE.make_runner(
         "Final-CIGAMF", _env(seed), _base_cfg(seed, core_budget), device
     )
+    runner.run(n_episodes=int(pretrain_episodes), eval_every=max(1, int(pretrain_episodes)))
     checkpoint = _capture_frozen_learning_checkpoint(runner)
+    checkpoint["pretrain_episodes"] = int(pretrain_episodes)
     return checkpoint
 
 
 def _cd_retrieval_mae(runner):
     latents, targets = [], []
+    active_pairs = set(getattr(runner.pair_rel_module, "active_core_pairs", set()))
     for ego, belief in runner.belief_modules.items():
         for neighbor in belief.neighbor_ids:
+            if (int(ego), int(neighbor)) not in active_pairs:
+                continue
             latents.append(runner.pair_rel_module.get_pair_latent(ego, neighbor))
             targets.append([
                 belief.debiased_mu(neighbor),
@@ -139,8 +152,11 @@ def _cd_retrieval_mae(runner):
 
 def _latent_profile_geometry(runner):
     latents, profiles = [], []
+    active_pairs = set(getattr(runner.pair_rel_module, "active_core_pairs", set()))
     for ego, belief in runner.belief_modules.items():
         for neighbor in belief.neighbor_ids:
+            if (int(ego), int(neighbor)) not in active_pairs:
+                continue
             latents.append(runner.pair_rel_module.get_pair_latent(ego, neighbor))
             profiles.append([
                 belief.debiased_mu(neighbor),
@@ -305,6 +321,36 @@ def _full_explicit_reference_from_checkpoint(seed, core_budget, device, checkpoi
     return runner
 
 
+def _matched_history_probe(
+    name, seed, core_budget, device, checkpoint, oracle_capacity, traces, bank,
+):
+    """Probe a variant after the same teacher-forced recurrent history.
+
+    Downstream policy/value weights originate from the common checkpoint and
+    are never optimised in this panel.  Thus logits and values differ only
+    through the representation allocation/history, not through independent
+    policy learning or environment trajectories.
+    """
+    cfg = _base_cfg(seed, core_budget)
+    cfg.update(VARIANTS[name])
+    cfg["freeze_policy_learning"] = True
+    cfg["freeze_graph_updates"] = True
+    cfg["freeze_representation_state"] = False
+    runner = RE.make_runner("Final-CIGAMF", _env(seed), cfg, device)
+    _restore_frozen_learning_checkpoint(runner, checkpoint)
+    runner.oracle_capacity_scores_by_ego = oracle_capacity
+    runner.pair_rel_module.state_mode = cfg["pair_state_mode"]
+    _set_oracle_fixed_core(
+        runner, oracle_capacity, core_budget,
+        full=bool(cfg.get("full_explicit_reference", False)),
+    )
+    replay_pair_history(
+        runner, traces, train_bc=True,
+        bc_steps=max(1, int(cfg.get("bc_train_steps", 1))),
+    )
+    return _probe_state_bank(runner, bank), runner
+
+
 def _promotion_panel(
     runner, seed, episodes, core_budget, device, oracle_capacity,
     initial_checkpoint,
@@ -320,17 +366,18 @@ def _promotion_panel(
     runner.cfg["freeze_policy_learning"] = True
     runner.cfg["freeze_pair_bc_learning"] = False
     runner.cfg["freeze_graph_updates"] = True
-    # The reference starts from the same checkpoint and runs throughout the
-    # pre-promotion interval with every pair explicit.  It is therefore a
-    # genuine full-model trajectory, not a post-hoc expansion of a sparse
-    # state dictionary at the intervention boundary.
+    # A single full-explicit teacher produces the only action/environment
+    # history used by both arms.  This prevents recurrent-state and policy
+    # trajectory differences from masquerading as warm-start fidelity.
+    teacher = _full_explicit_reference_from_checkpoint(
+        seed, core_budget, device, initial_checkpoint
+    )
+    traces = collect_teacher_trajectory(teacher, pre_steps + transient_steps)
     reference = _full_explicit_reference_from_checkpoint(
         seed, core_budget, device, initial_checkpoint
     )
     reference.cfg["freeze_pair_bc_learning"] = True
-    reference.run(n_episodes=pre_steps, eval_every=10)
-    # Reference execution advances process RNG state; restore the candidate
-    # branch point before its matched pre-promotion trajectory.
+    replay_pair_history(reference, traces[:pre_steps], train_bc=False, bc_steps=0)
     _restore_frozen_learning_checkpoint(runner, initial_checkpoint)
     runner.oracle_capacity_scores_by_ego = oracle_capacity
     runner.pair_rel_module.state_mode = "recurrent"
@@ -338,10 +385,10 @@ def _promotion_panel(
     runner.cfg["freeze_policy_learning"] = True
     runner.cfg["freeze_pair_bc_learning"] = False
     runner.cfg["freeze_graph_updates"] = True
-    pre_history = runner.run(n_episodes=pre_steps, eval_every=10)
-    bank_seed = int(seed) + 95021
-    bank = runner.env.sample_state_bank(n_states=4, burn_in=3, bank_seed=bank_seed)
-    reference_probe = _probe_state_bank(reference, bank)
+    replay_pair_history(
+        runner, traces[:pre_steps], train_bc=True,
+        bc_steps=max(1, int(runner.cfg.get("bc_train_steps", 1))),
+    )
     mapping, events = _promotion_mapping(runner, oracle_capacity, core_budget)
     for ego, core in mapping.items():
         runner.belief_modules[ego].set_fixed_core(core)
@@ -353,13 +400,18 @@ def _promotion_panel(
         for ego, _outgoing, incoming in events
     ):
         raise RuntimeError("promotion panel failed to allocate promoted full states")
-    series, history = [], {key: list(value) for key, value in pre_history.items()}
-    for _ in range(transient_steps):
-        step_history = runner.run(n_episodes=1, eval_every=1)
-        for key, values in step_history.items():
-            history.setdefault(key, []).extend(values)
-        fidelity = _decision_fidelity(_probe_state_bank(runner, bank), reference_probe)
-        fidelity["bc_loss"] = float(_mean(step_history.get("bc_loss", [])))
+    series, history = [], {"promoted": [int(len(events))]}
+    for trace in traces[pre_steps:]:
+        replay_pair_history(reference, [trace], train_bc=False, bc_steps=0)
+        replay_pair_history(
+            runner, [trace], train_bc=True,
+            bc_steps=max(1, int(runner.cfg.get("bc_train_steps", 1))),
+        )
+        bank = terminal_states([trace], n_states=4)
+        fidelity = _decision_fidelity(
+            _probe_state_bank(runner, bank), _probe_state_bank(reference, bank)
+        )
+        fidelity["bc_loss"] = float(runner.pair_rel_module.get_last_bc_loss())
         series.append(fidelity)
     def auc(key):
         return _mean([row[key] for row in series])
@@ -371,7 +423,7 @@ def _promotion_panel(
         "promotion_value_error_auc": auc("value_mae_to_full_explicit"),
         "promotion_action_agreement_auc": auc("action_agreement_to_full_explicit"),
         "promotion_bc_loss_auc": auc("bc_loss"),
-        "promotion_reference": "full_explicit_frozen_clone_state_bank",
+        "promotion_reference": "full_explicit_frozen_common_teacher_forced_history",
     }
 
 
@@ -410,9 +462,11 @@ def _run_variant(
     if any(size != expected_size for size in core_sizes):
         raise RuntimeError(f"{name}/seed={seed} violated fixed oracle core")
     row = {
+        "panel": "end_to_end_reward",
         "variant": name,
         "seed": int(seed),
         "episodes": int(episodes),
+        "pretrain_episodes": int(checkpoint.get("pretrain_episodes", 0)),
         "core_budget": int(core_budget),
         "core_contract": (
             "full_explicit_reference"
@@ -447,6 +501,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     parser.add_argument("--episodes", type=int, default=200)
+    parser.add_argument("--pretrain-episodes", type=int, default=60)
     parser.add_argument("--core-budget", type=int, default=3)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--variants", nargs="+", choices=list(VARIANTS), default=None)
@@ -454,7 +509,7 @@ def main(argv=None):
         "--out-root", default=os.path.join(ROOT, "results", "paper_b_pair_latent")
     )
     args = parser.parse_args(argv)
-    if args.episodes <= 0 or args.core_budget <= 0 or not args.seeds:
+    if args.episodes <= 0 or args.pretrain_episodes <= 0 or args.core_budget <= 0 or not args.seeds:
         parser.error("episodes, core budget, and seeds must be positive")
     if len(set(args.seeds)) != len(args.seeds):
         parser.error("seeds must be unique")
@@ -462,10 +517,22 @@ def main(argv=None):
     rows = []
     selected_variants = args.variants or list(VARIANTS)
     for seed in args.seeds:
-        checkpoint = _initial_checkpoint(seed, args.core_budget, args.device)
+        checkpoint = _initial_checkpoint(
+            seed, args.core_budget, args.device, args.pretrain_episodes
+        )
         oracle_capacity = _oracle_capacity_table(
             seed, checkpoint, args.core_budget, args.device
         )
+        # One full-explicit teacher generates the immutable state/action stream
+        # used by every representation-fidelity probe. End-to-end rows below
+        # deliberately remain independent policy-learning outcomes.
+        teacher = _full_explicit_reference_from_checkpoint(
+            seed, args.core_budget, args.device, checkpoint
+        )
+        teacher_traces = collect_teacher_trajectory(
+            teacher, max(1, int(args.episodes))
+        )
+        fidelity_bank = terminal_states(teacher_traces, n_states=4)
         variants = {}
         for name in selected_variants:
             variants[name] = _run_variant(
@@ -473,7 +540,14 @@ def main(argv=None):
                 checkpoint, oracle_capacity,
             )
         reference_name = "Full-Explicit-Reference"
-        reference = variants.get(reference_name, (None, None))[1]
+        matched = {
+            name: _matched_history_probe(
+                name, seed, args.core_budget, args.device, checkpoint,
+                oracle_capacity, teacher_traces, fidelity_bank,
+            )
+            for name in selected_variants
+        }
+        reference = matched.get(reference_name, (None, None))[0]
         for name, (row, probe) in variants.items():
             if reference is None:
                 row.update({
@@ -483,8 +557,15 @@ def main(argv=None):
                 })
                 row["decision_fidelity_reference"] = "not_collected"
             else:
-                row.update(_decision_fidelity(probe, reference))
+                row.update(_decision_fidelity(matched[name][0], reference))
                 row["decision_fidelity_reference"] = reference_name
+                row["decision_fidelity_protocol"] = (
+                    "common_checkpoint_frozen_downstream_teacher_forced_history"
+                )
+                row["decision_fidelity_history_steps"] = int(sum(
+                    len(trace) for trace in teacher_traces
+                ))
+                row["decision_fidelity_terminal_state_count"] = int(len(fidelity_bank))
             rows.append(row)
     summary_path = os.path.join(out_root, "summary_paper_b_pair_latent.csv")
     with open(summary_path, "w", newline="", encoding="utf-8") as handle:
@@ -498,6 +579,7 @@ def main(argv=None):
         "complete": True,
         "seeds": args.seeds,
         "episodes": args.episodes,
+        "pretrain_episodes": args.pretrain_episodes,
         "core_budget": args.core_budget,
         "variants": list(selected_variants),
         "summary": summary_path,

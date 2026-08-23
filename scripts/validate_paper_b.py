@@ -112,6 +112,20 @@ def validate(run_root, expected_seeds, protocol_mode):
             "paper": "B", "overall_status": "SMOKE_ONLY",
             "panels_complete": True,
         }, VC.EXIT_SMOKE_ONLY
+    required_isolation_protocol = "common_checkpoint_frozen_downstream_teacher_forced_history"
+    for row in pair_rows + periphery_rows:
+        if row.get("decision_fidelity_reference") == "not_collected":
+            raise ValueError("Paper-B representation fidelity reference is missing")
+        if row.get("decision_fidelity_protocol") != required_isolation_protocol:
+            raise ValueError(
+                "Paper-B representation fidelity must use a shared checkpoint, "
+                "frozen downstream policy/value, and teacher-forced history"
+            )
+    for row in allocation:
+        if row.get("panel") == "selector_isolation" and row.get(
+            "decision_fidelity_protocol"
+        ) != "common_checkpoint_frozen_state_bank":
+            raise ValueError("allocation fidelity must be computed in selector isolation")
 
     c_vs_d = _paired(
         allocation, "C-Core", "AbsD-Core", "selector_oracle_f1",
@@ -146,15 +160,15 @@ def validate(run_root, expected_seeds, protocol_mode):
     )
     c_logit_vs_d = [-value for value in _paired(
         allocation, "C-Core", "AbsD-Core",
-        "policy_logit_l2_to_full_explicit", panel="end_to_end",
+        "policy_logit_l2_to_full_explicit", panel="selector_isolation",
     )]
     c_value_vs_d = [-value for value in _paired(
         allocation, "C-Core", "AbsD-Core",
-        "value_mae_to_full_explicit", panel="end_to_end",
+        "value_mae_to_full_explicit", panel="selector_isolation",
     )]
     c_action_vs_d = _paired(
         allocation, "C-Core", "AbsD-Core",
-        "action_agreement_to_full_explicit", panel="end_to_end",
+        "action_agreement_to_full_explicit", panel="selector_isolation",
     )
     pair_retrieval = [
         -value for value in _paired(

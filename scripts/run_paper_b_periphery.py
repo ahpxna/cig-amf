@@ -32,6 +32,14 @@ import run_experiment as RE
 from runners.h3_ablation_runner import H3NoMultiMemoryRunner
 from models.peripheral_memory import PeripheralMultiMemory
 from models.single_mean_memory import SingleMeanPeripheral
+try:
+    from representation_isolation import (
+        collect_teacher_trajectory, terminal_states, train_periphery_on_teacher_history,
+    )
+except ModuleNotFoundError:
+    from scripts.representation_isolation import (
+        collect_teacher_trajectory, terminal_states, train_periphery_on_teacher_history,
+    )
 
 
 VARIANTS = {
@@ -83,6 +91,26 @@ def _decision_fidelity(probe, reference):
             probe["actions"] == reference["actions"]
         )),
     }
+
+
+def _probe_state_bank(runner, bank):
+    outer = runner.env.clone_state()
+    logits, values, actions = [], [], []
+    try:
+        for state in bank:
+            runner.env.restore_state(copy.deepcopy(state))
+            selected, cache = runner._select_actions_population(runner.env._get_obs_all())
+            logits.append(np.asarray(cache["policy_logits"], dtype=np.float64))
+            values.append(np.asarray(
+                [cache["value_cache"][agent] for agent in range(runner.n_agents)],
+                dtype=np.float64,
+            ))
+            actions.append(np.asarray(
+                [selected[agent] for agent in range(runner.n_agents)], dtype=np.int64,
+            ))
+    finally:
+        runner.env.restore_state(outer)
+    return {"logits": np.stack(logits), "values": np.stack(values), "actions": np.stack(actions)}
 
 
 def _unique_parameter_bytes(*modules):
@@ -271,12 +299,15 @@ def _env(seed):
     )
 
 
-def _common_checkpoint(seed, core_budget, device):
+def _common_checkpoint(seed, core_budget, device, pretrain_episodes=60):
     RE.set_global_seed(seed)
     runner = RE.make_runner(
         "Final-CIGAMF", _env(seed), _cfg(seed, core_budget), device
     )
-    return _capture_frozen_learning_checkpoint(runner)
+    runner.run(n_episodes=int(pretrain_episodes), eval_every=max(1, int(pretrain_episodes)))
+    checkpoint = _capture_frozen_learning_checkpoint(runner)
+    checkpoint["pretrain_episodes"] = int(pretrain_episodes)
+    return checkpoint
 
 
 def _restore_shared_state(runner, checkpoint):
@@ -367,9 +398,11 @@ def _run_variant(
         else {}
     )
     row = {
+        "panel": "end_to_end_reward",
         "variant": name,
         "seed": int(seed),
         "episodes": int(episodes),
+        "pretrain_episodes": int(checkpoint.get("pretrain_episodes", 0)),
         "core_budget": int(core_budget),
         "core_contract": (
             "full_explicit_reference" if spec["runner"] == "full"
@@ -394,10 +427,38 @@ def _run_variant(
     return row, _decision_probe(runner, n_states=4, seed=int(seed) + 94009)
 
 
+def _representation_isolation_probe(
+    name, seed, core_budget, device, checkpoint, oracle_capacity, traces, bank,
+):
+    """Train only peripheral representation against a frozen common policy."""
+    spec = VARIANTS[name]
+    cfg = _cfg(seed, core_budget)
+    cfg.update({key: value for key, value in spec.items() if key != "runner"})
+    cfg["freeze_downstream_policy_value"] = True
+    cfg["freeze_policy_learning"] = False
+    cfg["freeze_graph_updates"] = True
+    env = _env(seed)
+    if bool(spec.get("match_semantic_memory", False)):
+        cfg.update(_matched_single_mean_dimensions(cfg, action_dim=env.get_action_dim()))
+    if spec["runner"] == "full":
+        cfg["core_selection_mode"] = "full_explicit"
+    runner = (
+        H3NoMultiMemoryRunner(env, cfg, device=device)
+        if spec["runner"] == "single"
+        else RE.make_runner("Final-CIGAMF", env, cfg, device)
+    )
+    _restore_shared_state(runner, checkpoint)
+    _seed_oracle_core(runner, core_budget, oracle_capacity,
+                      full_explicit=(spec["runner"] == "full"))
+    train_periphery_on_teacher_history(runner, traces)
+    return _probe_state_bank(runner, bank)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     parser.add_argument("--episodes", type=int, default=200)
+    parser.add_argument("--pretrain-episodes", type=int, default=60)
     parser.add_argument("--core-budget", type=int, default=3)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--variants", nargs="+", choices=list(VARIANTS), default=None)
@@ -405,7 +466,7 @@ def main(argv=None):
         "--out-root", default=os.path.join(ROOT, "results", "paper_b_periphery")
     )
     args = parser.parse_args(argv)
-    if args.episodes <= 0 or args.core_budget <= 0 or not args.seeds:
+    if args.episodes <= 0 or args.pretrain_episodes <= 0 or args.core_budget <= 0 or not args.seeds:
         parser.error("episodes, core budget, and seeds must be positive")
     if len(set(args.seeds)) != len(args.seeds):
         parser.error("seeds must be unique")
@@ -413,17 +474,34 @@ def main(argv=None):
     rows = []
     selected_variants = args.variants or list(VARIANTS)
     for seed in args.seeds:
-        checkpoint = _common_checkpoint(seed, args.core_budget, args.device)
+        checkpoint = _common_checkpoint(
+            seed, args.core_budget, args.device, args.pretrain_episodes
+        )
         oracle_capacity = _oracle_capacity_table(
             seed, checkpoint, args.core_budget, args.device
         )
+        teacher_cfg = _cfg(seed, args.core_budget)
+        teacher_cfg["core_selection_mode"] = "full_explicit"
+        teacher_cfg["freeze_policy_learning"] = True
+        teacher = RE.make_runner("Final-CIGAMF", _env(seed), teacher_cfg, args.device)
+        _restore_shared_state(teacher, checkpoint)
+        _seed_oracle_core(teacher, args.core_budget, oracle_capacity, full_explicit=True)
+        teacher_traces = collect_teacher_trajectory(teacher, max(1, int(args.episodes)))
+        fidelity_bank = terminal_states(teacher_traces, n_states=4)
         variants = {}
         for name in selected_variants:
             variants[name] = _run_variant(
                 name, seed, args.episodes, args.core_budget, args.device,
                 checkpoint, oracle_capacity,
             )
-        reference = variants.get("Full-Explicit", (None, None))[1]
+        isolation_probes = {
+            name: _representation_isolation_probe(
+                name, seed, args.core_budget, args.device, checkpoint,
+                oracle_capacity, teacher_traces, fidelity_bank,
+            )
+            for name in selected_variants
+        }
+        reference = isolation_probes.get("Full-Explicit")
         for name, (row, probe) in variants.items():
             if reference is None:
                 row.update({
@@ -433,8 +511,14 @@ def main(argv=None):
                 })
                 row["decision_fidelity_reference"] = "not_collected"
             else:
-                row.update(_decision_fidelity(probe, reference))
+                row.update(_decision_fidelity(isolation_probes[name], reference))
                 row["decision_fidelity_reference"] = "Full-Explicit"
+                row["decision_fidelity_protocol"] = (
+                    "common_checkpoint_frozen_downstream_teacher_forced_history"
+                )
+                row["decision_fidelity_history_steps"] = int(sum(
+                    len(trace) for trace in teacher_traces
+                ))
             rows.append(row)
     summary_path = os.path.join(out_root, "summary_paper_b_periphery.csv")
     with open(summary_path, "w", newline="", encoding="utf-8") as handle:
@@ -448,6 +532,7 @@ def main(argv=None):
         "complete": True,
         "seeds": args.seeds,
         "episodes": args.episodes,
+        "pretrain_episodes": args.pretrain_episodes,
         "core_budget": args.core_budget,
         "variants": list(selected_variants),
         "memory_budget_control": {
