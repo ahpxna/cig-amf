@@ -40,7 +40,7 @@ def _atomic_json(path, payload):
 def _expand_paths(patterns):
     paths = []
     for pattern in patterns:
-        expanded = sorted(glob.glob(pattern))
+        expanded = sorted(glob.glob(pattern, recursive=True))
         paths.extend(expanded if expanded else [pattern])
     missing = [path for path in paths if not os.path.isfile(path)]
     if missing:

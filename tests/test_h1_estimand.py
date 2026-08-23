@@ -279,6 +279,8 @@ class H1ClaimGateTests(unittest.TestCase):
                     "capacity_active_support_pass": True,
                     "capacity_null_fpr_mean": 0.05,
                     "oracle_core_f1_mean": 0.80,
+                    "oracle_core_f1_random_baseline_mean": 0.20,
+                    "oracle_core_f1_adjusted_mean": 0.75,
                     "direction_spearman_mean": signed_rank,
                     "direction_mae_mean": abs(epsilon_bias[variant]),
                     "direction_bias_mean": epsilon_bias[variant],

@@ -21,8 +21,12 @@ class H3NoMultiMemoryRunner(FinalCIGAMFRunner):
         super().__init__(env=env, cfg=cfg, device=device)
         self.periph_module = SingleMeanPeripheral(
             action_dim=self.action_dim,
-            memory_dim=cfg["periph_memory_dim"],
+            # These two dimensions are independently configurable only for
+            # the matched-budget control.  The emitted representation keeps
+            # the production ``periph_dim`` so policy inputs remain identical.
+            memory_dim=cfg.get("single_mean_memory_dim", cfg["periph_memory_dim"]),
             out_dim=self.periph_dim,
+            item_hidden=cfg.get("single_mean_item_hidden", 48),
             mu_floor=cfg.get("periph_mu_floor", 0.02),
             beta_floor=cfg.get("periph_beta_floor", 0.05),
             beta_mode=cfg.get("periph_beta_mode", "capacity"),

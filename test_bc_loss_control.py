@@ -14,13 +14,14 @@ must drive bc_loss toward zero. A value near 1.79 means the model cannot use the
 input; a value near the recorded 2.3 confirms label misalignment.
 
 T2, shuffled labels: target_action is randomly permuted in bc_buffer before
-training. The target is independent of the input, so the original test expected
-ln(6). [P-5] later established that reported bc_loss includes a 0.25-weighted
-shadow loss, making the correct floor ``(1+0.25)*ln(6)=2.2397``. The earlier
-2.2336 result matches that floor within 6e-3, showing that the pipeline was not
-broken; the test's expected constant was wrong.
+training. The target is independent of the input.  The two-tier architecture
+has two distinct valid floors: shadow-only records contribute
+``0.25*ln(6)``, while records whose pair is explicitly core-active contribute
+``(1+0.25)*ln(6)``.  Both controls are checked so an allocation regression
+cannot masquerade as a label-alignment result.
 
-Gate: T1 < 0.3. T2 within 0.15 of ``(1+0.25)*ln(6)``.
+Gate: T1 < 0.3. T2a within 0.15 of ``0.25*ln(6)``. T2b within 0.15 of
+``(1+0.25)*ln(6)``.
 
 Run: ``python3 test_bc_loss_control.py``. A real PyTorch installation is
 required: either CPU PyTorch or a host with the runtime required by a CUDA-only
@@ -128,6 +129,14 @@ def _make_env_and_module(seed=0):
     return env, pair_rel
 
 
+def _activate_all_pairs(env, pair_rel):
+    """Seed the full recurrent tier explicitly for core-active controls."""
+    pair_rel.reconcile_core_sets({
+        ego: [neighbor for neighbor in range(env.n_agents) if neighbor != ego]
+        for ego in range(env.n_agents)
+    })
+
+
 def test_t1_scripted_policy_deterministic():
     print("\n" + "=" * 70)
     print("T1 — deterministic scripted policy: BC loss should converge to ~0")
@@ -138,6 +147,7 @@ def test_t1_scripted_policy_deterministic():
     random.seed(0)
 
     env, pair_rel = _make_env_and_module(seed=0)
+    _activate_all_pairs(env, pair_rel)
     collect_bc_buffer(env, pair_rel, n_steps=150, action_fn=_deterministic_actions)
 
     print(f"  bc_buffer size = {len(pair_rel.bc_buffer)}")
@@ -169,6 +179,16 @@ def test_t1_scripted_policy_deterministic():
     return ok
 
 
+def _shuffle_and_fit(pair_rel, action_dim):
+    rng = np.random.RandomState(0)
+    for sample in pair_rel.bc_buffer:
+        sample["target_action"] = int(rng.randint(0, action_dim))
+    loss = None
+    for _ in range(60):
+        loss = pair_rel.train_bc(n_steps=20, batch_size=512)
+    return float(loss)
+
+
 def test_t2_label_shuffle():
     print("\n" + "=" * 70)
     print("T2 — shuffled labels: BC loss should converge to the corrected floor")
@@ -178,37 +198,35 @@ def test_t2_label_shuffle():
     np.random.seed(0)
     random.seed(0)
 
-    env, pair_rel = _make_env_and_module(seed=0)
-    collect_bc_buffer(env, pair_rel, n_steps=150, action_fn=_deterministic_actions)
-
-    rng = np.random.RandomState(0)
-    A = env.get_action_dim()
-    for sample in pair_rel.bc_buffer:
-        sample["target_action"] = int(rng.randint(0, A))
-
-    loss = None
-    for epoch in range(60):
-        loss = pair_rel.train_bc(n_steps=20, batch_size=512)
-        if epoch % 10 == 0 or epoch == 59:
-            print(f"  epoch {epoch:3d}  bc_loss = {loss:.4f}")
-
+    shadow_env, shadow_pair_rel = _make_env_and_module(seed=0)
+    collect_bc_buffer(
+        shadow_env, shadow_pair_rel, n_steps=150,
+        action_fn=_deterministic_actions,
+    )
+    core_env, core_pair_rel = _make_env_and_module(seed=0)
+    _activate_all_pairs(core_env, core_pair_rel)
+    collect_bc_buffer(
+        core_env, core_pair_rel, n_steps=150,
+        action_fn=_deterministic_actions,
+    )
+    A = shadow_env.get_action_dim()
+    shadow_loss = _shuffle_and_fit(shadow_pair_rel, A)
+    core_loss = _shuffle_and_fit(core_pair_rel, A)
     ln6 = float(np.log(6))
-    # [P-5 FINAL DEBUG] Reported bc_loss includes the shadow loss with
-    # shadow_loss_weight=0.25. The shuffled-label floor is therefore
-    # (1+0.25)*ln6=2.2397, not ln6=1.7918. The previous 2.2336 measurement
-    # matches the correct floor within 6e-3: the pipeline was never broken;
-    # the expected test constant was wrong.
-    floor = (1.0 + 0.25) * ln6
-    print(f"\n  final BC loss = {loss:.4f}  (correct floor (1+0.25)·ln6 = {floor:.4f})")
-
-    ok = abs(loss - floor) < 0.15
-    print(f"  [{'PASS' if ok else 'FAIL'}] T2: |bc_loss - (1+0.25)·ln6| < 0.15")
+    shadow_floor = 0.25 * ln6
+    core_floor = (1.0 + 0.25) * ln6
+    print(f"\n  shadow-only loss = {shadow_loss:.4f}  (floor = {shadow_floor:.4f})")
+    print(f"  core-active loss = {core_loss:.4f}  (floor = {core_floor:.4f})")
+    ok_shadow = abs(shadow_loss - shadow_floor) < 0.15
+    ok_core = abs(core_loss - core_floor) < 0.15
+    ok = ok_shadow and ok_core
+    print(f"  [{'PASS' if ok_shadow else 'FAIL'}] T2a: shadow-only floor")
+    print(f"  [{'PASS' if ok_core else 'FAIL'}] T2b: core-active floor")
 
     if not ok:
         print(
-            "  >> Labels are shuffled but BC loss differs from the "
-            "(1+w_shadow)·ln6 floor. Check batching, loss composition, and "
-            "shadow_loss_weight."
+            "  >> Shuffled-label loss differs from its state-allocation "
+            "floor. Check core allocation, batch composition, and loss weights."
         )
 
     return ok

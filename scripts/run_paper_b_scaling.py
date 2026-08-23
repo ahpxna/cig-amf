@@ -18,8 +18,10 @@ import numpy as np
 
 try:
     from exp_common import ROOT, ensure_dir
+    from run_paper_b_periphery import _memory_accounting
 except ModuleNotFoundError:
     from scripts.exp_common import ROOT, ensure_dir
+    from scripts.run_paper_b_periphery import _memory_accounting
 
 import run_experiment as RE
 from runners.h3_ablation_runner import H3NoMultiMemoryRunner
@@ -49,27 +51,6 @@ def _atomic_json(path, payload):
 def _mean(values):
     values = [float(value) for value in values if np.isfinite(value)]
     return float(np.mean(values)) if values else float("nan")
-
-
-def _model_bytes(runner):
-    if not hasattr(runner, "pair_rel_module"):
-        modules = (runner.policy_value, runner.actor, runner.critic)
-        return int(sum(
-            parameter.numel() * parameter.element_size()
-            for module in modules for parameter in module.parameters()
-        ))
-    modules = (runner.policy_value, runner.pair_rel_module.full_encoder,
-               runner.periph_module, runner.belief_summary_builder)
-    parameters = sum(
-        parameter.numel() * parameter.element_size()
-        for module in modules for parameter in module.parameters()
-    )
-    # Measure actual state allocation after the run, not an old all-pair
-    # full-state formula.  Shadow is maintained for candidates; full z only
-    # exists for selected core pairs.
-    stats = runner.pair_rel_module.get_debug_stats()
-    state = int(stats["full_state_bytes"] + stats["shadow_state_bytes"])
-    return int(parameters + state)
 
 
 def _runner(variant, n_agents, seed, device, core_budget):
@@ -123,6 +104,7 @@ def main(argv=None):
                     min(args.core_budget, int(n_agents) - 1),
                 )
                 history = runner.run(n_episodes=int(args.episodes), eval_every=10)
+                memory = _memory_accounting(runner)
                 rows.append({
                     "variant": variant,
                     "seed": int(seed),
@@ -132,7 +114,7 @@ def main(argv=None):
                     "throughput_total": _mean(
                         history.get("throughput_total_agent_steps_per_sec", [])
                     ),
-                    "representation_memory_bytes": _model_bytes(runner),
+                    **memory,
                 })
     out_root = ensure_dir(os.path.abspath(args.out_root))
     summary = os.path.join(out_root, "summary_paper_b_scaling.csv")

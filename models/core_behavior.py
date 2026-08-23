@@ -1214,6 +1214,10 @@ class PairRelationalModule:
             "n_pairs": int(len(self.shadow_states)),
             "full_state_bytes": int(len(self.full_states) * self.hidden_dim * 4),
             "shadow_state_bytes": int(len(self.shadow_states) * self.shadow_dim * 4),
+            "pooled_state_bytes": int(
+                len(self.pooled_states) * self.shadow_dim * 4
+                if self.state_mode == "pooled" else 0
+            ),
             "hidden_dim": int(self.hidden_dim),
             "shadow_dim": int(self.shadow_dim),
             "bc_buffer_size": int(len(self.bc_buffer)),

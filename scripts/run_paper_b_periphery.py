@@ -30,6 +30,8 @@ except ModuleNotFoundError:
 
 import run_experiment as RE
 from runners.h3_ablation_runner import H3NoMultiMemoryRunner
+from models.peripheral_memory import PeripheralMultiMemory
+from models.single_mean_memory import SingleMeanPeripheral
 
 
 VARIANTS = {
@@ -48,6 +50,14 @@ VARIANTS = {
         "periph_lb_coeff": 0.0, "periph_orth_coeff": 0.0,
     },
     "Single-Mean": {"runner": "single", "num_memory_slots": 6},
+    # This is the fidelity control required by the Paper-B memory-budget
+    # claim.  Its internal width is selected before construction to match the
+    # semantic module's trainable peripheral parameter budget within ±5%; the
+    # output width stays fixed, so downstream policy inputs are unchanged.
+    "Single-Mean-Matched": {
+        "runner": "single", "num_memory_slots": 6,
+        "match_semantic_memory": True,
+    },
     "Attention-Mean": {
         "runner": "single", "num_memory_slots": 6,
         "periph_beta_mode": "attention",
@@ -57,6 +67,8 @@ VARIANTS = {
         "periph_beta_mode": "abs_direction",
     },
 }
+
+_MATCHED_DIMENSION_CACHE = {}
 
 
 def _decision_fidelity(probe, reference):
@@ -73,11 +85,140 @@ def _decision_fidelity(probe, reference):
     }
 
 
-def _representation_memory_bytes(runner):
-    periph_bytes = sum(
-        parameter.numel() * parameter.element_size()
-        for parameter in runner.periph_module.parameters()
+def _unique_parameter_bytes(*modules):
+    """Count shared parameters once across a runner's trainable modules."""
+    seen, total = set(), 0
+    for module in modules:
+        if module is None or not callable(getattr(module, "parameters", None)):
+            continue
+        for parameter in module.parameters():
+            marker = id(parameter)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            total += parameter.numel() * parameter.element_size()
+    return int(total)
+
+
+def _runner_trainable_parameter_bytes(runner):
+    modules = [
+        getattr(runner, "policy_value", None),
+        getattr(runner, "actor", None),
+        getattr(runner, "critic", None),
+        getattr(runner, "backbone", None),
+        getattr(runner, "periph_module", None),
+        getattr(runner, "belief_summary_builder", None),
+        getattr(runner, "single_periph_proj", None),
+        getattr(runner, "heads", None),
+    ]
+    pair = getattr(runner, "pair_rel_module", None)
+    if pair is not None:
+        modules.extend([
+            getattr(pair, "full_encoder", None),
+            getattr(pair, "shadow_encoder", None),
+            getattr(pair, "shadow_to_full", None),
+            getattr(pair, "bc_head", None),
+        ])
+    proxy = getattr(runner, "proxy", None)
+    if proxy is not None and not bool(getattr(proxy, "use_vmap_ensemble", False)):
+        modules.extend(getattr(proxy, "models", ()))
+    total = _unique_parameter_bytes(*modules)
+    # The vectorised ensemble keeps trainable tensors in functional stacks,
+    # not nn.Module.parameters().  Count those tensors once as well.
+    if bool(getattr(proxy, "use_vmap_ensemble", False)):
+        total += sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in getattr(proxy, "_stacked_params", {}).values()
+        )
+    return int(total)
+
+
+def _persistent_representation_state_bytes(runner):
+    """Persistent pair state is distinct from trainable parameter storage."""
+    pair = getattr(runner, "pair_rel_module", None)
+    if pair is None:
+        return 0
+    state_stats = pair.get_debug_stats()
+    return int(
+        state_stats.get("full_state_bytes", 0)
+        + state_stats.get("shadow_state_bytes", 0)
+        + state_stats.get("pooled_state_bytes", 0)
     )
+
+
+def _memory_accounting(runner):
+    trainable = _runner_trainable_parameter_bytes(runner)
+    persistent = _persistent_representation_state_bytes(runner)
+    return {
+        "trainable_parameter_bytes": int(trainable),
+        "persistent_representation_state_bytes": int(persistent),
+        "representation_memory_bytes": int(trainable + persistent),
+    }
+
+
+def _semantic_peripheral_parameter_bytes(cfg, action_dim):
+    module = PeripheralMultiMemory(
+        action_dim=int(action_dim),
+        memory_dim=int(cfg["periph_memory_dim"]),
+        out_dim=int(cfg["periph_dim"]),
+        num_slots=6,
+        routing_mode="semantic",
+        signature_mode=cfg.get("periph_signature_mode", "full"),
+        require_full_signature=cfg.get("periph_require_full_signature", True),
+        allow_legacy_items=cfg.get("periph_allow_legacy_items", False),
+        use_uniform_mix=cfg.get("periph_use_uniform_mix", False),
+    )
+    return _unique_parameter_bytes(module)
+
+
+def _matched_single_mean_dimensions(cfg, action_dim):
+    """Choose a one-mean encoder whose peripheral parameter budget matches.
+
+    The search is deterministic and architecture-local; it never uses
+    outcomes or oracle labels.  It therefore defines the control before any
+    experimental data are collected.
+    """
+    cache_key = (
+        int(action_dim), int(cfg["periph_memory_dim"]), int(cfg["periph_dim"]),
+        str(cfg.get("periph_signature_mode", "full")),
+        bool(cfg.get("periph_require_full_signature", True)),
+        bool(cfg.get("periph_allow_legacy_items", False)),
+    )
+    cached = _MATCHED_DIMENSION_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+    target = _semantic_peripheral_parameter_bytes(cfg, action_dim)
+    best = None
+    for memory_dim in range(8, 257, 4):
+        for item_hidden in range(16, 257, 8):
+            candidate = SingleMeanPeripheral(
+                action_dim=int(action_dim), memory_dim=memory_dim,
+                out_dim=int(cfg["periph_dim"]), item_hidden=item_hidden,
+                signature_mode=cfg.get("periph_signature_mode", "full"),
+                require_full_signature=cfg.get("periph_require_full_signature", True),
+                allow_legacy_items=cfg.get("periph_allow_legacy_items", False),
+            )
+            size = _unique_parameter_bytes(candidate)
+            error = abs(size - target)
+            key = (error, memory_dim * item_hidden, memory_dim, item_hidden)
+            if best is None or key < best[0]:
+                best = (key, memory_dim, item_hidden, size)
+    _, memory_dim, item_hidden, actual = best
+    relative_error = abs(actual - target) / max(target, 1)
+    if relative_error > 0.05:
+        raise RuntimeError(
+            "could not construct Single-Mean-Matched within the required "
+            f"±5% peripheral parameter budget (target={target}, actual={actual})"
+        )
+    result = {
+        "single_mean_memory_dim": int(memory_dim),
+        "single_mean_item_hidden": int(item_hidden),
+        "matched_periph_target_parameter_bytes": int(target),
+        "matched_periph_parameter_bytes": int(actual),
+        "matched_periph_relative_error": float(relative_error),
+    }
+    _MATCHED_DIMENSION_CACHE[cache_key] = dict(result)
+    return result
     state_stats = runner.pair_rel_module.get_debug_stats()
     pair_state_bytes = int(
         state_stats["full_state_bytes"] + state_stats["shadow_state_bytes"]
@@ -192,9 +333,15 @@ def _run_variant(
     spec = VARIANTS[name]
     cfg = _cfg(seed, core_budget)
     cfg.update({key: value for key, value in spec.items() if key != "runner"})
+    env = _env(seed)
+    matched_budget = {}
+    if bool(spec.get("match_semantic_memory", False)):
+        matched_budget = _matched_single_mean_dimensions(
+            cfg, action_dim=env.get_action_dim(),
+        )
+        cfg.update(matched_budget)
     if spec["runner"] == "full":
         cfg["core_selection_mode"] = "full_explicit"
-    env = _env(seed)
     runner = (
         H3NoMultiMemoryRunner(env, cfg, device=device)
         if spec["runner"] == "single"
@@ -235,7 +382,8 @@ def _run_variant(
         "throughput_total": _mean(
             history.get("throughput_total_agent_steps_per_sec", [])
         ),
-        "representation_memory_bytes": _representation_memory_bytes(runner),
+        **_memory_accounting(runner),
+        **matched_budget,
         "usage_entropy_ratio": float(
             diagnostics.get("usage_entropy_ratio", -1.0)
         ),
@@ -290,7 +438,9 @@ def main(argv=None):
             rows.append(row)
     summary_path = os.path.join(out_root, "summary_paper_b_periphery.csv")
     with open(summary_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=sorted(rows[0]))
+        writer = csv.DictWriter(
+            handle, fieldnames=sorted({key for row in rows for key in row})
+        )
         writer.writeheader()
         writer.writerows(rows)
     _atomic_json(os.path.join(out_root, "manifest.json"), {
@@ -300,6 +450,12 @@ def main(argv=None):
         "episodes": args.episodes,
         "core_budget": args.core_budget,
         "variants": list(selected_variants),
+        "memory_budget_control": {
+            "variant": "Single-Mean-Matched",
+            "target": "Semantic-Free trainable peripheral parameter bytes",
+            "tolerance": 0.05,
+            "selection": "deterministic architecture-only width search",
+        },
         "summary": summary_path,
     })
     print(summary_path)

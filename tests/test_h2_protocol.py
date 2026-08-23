@@ -8,6 +8,7 @@ import unittest
 from collections import deque
 
 import numpy as np
+import torch
 
 from runners.baseline_runner import (
     CorrelationMeanFieldRunner,
@@ -15,6 +16,7 @@ from runners.baseline_runner import (
     _ordered_geometry_snapshot,
 )
 from runners.final_runner import FinalCIGAMFRunner, NoTwoTimescaleRunner
+from models.core_behavior import PairRelationalModule
 from scripts.collect_results import (
     H1_VARIANTS,
     H2_PROTOCOL_VERSION,
@@ -24,8 +26,10 @@ from scripts.collect_results import (
     collect,
 )
 from scripts.run_h2_selectivity import (
+    _capture_frozen_learning_checkpoint,
     _matched_change_interval_mask,
     _recovery_statistics,
+    _restore_frozen_learning_checkpoint,
 )
 
 
@@ -93,6 +97,7 @@ class H2ProtocolTests(unittest.TestCase):
 
     def test_geometry_snapshot_orders_dictionary_values_by_agent_id(self):
         class Env:
+            n_agents = 2
             positions = {1: [8, 9], 0: [2, 3]}
             agent_zone = {1: 4, 0: 1}
             grid_size = 12
@@ -101,6 +106,40 @@ class H2ProtocolTests(unittest.TestCase):
         snapshot = _ordered_geometry_snapshot(Env(), 2)
         self.assertEqual(snapshot["positions"], [[2, 3], [8, 9]])
         self.assertEqual(snapshot["agent_zone"], [1, 4])
+
+    def test_checkpoint_restores_core_pair_allocation_with_full_states(self):
+        """A restored recurrent core must continue updating its full states."""
+        class Env:
+            def clone_state(self):
+                return {"state": 1}
+
+            def restore_state(self, state):
+                del state
+
+        class Runner:
+            def __init__(self):
+                self.device = "cpu"
+                self.env = Env()
+                self.policy_value = torch.nn.Linear(2, 2)
+                self.pair_rel_module = PairRelationalModule(
+                    n_agents=3, obs_dim=2, action_dim=2, hidden_dim=4,
+                    shadow_dim=2, rel_feat_dim=1, device="cpu",
+                )
+
+        source = Runner()
+        expected_core = {0: {1}, 1: {2}, 2: {0}}
+        source.pair_rel_module.reconcile_core_sets(expected_core)
+        checkpoint = _capture_frozen_learning_checkpoint(source)
+        restored = Runner()
+        _restore_frozen_learning_checkpoint(restored, checkpoint)
+        self.assertEqual(
+            set(restored.pair_rel_module.full_states),
+            set(restored.pair_rel_module.active_core_pairs),
+        )
+        self.assertEqual(
+            set(restored.pair_rel_module.active_core_pairs),
+            {(0, 1), (1, 2), (2, 0)},
+        )
 
     def test_shared_runner_preserves_global_episode_clock_across_chunks(self):
         runner = SharedAblationBase.__new__(SharedAblationBase)

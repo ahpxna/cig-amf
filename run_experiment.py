@@ -2,6 +2,7 @@ import argparse
 import gc
 import importlib
 import inspect
+import math
 import os
 import pkgutil
 import random
@@ -1436,6 +1437,10 @@ def _response_surface_calibration(proxy_q, oracle_q, neighbor_ids):
             float(np.mean(within_state_ranks))
             if within_state_ranks else float("nan")
         ),
+        # Keep pair-level sufficient statistics.  H1 aggregation must pool
+        # informative response surfaces, never average ego-state means that
+        # may be undefined when every oracle surface in that group is null.
+        "q_within_state_action_spearman_sum": float(np.sum(within_state_ranks)),
         "q_nonconstant_surface_count": int(nonconstant_count),
         "q_raw_mae": float(np.mean(np.abs(raw_diff))),
         "q_raw_rmse": float(np.sqrt(np.mean(raw_diff ** 2))),
@@ -2687,12 +2692,56 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
     ]
 
     for key in numeric_keys:
+        # H1a is defined over nonconstant action-response surfaces.  A null
+        # ego-state group carries no action rank and must neither poison the
+        # estimate with NaN nor receive the same weight as a group containing
+        # several informative surfaces.
+        if key == "q_within_state_action_spearman":
+            total_rank = float(sum(
+                float(row.get(
+                    "q_within_state_action_spearman_sum",
+                    float(row[key]) * int(row.get("q_nonconstant_surface_count", 0)),
+                ))
+                for row in aggregate_rows
+                if row.get(key) is not None
+                and math.isfinite(float(row[key]))
+                and int(row.get("q_nonconstant_surface_count", 0)) > 0
+            ))
+            total_weight = int(sum(
+                int(row.get("q_nonconstant_surface_count", 0))
+                for row in aggregate_rows
+                if row.get(key) is not None
+                and math.isfinite(float(row[key]))
+                and int(row.get("q_nonconstant_surface_count", 0)) > 0
+            ))
+            value = (
+                total_rank / total_weight
+                if total_weight > 0 else float("nan")
+            )
+            summary[f"{key}_mean"] = float(value)
+            summary[f"{key}_std"] = float("nan")
+            summary[f"{key}_min"] = float(value)
+            summary[f"{key}_max"] = float(value)
+            summary["q_within_state_action_spearman_sum"] = float(total_rank)
+            continue
+        if key == "q_nonconstant_surface_count":
+            total = int(sum(
+                int(row.get(key, 0)) for row in aggregate_rows
+                if row.get(key) is not None
+            ))
+            summary[f"{key}_mean"] = float(total)
+            summary[f"{key}_std"] = 0.0
+            summary[f"{key}_min"] = float(total)
+            summary[f"{key}_max"] = float(total)
+            continue
         vals = []
 
         for row in aggregate_rows:
             if key in row and row[key] is not None:
                 try:
-                    vals.append(float(row[key]))
+                    value = float(row[key])
+                    if math.isfinite(value):
+                        vals.append(value)
                 except Exception:
                     pass
 

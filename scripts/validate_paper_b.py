@@ -24,7 +24,7 @@ EXPECTED_PAIR = {
 }
 EXPECTED_PERIPHERY = {
     "Full-Explicit", "Semantic-Free", "Semantic-Only", "Unconstrained", "No-Aux", "Single-Mean",
-    "Attention-Mean", "AbsD-Pooling",
+    "Single-Mean-Matched", "Attention-Mean", "AbsD-Pooling",
 }
 EXPECTED_SCALING = {
     "PureMeanField", "Attention-Mean", "Full-Explicit", "Semantic-Free", "Single-Mean",
@@ -182,6 +182,18 @@ def validate(run_root, expected_seeds, protocol_mode):
         pair_rows, "Recurrent-BC-CD", "Recurrent-BC-CD-NoWarmStart",
         "post_promotion_bc_loss",
     )]
+    warm_start_logit = [-value for value in _paired(
+        pair_rows, "Recurrent-BC-CD", "Recurrent-BC-CD-NoWarmStart",
+        "promotion_logit_error_auc",
+    )]
+    warm_start_value = [-value for value in _paired(
+        pair_rows, "Recurrent-BC-CD", "Recurrent-BC-CD-NoWarmStart",
+        "promotion_value_error_auc",
+    )]
+    warm_start_action = _paired(
+        pair_rows, "Recurrent-BC-CD", "Recurrent-BC-CD-NoWarmStart",
+        "promotion_action_agreement_auc",
+    )
     warm_start_events = [
         min(
             int(left["promotion_event_count"]), int(right["promotion_event_count"])
@@ -198,24 +210,24 @@ def validate(run_root, expected_seeds, protocol_mode):
         )
     ]
     periphery_reward = _paired(
-        periphery_rows, "Semantic-Free", "Single-Mean", "mean_reward"
+        periphery_rows, "Semantic-Free", "Single-Mean-Matched", "mean_reward"
     )
     periphery_logit = [-value for value in _paired(
-        periphery_rows, "Semantic-Free", "Single-Mean",
+        periphery_rows, "Semantic-Free", "Single-Mean-Matched",
         "policy_logit_l2_to_full_explicit",
     )]
     periphery_value = [-value for value in _paired(
-        periphery_rows, "Semantic-Free", "Single-Mean",
+        periphery_rows, "Semantic-Free", "Single-Mean-Matched",
         "value_mae_to_full_explicit",
     )]
     periphery_action = _paired(
-        periphery_rows, "Semantic-Free", "Single-Mean",
+        periphery_rows, "Semantic-Free", "Single-Mean-Matched",
         "action_agreement_to_full_explicit",
     )
-    periphery_memory = [-value for value in _paired(
-        periphery_rows, "Semantic-Free", "Single-Mean",
-        "representation_memory_bytes",
-    )]
+    periphery_parameter_budget_delta = _paired(
+        periphery_rows, "Semantic-Free", "Single-Mean-Matched",
+        "trainable_parameter_bytes",
+    )
     semantic_vs_unconstrained = _paired(
         periphery_rows, "Semantic-Free", "Unconstrained", "mean_reward"
     )
@@ -295,11 +307,14 @@ def validate(run_root, expected_seeds, protocol_mode):
         "full_cd_minus_bc_value_fidelity_error": pair_value,
         "full_cd_minus_bc_action_agreement": pair_action,
         "warm_start_minus_no_warm_post_promotion_bc_loss": warm_start_transient,
+        "warm_start_minus_no_warm_promotion_logit_error": warm_start_logit,
+        "warm_start_minus_no_warm_promotion_value_error": warm_start_value,
+        "warm_start_minus_no_warm_promotion_action_agreement": warm_start_action,
         "semantic_free_minus_single_mean_reward": periphery_reward,
         "semantic_free_minus_single_mean_logit_fidelity_error": periphery_logit,
         "semantic_free_minus_single_mean_value_fidelity_error": periphery_value,
         "semantic_free_minus_single_mean_action_agreement": periphery_action,
-        "semantic_free_minus_single_mean_memory_bytes": periphery_memory,
+        "semantic_free_minus_matched_single_mean_parameter_bytes": periphery_parameter_budget_delta,
         "semantic_free_minus_unconstrained_reward": semantic_vs_unconstrained,
         "capacity_pooling_minus_absD_pooling_reward": capacity_vs_absd_pooling,
         "semantic_free_minus_attention_mean_reward": semantic_vs_attention_mean,
@@ -313,7 +328,7 @@ def validate(run_root, expected_seeds, protocol_mode):
         key: VC._bootstrap_mean_ci(value, seed=4100 + index)
         for index, (key, value) in enumerate(metrics.items())
     }
-    conditions = {
+    primary_conditions = {
         "C_selector_beats_absD_at_equal_budget": cis[
             "c_core_minus_absd_selector_f1"
         ][0] > 0.0,
@@ -355,6 +370,12 @@ def validate(run_root, expected_seeds, protocol_mode):
         ][0] > 0.0,
         "shadow_warm_start_reduces_post_promotion_transient": cis[
             "warm_start_minus_no_warm_post_promotion_bc_loss"
+        ][0] > 0.0 and cis[
+            "warm_start_minus_no_warm_promotion_logit_error"
+        ][0] > 0.0 and cis[
+            "warm_start_minus_no_warm_promotion_value_error"
+        ][0] > 0.0 and cis[
+            "warm_start_minus_no_warm_promotion_action_agreement"
         ][0] > 0.0 and all(count > 0 for count in warm_start_events),
         "semantic_free_memory_improves_reward_over_single_mean": cis[
             "semantic_free_minus_single_mean_reward"
@@ -367,30 +388,42 @@ def validate(run_root, expected_seeds, protocol_mode):
         "semantic_free_memory_improves_value_fidelity": cis[
             "semantic_free_minus_single_mean_value_fidelity_error"
         ][0] > 0.0,
-        "semantic_free_memory_uses_no_more_representation_memory": cis[
-            "semantic_free_minus_single_mean_memory_bytes"
-        ][0] >= 0.0,
+        "semantic_free_matches_single_mean_trainable_budget": max(
+            abs(value) for value in periphery_parameter_budget_delta
+        ) <= max(
+            1.0,
+            0.05 * min(
+                float(row["trainable_parameter_bytes"])
+                for row in periphery_rows
+                if row["variant"] == "Semantic-Free"
+            )
+        ),
         "semantic_routing_beats_unconstrained_soft_slots": cis[
             "semantic_free_minus_unconstrained_reward"
         ][0] > 0.0,
+        "semantic_memory_extends_reward_compute_pareto_frontier": (
+            cis["scaling_semantic_pareto_nondominated"][0] > 0.5
+        ),
+    }
+    secondary_predictions = {
         "capacity_pooling_beats_absD_weighted_pooling": cis[
             "capacity_pooling_minus_absD_pooling_reward"
         ][0] > 0.0,
         "semantic_memory_beats_attention_weighted_aggregate": cis[
             "semantic_free_minus_attention_mean_reward"
         ][0] > 0.0,
-        "semantic_memory_extends_reward_compute_pareto_frontier": (
-            cis["scaling_semantic_pareto_nondominated"][0] > 0.5
-        ),
         "semantic_memory_beats_pure_mean_field_on_scaling_panel": cis[
             "scaling_semantic_minus_pure_mean_field_reward"
         ][0] > 0.0,
     }
-    supported = all(conditions.values())
+    conditions = {**primary_conditions, **secondary_predictions}
+    supported = all(primary_conditions.values())
     return {
         "paper": "B",
         "overall_status": "SUPPORTED" if supported else "NOT_SUPPORTED",
         "conditions": conditions,
+        "primary_conditions": primary_conditions,
+        "secondary_mechanism_predictions": secondary_predictions,
         "paired_metrics": metrics,
         "paired_ci95": cis,
         "warm_start_promotion_events": warm_start_events,

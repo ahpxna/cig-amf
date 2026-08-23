@@ -2248,6 +2248,11 @@ class FinalCIGAMFRunner:
 
     def _should_update_graph_this_episode(self):
         """Return the graph-update cadence selected by the scheduler."""
+        # Fixed-core representation panels hold allocation constant by
+        # protocol.  This is different from freezing policy learning: pair
+        # shadow/full states may still evolve while the selector is held.
+        if bool(self.cfg.get("freeze_graph_updates", False)):
+            return False
         if bool(self.cfg.get("force_graph_update_every_episode", False)):
             return True
         return self.scheduler.should_update_graph()
@@ -2305,7 +2310,10 @@ class FinalCIGAMFRunner:
             policy_runtime = time.time() - t_policy
 
             t_bc = time.time()
-            bc_loss = 0.0 if learning_frozen else self.pair_rel_module.train_bc(
+            bc_learning_frozen = bool(
+                self.cfg.get("freeze_pair_bc_learning", learning_frozen)
+            )
+            bc_loss = 0.0 if bc_learning_frozen else self.pair_rel_module.train_bc(
                 n_steps=self.cfg["bc_train_steps"],
                 batch_size=self.cfg["bc_batch_size"],
                 heads=self.heads,

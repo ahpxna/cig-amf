@@ -79,6 +79,10 @@ class FlatlandCIGEnvironment:
         self._obs = [np.zeros(self.obs_dim, dtype=np.float32) for _ in range(self.n_agents)]
         self.last_actions = [0 for _ in range(self.n_agents)]
         self._behaviour_override = "cooperative"
+        # Route traces are an observation-time cache.  Relation construction
+        # is O(N^2), but each train's bounded topology search must be O(N),
+        # not re-run once per directed pair.
+        self._route_cache = {}
 
     def get_action_dim(self): return 5
     def get_obs_dim(self): return self.obs_dim
@@ -108,6 +112,7 @@ class FlatlandCIGEnvironment:
                 raise RuntimeError("unsupported Flatland reset API: no random_seed/seed parameter")
         observations = result[0] if isinstance(result, tuple) else result
         self._obs = self._normalise_obs(observations)
+        self._route_cache.clear()
         return self._obs
     def step(self, actions):
         result = self.rail_env.step({i: int(actions[i]) for i in range(self.n_agents)})
@@ -119,6 +124,7 @@ class FlatlandCIGEnvironment:
             done = bool(terminated.get("__all__", False) or truncated.get("__all__", False))
         self.last_actions = [int(a) for a in actions]
         self._obs = self._normalise_obs(observations)
+        self._route_cache.clear()
         return self._obs, [float(rewards.get(i, 0.0)) for i in range(self.n_agents)], done, dict(info)
     def valid_action_mask(self, agent):
         mask = np.zeros(5, dtype=bool)
@@ -185,13 +191,15 @@ class FlatlandCIGEnvironment:
             cell_distance[cell] = min(cell_distance.get(cell, depth), depth)
         return cell_distance
 
-    def _distance_to_target(self, agent):
-        position = getattr(agent, "position", None)
-        target = getattr(agent, "target", None)
-        if position is None or target is None:
-            return float("inf")
-        cells = self._reachable_rail_cells(agent)
-        return float(cells.get(tuple(target), float("inf")))
+    def _route_profile(self, agent_id):
+        """Return one bounded route trace for an agent in the current state."""
+        agent_id = int(agent_id)
+        cached = self._route_cache.get(agent_id)
+        if cached is not None:
+            return cached
+        cells = self._reachable_rail_cells(self.rail_env.agents[agent_id])
+        self._route_cache[agent_id] = cells
+        return cells
 
     def relation_features(self, ego, neighbour):
         """Rail-topological xi_ij, not Cartesian/grid feature aliases.
@@ -201,10 +209,10 @@ class FlatlandCIGEnvironment:
         ETA, future route merge, and an upstream indicator. Their meanings are
         adapter-local; downstream CIG-AMF modules treat the vector as opaque.
         """
-        a = self.rail_env.agents[int(ego)]
-        b = self.rail_env.agents[int(neighbour)]
-        paths_a = self._reachable_rail_cells(a)
-        paths_b = self._reachable_rail_cells(b)
+        ego = int(ego)
+        neighbour = int(neighbour)
+        paths_a = self._route_profile(ego)
+        paths_b = self._route_profile(neighbour)
         if not paths_a or not paths_b:
             return np.zeros(6, dtype=np.float32)
         shared = set(paths_a).intersection(paths_b)
@@ -226,8 +234,14 @@ class FlatlandCIGEnvironment:
                     break
             except Exception:
                 continue
-        eta_a, eta_b = self._distance_to_target(a), self._distance_to_target(b)
-        relative_eta = 0.0 if not np.isfinite(eta_a + eta_b) else float((eta_b - eta_a) / 32.0)
+        # The interaction-relevant quantity is arrival time at the first
+        # reachable shared conflict, not distance to each train's own target.
+        eta_a = float(paths_a[first]) if first is not None else float("inf")
+        eta_b = float(paths_b[first]) if first is not None else float("inf")
+        relative_eta = (
+            0.0 if not np.isfinite(eta_a + eta_b)
+            else float((eta_b - eta_a) / 32.0)
+        )
         route_merge = float(any(paths_a[cell] > 0 and paths_b[cell] > 0 for cell in shared))
         upstream = (
             float(paths_b[first] < paths_a[first])
@@ -246,9 +260,21 @@ class FlatlandCIGEnvironment:
     def clone_state(self):
         clone_from = getattr(type(self.rail_env), "clone_from", None)
         clone = clone_from(self.rail_env) if callable(clone_from) else copy.deepcopy(self.rail_env)
-        return clone, copy.deepcopy(self._obs), list(self.last_actions), self._behaviour_override
+        return (
+            clone,
+            copy.deepcopy(self._obs),
+            list(self.last_actions),
+            self._behaviour_override,
+            copy.deepcopy(self._route_cache),
+        )
     def restore_state(self, state):
-        self.rail_env, self._obs, self.last_actions, self._behaviour_override = state
+        (
+            self.rail_env,
+            self._obs,
+            self.last_actions,
+            self._behaviour_override,
+            self._route_cache,
+        ) = state
     def fixed_continuation_policy(self, agent):
         mask = self.valid_action_mask(agent)
         return int(2 if mask[2] else np.flatnonzero(mask)[0])

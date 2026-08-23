@@ -464,6 +464,11 @@ def _capture_frozen_learning_checkpoint(runner):
         runtime_state["pair_shadow_states"] = {
             key: value.detach().clone() for key, value in pair_module.shadow_states.items()
         }
+        runtime_state["pair_active_core_pairs"] = set(pair_module.active_core_pairs)
+        runtime_state["pair_pooled_states"] = {
+            key: value.detach().clone() for key, value in pair_module.pooled_states.items()
+        }
+        runtime_state["pair_state_mode"] = str(pair_module.state_mode)
         runtime_state["pair_bc_buffer"] = copy.deepcopy(pair_module.bc_buffer)
         runtime_state["pair_cd_norm_mean"] = pair_module.cd_norm_mean.copy()
         runtime_state["pair_cd_norm_std"] = pair_module.cd_norm_std.copy()
@@ -568,6 +573,21 @@ def _restore_frozen_learning_checkpoint(runner, checkpoint):
             key: value.detach().clone().to(runner.device)
             for key, value in runtime["pair_shadow_states"].items()
         }
+        pair_module.active_core_pairs = set(
+            runtime.get("pair_active_core_pairs", pair_module.full_states.keys())
+        )
+        pair_module.pooled_states = {
+            key: value.detach().clone().to(runner.device)
+            for key, value in runtime.get("pair_pooled_states", {}).items()
+        }
+        pair_module.state_mode = str(runtime.get("pair_state_mode", pair_module.state_mode))
+        if pair_module.state_mode != "pooled":
+            full_keys = set(pair_module.full_states)
+            if full_keys != set(pair_module.active_core_pairs):
+                raise RuntimeError(
+                    "checkpoint pair allocation mismatch: full-state keys and "
+                    "active-core pairs must be identical"
+                )
         pair_module.bc_buffer = copy.deepcopy(runtime["pair_bc_buffer"])
         pair_module.cd_norm_mean = runtime["pair_cd_norm_mean"].copy()
         pair_module.cd_norm_std = runtime["pair_cd_norm_std"].copy()
