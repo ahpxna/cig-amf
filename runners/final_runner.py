@@ -722,6 +722,47 @@ class FinalCIGAMFRunner:
             )
         return table, np.ones((table.shape[0],), dtype=np.float32)
 
+    def _raw_proxy_context_block(self, ego, current_actions=None):
+        """Build the raw DeepSets block once for one ego at one timestep.
+
+        Targets retain only a reference to this block.  The proxy forms the
+        literal leave-one-out set with ``S_i - e_ij`` rather than materialising
+        an O(N)-sized context table for every target j.
+        """
+        adapter = self.env_adapter
+        action_source = (
+            current_actions if current_actions is not None
+            else getattr(self.env, "last_actions", {})
+        )
+        ids = [other for other in range(self.n_agents) if other != int(ego)]
+        rows = []
+        for other in ids:
+            try:
+                action = int(action_source[other])
+            except (KeyError, IndexError, TypeError):
+                action = 0
+            rows.append(adapter.neighbour_features(ego, other, action))
+        items = (
+            np.stack(rows, axis=0).astype(np.float32)
+            if rows else np.zeros((0, adapter.context_item_dim), dtype=np.float32)
+        )
+        return {"neighbor_ids": np.asarray(ids, dtype=np.int64), "items": items}
+
+    def _raw_proxy_context_excluding_from_block(self, block, exclude_j):
+        """Legacy fixed-width context summary derived by sum-minus-one."""
+        items = np.asarray(block["items"], dtype=np.float32)
+        ids = np.asarray(block["neighbor_ids"], dtype=np.int64)
+        keep = ids != int(exclude_j)
+        active = items[keep]
+        width = int(self.env_adapter.context_item_dim)
+        if active.size == 0:
+            summary = np.zeros(2 * width + 1, dtype=np.float32)
+        else:
+            summary = np.concatenate([
+                active.sum(axis=0), np.square(active).sum(axis=0), [len(active)]
+            ]).astype(np.float32)
+        return self._split_raw_context(summary)
+
     # ============================================================
     # Action selection
     # ============================================================
@@ -884,7 +925,7 @@ class FinalCIGAMFRunner:
             "core_context_excluding": {},
             "periph_context_excluding": {},
             "proxy_context_excluding": {},
-            "proxy_context_items_excluding": {},
+            "proxy_context_blocks": {},
             "value_cache": {},
             # [FIX-X1] Snapshot geometry at this timestep so replay_builder can
             # construct x_ij at sample creation time. It cannot be reconstructed
@@ -915,7 +956,6 @@ class FinalCIGAMFRunner:
             cache["core_context_excluding"][ego] = {}
             cache["periph_context_excluding"][ego] = {}
             cache["proxy_context_excluding"][ego] = {}
-            cache["proxy_context_items_excluding"][ego] = {}
 
             for j in range(self.n_agents):
                 if j == ego:
@@ -929,13 +969,6 @@ class FinalCIGAMFRunner:
                 cache["periph_context_excluding"][ego][j] = self._periph_context_excluding(
                     ego,
                     j,
-                )
-                cache["proxy_context_excluding"][ego][j] = self._raw_proxy_context_excluding(
-                    ego,
-                    j,
-                )
-                cache["proxy_context_items_excluding"][ego][j] = (
-                    self._raw_proxy_context_items_excluding(ego, j)
                 )
 
             obs_batch.append(self.env_adapter.observation(obs_all, ego))
@@ -1050,21 +1083,17 @@ class FinalCIGAMFRunner:
             actions[ego] = int(actions_list[ego])
             cache["value_cache"][ego] = float(values_np[ego])
 
-        # Causal contexts must condition on the executed co-action vector at
-        # the intervention step. Rebuild after the behavioural adapter and
-        # epsilon forcing, while still before env.step().
+        # Causal contexts condition on executed co-actions.  Build one raw
+        # block per ego, then derive each legacy summary by sum-minus-target;
+        # no O(N^3) copied leave-one-out tables are created or retained.
+        cache["proxy_context_blocks"] = {}
         for ego in range(self.n_agents):
+            block = self._raw_proxy_context_block(ego, current_actions=actions_list)
+            cache["proxy_context_blocks"][ego] = block
             for j in range(self.n_agents):
                 if j != ego:
                     cache["proxy_context_excluding"][ego][j] = (
-                        self._raw_proxy_context_excluding(
-                            ego, j, current_actions=actions_list
-                        )
-                    )
-                    cache["proxy_context_items_excluding"][ego][j] = (
-                        self._raw_proxy_context_items_excluding(
-                            ego, j, current_actions=actions_list
-                        )
+                        self._raw_proxy_context_excluding_from_block(block, j)
                     )
 
         cache["forced_mask"] = forced_mask
@@ -1168,9 +1197,7 @@ class FinalCIGAMFRunner:
                     "core_context_excluding": cache["core_context_excluding"],
                     "periph_context_excluding": cache["periph_context_excluding"],
                     "proxy_context_excluding": cache["proxy_context_excluding"],
-                    "proxy_context_items_excluding": cache[
-                        "proxy_context_items_excluding"
-                    ],
+                    "proxy_context_blocks": cache["proxy_context_blocks"],
                     "value_cache": cache["value_cache"],
                     "geom_snapshot": cache["geom_snapshot"],   # [FIX-X1]
                     "forced_mask": cache["forced_mask"],
@@ -1179,6 +1206,12 @@ class FinalCIGAMFRunner:
                     "env_snapshot_after_step": env_snapshot_after_step,
                     "h_snapshot_before_latent_update": h_snapshot_before_latent_update,
                     "info": info,
+                    "terminated": bool(
+                        isinstance(info, dict) and info.get("terminated", False)
+                    ),
+                    "truncated": bool(
+                        isinstance(info, dict) and info.get("truncated", False)
+                    ),
                 }
             )
 
@@ -1415,6 +1448,7 @@ class FinalCIGAMFRunner:
         total_actor_loss = 0.0
         total_critic_loss = 0.0
         total_entropy = 0.0
+        total_importance_ratio = 0.0
         adv_mean_acc = []
         adv_std_acc = []
         count = 0
@@ -1423,6 +1457,7 @@ class FinalCIGAMFRunner:
             obs_batch = []
             core_batch = []
             actions_batch = []
+            behaviour_prob_batch = []
             returns_batch = []
             belief_tensors = []
             periph_tensors = []
@@ -1433,6 +1468,14 @@ class FinalCIGAMFRunner:
                 obs_batch.append(obs_i)
                 core_batch.append(step["core_summary_cache"][ego])
                 actions_batch.append(int(step["actions"][ego]))
+                behaviour_rows = step.get("behaviour_probs")
+                behaviour_prob_batch.append(
+                    1.0 if behaviour_rows is None else float(
+                        np.asarray(behaviour_rows[ego], dtype=np.float32)[
+                            int(step["actions"][ego])
+                        ]
+                    )
+                )
                 returns_batch.append(float(returns[t][ego]))
 
                 belief_tensors.append(
@@ -1512,7 +1555,18 @@ class FinalCIGAMFRunner:
 
             adv = (adv_raw - adv_raw.mean()) / (adv_raw.std(unbiased=False) + 1e-8)
 
-            policy_loss = -logp * adv
+            # Actions are collected from the known mixture behaviour policy
+            # b, while this network represents pi.  Use a clipped exact
+            # importance ratio rather than treating forced actions as on-policy.
+            pi_obs = torch.gather(probs, 1, action_t.unsqueeze(1)).squeeze(1)
+            b_obs = torch.tensor(
+                behaviour_prob_batch, dtype=torch.float32, device=self.device
+            )
+            rho = torch.clamp(
+                pi_obs.detach() / torch.clamp(b_obs, min=1e-8),
+                min=0.0, max=max(1.0, float(self.cfg.get("actor_importance_clip", 2.0))),
+            )
+            policy_loss = -rho * logp * adv
             value_loss = F.mse_loss(value, ret_t, reduction="none")
             entropy = dist.entropy()
 
@@ -1522,6 +1576,7 @@ class FinalCIGAMFRunner:
             total_actor_loss = total_actor_loss + policy_loss.sum()
             total_critic_loss = total_critic_loss + value_loss.sum()
             total_entropy = total_entropy + entropy.sum()
+            total_importance_ratio = total_importance_ratio + rho.sum()
             count += self.n_agents
 
         self.policy_optim.zero_grad()
@@ -1553,6 +1608,9 @@ class FinalCIGAMFRunner:
             "loss": float(policy_term.item()),
             "aux_loss": float(aux_term.item()) if torch.is_tensor(aux_term) else float(aux_term),
             "total_loss_with_aux": float(loss.item()),
+            "actor_importance_ratio_mean": float(
+                (total_importance_ratio / max(1, count)).item()
+            ),
             "actor_loss": float((total_actor_loss / max(1, count)).item()),
             "critic_loss": float((total_critic_loss / max(1, count)).item()),
             "entropy": float((total_entropy / max(1, count)).item()),
@@ -1643,6 +1701,9 @@ class FinalCIGAMFRunner:
             b_batch = []
             context_items_batch = []
             context_mask_batch = []
+            context_block = self._raw_proxy_context_block(
+                ego, current_actions=actions
+            )
             neighbor_ids = []
 
             for j in range(self.n_agents):
@@ -1652,8 +1713,8 @@ class FinalCIGAMFRunner:
                 obs_i_batch.append(obs_i)
                 action_i_batch.append(action_i)
                 action_j_batch.append(int(actions[j]))
-                raw_core, raw_periph = self._raw_proxy_context_excluding(
-                    ego, j, current_actions=actions
+                raw_core, raw_periph = self._raw_proxy_context_excluding_from_block(
+                    context_block, j
                 )
                 z_batch.append(raw_core)
                 m_batch.append(raw_periph)
@@ -1974,6 +2035,8 @@ class FinalCIGAMFRunner:
         grouped = {}
         discount = float(self.cfg.get("discount", 1.0))
         for sample in self.proxy.buffer:
+            if not bool(sample.get("horizon_complete", True)):
+                continue
             key = (int(sample["ego_id"]), int(sample["neighbor_id"]))
             lag = np.asarray(
                 sample.get("target_lag_rewards", []), dtype=np.float64

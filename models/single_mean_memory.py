@@ -249,7 +249,7 @@ class SingleMeanPeripheral(nn.Module):
         legacy_count = 0
         for neighbor_id in ids:
             pair = np.asarray(
-                adapter.pair_features(ego_id, neighbor_id),
+                adapter.relation_features(ego_id, neighbor_id),
                 dtype=np.float32,
             )
             if pair.size < 5:

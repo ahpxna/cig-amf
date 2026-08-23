@@ -323,14 +323,14 @@ class PairRelationalModule:
 
         adapter = resolve_env_adapter(env)
         pair = np.asarray(
-            adapter.pair_features(ego_id, neighbor_id), dtype=np.float32
+            adapter.relation_features(ego_id, neighbor_id), dtype=np.float32
         )
         if pair.size < 5:
             raise ValueError("adapter pair_features must expose five base channels")
         rel_row, rel_col, dist_norm, same_zone, zone_diff = pair[:5]
         same_role = 0.0
         ego_pair = np.asarray(
-            adapter.pair_features(neighbor_id, ego_id), dtype=np.float32
+            adapter.relation_features(neighbor_id, ego_id), dtype=np.float32
         )
         if pair.size > 5 and ego_pair.size == pair.size:
             same_role = float(

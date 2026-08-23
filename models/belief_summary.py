@@ -83,7 +83,7 @@ Follow paper:
 
         b = belief_state[j]
         pair = np.asarray(
-            resolve_env_adapter(env).pair_features(ego_id, j),
+            resolve_env_adapter(env).relation_features(ego_id, j),
             dtype=np.float32,
         )
         if pair.size < 5:

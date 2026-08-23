@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from envs.omni_arena import OmniArena
+from envs.causal_adapter import resolve_env_adapter
 
 
 ROLE_ORDER = ("blocker", "gatekeeper", "relay", "controller")
@@ -183,7 +184,9 @@ def run_gate(
         for role in ROLE_ORDER:
             source = int(role_agents[role])
             action_profiles = []
-            for action in range(env.N_ACTIONS):
+            adapter = resolve_env_adapter(env)
+            valid_actions = np.flatnonzero(adapter.valid_action_mask(source))
+            for action in valid_actions:
                 env.restore_state(state)
                 profile = env.compute_oracle_lag_response_from_current_state(
                     ego_id=ego,
@@ -244,7 +247,7 @@ def run_gate(
         "n_states": int(n_states),
         "horizon": int(horizon),
         "n_trials": int(n_trials),
-        "action_count": int(env.N_ACTIONS),
+        "action_count": int(env.get_action_dim()),
         "min_response_mass": float(min_response_mass),
         "rows": rows,
         **summary,

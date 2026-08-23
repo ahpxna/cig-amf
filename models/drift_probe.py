@@ -180,7 +180,12 @@ class DriftDetector:
         if buffer is None or len(buffer) == 0:
             return None
 
-        buf = list(buffer)
+        # Page-CUSUM targets a complete discounted H-return.  Right-censored
+        # episode tails are supervised by the proxy through lag masks, but are
+        # not valid witness observations.
+        buf = [sample for sample in buffer if bool(sample.get("horizon_complete", True))]
+        if not buf:
+            return None
         n = int(min(n, len(buf)))
         idx = self.rng.choice(len(buf), size=n, replace=False)
         batch = [buf[i] for i in idx]
@@ -317,7 +322,10 @@ class DriftDetector:
         if self.frozen is None or buffer is None or len(buffer) == 0:
             return None
 
-        buf = list(buffer)[-int(n):]
+        buf = [sample for sample in list(buffer)[-int(n):]
+               if bool(sample.get("horizon_complete", True))]
+        if not buf:
+            return None
 
         obs = torch.tensor(
             np.stack([b["obs_i"] for b in buf], axis=0),

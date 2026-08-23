@@ -32,6 +32,9 @@ class CausalMultiAgentEnvAdapter(Protocol):
     def pair_feature_dim(self) -> int: ...
 
     @property
+    def relation_feature_dim(self) -> int: ...
+
+    @property
     def context_item_dim(self) -> int: ...
 
     def observation(self, observations, agent: int) -> np.ndarray: ...
@@ -43,6 +46,8 @@ class CausalMultiAgentEnvAdapter(Protocol):
     def valid_action_mask(self, agent: int) -> np.ndarray: ...
 
     def pair_features(self, ego: int, target: int) -> np.ndarray: ...
+
+    def relation_features(self, ego: int, target: int) -> np.ndarray: ...
 
     def neighbour_features(
         self, ego: int, neighbour: int, action: int
@@ -102,6 +107,10 @@ class OmniArenaAdapter:
     @property
     def pair_feature_dim(self):
         return 5 + len(PUBLIC_ROLES)
+
+    @property
+    def relation_feature_dim(self):
+        return self.pair_feature_dim
 
     @property
     def context_item_dim(self):
@@ -169,6 +178,10 @@ class OmniArenaAdapter:
             target,
             getattr(self.env, "agent_role", None),
         )
+
+    def relation_features(self, ego, target):
+        """Observable domain relation xi_ij; pair_features is its Omni view."""
+        return self.pair_features(ego, target)
 
     def _mechanism_features(self, neighbour):
         neighbour = int(neighbour)

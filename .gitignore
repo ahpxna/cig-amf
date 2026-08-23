@@ -14,6 +14,10 @@ env/
 *.pth
 results/
 
+# Third-party benchmark checkouts are reproducibly cloned by
+# scripts/setup_external_envs.sh and must never enter this repository.
+external_envs/
+
 # Local research notes and conversation exports. Files already tracked by Git
 # require an explicit index/history migration; ignore rules affect new files.
 docs/

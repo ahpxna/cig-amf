@@ -38,7 +38,7 @@ class MultiEgoReplayBuilder:
         self.discount = float(discount)
         self.horizon = int(horizon)
 
-    def build_h_step_returns(self, trajectory, n_agents):
+    def build_h_step_returns(self, trajectory, n_agents, complete_only=False):
         """
         R_i^(H)(t) = sum_{h=0}^{H-1} gamma^h r_i(t+h)
 
@@ -57,11 +57,15 @@ class MultiEgoReplayBuilder:
         out = []
 
         for t in range(T):
-            row = {}
+            row, mask_row = {}, {}
 
             for ego in range(int(n_agents)):
                 val = 0.0
 
+                complete = t + self.horizon <= T
+                if complete_only and not complete:
+                    row[ego] = None
+                    continue
                 for h in range(self.horizon):
                     if t + h < T:
                         val += (
@@ -74,7 +78,8 @@ class MultiEgoReplayBuilder:
 
         return out
 
-    def build_lag_rewards(self, trajectory, n_agents, n_horizons=None):
+    def build_lag_rewards(self, trajectory, n_agents, n_horizons=None,
+                          return_valid_mask=False):
         """Build direct reward targets at each post-intervention lag.
 
         ``out[t][ego][ell]`` is ``r_i(t + ell)``.  The response network learns
@@ -82,30 +87,44 @@ class MultiEgoReplayBuilder:
         ``Q^(h) = sum_{ell<h} gamma**ell * g^[ell]``.  Keeping the primitive
         target non-cumulative makes the latency spectrum identifiable and
         guarantees that an H-step residual is compared with Q at the same H.
-        Missing rewards beyond an episode boundary are zero padded.
+
+        Time-limit boundaries are right-censoring, not zero reward.  The
+        returned mask marks observed lags; callers must not treat unobserved
+        tail values as terminal outcomes.  An environment can explicitly mark
+        a transition as ``terminated`` to state that its future rewards are
+        absorbing zeros.
         """
         if n_horizons is None:
             n_horizons = self.horizon
 
         T = len(trajectory)
-        out = []
+        out, masks = [], []
 
         for t in range(T):
             row = {}
             for ego in range(int(n_agents)):
                 per_lag = np.zeros((int(n_horizons),), dtype=np.float32)
+                valid = np.zeros((int(n_horizons),), dtype=np.float32)
                 for lag in range(int(n_horizons)):
                     if t + lag < T:
                         per_lag[lag] = float(trajectory[t + lag]["rewards"][ego])
+                        valid[lag] = 1.0
+                    elif any(bool(step.get("terminated", False))
+                             for step in trajectory[t:]):
+                        # An absorbing terminal event, unlike a time limit,
+                        # identifies the missing future reward as zero.
+                        valid[lag] = 1.0
                 row[ego] = per_lag
+                mask_row[ego] = valid
             out.append(row)
+            masks.append(mask_row)
 
-        return out
+        return (out, masks) if return_valid_mask else out
 
     def build_h_step_returns_multi(self, trajectory, n_agents, n_horizons=None):
         """Compatibility helper returning cumulative responses at every H."""
-        lag_rewards = self.build_lag_rewards(
-            trajectory, n_agents, n_horizons=n_horizons
+        lag_rewards, lag_masks = self.build_lag_rewards(
+            trajectory, n_agents, n_horizons=n_horizons, return_valid_mask=True
         )
         out = []
         for row in lag_rewards:
@@ -115,7 +134,8 @@ class MultiEgoReplayBuilder:
                 discounts = np.power(
                     self.discount, np.arange(values.size, dtype=np.float32)
                 )
-                cumulative_row[ego] = np.cumsum(values * discounts).astype(np.float32)
+                valid = np.asarray(lag_masks[len(out)][ego], dtype=np.float32)
+                cumulative_row[ego] = np.cumsum(values * discounts * valid).astype(np.float32)
             out.append(cumulative_row)
         return out
 
@@ -167,8 +187,9 @@ class MultiEgoReplayBuilder:
         h_returns = self.build_h_step_returns(trajectory, n_agents)
         # The network predicts direct lag rewards, not cumulative returns.
         n_horizons_for_push = getattr(proxy_ensemble, "n_horizons", self.horizon)
-        lag_rewards = self.build_lag_rewards(
-            trajectory, n_agents, n_horizons=n_horizons_for_push
+        lag_rewards, lag_valid_masks = self.build_lag_rewards(
+            trajectory, n_agents, n_horizons=n_horizons_for_push,
+            return_valid_mask=True,
         )
 
         pushed = 0
@@ -178,10 +199,11 @@ class MultiEgoReplayBuilder:
             if (
                 int(getattr(proxy_ensemble, "context_item_dim", 0)) > 0
                 and "proxy_context_items_excluding" not in step
+                and "proxy_context_blocks" not in step
             ):
                 raise KeyError(
                     "literal DeepSets proxy requires action-time "
-                    "proxy_context_items_excluding"
+                    "proxy_context_items_excluding or proxy_context_blocks"
                 )
 
             obs_all = step["obs_all"]
@@ -222,6 +244,12 @@ class MultiEgoReplayBuilder:
                             "proxy_context_excluding[ego][neighbor]."
                         )
                     belief_summary = step["belief_summary_cache"][ego]
+                    # New replay stores one raw ContextBlock per ego/timestep,
+                    # not a copied leave-one-out table per (ego, target) pair.
+                    # This is the sum-minus-one DeepSets representation and
+                    # reduces collection storage from O(N^3) to O(N^2).
+                    context_block = step.get("proxy_context_blocks", {}).get(ego)
+                    context_target_id = int(j)
                     try:
                         context_items, context_mask = step[
                             "proxy_context_items_excluding"
@@ -230,6 +258,8 @@ class MultiEgoReplayBuilder:
                         context_items, context_mask = None, None
                     target_h = h_returns[t][ego]
                     target_lags = lag_rewards[t][ego]
+                    target_lag_mask = lag_valid_masks[t][ego]
+                    horizon_complete = bool(np.all(target_lag_mask > 0.5))
 
                     was_forced = False
                     behaviour_prob_j = None
@@ -269,6 +299,8 @@ class MultiEgoReplayBuilder:
                         belief_summary=belief_summary,
                         target_return_h=float(target_h),
                         target_lag_rewards=target_lags,
+                        target_lag_valid_mask=target_lag_mask,
+                        horizon_complete=horizon_complete,
                         behaviour_prob_j=behaviour_prob_j,
                         was_forced=was_forced,
                         pair_feat=pair_feat,   # [FIX-X1]
@@ -277,10 +309,16 @@ class MultiEgoReplayBuilder:
                             if step.get("policy_probs") is None
                             else step["policy_probs"][j]
                         ),
+                        valid_action_mask=(
+                            None if step.get("valid_action_masks") is None
+                            else step["valid_action_masks"][j]
+                        ),
                         episode_id=step.get("episode_id"),
                         timestep=step.get("timestep", t),
                         context_items=context_items,
                         context_mask=context_mask,
+                        context_block=context_block,
+                        context_target_id=context_target_id,
                     )
 
                     pushed += 1

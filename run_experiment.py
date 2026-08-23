@@ -8,6 +8,7 @@ import random
 from pathlib import Path
 
 import numpy as np
+from envs.causal_adapter import resolve_env_adapter
 import torch
 
 
@@ -1295,7 +1296,10 @@ def _compute_tiny_oracle_scores(tiny_env, state, ego, neighbor_ids, cfg, tiny_ho
         magnitude_vals = []
         range_vals = []
 
-        for action in candidate_actions:
+        valid_actions = np.flatnonzero(
+            resolve_env_adapter(tiny_env).valid_action_mask(int(j))
+        )
+        for action in valid_actions:
             tiny_env.restore_state(state)
 
             score = _call_oracle_influence(
@@ -1744,7 +1748,7 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
     """
     required = (
         "obs_all", "actions", "rewards", "proxy_context_excluding",
-        "proxy_context_items_excluding",
+        "proxy_context_blocks",
         "belief_summary_cache", "geom_snapshot",
         "behaviour_probs", "policy_probs", "valid_action_masks",
         "env_snapshot_before_step",
@@ -1796,11 +1800,15 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
                 for j in neighbor_ids
             ],
             context_items_batch=np.stack([
-                step["proxy_context_items_excluding"][ego][j][0]
+                np.asarray(step["proxy_context_blocks"][ego]["items"], dtype=np.float32)[
+                    np.asarray(step["proxy_context_blocks"][ego]["neighbor_ids"], dtype=np.int64) != int(j)
+                ]
                 for j in neighbor_ids
             ], axis=0),
             context_mask_batch=np.stack([
-                step["proxy_context_items_excluding"][ego][j][1]
+                np.ones(int(np.count_nonzero(
+                    np.asarray(step["proxy_context_blocks"][ego]["neighbor_ids"], dtype=np.int64) != int(j)
+                )), dtype=np.float32)
                 for j in neighbor_ids
             ], axis=0),
             valid_action_mask_batch=np.stack([
@@ -1882,7 +1890,10 @@ def _h1_one_step_oracle_scores(tiny_env, step, ego, neighbor_ids,
 
     for j in neighbor_ids:
         candidate_returns = []
-        for action in candidate_actions:
+        valid_actions = np.flatnonzero(
+            resolve_env_adapter(tiny_env).valid_action_mask(int(j))
+        )
+        for action in valid_actions:
             intervened = list(factual_actions)
             intervened[int(j)] = int(action)
             tiny_env.restore_state(state)
@@ -1892,12 +1903,8 @@ def _h1_one_step_oracle_scores(tiny_env, step, ego, neighbor_ids,
         candidate_returns = np.asarray(candidate_returns, dtype=np.float64)
         response_surfaces[int(j)] = candidate_returns.tolist()
         policy = np.asarray(step["policy_probs"][int(j)], dtype=np.float64)
+        policy = policy[valid_actions]
         policy = policy / np.clip(policy.sum(), 1e-12, None)
-        if policy.shape != candidate_returns.shape:
-            raise RuntimeError(
-                "H1 oracle action support does not match the logged policy: "
-                f"{candidate_returns.shape} versus {policy.shape}"
-            )
         signed = float(
             np.dot(policy, candidate_returns) - np.mean(candidate_returns)
         )

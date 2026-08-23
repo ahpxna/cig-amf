@@ -1038,7 +1038,7 @@ class PeripheralMultiMemory(nn.Module):
 
         for j in ids:
             pair = np.asarray(
-                adapter.pair_features(ego_id, j), dtype=np.float32
+                adapter.relation_features(ego_id, j), dtype=np.float32
             )
             if pair.size < 5:
                 raise ValueError(

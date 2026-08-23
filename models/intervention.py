@@ -126,6 +126,7 @@ class EpsilonForcedActionController:
         # Paper-reporting statistics, including the reward cost of epsilon.
         self.total_steps = 0
         self.total_forced = 0
+        self.total_eligible = 0
 
     # ------------------------------------------------------------------
     # Epsilon schedule
@@ -293,7 +294,9 @@ class EpsilonForcedActionController:
         eps_vec = self.get_eps_per_agent()          # [n_agents]
 
         draw = self.rng.rand(self.n_agents)         # [n_agents]
-        forced_mask = draw < eps_vec                # [n_agents] bool
+        # A singleton valid-action set cannot supply randomized evidence.
+        eligible = valid.sum(axis=1) >= 2
+        forced_mask = (draw < eps_vec) & eligible   # [n_agents] bool
 
         # ------------------------------------------------------------------
         # [FIX-P1] Capping the number of simultaneously forced agents BREAKS
@@ -359,7 +362,7 @@ class EpsilonForcedActionController:
         # Each agent has its own eps and hence its own propensity. Record the
         # eps actually used; otherwise DR divides by the wrong quantity and
         # loses unbiasedness.
-        e = eps_vec.reshape(-1, 1).astype(np.float32)   # [n_agents, 1]
+        e = (eps_vec * eligible.astype(np.float32)).reshape(-1, 1)
 
         effective_probs = (
             e * uniform + (1.0 - e) * probs
@@ -372,6 +375,7 @@ class EpsilonForcedActionController:
         # ---- 4. Statistics ------------------------------------------------
         self.total_steps += self.n_agents
         self.total_forced += int(np.sum(forced_mask))
+        self.total_eligible = getattr(self, "total_eligible", 0) + int(np.sum(eligible))
 
         return forced_mask, effective_probs
 
@@ -393,6 +397,9 @@ class EpsilonForcedActionController:
             "total_agent_steps": int(self.total_steps),
             "total_forced": int(self.total_forced),
             "realised_forcing_rate": float(rate),
+            "eligible_agent_steps": int(getattr(self, "total_eligible", 0)),
+            "eligible_rate": float(getattr(self, "total_eligible", 0)) / float(max(1, self.total_steps)),
+            "realised_forcing_rate_eligible": float(self.total_forced) / float(max(1, getattr(self, "total_eligible", 0))),
             "episode": int(self.episode),
             "targeting_enabled": bool(
                 getattr(self, "_eps_per_agent", None) is not None
@@ -418,6 +425,7 @@ class EpsilonForcedActionController:
             ),
             "total_steps": int(self.total_steps),
             "total_forced": int(self.total_forced),
+            "total_eligible": int(getattr(self, "total_eligible", 0)),
             "rng_state": self.rng.get_state(),
             "cap_warned": bool(getattr(self, "_cap_warned", False)),
         }
@@ -441,6 +449,7 @@ class EpsilonForcedActionController:
         )
         self.total_steps = int(state["total_steps"])
         self.total_forced = int(state["total_forced"])
+        self.total_eligible = int(state.get("total_eligible", 0))
         self.rng.set_state(state["rng_state"])
         self._cap_warned = bool(state.get("cap_warned", False))
 

@@ -93,8 +93,10 @@ if [ "$CIG_QUICK" -eq 1 ]; then
   CIG_PAPER_B_SELECTOR_STATES="${CIG_PAPER_B_SELECTOR_STATES:-2}"
   CIG_MODE="quick"
 else
-  CIG_DEFAULT_H1_SEEDS="0 1 2 3 4 5 6 7"
-  CIG_DEFAULT_H23_SEEDS="0 1 2 3 4"
+  # Untouched confirmatory seeds.  Development seeds remain opt-in through
+  # CIG_H1_SEEDS/CIG_RUN_SEEDS and are recorded as non-confirmatory metadata.
+  CIG_DEFAULT_H1_SEEDS="101 102 103 104 105 106 107 108"
+  CIG_DEFAULT_H23_SEEDS="201 202 203 204 205"
   CIG_H2_EPISODES="${CIG_H2_EPISODES:-400}"
   CIG_H3_EPISODES="${CIG_H3_EPISODES:-200}"
   CIG_LATENCY_TRAIN_EPISODES="${CIG_LATENCY_TRAIN_EPISODES:-200}"
@@ -112,6 +114,14 @@ read -r -a CIG_H23_SEED_ARRAY <<< "$CIG_H23_SEED_TEXT"
 if [ "${#CIG_H1_SEED_ARRAY[@]}" -eq 0 ] || [ "${#CIG_H23_SEED_ARRAY[@]}" -eq 0 ]; then
   echo "CIG_RUN_SEEDS resolved to an empty seed list." >&2
   exit 2
+fi
+
+if [ "$CIG_MODE" = "confirmatory" ] && [ "${CIG_ALLOW_DIRTY_CONFIRMATORY:-0}" != "1" ]; then
+  if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+    echo "Confirmatory mode requires a clean git worktree. Commit the frozen source first." >&2
+    echo "Use --quick or CIG_ALLOW_DIRTY_CONFIRMATORY=1 only for non-confirmatory development." >&2
+    exit 2
+  fi
 fi
 for CIG_SEED in "${CIG_H1_SEED_ARRAY[@]}" "${CIG_H23_SEED_ARRAY[@]}"; do
   case "$CIG_SEED" in

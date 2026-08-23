@@ -22,6 +22,7 @@ except ModuleNotFoundError:
     from scripts.exp_common import ROOT, ensure_dir
 
 import run_experiment as RE
+from envs.causal_adapter import resolve_env_adapter
 try:
     from run_h2_selectivity import (
         _capture_frozen_learning_checkpoint,
@@ -125,7 +126,10 @@ def _oracle_capacity_for_state(
                     + int(ego) * 1009 + int(source) * 9176
                 )
                 action_values = []
-                for action in range(int(env.get_action_dim())):
+                valid_actions = np.flatnonzero(
+                    resolve_env_adapter(env).valid_action_mask(source)
+                )
+                for action in valid_actions:
                     env.restore_state(copy.deepcopy(state))
                     env.set_behaviour_override("cooperative")
                     response = env.compute_oracle_lag_response_from_current_state(
@@ -166,10 +170,12 @@ def _f1(predicted, truth):
     return 2.0 * len(predicted & truth) / denom if denom else 1.0
 
 
-def _capacity_ndcg_at_k(predicted, oracle_scores, core_budget):
-    gains = sorted(
-        (max(0.0, float(oracle_scores[j])) for j in predicted), reverse=True
-    )[:int(core_budget)]
+def _capacity_ndcg_at_k(predicted_ranking, oracle_scores, core_budget):
+    """nDCG retains the selector's rank order; never sort by oracle gain."""
+    gains = [
+        max(0.0, float(oracle_scores.get(int(j), 0.0)))
+        for j in list(predicted_ranking)[:int(core_budget)]
+    ]
     ideal = sorted(
         (max(0.0, float(value)) for value in oracle_scores.values()),
         reverse=True,
@@ -221,7 +227,12 @@ def _isolation_rows(
                 policy_probs=cache.get("policy_probs"),
             )
             for ego, belief in runner.belief_modules.items():
-                predicted = set(belief.get_core_set())
+                predicted_ranking = sorted(
+                    belief.get_core_set(),
+                    key=lambda j: float(belief._lcb_score(int(j))),
+                    reverse=True,
+                )
+                predicted = set(predicted_ranking)
                 truth = _top_k(oracle_scores[int(ego)], ego, core_budget)
                 records[variant].append({
                     "key": (int(state_index), int(ego)),
@@ -229,7 +240,7 @@ def _isolation_rows(
                     "truth": truth,
                     "f1": _f1(predicted, truth),
                     "ndcg": _capacity_ndcg_at_k(
-                        predicted, oracle_scores[int(ego)], core_budget
+                        predicted_ranking, oracle_scores[int(ego)], core_budget
                     ),
                     "core_size": len(predicted),
                 })
@@ -316,7 +327,7 @@ def _end_to_end_row(
         "mean_core_size": _mean(history.get("mean_core_size", [])),
         "selector_oracle_f1": float("nan"),
         "oracle_reference": (
-            "clone_state_bank_mean_C"
+            "static_bank_mean_oracle_capacity"
             if VARIANTS[variant] == "oracle_capacity" else "not_applicable"
         ),
         "mean_reward": _mean(history.get("mean_reward", [])),

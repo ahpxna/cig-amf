@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from envs.omni_arena import OmniArena
+from envs.causal_adapter import resolve_env_adapter
 import run_experiment as RE
 try:
     from run_latency_oracle import _rank_correlation
@@ -47,7 +48,9 @@ def _centre(spectrum):
 
 def _oracle_spectrum(env, state, ego, source, horizon, trials, seed):
     profiles = []
-    for action in range(env.N_ACTIONS):
+    for action in np.flatnonzero(
+        resolve_env_adapter(env).valid_action_mask(source)
+    ):
         env.restore_state(state)
         result = env.compute_oracle_lag_response_from_current_state(
             ego_id=int(ego), agent_j=int(source), intervention_action=int(action),

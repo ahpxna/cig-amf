@@ -72,6 +72,7 @@ class CrossFittedConditionalAIPW:
             if sample.get("episode_id") is not None
             and sample.get("policy_probs_j") is not None
             and sample.get("behaviour_prob_j") is not None
+            and bool(sample.get("horizon_complete", True))
         ]
         episodes = sorted({sample["episode_id"] for sample in rows})
         if len(episodes) < 2:
@@ -85,7 +86,6 @@ class CrossFittedConditionalAIPW:
         )
         phi = np.full(len(rows), np.nan, dtype=np.float64)
         leakage_checks = []
-        q_uniform = np.full(self.action_dim, 1.0 / self.action_dim)
 
         for fold in range(n_folds):
             train_idx = np.asarray(
@@ -121,7 +121,13 @@ class CrossFittedConditionalAIPW:
                 sample = rows[row_index]
                 action = int(sample["observed_action_j"])
                 pi = np.asarray(sample["policy_probs_j"], dtype=np.float64)
+                valid = np.asarray(
+                    sample.get("valid_action_mask", np.ones(self.action_dim)),
+                    dtype=bool,
+                )
+                pi = np.where(valid, pi, 0.0)
                 pi = pi / np.clip(pi.sum(), 1e-12, None)
+                q_uniform = valid.astype(np.float64) / float(max(1, valid.sum()))
                 behaviour = max(float(sample["behaviour_prob_j"]), 1e-12)
                 weight = (pi[action] - q_uniform[action]) / behaviour
                 if self.iw_clip is not None:

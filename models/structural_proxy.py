@@ -495,7 +495,7 @@ class LocalCounterfactualProxyEnsemble:
         ]
 
         # ---------------------------------------------------------------
-        # [BB1 — GPU_OPTIMIZATION_CONTRACT.md] Fixed bootstrap masks; never
+        # Fixed bootstrap membership is attached to immutable sample IDs.
         # redraw them on each call.
         #
         # If every train_step draws a new member pool, as the previous version
@@ -504,21 +504,12 @@ class LocalCounterfactualProxyEnsemble:
         # difference disappears, functions converge, and Eq. 10 sigma
         # collapses to zero as in v1.
         #
-        # Correction: each member receives a fixed, independently seeded
-        # permutation selecting about bootstrap_ratio of buffer positions.
-        # These are ranks rather than samples: deque elements shift over time,
-        # but the visible rank set remains fixed. Each member consistently
-        # excludes the same fraction, preserving systematic diversity.
+        # A deque rank is not sample identity: survivors move when old entries
+        # are evicted.  Membership is therefore generated from (sample_id,
+        # member seed) at insertion and stored with the sample.
         # ---------------------------------------------------------------
-        self._member_pool_mask: List[np.ndarray] = []
-        keep_n = max(1, int(self.buffer_size * self.bootstrap_ratio))
-
-        for k in range(self.n_ensemble):
-            rng_k = np.random.RandomState(int(seed) * 7919 + k)
-            perm = rng_k.permutation(self.buffer_size)
-            mask = np.zeros(self.buffer_size, dtype=bool)
-            mask[perm[:keep_n]] = True
-            self._member_pool_mask.append(mask)
+        self._bootstrap_seed = int(seed) * 104729 + 8191
+        self._next_sample_id = 0
 
         self.buffer = deque(maxlen=self.buffer_size)
 
@@ -727,14 +718,19 @@ class LocalCounterfactualProxyEnsemble:
         pair_feat=None,
         target_returns_multi=None,
         target_lag_rewards=None,
+        target_lag_valid_mask=None,
+        horizon_complete=None,
         behaviour_prob_j=None,
         was_forced=False,
         state_key=None,
         policy_probs_j=None,
+        valid_action_mask=None,
         episode_id=None,
         timestep=None,
         context_items=None,
         context_mask=None,
+        context_block=None,
+        context_target_id=None,
     ):
         """
         Add one supervised sample.
@@ -776,6 +772,28 @@ class LocalCounterfactualProxyEnsemble:
                     f"got {multi.shape[0]}"
                 )
 
+        if target_lag_valid_mask is None:
+            lag_valid = np.ones((self.n_horizons,), dtype=np.float32)
+        else:
+            lag_valid = np.asarray(target_lag_valid_mask, dtype=np.float32).reshape(-1)
+            if lag_valid.shape[0] != self.n_horizons:
+                raise ValueError("target_lag_valid_mask horizon mismatch")
+            lag_valid = (lag_valid > 0.5).astype(np.float32)
+        if horizon_complete is None:
+            horizon_complete = bool(np.all(lag_valid > 0.5))
+
+        sample_id = int(self._next_sample_id)
+        self._next_sample_id += 1
+        # Stateless integer mixing keeps membership immutable without a
+        # per-insertion RNG allocation on large replay streams.
+        membership = np.asarray([
+            (((sample_id * 1103515245 + self._bootstrap_seed + member * 12345)
+              & 0xFFFFFFFF) / float(0x100000000)) < self.bootstrap_ratio
+            for member in range(self.n_ensemble)
+        ], dtype=bool)
+        if not np.any(membership):
+            membership[sample_id % self.n_ensemble] = True
+
         sample = {
             "ego_id": int(ego_id),
             "neighbor_id": int(neighbor_id),
@@ -798,6 +816,10 @@ class LocalCounterfactualProxyEnsemble:
             ),
             "target_return_h": float(target_return_h),
             "target_lag_rewards": multi,                        # [n_horizons]
+            "target_lag_valid_mask": lag_valid,
+            "horizon_complete": bool(horizon_complete),
+            "sample_id": sample_id,
+            "bootstrap_membership": membership,
             "behaviour_prob_j": (
                 None if behaviour_prob_j is None else float(behaviour_prob_j)
             ),
@@ -808,11 +830,19 @@ class LocalCounterfactualProxyEnsemble:
                 if policy_probs_j is None
                 else self._normalise_vector(policy_probs_j, self.action_dim)
             ),
+            "valid_action_mask": (
+                np.ones((self.action_dim,), dtype=bool)
+                if valid_action_mask is None
+                else np.asarray(valid_action_mask, dtype=bool).reshape(self.action_dim)
+            ),
             "episode_id": episode_id,
             "timestep": timestep,
         }
         if self.context_item_dim > 0:
-            if context_items is None:
+            if context_block is not None:
+                sample["context_block"] = context_block
+                sample["context_target_id"] = int(context_target_id)
+            elif context_items is None:
                 item_array = np.zeros(
                     (1, self.context_item_dim), dtype=np.float32
                 )
@@ -938,13 +968,27 @@ class LocalCounterfactualProxyEnsemble:
             [b.get("target_lag_rewards", b.get("target_returns_multi")) for b in batch],
             axis=0,
         )                                                            # [B, n_horizons]
+        target_valid = np.stack([
+            b.get("target_lag_valid_mask", np.ones(self.n_horizons, dtype=np.float32))
+            for b in batch
+        ], axis=0)
 
         context_items_t = None
         context_mask_t = None
         if self.context_item_dim > 0:
-            item_rows = [
-                np.asarray(b["context_items"], dtype=np.float32) for b in batch
-            ]
+            item_rows = []
+            item_masks = []
+            for b in batch:
+                if "context_block" in b:
+                    block = b["context_block"]
+                    raw = np.asarray(block["items"], dtype=np.float32)
+                    ids = np.asarray(block["neighbor_ids"], dtype=np.int64)
+                    keep = ids != int(b["context_target_id"])
+                    item_rows.append(raw[keep])
+                    item_masks.append(np.ones(int(np.count_nonzero(keep)), dtype=np.float32))
+                else:
+                    item_rows.append(np.asarray(b["context_items"], dtype=np.float32))
+                    item_masks.append(np.asarray(b["context_mask"], dtype=np.float32))
             max_items = max(row.shape[0] for row in item_rows)
             padded_items = np.zeros(
                 (len(batch), max_items, self.context_item_dim), dtype=np.float32
@@ -952,7 +996,7 @@ class LocalCounterfactualProxyEnsemble:
             padded_mask = np.zeros((len(batch), max_items), dtype=np.float32)
             for index, (row, sample) in enumerate(zip(item_rows, batch)):
                 padded_items[index, :row.shape[0]] = row
-                mask = np.asarray(sample["context_mask"], dtype=np.float32)
+                mask = item_masks[index]
                 padded_mask[index, :row.shape[0]] = mask
             context_items_t = torch.tensor(
                 padded_items, dtype=torch.float32, device=self.device
@@ -970,13 +1014,14 @@ class LocalCounterfactualProxyEnsemble:
             torch.tensor(m, dtype=torch.float32, device=self.device),
             torch.tensor(belief, dtype=torch.float32, device=self.device),
             torch.tensor(target_multi, dtype=torch.float32, device=self.device),
+            torch.tensor(target_valid, dtype=torch.float32, device=self.device),
             torch.tensor(pair_feat, dtype=torch.float32, device=self.device),
             torch.tensor(b_obs, dtype=torch.float32, device=self.device),
             context_items_t,
             context_mask_t,
         )
 
-    def _discounted_return_residual(self, prediction, target):
+    def _discounted_return_residual(self, prediction, target, valid_mask=None):
         """Absolute error of the discounted H-step return for each row."""
         if prediction.shape != target.shape or prediction.shape[-1] != self.n_horizons:
             raise ValueError(
@@ -994,9 +1039,12 @@ class LocalCounterfactualProxyEnsemble:
                 device=prediction.device,
             ),
         )
+        if valid_mask is None:
+            valid_mask = torch.ones_like(target)
+        valid_mask = valid_mask.to(dtype=prediction.dtype, device=prediction.device)
         return torch.abs(
-            torch.sum(prediction * weights, dim=-1)
-            - torch.sum(target * weights, dim=-1)
+            torch.sum(prediction * weights * valid_mask, dim=-1)
+            - torch.sum(target * weights * valid_mask, dim=-1)
         )
 
     def _sample_for_member(self, buf_list: list, member_idx: int, n: int,
@@ -1030,8 +1078,10 @@ class LocalCounterfactualProxyEnsemble:
 
         rng = self._member_rngs[member_idx]
 
-        mask = self._member_pool_mask[member_idx][: len(buf_list)]
-        pool_positions = np.nonzero(mask)[0]
+        pool_positions = np.asarray([
+            index for index, sample in enumerate(buf_list)
+            if bool(sample.get("bootstrap_membership", [True] * self.n_ensemble)[member_idx])
+        ], dtype=np.int64)
 
         if pool_positions.size == 0:
             # Only possible with a very small early-training buffer whose short
@@ -1108,14 +1158,14 @@ class LocalCounterfactualProxyEnsemble:
             if any(len(b) == 0 for b in member_batches):
                 continue
 
-            obs_l, ai_l, aj_l, z_l, m_l, bl_l, tgt_l = [], [], [], [], [], [], []
+            obs_l, ai_l, aj_l, z_l, m_l, bl_l, tgt_l, valid_l = [], [], [], [], [], [], [], []
             pf_l = []   # [FIX-X1] x_ij per member
             bobs_l = []  # [FIX-HC1] b_j(a_j|s) per member
             ctx_l, ctx_mask_l = [], []
 
             for b in member_batches:
                 (obs_t, a_i_oh, a_j_idx, z_t, m_t, belief_t, target_multi_t,
-                 pf_t, bobs_t, context_items_t, context_mask_t) = (
+                 target_valid_t, pf_t, bobs_t, context_items_t, context_mask_t) = (
                     self._batch_to_tensors(b)
                 )
                 pf_l.append(pf_t); bobs_l.append(bobs_t)
@@ -1127,6 +1177,7 @@ class LocalCounterfactualProxyEnsemble:
                 m_l.append(m_t)
                 bl_l.append(belief_t)
                 tgt_l.append(target_multi_t)
+                valid_l.append(target_valid_t)
 
             obs_e = torch.stack(obs_l, dim=0)    # [E, B, obs_dim]
             ai_e = torch.stack(ai_l, dim=0)      # [E, B, A]
@@ -1135,6 +1186,7 @@ class LocalCounterfactualProxyEnsemble:
             m_e = torch.stack(m_l, dim=0)        # [E, B, periph_dim]
             bel_e = torch.stack(bl_l, dim=0)     # [E, B, belief_dim]
             tgt_e = torch.stack(tgt_l, dim=0)    # [E, B, H]
+            target_valid_e = torch.stack(valid_l, dim=0)  # [E, B, H]
             pf_e = torch.stack(pf_l, dim=0)      # [E, B, pair_feat_dim]
             bobs_e = torch.stack(bobs_l, dim=0)  # [E, B]
             ctx_e = (
@@ -1181,7 +1233,10 @@ class LocalCounterfactualProxyEnsemble:
             )                                                    # [E, B]
             iw = iw / torch.clamp(iw.mean(dim=1, keepdim=True), min=1e-8)
 
-            sq = F.mse_loss(preds, tgt_e, reduction="none").mean(dim=2)  # [E,B]
+            sq_raw = F.mse_loss(preds, tgt_e, reduction="none")
+            sq = (sq_raw * target_valid_e).sum(dim=2) / torch.clamp(
+                target_valid_e.sum(dim=2), min=1.0
+            )
             per_member_loss = (sq * iw).mean(dim=1)  # [E]
 
             loss = per_member_loss.sum()  # Backpropagate the component sum.
@@ -1197,7 +1252,7 @@ class LocalCounterfactualProxyEnsemble:
 
             with torch.no_grad():
                 res = torch.mean(
-                    self._discounted_return_residual(preds, tgt_e), dim=1
+                    self._discounted_return_residual(preds, tgt_e, target_valid_e), dim=1
                 )  # [E] discounted H-return residual.
                 # [FIX-HC2] res_forced vs res_control lost diagnostic value
                 # after the TARNet refactor. a_j is no longer input; forcing
@@ -1244,7 +1299,7 @@ class LocalCounterfactualProxyEnsemble:
         if holdout_size > 0 and len(self.buffer) > holdout_size:
             ho_batch = random.sample(list(self.buffer), int(holdout_size))
 
-            (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target, ho_pf,
+            (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target, ho_valid, ho_pf,
              _ho_bobs, ho_ctx, ho_ctx_mask) = (
                 self._batch_to_tensors(ho_batch)
             )
@@ -1264,7 +1319,7 @@ class LocalCounterfactualProxyEnsemble:
                 pred_mean = stacked.mean(dim=0)  # [B, H]
 
                 holdout_residual_t = torch.mean(
-                    self._discounted_return_residual(pred_mean, ho_target)
+                    self._discounted_return_residual(pred_mean, ho_target, ho_valid)
                 )
 
                 # [L3] Diagnose genuine ensemble disagreement. A value near
@@ -1321,7 +1376,7 @@ class LocalCounterfactualProxyEnsemble:
                     continue
 
                 (obs_t, a_i_oh, a_j_idx, z_t, m_t, belief_t, target_multi_t,
-                 pf_t, _bobs_t, context_items_t, context_mask_t) = (
+                 target_valid_t, pf_t, _bobs_t, context_items_t, context_mask_t) = (
                     self._batch_to_tensors(batch)
                 )
 
@@ -1342,7 +1397,9 @@ class LocalCounterfactualProxyEnsemble:
                 idx = a_j_idx.view(B_, 1, 1).expand(B_, 1, H_)
                 pred = torch.gather(pred_all, dim=1, index=idx).squeeze(1)  # [B, H]
 
-                loss = F.mse_loss(pred, target_multi_t)
+                loss = ((pred - target_multi_t).pow(2) * target_valid_t).sum() / torch.clamp(
+                    target_valid_t.sum(), min=1.0
+                )
 
                 optim.zero_grad()
                 loss.backward()
@@ -1353,7 +1410,7 @@ class LocalCounterfactualProxyEnsemble:
 
                 with torch.no_grad():
                     res = torch.mean(
-                        self._discounted_return_residual(pred, target_multi_t)
+                    self._discounted_return_residual(pred, target_multi_t, target_valid_t)
                     )
                 train_residuals.append(res)
 
@@ -1363,7 +1420,7 @@ class LocalCounterfactualProxyEnsemble:
 
         if holdout_size > 0 and len(self.buffer) > holdout_size:
             ho_batch = random.sample(list(self.buffer), int(holdout_size))
-            (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target, ho_pf,
+            (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target, ho_valid, ho_pf,
              _ho_bobs2, ho_ctx, ho_ctx_mask) = (
                 self._batch_to_tensors(ho_batch)
             )
@@ -1385,7 +1442,7 @@ class LocalCounterfactualProxyEnsemble:
                 stacked = torch.stack(preds, dim=0)
                 pred_mean = stacked.mean(dim=0)
                 holdout_residual = float(torch.mean(
-                    self._discounted_return_residual(pred_mean, ho_target)
+                    self._discounted_return_residual(pred_mean, ho_target, ho_valid)
                 ))
 
 

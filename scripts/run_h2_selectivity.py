@@ -48,6 +48,7 @@ except ModuleNotFoundError:  # Support ``import scripts.run_h2_selectivity`` in 
     )
 
 import run_experiment as RE
+from envs.causal_adapter import resolve_env_adapter
 
 
 # Eq. 33 requires an explicit influence matrix W. CorrelationMeanField is the
@@ -209,8 +210,11 @@ def _fixed_estimand_panel(
                     pi = np.asarray(
                         env.scripted_policy_distribution(target), dtype=np.float64
                     )
+                    valid_mask = resolve_env_adapter(env).valid_action_mask(target)
+                    pi = np.where(valid_mask, pi, 0.0)
                     pi = pi / np.clip(pi.sum(), 1e-12, None)
-                    for action in range(env.get_action_dim()):
+                    valid_actions = np.flatnonzero(valid_mask)
+                    for action in valid_actions:
                         env.restore_state(state)
                         env.set_behaviour_override("cooperative")
                         response = env.compute_oracle_lag_response_from_current_state(
