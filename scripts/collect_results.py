@@ -41,7 +41,7 @@ H3_VARIANTS = {
     "Fixed-Cardinality",
     "NoMultiMemory-SingleMean",
 }
-H2_PROTOCOL_VERSION = "h2_cd_execution_adapter_v3"
+H2_PROTOCOL_VERSION = "h2_frozen_policy_subset_adapter_v4"
 H1_PROTOCOL_VERSION = "h1_qcd_v2"
 
 SPECS = {
@@ -246,6 +246,17 @@ def _load_h2_complete_rows(h2_dir):
         if n_structural <= 0 or n_structural != n_behavioral:
             raise ResultValidationError(
                 "H2 structural and behavioral post-change windows are not matched"
+            )
+        if str(row.get("policy_learning_frozen", "")).lower() not in {"1", "true"}:
+            raise ResultValidationError("H2 arms did not freeze policy/value learning")
+        if int(row.get("pretrain_episodes", 0) or 0) <= 0:
+            raise ResultValidationError("H2 has no common-policy pretraining")
+        if int(row.get("behavioral_adapter_target_count", 0) or 0) <= 0:
+            raise ResultValidationError("H2 behavioral adapter manipulated no neighbour subset")
+        non_target_tv = _fnum(row.get("behavioral_adapter_non_target_tv"))
+        if non_target_tv is None or non_target_tv > 1e-9:
+            raise ResultValidationError(
+                "H2 behavioral adapter altered the held-fixed evaluation population"
             )
         if row.get("model") == "NoTwoTimescale" and (
             row.get("runner_class") != "NoTwoTimescaleRunner"

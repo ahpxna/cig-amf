@@ -24,10 +24,9 @@ that test; the pre-correction result should be retained as paper evidence.
 
 THREE LOSS TERMS
 
-[E1] INFLUENCE HEAD — predict w_ij from z_ij. This directly requires z_ij to
-     encode how j affects i. Unlike a_j, w_ij depends on both parties, forcing
-     the encoder to use o_i and a_i. The idea follows difference rewards/COMA
-     but applies them to directed pairs.
+[E1] C/D HEAD — predict [C_ij,D_ij] from z_ij. This directly requires z_ij to
+     encode both whether j is consequential for i and how its current policy
+     direction affects i. Unlike a_j, this target depends on both parties.
 
 [E2] CONTRASTIVE EGO — separate z_ij from z_i'j. The same neighbour viewed by
      different egos should have different latents unless its effects are truly
@@ -56,18 +55,17 @@ class EgoConditionedHeads(nn.Module):
 
     They extend PairRelationalModule without rewriting it. During training,
     construct the heads and optimizer, then compute loss from z_batch,
-    ego_ids, neighbour_ids, and w_targets before the normal backward/update.
+    ego_ids, neighbour_ids, and C/D targets before the normal backward/update.
 
-    latent_dim equals pair_rel_module.hidden_dim. With n_horizons>1, the
-    influence head predicts w at each horizon and forces z_ij to encode latency
-    as well as magnitude. proj_dim sets contrastive projection size, and lower
-    InfoNCE temperature penalizes nearby pairs more strongly.
+    latent_dim equals pair_rel_module.hidden_dim.  The auxiliary head predicts
+    the structural-capacity/directional pair ``[C,D]``.  Latency remains a
+    separate gated research path and is deliberately not overloaded onto this
+    representation head.  proj_dim sets contrastive projection size.
     """
 
     def __init__(
         self,
         latent_dim: int,
-        n_horizons: int = 3,
         hidden: int = 64,
         proj_dim: int = 32,
         temperature: float = 0.2,
@@ -75,14 +73,13 @@ class EgoConditionedHeads(nn.Module):
         super().__init__()
 
         self.latent_dim = int(latent_dim)
-        self.n_horizons = int(n_horizons)
         self.temperature = float(temperature)
 
-        # E1: z_ij -> w_ij (has signs, per horizon)
-        self.influence_head = nn.Sequential(
+        # E1: z_ij -> [C_ij, D_ij].
+        self.cd_head = nn.Sequential(
             nn.Linear(self.latent_dim, int(hidden)),
             nn.ReLU(),
-            nn.Linear(int(hidden), self.n_horizons),
+            nn.Linear(int(hidden), 2),
         )
 
         # E2: z_ij -> contrastive space
@@ -99,10 +96,10 @@ class EgoConditionedHeads(nn.Module):
     def influence_loss(
         self,
         z: torch.Tensor,            # [B, latent_dim]
-        w_target: torch.Tensor,     # [B, n_horizons] or [B]
+        cd_target: torch.Tensor,    # [B, 2]
     ) -> torch.Tensor:
         """
-        Force z_ij to predict the signed causal influence of j on i.
+        Force z_ij to predict structural capacity C and behavioural direction D.
 
         Because w_ij depends on both i and j, successful prediction requires
         the encoder to use o_i and a_i, precisely the inputs the old a_j-only
@@ -111,12 +108,12 @@ class EgoConditionedHeads(nn.Module):
         if z.shape[0] == 0:
             return torch.zeros((), dtype=torch.float32, device=z.device)
 
-        pred = self.influence_head(z)  # [B, n_horizons]
-
-        if w_target.dim() == 1:
-            target = w_target.unsqueeze(1).expand(-1, self.n_horizons)
-        else:
-            target = w_target
+        pred = self.cd_head(z)  # [B, 2]
+        target = cd_target
+        if target.dim() != 2 or target.shape[-1] != 2:
+            raise ValueError(
+                "cd_target must have shape [batch, 2] containing [C, D]"
+            )
 
         # Huber is more stable than MSE with outliers (proxy sometimes jumps).
         return F.smooth_l1_loss(pred, target)
@@ -130,9 +127,11 @@ class EgoConditionedHeads(nn.Module):
         z: torch.Tensor,               # [B, latent_dim]
         ego_ids: torch.Tensor,         # [B] long
         neighbor_ids: torch.Tensor,    # [B] long
+        cd_targets: Optional[torch.Tensor] = None,  # [B, 2]
+        profile_distance_threshold: float = 0.05,
     ) -> torch.Tensor:
         """
-        InfoNCE separating z_ij from z_i'j for the same neighbour and different egos.
+        InfoNCE with signal-aware same-neighbour/different-ego hard negatives.
 
         An anchor's positive is another sample from the same (ego,neighbour)
         pair and its negatives share neighbour j but have different egos. Do
@@ -155,6 +154,13 @@ class EgoConditionedHeads(nn.Module):
 
         pos_mask = same_ego & same_nb & (~eye)     # Same pair, different time point
         neg_mask = (~same_ego) & same_nb           # Same j, different ego
+        if cd_targets is not None:
+            if cd_targets.dim() != 2 or cd_targets.shape != (B, 2):
+                raise ValueError("cd_targets must have shape [batch, 2]")
+            profile_distance = torch.abs(
+                cd_targets.unsqueeze(1) - cd_targets.unsqueeze(0)
+            ).sum(dim=-1)
+            neg_mask = neg_mask & (profile_distance > float(profile_distance_threshold))
 
         # Only for anchors with both positive and negative labels.
         valid = pos_mask.any(dim=1) & neg_mask.any(dim=1)  # [B]
@@ -183,7 +189,7 @@ class EgoConditionedHeads(nn.Module):
         z: torch.Tensor,                       # [B, latent_dim]
         ego_ids: torch.Tensor,                 # [B]
         neighbor_ids: torch.Tensor,            # [B]
-        w_target: Optional[torch.Tensor] = None,   # [B,H] or [B]
+        cd_target: Optional[torch.Tensor] = None,  # [B,2]
         w_influence: float = 1.0,
         w_contrastive: float = 0.3,
     ) -> Dict[str, torch.Tensor]:
@@ -197,9 +203,11 @@ class EgoConditionedHeads(nn.Module):
         zero = torch.zeros((), dtype=torch.float32, device=device)
 
         l_inf = (
-            self.influence_loss(z, w_target) if w_target is not None else zero
+            self.influence_loss(z, cd_target) if cd_target is not None else zero
         )
-        l_con = self.contrastive_loss(z, ego_ids, neighbor_ids)
+        l_con = self.contrastive_loss(
+            z, ego_ids, neighbor_ids, cd_targets=cd_target
+        )
 
         total = w_influence * l_inf + w_contrastive * l_con
 

@@ -105,7 +105,12 @@ class TestSignatureInputProtocol(unittest.TestCase):
         legacy[:, 1] = [0.2, -0.3]
         legacy[:, 2] = 0.1
 
-        compatible = PeripheralMultiMemory(action_dim=4, num_slots=4)
+        compatible = PeripheralMultiMemory(
+            action_dim=4,
+            num_slots=4,
+            require_full_signature=False,
+            allow_legacy_items=True,
+        )
         compatible.forward_full(legacy)
         diag = compatible.get_slot_diagnostics()
         self.assertEqual(diag["signature_source"], "legacy_derived")
@@ -122,6 +127,15 @@ class TestSignatureInputProtocol(unittest.TestCase):
 
 
 class TestRoutingAndCollapseDiagnostics(unittest.TestCase):
+    def test_orthogonality_excludes_empty_slots(self):
+        module = PeripheralMultiMemory(action_dim=4, num_slots=4)
+        memories = torch.randn(4, module.memory_dim)
+        loss = module._orthogonality_loss(
+            memories,
+            slot_support=torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        )
+        self.assertEqual(float(loss), 0.0)
+
     def test_diagnostics_can_be_recomputed_on_a_heldout_pass(self):
         module = PeripheralMultiMemory(action_dim=4, num_slots=4)
         module.forward_full(role_items())

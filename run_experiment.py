@@ -179,8 +179,13 @@ def default_cfg():
         # at which k_i binds at k_max." The implementation already exists in
         # belief_layer.py:322–360.
         "belief_adaptive_k": True,
-        "belief_adaptive_k_min": 1,
+        # The adaptive budget and capacity application share this one lower
+        # bound; a separate adaptive minimum made min_core_size ineffective.
+        "belief_adaptive_k_min": 2,
         "belief_signed_balance": 0.5,
+        # ``behavioral_direction`` is a Paper-B ablation: it retains C's
+        # budget but ranks candidates by |D|.  It must never update belief C.
+        "core_selection_mode": "structural_capacity",
 
         "periph_mu_floor": 0.015,
         "periph_beta_floor": 0.05,
@@ -190,11 +195,11 @@ def default_cfg():
         "periph_use_uniform_mix": False,
         "periph_routing_mode": "semantic",
         "periph_signature_mode": "full",
-        # Main runners may opt into strictness once the signature tracker is
-        # plumbed into build_inputs. H3 overrides this to True and fails fast
-        # if it would otherwise test the legacy derived vector.
-        "periph_require_full_signature": False,
-        "periph_allow_legacy_items": True,
+        # The redesigned runtime consumes only tracker-derived 5D signatures.
+        # Legacy vectors remain available only through explicit compatibility
+        # unit tests and cannot silently enter a confirmatory run.
+        "periph_require_full_signature": True,
+        "periph_allow_legacy_items": False,
         # Switch load balancing now applies only to trainable exchangeable
         # slots. The previous four-slot configuration contained only fixed
         # semantic gates, so changing this coefficient could not change router
@@ -218,11 +223,11 @@ def default_cfg():
         "proxy_iw_clip": 10.0,
         "proxy_bootstrap_ratio": 0.8,
         "proxy_use_belief_input": False,
-        # [FIX-X1] x_ij dimensionality in Equation 8. The default five features
-        # are drow, dcol, distance, same_zone, and zone_diff. Set this to zero
+        # x_ij includes drow, dcol, distance, same_zone, zone_diff, and the
+        # target's public role code. Set this to zero
         # to reproduce the old configuration, where f_theta is blind to
         # neighbour identity, for the H1 ablation.
-        "proxy_pair_feat_dim": 5,
+        "proxy_pair_feat_dim": 6,
         "proxy_ensemble_dropout": 0.0,
         # Controlled H2 behavioural manipulation.  The active policy becomes
         # (1-lambda)*pi_learned + lambda*pi_scripted before epsilon forcing.
@@ -230,6 +235,8 @@ def default_cfg():
         # to one in its behavioural arm and verifies KL/TV diagnostics.
         "behavioral_adapter_lambda": 0.0,
         "behavioral_adapter_only_in_behavioral_drift": True,
+        "behavioral_adapter_target_roles": None,
+        "freeze_policy_learning": False,
         "seed": 0,
 
         # final_runner.py sig_tracker/forcer/heads/drift/matdet/recip defaults
@@ -1591,6 +1598,7 @@ def _score_learned_proxy_for_state(runner, tiny_env, state, ego, neighbor_ids):
                     tiny_env.positions, tiny_env.agent_zone,
                     getattr(tiny_env, "grid_size", 1),
                     getattr(tiny_env, "n_zones", 1), int(ego), int(j),
+                    agent_role=getattr(tiny_env, "agent_role", None),
                 )
                 for j in neighbor_ids
             ],
@@ -1675,7 +1683,7 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
             pair_feat_batch=[
                 build_pair_feat(
                     geom["positions"], geom["agent_zone"], geom["grid_size"],
-                    geom["n_zones"], ego, j,
+                    geom["n_zones"], ego, j, agent_role=geom.get("agent_role"),
                 )
                 for j in neighbor_ids
             ],

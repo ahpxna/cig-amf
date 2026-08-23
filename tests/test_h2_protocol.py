@@ -17,6 +17,7 @@ from runners.baseline_runner import (
 from runners.final_runner import FinalCIGAMFRunner, NoTwoTimescaleRunner
 from scripts.collect_results import (
     H1_VARIANTS,
+    H2_PROTOCOL_VERSION,
     H3_VARIANTS,
     ResultValidationError,
     _load_h2_complete_rows,
@@ -335,19 +336,21 @@ class H2ProtocolTests(unittest.TestCase):
                 _load_h2_complete_rows(directory)
 
     def test_collector_accepts_checksum_bound_complete_h2_summary(self):
-        with tempfile.TemporaryDirectory(dir=os.path.join(ROOT_FOR_TESTS, "results")) as directory:
+        with tempfile.TemporaryDirectory() as directory:
             summary = os.path.join(directory, "summary.csv")
             with open(summary, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=[
                     "run_id", "protocol_version", "model", "seed",
                     "claim_evaluable", "n_complete_structural_windows",
                     "n_complete_behavioral_windows", "runner_class",
-                    "ablation_contract",
+                    "ablation_contract", "policy_learning_frozen",
+                    "pretrain_episodes", "behavioral_adapter_target_count",
+                    "behavioral_adapter_non_target_tv",
                 ])
                 writer.writeheader()
                 writer.writerow({
                     "run_id": "run-1",
-                    "protocol_version": "h2_cd_execution_adapter_v3",
+                    "protocol_version": H2_PROTOCOL_VERSION,
                     "model": "Final-CIGAMF",
                     "seed": 0,
                     "claim_evaluable": 1,
@@ -355,13 +358,17 @@ class H2ProtocolTests(unittest.TestCase):
                     "n_complete_behavioral_windows": 1,
                     "runner_class": "FinalCIGAMFRunner",
                     "ablation_contract": "",
+                    "policy_learning_frozen": 1,
+                    "pretrain_episodes": 1,
+                    "behavioral_adapter_target_count": 1,
+                    "behavioral_adapter_non_target_tv": 0.0,
                 })
             with open(summary, "rb") as f:
                 checksum = hashlib.sha256(f.read()).hexdigest()
             marker = {
                 "run_id": "run-1",
                 "status": "complete",
-                "protocol_version": "h2_cd_execution_adapter_v3",
+                "protocol_version": H2_PROTOCOL_VERSION,
                 "required_comparator_present": True,
                 "required_claim_models_present": True,
                 "models": ["Final-CIGAMF"],
@@ -375,7 +382,7 @@ class H2ProtocolTests(unittest.TestCase):
                     for mode in ("behavioral_drift", "structural_shift")
                 ],
                 "failed_attempt": None,
-                "summary_path": os.path.relpath(summary, ROOT_FOR_TESTS),
+                "summary_path": summary,
                 "summary_sha256": checksum,
                 "expected_summary_rows": 1,
                 "summary_rows": 1,
@@ -445,7 +452,7 @@ class H2ProtocolTests(unittest.TestCase):
             h2_rows = [
                 {
                     "run_id": "h2-run",
-                    "protocol_version": "h2_cd_execution_adapter_v3",
+                    "protocol_version": H2_PROTOCOL_VERSION,
                     "model": model,
                     "seed": 0,
                     "claim_evaluable": 1,
@@ -474,6 +481,10 @@ class H2ProtocolTests(unittest.TestCase):
                         if model == "NoTwoTimescale"
                         else ""
                     ),
+                    "policy_learning_frozen": 1,
+                    "pretrain_episodes": 1,
+                    "behavioral_adapter_target_count": 1,
+                    "behavioral_adapter_non_target_tv": 0.0,
                 }
                 for model in h2_models
             ]
@@ -485,7 +496,7 @@ class H2ProtocolTests(unittest.TestCase):
                 json.dump({
                     "run_id": "h2-run",
                     "status": "complete",
-                    "protocol_version": "h2_cd_execution_adapter_v3",
+                    "protocol_version": H2_PROTOCOL_VERSION,
                     "required_comparator_present": True,
                     "required_claim_models_present": True,
                     "expected_attempts": [

@@ -194,6 +194,7 @@ class MultiEgoReplayBuilder:
                         pair_feat = build_pair_feat(
                             geom["positions"], geom["agent_zone"],
                             geom["grid_size"], geom["n_zones"], ego, j,
+                            agent_role=geom.get("agent_role"),
                         )
 
                     try:

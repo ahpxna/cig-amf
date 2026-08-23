@@ -111,7 +111,7 @@ class BayesLightBeliefState:
         kappa: float = 1.0,
         alpha_decay: float = 0.7,
         adaptive_k: bool = False,
-        adaptive_k_min: int = 1,
+        adaptive_k_min: Optional[int] = None,
         signed_balance: float = 0.5,
         sigma_alpha_max: float = 1.0,
     ):
@@ -144,7 +144,15 @@ class BayesLightBeliefState:
         self.kappa = float(kappa)
         self.alpha_decay = float(alpha_decay)
         self.adaptive_k = bool(adaptive_k)
-        self.adaptive_k_min = int(max(1, adaptive_k_min))
+        # There is one lower capacity bound.  Keeping a second adaptive-only
+        # minimum allowed _apply_capacity() to first fill to one value and
+        # then prune to another, so ``min_core_size`` was not a true minimum.
+        if adaptive_k_min is not None and int(adaptive_k_min) != self.min_core_size:
+            raise ValueError(
+                "adaptive_k_min must equal min_core_size; the core budget has "
+                "a single lower bound"
+            )
+        self.adaptive_k_min = self.min_core_size
         self.signed_balance = float(np.clip(signed_balance, 0.0, 1.0))
         self.sigma_alpha_max = max(float(sigma_alpha_max), self.sigma_floor)
 
@@ -332,7 +340,9 @@ class BayesLightBeliefState:
         total = float(np.sum(vals))
 
         if total <= self.eps or len(vals) <= 1:
-            return int(self.max_core_size)
+            # No positive structural-capacity evidence must not allocate the
+            # largest explicit core.  The lower bound remains a safety valve.
+            return int(self.min_core_size)
 
         p = vals / total                                  # [n_neighbors]
         p = np.clip(p, 1e-12, 1.0)
@@ -661,6 +671,37 @@ class BayesLightBeliefState:
                 new_core.add(j)
 
         return new_core
+
+    def select_core_from_external_scores(
+        self,
+        scores: Dict[int, float],
+        target_size: Optional[int] = None,
+    ) -> Tuple[Set[int], Set[int]]:
+        """Apply an explicit experimental allocation rule with a fixed budget.
+
+        The structural belief remains updated from C regardless of this method.
+        This hook is only for controlled allocation ablations such as C-core
+        versus ``|D|``-core at the same per-ego budget; it does not turn D into
+        a structural belief signal.
+        """
+        old_core = set(self.core_set)
+        self.prev_core_set = set(old_core)
+        effective_max = self._effective_max_k()
+        requested = len(old_core) if target_size is None else int(target_size)
+        k = int(np.clip(requested, self.min_core_size, effective_max))
+        ranked = sorted(
+            self.neighbor_ids,
+            key=lambda j: float(scores.get(int(j), float("-inf"))),
+            reverse=True,
+        )
+        self.n_core_updates += 1
+        if k == self.min_core_size:
+            self.n_hit_min += 1
+        if k == effective_max:
+            self.n_hit_max += 1
+        self.core_set = set(int(j) for j in ranked[:k])
+        self._record_core_change(old_core, self.core_set)
+        return set(self.last_promoted), set(self.last_demoted)
 
     def _update_core_set(self) -> Tuple[Set[int], Set[int]]:
         old_core = set(self.core_set)

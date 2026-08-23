@@ -878,7 +878,7 @@ class PairRelationalModule:
         heads_optim=None,
         w_contrastive=0.3,
         w_influence=1.0,
-        w_target_fn=None,
+        cd_target_fn=None,
     ):
         """
         Train auxiliary behavioural prediction objective.
@@ -908,7 +908,7 @@ class PairRelationalModule:
         [ego_conditioned_latent.py — pair-specificity correction; see that
         file's docstring] When `heads` (EgoConditionedHeads) is provided, add:
 
-            total += w_influence * L_influence + w_contrastive * L_contrastive
+            total += w_influence * L_CD + w_contrastive * L_contrastive
 
         to the same loss and backpropagate it together with full_loss and
         shadow_loss. Crucially, L_influence/L_contrastive must be computed on
@@ -919,17 +919,14 @@ class PairRelationalModule:
         converges to a global opponent model as in the original defect, while
         the heads only create the appearance of pair specificity.
 
-        Batch ego_id/neighbor_id values come directly from bc_buffer, where
-        add_bc_transition already stored them. Do not group by ego in the
-        runner: a shared pair buffer naturally mixes egos, ensuring that the
-        contrastive-loss neg_mask for the same j under different egos is not
-        empty.
+        Batch ego_id/neighbor_id values come directly from bc_buffer. A shared
+        pair buffer mixes egos. Same-neighbour/different-ego examples become
+        hard negatives only when their C/D targets differ materially.
 
-        w_target_fn: callable(ego_id, neighbor_id) -> float, used as the w_ij
-        target for influence_loss. The BC buffer has no separate causal label,
-        so the runner's current belief.debiased_mu(j) serves as the proxy target,
-        its best available w_ij estimate at call time. None disables
-        influence_loss and retains contrastive loss only.
+        cd_target_fn: callable(ego_id, neighbor_id) -> ``[C,D]``.  C is the
+        current debiased structural-capacity belief and D comes from the fast
+        response signature tracker.  None disables the C/D head while keeping
+        the action-prediction objective.
         """
         self.last_bc_batch_count = 0
         self.last_heads_loss = 0.0
@@ -994,19 +991,24 @@ class PairRelationalModule:
 
                 # [E2] Use z_next with gradients intact so full_encoder must
                 # encode ego information in z_ij; see this method's docstring.
-                con_loss = heads.contrastive_loss(z_next, ego_t, nb_t)
-
-                if w_target_fn is not None:
-                    w_vals = [
-                        float(w_target_fn(ego_ids_batch[k], nb_ids_batch[k]))
+                if cd_target_fn is not None:
+                    cd_vals = [
+                        cd_target_fn(ego_ids_batch[k], nb_ids_batch[k])
                         for k in range(len(batch))
                     ]
-                    w_t = torch.tensor(
-                        w_vals, dtype=torch.float32, device=self.device
+                    cd_t = torch.tensor(
+                        np.asarray(cd_vals, dtype=np.float32),
+                        dtype=torch.float32, device=self.device,
                     )
-                    inf_loss = heads.influence_loss(z_next, w_t)
+                    inf_loss = heads.influence_loss(z_next, cd_t)
+                    con_loss = heads.contrastive_loss(
+                        z_next, ego_t, nb_t, cd_targets=cd_t
+                    )
                 else:
                     inf_loss = torch.zeros(
+                        (), dtype=torch.float32, device=self.device
+                    )
+                    con_loss = torch.zeros(
                         (), dtype=torch.float32, device=self.device
                     )
 

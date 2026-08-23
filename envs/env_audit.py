@@ -32,7 +32,10 @@ import os
 import sys
 import numpy as np
 
-from omni_arena import OmniArena
+try:
+    from envs.omni_arena import OmniArena
+except ModuleNotFoundError:  # Support direct execution from envs/.
+    from omni_arena import OmniArena
 
 
 # ============================================================

@@ -169,9 +169,9 @@ class FinalCIGAMFRunner:
             routing_mode=cfg.get("periph_routing_mode", "semantic"),
             signature_mode=cfg.get("periph_signature_mode", "full"),
             require_full_signature=cfg.get(
-                "periph_require_full_signature", False
+                "periph_require_full_signature", True
             ),
-            allow_legacy_items=cfg.get("periph_allow_legacy_items", True),
+            allow_legacy_items=cfg.get("periph_allow_legacy_items", False),
         ).to(device)
 
         self.belief_summary_builder = BeliefSummaryBuilder(
@@ -227,7 +227,6 @@ class FinalCIGAMFRunner:
         )
         self.heads = EgoConditionedHeads(
             latent_dim=self.pair_rel_module.hidden_dim,
-            n_horizons=cfg.get("proxy_n_horizons", 3),
         ).to(self.device)
         self.heads_optim = torch.optim.Adam(
             self.heads.parameters(), lr=cfg.get("heads_lr", cfg.get("core_lr", 5e-4))
@@ -271,7 +270,9 @@ class FinalCIGAMFRunner:
                 kappa=cfg.get("belief_kappa", 1.0),
                 alpha_decay=cfg.get("belief_alpha_decay", 0.7),
                 adaptive_k=cfg.get("belief_adaptive_k", False),
-                adaptive_k_min=cfg.get("belief_adaptive_k_min", 1),
+                adaptive_k_min=cfg.get(
+                    "belief_adaptive_k_min", cfg.get("min_core_size", 1)
+                ),
                 signed_balance=cfg.get("belief_signed_balance", 0.5),
                 sigma_alpha_max=cfg.get("belief_sigma_alpha_max", 1.0),
             )
@@ -728,7 +729,32 @@ class FinalCIGAMFRunner:
             [self._behavioural_execution_distribution(agent) for agent in range(self.n_agents)],
             axis=0,
         )
-        executed = (1.0 - lam) * learned + lam * scripted
+        target_ids = self.cfg.get("behavioral_adapter_target_agents")
+        target_roles = self.cfg.get("behavioral_adapter_target_roles")
+        target_mask = np.zeros(self.n_agents, dtype=bool)
+        if target_ids is not None:
+            for agent in target_ids:
+                if 0 <= int(agent) < self.n_agents:
+                    target_mask[int(agent)] = True
+        elif target_roles is not None:
+            allowed_roles = {str(role) for role in target_roles}
+            roles = getattr(self.env, "agent_role", {})
+            for agent in range(self.n_agents):
+                try:
+                    target_mask[agent] = str(roles[agent]) in allowed_roles
+                except (KeyError, IndexError, TypeError):
+                    target_mask[agent] = False
+        else:
+            # Existing non-H2 callers retain their explicit all-agent opt-in.
+            # The H2 runner always supplies a non-ego role subset.
+            target_mask[:] = True
+
+        executed = learned.copy()
+        if adapter_active:
+            executed[target_mask] = (
+                (1.0 - lam) * learned[target_mask]
+                + lam * scripted[target_mask]
+            )
         executed = np.stack(
             [_safe_distribution(row, self.action_dim) for row in executed], axis=0
         )
@@ -742,11 +768,17 @@ class FinalCIGAMFRunner:
             axis=1,
         )
         tv = 0.5 * np.abs(executed - learned).sum(axis=1)
+        selected = target_mask if adapter_active else np.zeros(self.n_agents, dtype=bool)
+        unselected = ~selected
         diagnostics = {
             "behavioral_adapter_active": int(adapter_active),
             "behavioral_adapter_lambda": lam,
             "behavioral_adapter_kl": float(np.mean(kl)),
             "behavioral_adapter_tv": float(np.mean(tv)),
+            "behavioral_adapter_target_count": int(selected.sum()),
+            "behavioral_adapter_non_target_count": int(unselected.sum()),
+            "behavioral_adapter_target_tv": float(np.mean(tv[selected])) if selected.any() else 0.0,
+            "behavioral_adapter_non_target_tv": float(np.mean(tv[unselected])) if unselected.any() else 0.0,
             "behavioral_adapter_scripted_mass": float(
                 np.mean(np.sum(executed * scripted, axis=1))
             ),
@@ -786,6 +818,10 @@ class FinalCIGAMFRunner:
                 "agent_zone": [
                     int(self.env.agent_zone[i]) for i in range(self.n_agents)
                 ],
+                "agent_role": (
+                    [str(self.env.agent_role[i]) for i in range(self.n_agents)]
+                    if hasattr(self.env, "agent_role") else None
+                ),
                 "grid_size": int(getattr(self.env, "grid_size", 1)),
                 "n_zones": int(getattr(self.env, "n_zones", 1)),
             },
@@ -1114,6 +1150,10 @@ class FinalCIGAMFRunner:
                     "behavioral_adapter_kl",
                     "behavioral_adapter_tv",
                     "behavioral_adapter_scripted_mass",
+                    "behavioral_adapter_target_count",
+                    "behavioral_adapter_non_target_count",
+                    "behavioral_adapter_target_tv",
+                    "behavioral_adapter_non_target_tv",
                 )
             }
             expected_actions = np.mean(
@@ -1543,6 +1583,7 @@ class FinalCIGAMFRunner:
                         self.env.positions, self.env.agent_zone,
                         getattr(self.env, "grid_size", 1),
                         getattr(self.env, "n_zones", 1), ego, j,
+                        agent_role=getattr(self.env, "agent_role", None),
                     )
                     for j in neighbor_ids
                 ],
@@ -1577,6 +1618,29 @@ class FinalCIGAMFRunner:
                 demoted = set()
             else:
                 promoted, demoted = update_result
+
+            allocation_mode = str(
+                self.cfg.get("core_selection_mode", "structural_capacity")
+            ).strip().lower()
+            if allocation_mode == "behavioral_direction":
+                # Paper-B allocation ablation only: preserve the capacity
+                # budget selected from C, but substitute |D| for the ranking.
+                # C remains the sole structural-belief update signal.
+                direction_scores = {
+                    int(j): abs(float(d_mu_arr[k]))
+                    for k, j in enumerate(neighbor_ids)
+                }
+                promoted, demoted = self.belief_modules[
+                    ego
+                ].select_core_from_external_scores(
+                    direction_scores,
+                    target_size=len(self.belief_modules[ego].get_core_set()),
+                )
+            elif allocation_mode != "structural_capacity":
+                raise ValueError(
+                    "core_selection_mode must be 'structural_capacity' or "
+                    f"'behavioral_direction', got {allocation_mode!r}"
+                )
 
             self.pair_rel_module.warm_start_if_promoted(ego, promoted)
 
@@ -1889,24 +1953,39 @@ class FinalCIGAMFRunner:
             pushed_proxy_samples = self.push_trajectory_to_proxy_buffer(trajectory)
 
             t_policy = time.time()
-            policy_update_info = self.update_policy(trajectory)
+            learning_frozen = bool(self.cfg.get("freeze_policy_learning", False))
+            policy_update_info = (
+                {
+                    "loss": 0.0,
+                    "aux_loss": 0.0,
+                    "actor_loss": 0.0,
+                    "critic_loss": 0.0,
+                    "entropy": 0.0,
+                    "grad_norm_preclip": 0.0,
+                    "adv_mean": 0.0,
+                    "adv_std": 0.0,
+                }
+                if learning_frozen
+                else self.update_policy(trajectory)
+            )
             policy_loss = policy_update_info["loss"]
             policy_runtime = time.time() - t_policy
 
             t_bc = time.time()
-            bc_loss = self.pair_rel_module.train_bc(
+            bc_loss = 0.0 if learning_frozen else self.pair_rel_module.train_bc(
                 n_steps=self.cfg["bc_train_steps"],
                 batch_size=self.cfg["bc_batch_size"],
-                # [ego_conditioned_latent.py] Add E1/E2 to the same train_bc
-                # loss/backward so z_ij is forced to carry ego information.
-                # docstring train_bc trong core_behavior.py.
                 heads=self.heads,
                 heads_optim=self.heads_optim,
                 w_contrastive=self.cfg.get("heads_w_contrastive", 0.3),
                 w_influence=self.cfg.get("heads_w_influence", 1.0),
-                w_target_fn=lambda ego_id, nb_id: self.belief_modules[
-                    ego_id
-                ].debiased_mu(nb_id),
+                cd_target_fn=lambda ego_id, nb_id: np.asarray(
+                    [
+                        self.belief_modules[ego_id].debiased_mu(nb_id),
+                        self.sig_tracker.get_signature(ego_id, nb_id)[1],
+                    ],
+                    dtype=np.float32,
+                ),
             )
             bc_runtime = time.time() - t_bc
 
@@ -2012,6 +2091,18 @@ class FinalCIGAMFRunner:
                 ),
                 "behavioral_adapter_action_freq_tv": float(
                     adapter_metrics.get("behavioral_adapter_action_freq_tv", 0.0)
+                ),
+                "behavioral_adapter_target_count": int(
+                    round(float(adapter_metrics.get("behavioral_adapter_target_count", 0.0)))
+                ),
+                "behavioral_adapter_non_target_count": int(
+                    round(float(adapter_metrics.get("behavioral_adapter_non_target_count", 0.0)))
+                ),
+                "behavioral_adapter_target_tv": float(
+                    adapter_metrics.get("behavioral_adapter_target_tv", 0.0)
+                ),
+                "behavioral_adapter_non_target_tv": float(
+                    adapter_metrics.get("behavioral_adapter_non_target_tv", 0.0)
                 ),
             })
             self.episodes_completed = episode_number

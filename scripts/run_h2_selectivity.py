@@ -23,6 +23,7 @@ finished and the summary checksum has been recorded. This prevents a failed
 attempt from silently publishing a summary left by an older run.
 """
 import argparse
+import copy
 import csv
 import hashlib
 import json
@@ -32,6 +33,7 @@ import uuid
 from datetime import datetime, timezone
 
 import numpy as np
+import torch
 
 try:
     from exp_common import ROOT, append_jsonl, delta_norm, ensure_dir, last, make_args, w_matrix
@@ -55,8 +57,12 @@ import run_experiment as RE
 # cannot define Eq. 33.
 MODELS = ["Final-CIGAMF", "CorrelationMeanField", "NoTwoTimescale"]
 MODES = ["behavioral_drift", "structural_shift"]
-PROTOCOL_VERSION = "h2_cd_execution_adapter_v3"
+PROTOCOL_VERSION = "h2_frozen_policy_subset_adapter_v4"
 CHANGE_WINDOW_EVAL_INTERVALS = 2
+H2_EVALUATION_EGO_ROLES = ("collector",)
+H2_MANIPULATED_NEIGHBOR_ROLES = (
+    "gatekeeper", "relay", "blocker", "controller", "drifter",
+)
 
 
 def _utc_now():
@@ -148,7 +154,7 @@ def _mean_finite(values):
     return float(np.mean(finite)) if finite else float("nan")
 
 
-def _runner_influence_matrix(runner, n_agents):
+def _runner_influence_matrix(runner, n_agents, ego_ids=None):
     if hasattr(runner, "get_influence_matrix"):
         matrix = np.asarray(runner.get_influence_matrix(), dtype=np.float64)
         expected = (int(n_agents), int(n_agents))
@@ -156,13 +162,13 @@ def _runner_influence_matrix(runner, n_agents):
             raise RuntimeError(
                 f"runner influence matrix has shape {matrix.shape}; expected {expected}"
             )
-        return matrix.copy()
+        return matrix.copy() if ego_ids is None else matrix[np.asarray(ego_ids, dtype=int)].copy()
     if hasattr(runner, "belief_modules"):
         return w_matrix(runner, n_agents)
     return None
 
 
-def _runner_direction_matrix(runner, n_agents):
+def _runner_direction_matrix(runner, n_agents, ego_ids=None):
     getter = getattr(runner, "get_direction_matrix", None)
     if not callable(getter):
         return None
@@ -172,7 +178,147 @@ def _runner_direction_matrix(runner, n_agents):
         raise RuntimeError(
             f"runner direction matrix has shape {matrix.shape}; expected {expected}"
         )
-    return matrix.copy()
+    return matrix.copy() if ego_ids is None else matrix[np.asarray(ego_ids, dtype=int)].copy()
+
+
+def _agents_with_roles(env, roles):
+    """Resolve a protocol-specified public role subset without oracle labels."""
+    wanted = {str(role) for role in roles}
+    table = getattr(env, "agent_role", {})
+    selected = []
+    for agent in range(int(env.n_agents)):
+        try:
+            if str(table[agent]) in wanted:
+                selected.append(agent)
+        except (KeyError, IndexError, TypeError):
+            continue
+    if not selected:
+        raise RuntimeError(f"H2 role subset {sorted(wanted)} resolved to no agents")
+    return selected
+
+
+_FROZEN_COMPONENT_PATHS = (
+    "policy_value", "actor", "critic", "backbone", "periph_module",
+    "belief_summary_builder", "single_periph_proj", "heads",
+    "pair_rel_module.full_encoder", "pair_rel_module.shadow_encoder",
+    "pair_rel_module.shadow_to_full", "pair_rel_module.bc_head",
+)
+
+
+def _resolve_component(root, path):
+    value = root
+    for part in path.split("."):
+        value = getattr(value, part, None)
+        if value is None:
+            return None
+    return value
+
+
+def _capture_frozen_learning_checkpoint(runner):
+    """Capture a common trained checkpoint while keeping proxy learning live.
+
+    The proxy is copied as an initial response-surface checkpoint, then keeps
+    training independently in each arm. Optimizer/replay state and pair hidden
+    states are intentionally not copied: only parameters and persistent module
+    buffers define the common starting point.
+    """
+    state = {}
+    for path in _FROZEN_COMPONENT_PATHS:
+        module = _resolve_component(runner, path)
+        if module is not None and callable(getattr(module, "state_dict", None)):
+            state[path] = copy.deepcopy(module.state_dict())
+    if not state:
+        raise RuntimeError("H2 could not capture any policy/representation modules")
+    digest = hashlib.sha256()
+    for path in sorted(state):
+        digest.update(path.encode("utf-8"))
+        for key, value in sorted(state[path].items()):
+            digest.update(key.encode("utf-8"))
+            digest.update(np.asarray(value.detach().cpu()).tobytes())
+    proxy = getattr(runner, "proxy", None)
+    proxy_state = None
+    if proxy is not None:
+        if bool(getattr(proxy, "use_vmap_ensemble", False)):
+            proxy_state = {
+                "kind": "vmap",
+                "params": {
+                    key: value.detach().clone()
+                    for key, value in proxy._stacked_params.items()
+                },
+                "buffers": {
+                    key: value.detach().clone()
+                    for key, value in proxy._stacked_buffers.items()
+                },
+            }
+        elif hasattr(proxy, "models"):
+            proxy_state = {
+                "kind": "models",
+                "models": [copy.deepcopy(model.state_dict()) for model in proxy.models],
+            }
+        if proxy_state is not None:
+            digest.update(b"proxy")
+            for group in ("params", "buffers"):
+                for key, value in sorted(proxy_state.get(group, {}).items()):
+                    digest.update(key.encode("utf-8"))
+                    digest.update(np.asarray(value.detach().cpu()).tobytes())
+            for model_state in proxy_state.get("models", []):
+                for key, value in sorted(model_state.items()):
+                    digest.update(key.encode("utf-8"))
+                    digest.update(np.asarray(value.detach().cpu()).tobytes())
+    return {"state": state, "proxy_state": proxy_state, "sha256": digest.hexdigest()}
+
+
+def _restore_frozen_learning_checkpoint(runner, checkpoint):
+    for path, state in checkpoint["state"].items():
+        module = _resolve_component(runner, path)
+        if module is None:
+            raise RuntimeError(f"H2 checkpoint component is missing: {path}")
+        module.load_state_dict(state)
+    proxy_state = checkpoint.get("proxy_state")
+    proxy = getattr(runner, "proxy", None)
+    if proxy_state is None:
+        return
+    if proxy is None:
+        raise RuntimeError("H2 checkpoint has a proxy but the runner does not")
+    if proxy_state["kind"] == "vmap":
+        with torch.no_grad():
+            for key, value in proxy_state["params"].items():
+                proxy._stacked_params[key].copy_(value)
+            for key, value in proxy_state["buffers"].items():
+                proxy._stacked_buffers[key].copy_(value)
+    elif proxy_state["kind"] == "models":
+        if len(proxy.models) != len(proxy_state["models"]):
+            raise RuntimeError("H2 proxy ensemble cardinality differs from checkpoint")
+        for model, state in zip(proxy.models, proxy_state["models"]):
+            model.load_state_dict(state)
+    else:
+        raise RuntimeError(f"unknown H2 proxy checkpoint kind: {proxy_state['kind']}")
+
+
+def _pretrain_common_checkpoint(model, seed, episodes, device):
+    """Train a neutral common policy checkpoint before both H2 arms."""
+    RE.set_global_seed(seed)
+    cfg = RE.default_cfg()
+    cfg["seed"] = int(seed)
+    cfg["behavioral_adapter_lambda"] = 0.0
+    cfg["freeze_policy_learning"] = False
+    # Hold the environment in its initial regime during shared pretraining.
+    env = RE.make_main_env(
+        task_mode="behavioral_drift",
+        n_agents=24,
+        max_steps=30,
+        phase_length=max(100000, int(episodes) + 1),
+        seed=seed,
+    )
+    runner = RE.make_runner(model, env, cfg, device)
+    runner.run(n_episodes=int(episodes), eval_every=max(1, int(episodes)))
+    checkpoint = _capture_frozen_learning_checkpoint(runner)
+    return {
+        **checkpoint,
+        "episodes": int(episodes),
+        "model": str(model),
+        "seed": int(seed),
+    }
 
 
 def _recovery_statistics(
@@ -324,7 +470,10 @@ def _matched_change_interval_mask(finite_rows, change_episodes, n_intervals):
     return mask, windows
 
 
-def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
+def run_one(
+    model, mode, seed, episodes, eval_every, device, out_root, run_id,
+    frozen_checkpoint=None,
+):
     out_dir = os.path.join(out_root, f"{model}_{mode}_seed{seed}")
     os.mkdir(out_dir)
     jsonl = os.path.join(out_dir, "eval.jsonl")
@@ -340,6 +489,8 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
     # disabled in the structural arm so the two perturbations remain separate.
     cfg["behavioral_adapter_lambda"] = 1.0 if mode == "behavioral_drift" else 0.0
     cfg["behavioral_adapter_only_in_behavioral_drift"] = True
+    cfg["behavioral_adapter_target_roles"] = list(H2_MANIPULATED_NEIGHBOR_ROLES)
+    cfg["freeze_policy_learning"] = True
     make_args(seed=seed, device=device)  # Validate the shared CLI defaults.
 
     max_steps = 30
@@ -352,11 +503,17 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
         seed=seed,
     )
     runner = RE.make_runner(model, env, cfg, device)
+    if frozen_checkpoint is None:
+        raise RuntimeError("H2 requires a common pretraining checkpoint")
+    _restore_frozen_learning_checkpoint(runner, frozen_checkpoint)
+
+    evaluation_egos = _agents_with_roles(env, H2_EVALUATION_EGO_ROLES)
+    manipulated_agents = _agents_with_roles(env, H2_MANIPULATED_NEIGHBOR_ROLES)
 
     causal_horizon = int(cfg.get("causal_horizon", 8))
-    previous_w = _runner_influence_matrix(runner, env.n_agents)
+    previous_w = _runner_influence_matrix(runner, env.n_agents, evaluation_egos)
     has_influence_matrix = previous_w is not None
-    previous_d = _runner_direction_matrix(runner, env.n_agents)
+    previous_d = _runner_direction_matrix(runner, env.n_agents, evaluation_egos)
     has_direction_matrix = previous_d is not None
     previous_phi = _phi_fingerprint(env)
     deltas = []
@@ -414,6 +571,18 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
             event.get("behavioral_adapter_action_freq_tv", float("nan"))
             for event in adapter_rows
         ])
+        adapter_target_tv = _mean_finite([
+            event.get("behavioral_adapter_target_tv", float("nan"))
+            for event in adapter_rows
+        ])
+        adapter_non_target_tv = _mean_finite([
+            event.get("behavioral_adapter_non_target_tv", float("nan"))
+            for event in adapter_rows
+        ])
+        adapter_target_count = max(
+            [int(event.get("behavioral_adapter_target_count", 0)) for event in adapter_rows]
+            or [0]
+        )
 
         # Compatibility fallback for a future runner that has not yet adopted
         # the per-episode event interface. Current H2 runners use exact events.
@@ -429,13 +598,13 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
 
         delta = float("nan")
         if has_influence_matrix:
-            current_w = _runner_influence_matrix(runner, env.n_agents)
+            current_w = _runner_influence_matrix(runner, env.n_agents, evaluation_egos)
             delta = delta_norm(previous_w, current_w)
             previous_w = current_w
 
         direction_delta = float("nan")
         if has_direction_matrix:
-            current_d = _runner_direction_matrix(runner, env.n_agents)
+            current_d = _runner_direction_matrix(runner, env.n_agents, evaluation_egos)
             direction_delta = delta_norm(previous_d, current_d)
             previous_d = current_d
 
@@ -459,6 +628,9 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
             "behavioral_adapter_kl": adapter_kl,
             "behavioral_adapter_tv": adapter_tv,
             "behavioral_adapter_action_freq_tv": adapter_action_freq_tv,
+            "behavioral_adapter_target_tv": adapter_target_tv,
+            "behavioral_adapter_non_target_tv": adapter_non_target_tv,
+            "behavioral_adapter_target_count": adapter_target_count,
             "f1": last(history, "mean_f1"),
             "reward": last(history, "mean_reward"),
             "core_size": last(history, "mean_core_size"),
@@ -568,6 +740,13 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
         "mode": mode,
         "seed": seed,
         "episodes": episodes,
+        "pretrain_episodes": int(frozen_checkpoint["episodes"]),
+        "frozen_checkpoint_sha256": str(frozen_checkpoint["sha256"]),
+        "policy_learning_frozen": True,
+        "evaluation_ego_roles": list(H2_EVALUATION_EGO_ROLES),
+        "evaluation_ego_count": len(evaluation_egos),
+        "manipulated_neighbor_roles": list(H2_MANIPULATED_NEIGHBOR_ROLES),
+        "manipulated_neighbor_count": len(manipulated_agents),
         "episodes_completed": int(getattr(runner, "episodes_completed", 0)),
         "eval_every": eval_every,
         "n_eval_points": len(eval_records),
@@ -607,6 +786,15 @@ def run_one(model, mode, seed, episodes, eval_every, device, out_root, run_id):
         "behavioral_adapter_action_freq_tv": _mean_finite([
             row["behavioral_adapter_action_freq_tv"] for row in eval_records
         ]),
+        "behavioral_adapter_target_tv": _mean_finite([
+            row["behavioral_adapter_target_tv"] for row in eval_records
+        ]),
+        "behavioral_adapter_non_target_tv": _mean_finite([
+            row["behavioral_adapter_non_target_tv"] for row in eval_records
+        ]),
+        "behavioral_adapter_target_count": max(
+            [int(row["behavioral_adapter_target_count"]) for row in eval_records] or [0]
+        ),
         "n_triggers": len(set(trigger_episodes)),
         "trigger_episodes": sorted(set(trigger_episodes)),
         "final_f1": last(getattr(runner, "history", {}), "mean_f1"),
@@ -657,6 +845,10 @@ def main(argv=None):
     parser.add_argument("--episodes", type=int, default=400)
     parser.add_argument("--eval_every", type=int, default=10)
     parser.add_argument(
+        "--pretrain-episodes", type=int, default=60,
+        help="Neutral common-policy pretraining before both H2 arms.",
+    )
+    parser.add_argument(
         "--models",
         type=str,
         nargs="+",
@@ -682,6 +874,8 @@ def main(argv=None):
         parser.error("--episodes must be positive")
     if args.eval_every <= 0:
         parser.error("--eval_every must be positive")
+    if args.pretrain_episodes <= 0:
+        parser.error("--pretrain-episodes must be positive")
     if len(set(args.seeds)) != len(args.seeds):
         parser.error("--seeds must not contain duplicates")
     if len(set(args.models)) != len(args.models):
@@ -703,6 +897,10 @@ def main(argv=None):
         "started_at": started_at,
         "episodes": args.episodes,
         "eval_every": args.eval_every,
+        "pretrain_episodes": args.pretrain_episodes,
+        "policy_learning_frozen_during_arms": True,
+        "evaluation_ego_roles": list(H2_EVALUATION_EGO_ROLES),
+        "manipulated_neighbor_roles": list(H2_MANIPULATED_NEIGHBOR_ROLES),
         "change_window_eval_intervals": CHANGE_WINDOW_EVAL_INTERVALS,
         "models": list(args.models),
         "seeds": list(args.seeds),
@@ -727,6 +925,12 @@ def main(argv=None):
         rows = []
         for seed in args.seeds:
             for model in args.models:
+                checkpoint = _pretrain_common_checkpoint(
+                    model=model,
+                    seed=seed,
+                    episodes=args.pretrain_episodes,
+                    device=args.device,
+                )
                 per_mode = {}
                 for mode in MODES:
                     per_mode[mode] = run_one(
@@ -738,6 +942,7 @@ def main(argv=None):
                         device=args.device,
                         out_root=run_dir,
                         run_id=run_id,
+                        frozen_checkpoint=checkpoint,
                     )
                     attempt["completed_attempts"].append({
                         "model": model,
@@ -770,6 +975,11 @@ def main(argv=None):
                     and np.isfinite(behavioral["behavioral_adapter_kl"])
                     and np.isfinite(behavioral["behavioral_adapter_tv"])
                     and behavioral["behavioral_adapter_tv"] > 1e-6
+                    and behavioral["behavioral_adapter_target_count"] > 0
+                    and np.isfinite(behavioral["behavioral_adapter_target_tv"])
+                    and behavioral["behavioral_adapter_target_tv"] > 1e-6
+                    and np.isfinite(behavioral["behavioral_adapter_non_target_tv"])
+                    and behavioral["behavioral_adapter_non_target_tv"] <= 1e-9
                 )
                 rows.append({
                     "run_id": run_id,
@@ -781,6 +991,13 @@ def main(argv=None):
                     "seed": seed,
                     "episodes": args.episodes,
                     "eval_every": args.eval_every,
+                    "pretrain_episodes": checkpoint["episodes"],
+                    "frozen_checkpoint_sha256": checkpoint["sha256"],
+                    "policy_learning_frozen": 1,
+                    "evaluation_ego_roles": ";".join(H2_EVALUATION_EGO_ROLES),
+                    "evaluation_ego_count": structural["evaluation_ego_count"],
+                    "manipulated_neighbor_roles": ";".join(H2_MANIPULATED_NEIGHBOR_ROLES),
+                    "manipulated_neighbor_count": structural["manipulated_neighbor_count"],
                     "claim_evaluable": int(claim_evaluable),
                     "required_comparator_present": int(
                         "CorrelationMeanField" in args.models
@@ -829,6 +1046,15 @@ def main(argv=None):
                     "behavioral_adapter_tv": behavioral["behavioral_adapter_tv"],
                     "behavioral_adapter_action_freq_tv": behavioral[
                         "behavioral_adapter_action_freq_tv"
+                    ],
+                    "behavioral_adapter_target_tv": behavioral[
+                        "behavioral_adapter_target_tv"
+                    ],
+                    "behavioral_adapter_non_target_tv": behavioral[
+                        "behavioral_adapter_non_target_tv"
+                    ],
+                    "behavioral_adapter_target_count": behavioral[
+                        "behavioral_adapter_target_count"
                     ],
                     "n_complete_structural_windows": structural[
                         "n_complete_structural_windows"

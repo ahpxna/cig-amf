@@ -27,8 +27,10 @@ properties:
       Partition changes cannot affect it, eliminating the second contamination
       path completely.
 
-Its residual rises if and only if the environment law changes, rather than
-because internal bookkeeping changes.
+Its residual is a frozen regime-change witness: it is insulated from internal
+partition bookkeeping, but policy drift or covariate-support shifts may still
+raise it without a structural-law change. The H2 protocol measures that false
+trigger rate under behavioural-only intervention.
 
 IMPORTANT: SNAPSHOT AGAIN AFTER ADAPTATION
 

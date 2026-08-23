@@ -9,7 +9,11 @@ from models.influence_signature import (
     InfluenceSignatureTracker,
     ROLE_BENEFICIAL,
 )
-from models.structural_proxy import LocalCounterfactualProxyEnsemble
+from models.structural_proxy import (
+    LocalCounterfactualProxyEnsemble,
+    PAIR_FEAT_DIM,
+    build_pair_feat,
+)
 from runners.baseline_runner import SharedAblationBase, _adapt_executed_policy
 from runners.final_runner import FinalCIGAMFRunner
 
@@ -71,6 +75,85 @@ class CDDecompositionTests(unittest.TestCase):
         )
         np.testing.assert_allclose(baseline_executed, executed)
         self.assertEqual(baseline_diagnostics["behavioral_adapter_active"], 1)
+
+    def test_behavioral_adapter_can_hold_evaluation_egos_fixed(self):
+        class Env:
+            mode = "behavioral_drift"
+            agent_role = ["collector", "blocker", "collector"]
+
+            @staticmethod
+            def scripted_policy_distribution(_agent):
+                return np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+
+        learned = np.asarray(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+        final = FinalCIGAMFRunner.__new__(FinalCIGAMFRunner)
+        final.env = Env()
+        final.n_agents = 3
+        final.action_dim = 3
+        final.cfg = {
+            "behavioral_adapter_lambda": 1.0,
+            "behavioral_adapter_only_in_behavioral_drift": True,
+            "behavioral_adapter_target_roles": ["blocker"],
+        }
+        executed, _scripted, diagnostics = final._execution_policy_adapter(learned)
+        np.testing.assert_allclose(executed[[0, 2]], learned[[0, 2]])
+        np.testing.assert_allclose(executed[1], [0.0, 1.0, 0.0])
+        self.assertEqual(diagnostics["behavioral_adapter_target_count"], 1)
+        self.assertEqual(diagnostics["behavioral_adapter_non_target_count"], 2)
+        self.assertEqual(diagnostics["behavioral_adapter_non_target_tv"], 0.0)
+
+    def test_adaptive_core_uses_one_minimum_and_zero_evidence_stays_small(self):
+        belief = BayesLightBeliefState(
+            ego_id=0,
+            neighbor_ids=[1, 2, 3],
+            min_core_size=1,
+            max_core_size=3,
+            adaptive_k=True,
+            adaptive_k_min=1,
+        )
+        self.assertEqual(belief._effective_max_k(), 1)
+        with self.assertRaisesRegex(ValueError, "single lower bound"):
+            BayesLightBeliefState(
+                ego_id=0,
+                neighbor_ids=[1, 2],
+                min_core_size=1,
+                max_core_size=2,
+                adaptive_k=True,
+                adaptive_k_min=2,
+            )
+
+    def test_direction_allocation_keeps_capacity_budget_but_changes_ranking(self):
+        belief = BayesLightBeliefState(
+            ego_id=0,
+            neighbor_ids=[1, 2, 3],
+            min_core_size=2,
+            max_core_size=2,
+        )
+        belief.core_set = {1, 2}
+        promoted, demoted = belief.select_core_from_external_scores(
+            {1: 0.1, 2: 0.2, 3: 0.9}, target_size=2
+        )
+        self.assertEqual(belief.get_core_set(), {2, 3})
+        self.assertEqual(promoted, {3})
+        self.assertEqual(demoted, {1})
+
+    def test_pair_feature_uses_public_target_role_without_oracle_label(self):
+        role = ["collector", "blocker"]
+        feat = build_pair_feat(
+            positions=[[0, 0], [2, 1]],
+            agent_zone=[0, 0],
+            grid_size=10,
+            n_zones=1,
+            ego=0,
+            j=1,
+            agent_role=role,
+        )
+        self.assertEqual(PAIR_FEAT_DIM, 6)
+        self.assertEqual(feat.shape, (6,))
+        self.assertGreater(feat[-1], 0.0)
 
     def test_tracker_keeps_capacity_direction_and_uncertainties_separate(self):
         tracker = InfluenceSignatureTracker(n_agents=3, window=8)

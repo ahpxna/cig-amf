@@ -80,6 +80,7 @@ VARIANTS = [
         "overrides": {
             "belief_adaptive_k": False,
             "min_core_size": 4,
+            "belief_adaptive_k_min": 4,
             "max_core_size": 4,
         },
     },
@@ -296,6 +297,8 @@ def _validate_variant_config(spec, cfg):
             errors.append("Fixed-Cardinality must disable adaptive k")
         if int(cfg.get("min_core_size", -1)) != int(cfg.get("max_core_size", -2)):
             errors.append("Fixed-Cardinality must set min_core_size=max_core_size")
+    if int(cfg.get("belief_adaptive_k_min", -1)) != int(cfg.get("min_core_size", -2)):
+        errors.append("adaptive and fixed core minima must be identical")
 
     if errors:
         raise ValueError(f"Invalid H3 config for {name}: " + "; ".join(errors))

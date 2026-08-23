@@ -205,8 +205,8 @@ class PeripheralMultiMemory(nn.Module):
         uniform_mix: float = 0.25,
         routing_mode: str = "semantic",
         signature_mode: str = "full",
-        require_full_signature: bool = False,
-        allow_legacy_items: bool = True,
+        require_full_signature: bool = True,
+        allow_legacy_items: bool = False,
         mu_floor: float = 0.02,
         beta_floor: float = 0.05,
         eps: float = 1e-6,
@@ -728,7 +728,11 @@ class PeripheralMultiMemory(nn.Module):
 
         return float(K) * torch.sum(f * P)
 
-    def _orthogonality_loss(self, memories: torch.Tensor) -> torch.Tensor:
+    def _orthogonality_loss(
+        self,
+        memories: torch.Tensor,
+        slot_support: torch.Tensor,
+    ) -> torch.Tensor:
         """
         [T3] Penalize overly similar slot vectors to prevent uniform content.
 
@@ -748,12 +752,25 @@ class PeripheralMultiMemory(nn.Module):
         if K < 2:
             return torch.zeros((), dtype=torch.float32, device=memories.device)
 
+        supported = slot_support.reshape(-1) > self.eps
+        if int(supported.sum().item()) < 2:
+            return torch.zeros((), dtype=torch.float32, device=memories.device)
+
         normed = F.normalize(memories, p=2, dim=1, eps=self.eps)  # [K, D]
         gram = normed @ normed.t()                                 # [K, K]
 
-        # Select off-diagonal entries.
-        mask = ~torch.eye(K, dtype=torch.bool, device=memories.device)  # [K, K]
+        # Empty or near-empty slots have no semantic content.  Including them
+        # lets the model lower this loss by killing slots instead of separating
+        # their representations.
+        mask = (
+            ~torch.eye(K, dtype=torch.bool, device=memories.device)
+            & supported.unsqueeze(0)
+            & supported.unsqueeze(1)
+        )
         off_diag = gram[mask]                                            # [K*(K-1)]
+
+        if off_diag.numel() == 0:
+            return torch.zeros((), dtype=torch.float32, device=memories.device)
 
         return torch.mean(off_diag ** 2)
 
@@ -852,7 +869,10 @@ class PeripheralMultiMemory(nn.Module):
             if balance_probs is not None
             else zero
         )
-        orth_loss = self._orthogonality_loss(memories)
+        orth_loss = self._orthogonality_loss(
+            memories,
+            slot_support=weighted.sum(dim=0),
+        )
         aux_loss = self.lb_coeff * lb_loss + self.orth_coeff * orth_loss
 
         usage = slot_probs.mean(dim=0)
@@ -1043,7 +1063,6 @@ class PeripheralMultiMemory(nn.Module):
                         mu_legacy,
                         sigma_legacy,
                         sigma_legacy,
-                        0.0,
                         0.0,
                     ],
                     dtype=np.float32,

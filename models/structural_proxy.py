@@ -1882,11 +1882,25 @@ class LocalCounterfactualProxyEnsemble:
 # [FIX-X1] x_ij — pair features for Equation 8
 # =========================================================================
 
-PAIR_FEAT_DIM = 5
+PAIR_FEAT_DIM = 6
 
 
-def build_pair_feat(positions, agent_zone, grid_size, n_zones, ego, j):
-    """x_ij = [drow/G, dcol/G, L1dist/G, same_zone, zone_diff/(n_zones-1)].
+def build_pair_feat(
+    positions,
+    agent_zone,
+    grid_size,
+    n_zones,
+    ego,
+    j,
+    agent_role=None,
+):
+    """Build ``x_ij`` from pre-treatment observable pair state.
+
+    The six channels are relative row, relative column, L1 distance,
+    same-zone, normalized zone difference, and the target's public role code.
+    OmniArena exposes role in every observed neighbour record; it is a task
+    identity available before the intervention, not the oracle influence label.
+    Environments without public roles receive a neutral zero role feature.
 
     WHY THIS IS REQUIRED (see FIX-X1 in LocalCounterfactualProxyNet.__init__):
     In omni_arena, w_ij(s)=phi_ij*delta_ij(s), where delta_ij(s) is purely a
@@ -1911,6 +1925,17 @@ def build_pair_feat(positions, agent_zone, grid_size, n_zones, ego, j):
     same_zone = 1.0 if zi == zj else 0.0
     zone_diff = (zj - zi) / float(max(1, int(n_zones) - 1))
 
+    role_code = 0.0
+    if agent_role is not None:
+        try:
+            raw_role = agent_role[int(j)]
+            role_order = (
+                "collector", "gatekeeper", "relay", "blocker", "controller", "drifter"
+            )
+            role_code = float(role_order.index(str(raw_role))) / float(len(role_order) - 1)
+        except (KeyError, IndexError, TypeError, ValueError):
+            role_code = 0.0
+
     return _np.asarray(
-        [drow, dcol, dist, same_zone, zone_diff], dtype=_np.float32
+        [drow, dcol, dist, same_zone, zone_diff, role_code], dtype=_np.float32
     )

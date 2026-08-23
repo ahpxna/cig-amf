@@ -31,6 +31,10 @@ def _ordered_geometry_snapshot(env, n_agents):
     return {
         "positions": [list(env.positions[int(i)]) for i in range(int(n_agents))],
         "agent_zone": [int(env.agent_zone[int(i)]) for i in range(int(n_agents))],
+        "agent_role": (
+            [str(env.agent_role[int(i)]) for i in range(int(n_agents))]
+            if hasattr(env, "agent_role") else None
+        ),
         "grid_size": int(getattr(env, "grid_size", 1)),
         "n_zones": int(getattr(env, "n_zones", 1)),
     }
@@ -72,17 +76,44 @@ def _adapt_executed_policy(env, cfg, learned_probs):
         [_scripted_execution_distribution(env, agent, action_dim) for agent in range(n_agents)],
         axis=0,
     )
-    executed = (1.0 - lam) * learned + lam * scripted
+    target_ids = cfg.get("behavioral_adapter_target_agents")
+    target_roles = cfg.get("behavioral_adapter_target_roles")
+    target_mask = np.zeros(n_agents, dtype=bool)
+    if target_ids is not None:
+        for agent in target_ids:
+            if 0 <= int(agent) < n_agents:
+                target_mask[int(agent)] = True
+    elif target_roles is not None:
+        allowed_roles = {str(role) for role in target_roles}
+        roles = getattr(env, "agent_role", {})
+        for agent in range(n_agents):
+            try:
+                target_mask[agent] = str(roles[agent]) in allowed_roles
+            except (KeyError, IndexError, TypeError):
+                target_mask[agent] = False
+    else:
+        target_mask[:] = True
+    executed = learned.copy()
+    if active:
+        executed[target_mask] = (
+            (1.0 - lam) * learned[target_mask] + lam * scripted[target_mask]
+        )
     executed = executed / np.clip(executed.sum(axis=1, keepdims=True), 1e-12, None)
     eps = 1e-12
     kl = np.sum(executed * (np.log(np.clip(executed, eps, 1.0))
                               - np.log(np.clip(learned, eps, 1.0))), axis=1)
     tv = 0.5 * np.abs(executed - learned).sum(axis=1)
+    selected = target_mask if active else np.zeros(n_agents, dtype=bool)
+    unselected = ~selected
     return executed.astype(np.float32), {
         "behavioral_adapter_active": int(active),
         "behavioral_adapter_lambda": lam,
         "behavioral_adapter_kl": float(np.mean(kl)),
         "behavioral_adapter_tv": float(np.mean(tv)),
+        "behavioral_adapter_target_count": int(selected.sum()),
+        "behavioral_adapter_non_target_count": int(unselected.sum()),
+        "behavioral_adapter_target_tv": float(np.mean(tv[selected])) if selected.any() else 0.0,
+        "behavioral_adapter_non_target_tv": float(np.mean(tv[unselected])) if unselected.any() else 0.0,
     }
 
 
@@ -380,7 +411,10 @@ class PureMeanFieldRunner:
         for local_ep in range(n_episodes):
             episode_number = int(self.episodes_completed) + 1
             trajectory, episode_reward, runtime = self.collect_episode()
-            policy_loss = self.update_policy(trajectory)
+            policy_loss = (
+                0.0 if bool(self.cfg.get("freeze_policy_learning", False))
+                else self.update_policy(trajectory)
+            )
             self._observe_episode(trajectory)
 
             agent_steps = float(self.n_agents * len(trajectory))
@@ -422,6 +456,18 @@ class PureMeanFieldRunner:
                 ),
                 "behavioral_adapter_action_freq_tv": float(
                     adapter_metrics.get("behavioral_adapter_action_freq_tv", 0.0)
+                ),
+                "behavioral_adapter_target_count": int(
+                    adapter_metrics.get("behavioral_adapter_target_count", 0)
+                ),
+                "behavioral_adapter_non_target_count": int(
+                    adapter_metrics.get("behavioral_adapter_non_target_count", 0)
+                ),
+                "behavioral_adapter_target_tv": float(
+                    adapter_metrics.get("behavioral_adapter_target_tv", 0.0)
+                ),
+                "behavioral_adapter_non_target_tv": float(
+                    adapter_metrics.get("behavioral_adapter_non_target_tv", 0.0)
                 ),
             })
             self.episodes_completed = episode_number
@@ -798,7 +844,10 @@ class OracleCoreRunner:
     def run(self, n_episodes=100, eval_every=10):
         for ep in range(int(n_episodes)):
             trajectory, episode_reward, runtime = self.collect_episode()
-            policy_loss = self.update_policy(trajectory)
+            policy_loss = (
+                0.0 if bool(self.cfg.get("freeze_policy_learning", False))
+                else self.update_policy(trajectory)
+            )
             agent_steps = float(self.n_agents * len(trajectory))
             throughput = agent_steps / max(float(runtime), 1e-9)
             mean_reward = float(np.mean(episode_reward))
@@ -1123,7 +1172,10 @@ class FullExplicitLocalRunner:
     def run(self, n_episodes=100, eval_every=10):
         for ep in range(int(n_episodes)):
             trajectory, episode_reward, runtime = self.collect_episode()
-            policy_loss = self.update_policy(trajectory)
+            policy_loss = (
+                0.0 if bool(self.cfg.get("freeze_policy_learning", False))
+                else self.update_policy(trajectory)
+            )
 
             agent_steps = float(self.n_agents * len(trajectory))
             throughput = agent_steps / max(float(runtime), 1e-9)
@@ -1400,7 +1452,9 @@ class SharedAblationBase:
                 alpha_decay=self.cfg.get("belief_alpha_decay", 0.7),
                 sigma_alpha_max=self.cfg.get("belief_sigma_alpha_max", 1.0),
                 adaptive_k=self.cfg.get("belief_adaptive_k", False),
-                adaptive_k_min=self.cfg.get("belief_adaptive_k_min", 1),
+                adaptive_k_min=self.cfg.get(
+                    "belief_adaptive_k_min", self.cfg.get("min_core_size", 1)
+                ),
                 signed_balance=self.cfg.get("belief_signed_balance", 0.5),
             )
         except TypeError:
@@ -2036,6 +2090,7 @@ class SharedAblationBase:
                         self.env.positions, self.env.agent_zone,
                         getattr(self.env, "grid_size", 1),
                         getattr(self.env, "n_zones", 1), ego, j,
+                        agent_role=getattr(self.env, "agent_role", None),
                     )
                     for j in neighbor_ids
                 ],
@@ -2286,11 +2341,12 @@ class SharedAblationBase:
             pushed_proxy_samples = self.push_trajectory_to_proxy_buffer(trajectory)
 
             t_policy = time.time()
-            policy_loss = self.update_policy(trajectory)
+            learning_frozen = bool(self.cfg.get("freeze_policy_learning", False))
+            policy_loss = 0.0 if learning_frozen else self.update_policy(trajectory)
             policy_runtime = time.time() - t_policy
 
             t_bc = time.time()
-            bc_loss = self.pair_rel_module.train_bc(
+            bc_loss = 0.0 if learning_frozen else self.pair_rel_module.train_bc(
                 n_steps=self.cfg["bc_train_steps"],
                 batch_size=self.cfg["bc_batch_size"],
             )

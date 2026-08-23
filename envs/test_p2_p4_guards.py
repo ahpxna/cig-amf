@@ -9,8 +9,12 @@ continuing.
 
 Run: python3 test_p2_p4_guards.py
 """
-from omni_arena import OmniArena
-from tiny_oracle_dig import TinyOracleDIG
+try:
+    from envs.omni_arena import OmniArena
+    from envs.tiny_oracle_dig import TinyOracleDIG
+except ModuleNotFoundError:  # Allow direct execution from envs/.
+    from omni_arena import OmniArena
+    from tiny_oracle_dig import TinyOracleDIG
 
 
 def test_guard_a_mid_episode_shift_asserts():

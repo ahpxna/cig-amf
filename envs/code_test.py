@@ -47,15 +47,26 @@ does not compute a synthetic value.
 import sys
 import numpy as np
 
-from env_audit import (
-    OmniArena,
-    gini,
-    pearson_corr,
-    oracle_w_star_sustained,
-    build_declared_pair_list,
-    sample_states,
-    N_AGENTS, GRID_SIZE, N_ZONES, MAX_STEPS, PHASE_LENGTH, SEED,
-)
+try:
+    from envs.env_audit import (
+        OmniArena,
+        gini,
+        pearson_corr,
+        oracle_w_star_sustained,
+        build_declared_pair_list,
+        sample_states,
+        N_AGENTS, GRID_SIZE, N_ZONES, MAX_STEPS, PHASE_LENGTH, SEED,
+    )
+except ModuleNotFoundError:  # Allow ``python envs/code_test.py`` as well.
+    from env_audit import (
+        OmniArena,
+        gini,
+        pearson_corr,
+        oracle_w_star_sustained,
+        build_declared_pair_list,
+        sample_states,
+        N_AGENTS, GRID_SIZE, N_ZONES, MAX_STEPS, PHASE_LENGTH, SEED,
+    )
 
 H_VALUES = [1, 2, 3, 5, 8]
 N_STATES = 10          # Shared states for every H (apples-to-apples).

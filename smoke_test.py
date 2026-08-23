@@ -378,11 +378,11 @@ try:
     check("usage entropy is adequate", ent > 0.5, f"entropy ratio={ent:.3f}")
 
     # ---- ego-conditioned heads ----
-    hd = EgoConditionedHeads(latent_dim=32, n_horizons=H)
+    hd = EgoConditionedHeads(latent_dim=32)
     z = torch.randn(24, 32)
     ego = torch.tensor(np.repeat([0, 1, 2], 8))
     nbr = torch.tensor(np.tile([1, 1, 2, 2, 3, 3, 4, 4], 3))
-    lo = hd.compute_loss(z, ego, nbr, w_target=torch.randn(24, H))
+    lo = hd.compute_loss(z, ego, nbr, cd_target=torch.randn(24, 2))
     print(f"       L_influence={float(lo['influence']):.4f} "
           f"L_contrastive={float(lo['contrastive']):.4f}")
     check("influence loss is finite", np.isfinite(float(lo["influence"])))

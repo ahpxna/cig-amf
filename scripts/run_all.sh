@@ -10,7 +10,7 @@
 # Runtime settings can be overridden without editing this file:
 #
 #   CIG_H1_SEEDS="0 1 2 3 4 5 6 7" CIG_RUN_SEEDS="0 1 2 3 4" bash scripts/run_all.sh
-#   CIG_H2_EPISODES=400 CIG_H3_EPISODES=200 bash scripts/run_all.sh
+#   CIG_H2_EPISODES=400 CIG_H2_PRETRAIN_EPISODES=60 CIG_H3_EPISODES=200 bash scripts/run_all.sh
 #
 # Exit codes distinguish execution from evidence:
 #   0: all commands completed and all hypothesis gates were supported
@@ -102,6 +102,7 @@ CIG_H23_SEED_TEXT="${CIG_RUN_SEEDS:-$CIG_DEFAULT_H23_SEEDS}"
 CIG_H1_SEED_TEXT="${CIG_H1_SEEDS:-${CIG_RUN_SEEDS:-$CIG_DEFAULT_H1_SEEDS}}"
 CIG_LATENCY_ORACLE_STATES="${CIG_LATENCY_ORACLE_STATES:-12}"
 CIG_LATENCY_ORACLE_TRIALS="${CIG_LATENCY_ORACLE_TRIALS:-2}"
+CIG_H2_PRETRAIN_EPISODES="${CIG_H2_PRETRAIN_EPISODES:-60}"
 read -r -a CIG_H1_SEED_ARRAY <<< "$CIG_H1_SEED_TEXT"
 read -r -a CIG_H23_SEED_ARRAY <<< "$CIG_H23_SEED_TEXT"
 if [ "${#CIG_H1_SEED_ARRAY[@]}" -eq 0 ] || [ "${#CIG_H23_SEED_ARRAY[@]}" -eq 0 ]; then
@@ -138,7 +139,7 @@ for CIG_SEED in "${CIG_H23_SEED_ARRAY[@]}"; do
   CIG_SEEN_SEEDS="$CIG_SEEN_SEEDS$CIG_SEED "
 done
 
-for CIG_EPISODE_BUDGET in "$CIG_H2_EPISODES" "$CIG_H3_EPISODES" \
+for CIG_EPISODE_BUDGET in "$CIG_H2_EPISODES" "$CIG_H2_PRETRAIN_EPISODES" "$CIG_H3_EPISODES" \
   "$CIG_LATENCY_ORACLE_STATES" "$CIG_LATENCY_ORACLE_TRIALS"; do
   case "$CIG_EPISODE_BUDGET" in
     *[!0-9]*|""|0)
@@ -186,6 +187,7 @@ printf 'category\tlabel\texit_code\telapsed_seconds\tlog\n' > "$CIG_STATUS_TSV"
   printf 'h1_seeds=%s\n' "${CIG_H1_SEED_ARRAY[*]}"
   printf 'h2_h3_seeds=%s\n' "${CIG_H23_SEED_ARRAY[*]}"
   printf 'h2_episodes=%s\n' "$CIG_H2_EPISODES"
+  printf 'h2_pretrain_episodes=%s\n' "$CIG_H2_PRETRAIN_EPISODES"
   printf 'h3_episodes=%s\n' "$CIG_H3_EPISODES"
   printf 'latency_oracle_states=%s\n' "$CIG_LATENCY_ORACLE_STATES"
   printf 'latency_oracle_trials=%s\n' "$CIG_LATENCY_ORACLE_TRIALS"
@@ -301,8 +303,9 @@ echo "Device: $CIG_DEVICE"
 echo "H1 seeds: ${CIG_H1_SEED_ARRAY[*]}"
 echo "H2/H3 seeds: ${CIG_H23_SEED_ARRAY[*]}"
 echo "Planned H1 attempts: $((7 * ${#CIG_H1_SEED_ARRAY[@]}))"
-echo "Planned H2 episodes: $((3 * 2 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H2_EPISODES))"
+echo "Planned H2 episodes: $((3 * ${#CIG_H23_SEED_ARRAY[@]} * (2 * CIG_H2_EPISODES + CIG_H2_PRETRAIN_EPISODES)))"
 echo "Planned H3 episodes: $((6 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
+echo "Planned Paper-B allocation episodes: $((2 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
 echo "Latency oracle: ${CIG_LATENCY_ORACLE_STATES} states x ${CIG_LATENCY_ORACLE_TRIALS} CRN trials"
 
 # ---------------------------------------------------------------------------
@@ -465,8 +468,9 @@ run_logged "hypothesis" "H1 one-step causal identification and calibration" "60_
   --quiet
 run_logged "hypothesis" "H2 structural selectivity and recovery" "61_h2.log" \
   "$CIG_PYTHON" scripts/run_h2_selectivity.py \
-  --seeds "${CIG_H23_SEED_ARRAY[@]}" \
-  --episodes "$CIG_H2_EPISODES" \
+    --seeds "${CIG_H23_SEED_ARRAY[@]}" \
+    --episodes "$CIG_H2_EPISODES" \
+    --pretrain-episodes "$CIG_H2_PRETRAIN_EPISODES" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/h2"
 run_logged "hypothesis" "H3 specialization, capacity, and no-memory controls" "62_h3.log" \
@@ -475,6 +479,12 @@ run_logged "hypothesis" "H3 specialization, capacity, and no-memory controls" "6
   --episodes "$CIG_H3_EPISODES" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/h3"
+run_logged "allocation" "Paper-B C-core versus |D|-core allocation" "63_paper_b_allocation.log" \
+  "$CIG_PYTHON" scripts/run_paper_b_allocation.py \
+  --seeds "${CIG_H23_SEED_ARRAY[@]}" \
+  --episodes "$CIG_H3_EPISODES" \
+  --device "$CIG_DEVICE" \
+  --out-root "$CIG_RUN_DIR/paper_b_allocation"
 
 # ---------------------------------------------------------------------------
 # 7. Diagnostic figure.
