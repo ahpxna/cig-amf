@@ -16,7 +16,7 @@ try:
         _restore_frozen_learning_checkpoint,
     )
     from run_paper_b_allocation import (
-        _mean_oracle_capacity, _oracle_capacity_for_state,
+        _decision_probe, _mean_oracle_capacity, _oracle_capacity_for_state,
     )
 except ModuleNotFoundError:
     from scripts.exp_common import ROOT, ensure_dir
@@ -25,7 +25,7 @@ except ModuleNotFoundError:
         _restore_frozen_learning_checkpoint,
     )
     from scripts.run_paper_b_allocation import (
-        _mean_oracle_capacity, _oracle_capacity_for_state,
+        _decision_probe, _mean_oracle_capacity, _oracle_capacity_for_state,
     )
 
 import run_experiment as RE
@@ -33,6 +33,7 @@ from runners.h3_ablation_runner import H3NoMultiMemoryRunner
 
 
 VARIANTS = {
+    "Full-Explicit": {"runner": "full", "num_memory_slots": 4},
     "Semantic-Free": {"runner": "multi", "num_memory_slots": 6},
     "Semantic-Only": {
         "runner": "multi", "num_memory_slots": 4,
@@ -48,6 +49,32 @@ VARIANTS = {
     },
     "Single-Mean": {"runner": "single", "num_memory_slots": 6},
 }
+
+
+def _decision_fidelity(probe, reference):
+    return {
+        "policy_logit_l2_to_full_explicit": float(np.mean(
+            (probe["logits"] - reference["logits"]) ** 2
+        ) ** 0.5),
+        "value_mae_to_full_explicit": float(np.mean(np.abs(
+            probe["values"] - reference["values"]
+        ))),
+        "action_agreement_to_full_explicit": float(np.mean(
+            probe["actions"] == reference["actions"]
+        )),
+    }
+
+
+def _representation_memory_bytes(runner):
+    periph_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in runner.periph_module.parameters()
+    )
+    pair_state_bytes = (
+        runner.n_agents * max(0, runner.n_agents - 1)
+        * runner.pair_rel_module.hidden_dim * 4
+    )
+    return int(periph_bytes + pair_state_bytes)
 
 
 def _atomic_json(path, payload):
@@ -110,7 +137,7 @@ def _restore_shared_state(runner, checkpoint):
     _restore_frozen_learning_checkpoint(runner, shared)
 
 
-def _seed_oracle_core(runner, core_budget, table):
+def _seed_oracle_core(runner, core_budget, table, full_explicit=False):
     runner.oracle_capacity_scores_by_ego = copy.deepcopy(table)
     for ego, belief in runner.belief_modules.items():
         row = table.get(int(ego), {})
@@ -119,7 +146,9 @@ def _seed_oracle_core(runner, core_budget, table):
             key=lambda neighbor: float(row.get(int(neighbor), 0.0)),
             reverse=True,
         )
-        belief.set_fixed_core(ranked[:int(core_budget)])
+        belief.set_fixed_core(
+            belief.neighbor_ids if full_explicit else ranked[:int(core_budget)]
+        )
 
 
 def _oracle_capacity_table(seed, checkpoint, core_budget, device, n_states=2):
@@ -152,6 +181,8 @@ def _run_variant(
     spec = VARIANTS[name]
     cfg = _cfg(seed, core_budget)
     cfg.update({key: value for key, value in spec.items() if key != "runner"})
+    if spec["runner"] == "full":
+        cfg["core_selection_mode"] = "full_explicit"
     env = _env(seed)
     runner = (
         H3NoMultiMemoryRunner(env, cfg, device=device)
@@ -159,24 +190,33 @@ def _run_variant(
         else RE.make_runner("Final-CIGAMF", env, cfg, device)
     )
     _restore_shared_state(runner, checkpoint)
-    _seed_oracle_core(runner, core_budget, oracle_capacity)
+    _seed_oracle_core(
+        runner, core_budget, oracle_capacity,
+        full_explicit=(spec["runner"] == "full"),
+    )
     history = runner.run(n_episodes=int(episodes), eval_every=10)
     core_sizes = [
         len(module.get_core_set()) for module in runner.belief_modules.values()
     ]
-    if any(size != int(core_budget) for size in core_sizes):
+    expected_size = (
+        runner.n_agents - 1 if spec["runner"] == "full" else int(core_budget)
+    )
+    if any(size != expected_size for size in core_sizes):
         raise RuntimeError(f"{name}/seed={seed} violated fixed oracle core")
     diagnostics = (
         runner.periph_module.get_slot_diagnostics()
         if callable(getattr(runner.periph_module, "get_slot_diagnostics", None))
         else {}
     )
-    return {
+    row = {
         "variant": name,
         "seed": int(seed),
         "episodes": int(episodes),
         "core_budget": int(core_budget),
-        "core_contract": "oracle_fixed_equal_budget",
+        "core_contract": (
+            "full_explicit_reference" if spec["runner"] == "full"
+            else "oracle_fixed_equal_budget"
+        ),
         "checkpoint_sha256": checkpoint["sha256"],
         "mean_core_size": _mean(core_sizes),
         "mean_reward": _mean(history.get("mean_reward", [])),
@@ -184,6 +224,7 @@ def _run_variant(
         "throughput_total": _mean(
             history.get("throughput_total_agent_steps_per_sec", [])
         ),
+        "representation_memory_bytes": _representation_memory_bytes(runner),
         "usage_entropy_ratio": float(
             diagnostics.get("usage_entropy_ratio", -1.0)
         ),
@@ -191,6 +232,7 @@ def _run_variant(
             diagnostics.get("mean_offdiag_cosine", -1.0)
         ),
     }
+    return row, _decision_probe(runner, n_states=4, seed=int(seed) + 94009)
 
 
 def main(argv=None):
@@ -216,11 +258,25 @@ def main(argv=None):
         oracle_capacity = _oracle_capacity_table(
             seed, checkpoint, args.core_budget, args.device
         )
+        variants = {}
         for name in selected_variants:
-            rows.append(_run_variant(
+            variants[name] = _run_variant(
                 name, seed, args.episodes, args.core_budget, args.device,
                 checkpoint, oracle_capacity,
-            ))
+            )
+        reference = variants.get("Full-Explicit", (None, None))[1]
+        for name, (row, probe) in variants.items():
+            if reference is None:
+                row.update({
+                    "policy_logit_l2_to_full_explicit": float("nan"),
+                    "value_mae_to_full_explicit": float("nan"),
+                    "action_agreement_to_full_explicit": float("nan"),
+                })
+                row["decision_fidelity_reference"] = "not_collected"
+            else:
+                row.update(_decision_fidelity(probe, reference))
+                row["decision_fidelity_reference"] = "Full-Explicit"
+            rows.append(row)
     summary_path = os.path.join(out_root, "summary_paper_b_periphery.csv")
     with open(summary_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=sorted(rows[0]))

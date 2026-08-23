@@ -16,7 +16,7 @@ try:
         _restore_frozen_learning_checkpoint,
     )
     from run_paper_b_allocation import (
-        _mean_oracle_capacity, _oracle_capacity_for_state,
+        _decision_probe, _mean_oracle_capacity, _oracle_capacity_for_state,
     )
 except ModuleNotFoundError:
     from scripts.exp_common import ROOT, ensure_dir
@@ -25,7 +25,7 @@ except ModuleNotFoundError:
         _restore_frozen_learning_checkpoint,
     )
     from scripts.run_paper_b_allocation import (
-        _mean_oracle_capacity, _oracle_capacity_for_state,
+        _decision_probe, _mean_oracle_capacity, _oracle_capacity_for_state,
     )
 
 import run_experiment as RE
@@ -41,6 +41,10 @@ VARIANTS = {
                      "heads_w_contrastive": 0.0},
     "Recurrent-BC-CD": {"pair_state_mode": "recurrent", "heads_w_influence": 1.0,
                         "heads_w_contrastive": 0.0},
+    "Recurrent-BC-CD-NoWarmStart": {
+        "pair_state_mode": "recurrent", "heads_w_influence": 1.0,
+        "heads_w_contrastive": 0.0, "pair_warm_start": False,
+    },
     "Recurrent-BC-CD-Contrastive": {
         "pair_state_mode": "recurrent", "heads_w_influence": 1.0,
         "heads_w_contrastive": 1.0,
@@ -144,6 +148,30 @@ def _latent_profile_geometry(runner):
     return float(RE.safe_spearman(dz, dp)[0])
 
 
+def _decision_fidelity(probe, reference):
+    return {
+        "policy_logit_l2_to_cd_contrastive": float(np.mean(
+            (probe["logits"] - reference["logits"]) ** 2
+        ) ** 0.5),
+        "value_mae_to_cd_contrastive": float(np.mean(np.abs(
+            probe["values"] - reference["values"]
+        ))),
+        "action_agreement_to_cd_contrastive": float(np.mean(
+            probe["actions"] == reference["actions"]
+        )),
+    }
+
+
+def _post_promotion_bc_loss(history):
+    promoted = list(history.get("promoted", []))
+    losses = list(history.get("bc_loss", []))
+    values = [float(loss) for loss, count in zip(losses, promoted) if int(count) > 0]
+    # Keep the CSV finite when a fixed-core run never promotes a pair. The
+    # event count is reported separately and the validator marks that outcome
+    # unsupported rather than treating it as a malformed artifact.
+    return _mean(values) if values else 0.0
+
+
 def _oracle_capacity_table(seed, checkpoint, core_budget, device, n_states=2):
     runner = RE.make_runner(
         "Final-CIGAMF", _env(seed), _base_cfg(seed, core_budget), device
@@ -184,7 +212,7 @@ def _run_variant(
     ]
     if any(size != int(core_budget) for size in core_sizes):
         raise RuntimeError(f"{name}/seed={seed} violated fixed oracle core")
-    return {
+    row = {
         "variant": name,
         "seed": int(seed),
         "episodes": int(episodes),
@@ -194,6 +222,7 @@ def _run_variant(
         "pair_state_mode": cfg["pair_state_mode"],
         "w_cd": float(cfg["heads_w_influence"]),
         "w_contrastive": float(cfg["heads_w_contrastive"]),
+        "pair_warm_start": bool(cfg.get("pair_warm_start", True)),
         "mean_reward": _mean(history.get("mean_reward", [])),
         "mean_f1": _mean(history.get("mean_f1", [])),
         "throughput_total": _mean(
@@ -202,7 +231,10 @@ def _run_variant(
         "pair_specificity_ratio": float(specificity["specificity_ratio"]),
         "latent_profile_distance_spearman": _latent_profile_geometry(runner),
         "cd_retrieval_mae": _cd_retrieval_mae(runner),
+        "promotion_event_count": int(sum(history.get("promoted", []))),
+        "post_promotion_bc_loss": _post_promotion_bc_loss(history),
     }
+    return row, _decision_probe(runner, n_states=4, seed=int(seed) + 93011)
 
 
 def main(argv=None):
@@ -228,11 +260,26 @@ def main(argv=None):
         oracle_capacity = _oracle_capacity_table(
             seed, checkpoint, args.core_budget, args.device
         )
+        variants = {}
         for name in selected_variants:
-            rows.append(_run_variant(
+            variants[name] = _run_variant(
                 name, seed, args.episodes, args.core_budget, args.device,
                 checkpoint, oracle_capacity,
-            ))
+            )
+        reference_name = "Recurrent-BC-CD-Contrastive"
+        reference = variants.get(reference_name, (None, None))[1]
+        for name, (row, probe) in variants.items():
+            if reference is None:
+                row.update({
+                    "policy_logit_l2_to_cd_contrastive": float("nan"),
+                    "value_mae_to_cd_contrastive": float("nan"),
+                    "action_agreement_to_cd_contrastive": float("nan"),
+                })
+                row["decision_fidelity_reference"] = "not_collected"
+            else:
+                row.update(_decision_fidelity(probe, reference))
+                row["decision_fidelity_reference"] = reference_name
+            rows.append(row)
     summary_path = os.path.join(out_root, "summary_paper_b_pair_latent.csv")
     with open(summary_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=sorted(rows[0]))

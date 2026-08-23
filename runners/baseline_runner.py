@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from models.structural_proxy import (
     LocalCounterfactualProxyEnsemble,
 )
-from envs.causal_adapter import resolve_env_adapter
+from envs.causal_adapter import compact_relation_features, resolve_env_adapter
 from models.belief_layer import BayesLightBeliefState
 from models.core_behavior import PairRelationalModule
 from models.peripheral_memory import PeripheralMultiMemory
@@ -20,23 +20,11 @@ from training.replay_builder import MultiEgoReplayBuilder
 
 
 def _ordered_geometry_snapshot(env, n_agents):
-    """Return geometry ordered by agent id for replay construction.
-
-    OmniArena stores ``positions`` and ``agent_zone`` as dictionaries.  Plain
-    iteration over those containers yields integer keys, not position vectors;
-    indexing by agent id also keeps this helper compatible with list-backed
-    environments.
-    """
-    return {
-        "positions": [list(env.positions[int(i)]) for i in range(int(n_agents))],
-        "agent_zone": [int(env.agent_zone[int(i)]) for i in range(int(n_agents))],
-        "agent_role": (
-            [str(env.agent_role[int(i)]) for i in range(int(n_agents))]
-            if hasattr(env, "agent_role") else None
-        ),
-        "grid_size": int(getattr(env, "grid_size", 1)),
-        "n_zones": int(getattr(env, "n_zones", 1)),
-    }
+    """Return an adapter-owned action-time feature snapshot for replay."""
+    adapter = resolve_env_adapter(env)
+    if int(adapter.n_agents) != int(n_agents):
+        raise ValueError("snapshot agent count does not match adapter population")
+    return adapter.feature_snapshot()
 
 
 def _current_behavioral_phase(env):
@@ -1026,43 +1014,33 @@ class FullExplicitLocalRunner:
         }
 
     def _explicit_summary_for_ego(self, ego, actions_ref):
-        pi = self.env.positions[int(ego)]
-        zi = int(self.env.agent_zone[int(ego)])
-
         act_mean = np.zeros(self.action_dim, dtype=np.float32)
-        rel_rows = []
-        rel_cols = []
-        same_zones = []
+        relation_rows = []
         count = 0
 
         for j in range(self.n_agents):
             if j == ego:
                 continue
 
-            pj = self.env.positions[int(j)]
-            zj = int(self.env.agent_zone[int(j)])
-
             a = int(actions_ref[j]) if j < len(actions_ref) else 0
             if 0 <= a < self.action_dim:
                 act_mean[a] += 1.0
-
-            rel_rows.append(float((pj[0] - pi[0]) / max(1, int(self.env.grid_size))))
-            rel_cols.append(float((pj[1] - pi[1]) / max(1, int(self.env.grid_size))))
-            same_zones.append(1.0 if zi == zj else 0.0)
+            relation_rows.append(compact_relation_features(
+                self.env_adapter, ego, j, width=3
+            ))
             count += 1
 
         if count > 0:
             act_mean /= float(count)
 
-        aux = np.array(
-            [
-                float(np.mean(rel_rows)) if len(rel_rows) > 0 else 0.0,
-                float(np.mean(rel_cols)) if len(rel_cols) > 0 else 0.0,
-                float(np.mean(same_zones)) if len(same_zones) > 0 else 0.0,
-                float(count / max(1, self.n_agents - 1)),
-            ],
-            dtype=np.float32,
+        relation_mean = (
+            np.mean(np.stack(relation_rows, axis=0), axis=0)
+            if relation_rows else np.zeros(3, dtype=np.float32)
         )
+        aux = np.concatenate([
+            relation_mean.astype(np.float32),
+            np.asarray([float(count / max(1, self.n_agents - 1))], dtype=np.float32),
+        ])
 
         return np.concatenate([act_mean, aux], axis=0).astype(np.float32)
 
@@ -1591,43 +1569,33 @@ class SharedAblationBase:
         periph_ids = sorted(list(belief_mod.get_peripheral_set()))
         last_actions = getattr(self.env, "last_actions", [0 for _ in range(self.n_agents)])
 
-        pi = self.env.positions[int(ego)]
-        zi = int(self.env.agent_zone[int(ego)])
-
         act_mean = np.zeros(self.action_dim, dtype=np.float32)
-        rel_rows = []
-        rel_cols = []
-        same_zones = []
+        relation_rows = []
         count = 0
 
         for j in periph_ids:
             if exclude_j is not None and int(j) == int(exclude_j):
                 continue
 
-            pj = self.env.positions[int(j)]
-            zj = int(self.env.agent_zone[int(j)])
-
             a = int(last_actions[int(j)]) if int(j) < len(last_actions) else 0
             if 0 <= a < self.action_dim:
                 act_mean[a] += 1.0
-
-            rel_rows.append(float((pj[0] - pi[0]) / max(1, int(self.env.grid_size))))
-            rel_cols.append(float((pj[1] - pi[1]) / max(1, int(self.env.grid_size))))
-            same_zones.append(1.0 if zi == zj else 0.0)
+            relation_rows.append(compact_relation_features(
+                self.env_adapter, ego, j, width=3
+            ))
             count += 1
 
         if count > 0:
             act_mean /= float(count)
 
-        aux = np.array(
-            [
-                float(np.mean(rel_rows)) if len(rel_rows) > 0 else 0.0,
-                float(np.mean(rel_cols)) if len(rel_cols) > 0 else 0.0,
-                float(np.mean(same_zones)) if len(same_zones) > 0 else 0.0,
-                float(count / max(1, self.n_agents - 1)),
-            ],
-            dtype=np.float32,
+        relation_mean = (
+            np.mean(np.stack(relation_rows, axis=0), axis=0)
+            if relation_rows else np.zeros(3, dtype=np.float32)
         )
+        aux = np.concatenate([
+            relation_mean.astype(np.float32),
+            np.asarray([float(count / max(1, self.n_agents - 1))], dtype=np.float32),
+        ])
 
         return np.concatenate([act_mean, aux], axis=0).astype(np.float32)
 

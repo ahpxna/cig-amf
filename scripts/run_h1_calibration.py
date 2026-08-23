@@ -51,9 +51,11 @@ KEEP_KEYS = (
     "bias_mean", "mae_mean", "pearson_mean", "n_states", "n_pairs",
     "q_mae_mean", "q_rmse_mean", "q_spearman_mean",
     "q_centered_mae_mean", "q_centered_rmse_mean",
-    "q_within_state_action_spearman_mean", "q_raw_mae_mean", "q_raw_rmse_mean",
+    "q_within_state_action_spearman_mean", "q_nonconstant_surface_count_mean",
+    "q_raw_mae_mean", "q_raw_rmse_mean",
     "capacity_rank_correlation_mean", "capacity_mae_mean",
     "capacity_bias_mean", "oracle_core_f1_mean",
+    "oracle_core_f1_random_baseline_mean", "oracle_core_f1_adjusted_mean",
     "direction_spearman_mean", "direction_mae_mean",
     "direction_bias_mean", "direction_sign_agreement_mean",
     "capacity_active_mae_mean", "capacity_active_spearman_mean",
@@ -68,7 +70,7 @@ KEEP_KEYS = (
     "direction_row_aipw_sign_agreement_mean",
 )
 
-PROTOCOL_VERSION = "h1_qcd_crossfit_v3"
+PROTOCOL_VERSION = "h1_qcd_crossfit_v4"
 MIN_CONFIRMATORY_SEEDS = 8
 BOOTSTRAP_REPLICATES = 20000
 BOOTSTRAP_SEED = 1729
@@ -126,6 +128,57 @@ def _fingerprint(payload):
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
 
+def _load_threshold_calibration(path):
+    """Load the oracle-only threshold decision frozen before an H1 run."""
+    with open(path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("oracle_only") is not True:
+        raise ValueError("H1 threshold calibration must be explicitly oracle-only")
+    required = (
+        "capacity_active_threshold",
+        "capacity_prediction_threshold",
+        "direction_active_threshold",
+        "direction_prediction_threshold",
+    )
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise ValueError(
+            "H1 threshold calibration is incomplete; missing "
+            + ", ".join(missing)
+        )
+    values = {key: float(payload[key]) for key in required}
+    if any(not math.isfinite(value) or value < 0.0 for value in values.values()):
+        raise ValueError("H1 threshold calibration contains invalid thresholds")
+    return values, _fingerprint(payload)
+
+
+def build_h1_config(cfg_override, seed, threshold_calibration=None):
+    """Build the one-step H1 configuration shared by CLI and contract tests."""
+    cfg = RE.default_cfg()
+    cfg.update(cfg_override)
+    cfg["forcer_anneal_to"] = float(cfg_override["eps"])
+    # H1 identifies the one-step estimand.  The runner rejects mismatched
+    # proxy/replay horizons, so both fields are protocol-critical.
+    cfg["causal_horizon"] = 1
+    cfg["proxy_n_horizons"] = 1
+    cfg["proxy_iw_clip"] = 2000.0
+    cfg["seed"] = int(seed)
+    if threshold_calibration is not None:
+        cfg["h1_capacity_active_threshold"] = float(
+            threshold_calibration["capacity_active_threshold"]
+        )
+        cfg["h1_capacity_prediction_threshold"] = float(
+            threshold_calibration["capacity_prediction_threshold"]
+        )
+        cfg["h1_direction_active_threshold"] = float(
+            threshold_calibration["direction_active_threshold"]
+        )
+        cfg["h1_direction_prediction_threshold"] = float(
+            threshold_calibration["direction_prediction_threshold"]
+        )
+    return cfg
+
+
 def _variant_means(rows, variant):
     selected = [row for row in rows if row["variant"] == variant]
     out = {}
@@ -143,8 +196,11 @@ def _variant_means(rows, variant):
         "sign_agreement_mean", "signed_bias_mean", "signed_mae_mean",
         "range_rank_correlation_mean",
         "q_spearman_mean", "q_mae_mean", "q_rmse_mean",
+        "q_centered_mae_mean", "q_centered_rmse_mean",
+        "q_within_state_action_spearman_mean", "q_nonconstant_surface_count_mean",
         "capacity_rank_correlation_mean", "capacity_mae_mean",
         "capacity_bias_mean", "oracle_core_f1_mean",
+        "oracle_core_f1_random_baseline_mean", "oracle_core_f1_adjusted_mean",
         "direction_spearman_mean", "direction_mae_mean",
         "direction_bias_mean", "direction_sign_agreement_mean",
         "capacity_active_mae_mean", "capacity_active_spearman_mean",
@@ -424,11 +480,15 @@ def _claim_gate(rows):
         seed_offset=1,
     )
     forcing_reporting = _forcing_reporting(rows)
-    q_recovery = bool(plugin["q_spearman_mean"] >= MIN_Q_SPEARMAN)
+    q_recovery = bool(
+        math.isfinite(plugin["q_within_state_action_spearman_mean"])
+        and plugin["q_nonconstant_surface_count_mean"] > 0.0
+        and plugin["q_within_state_action_spearman_mean"] >= MIN_Q_SPEARMAN
+    )
     capacity_recovery = bool(
         math.isfinite(plugin["capacity_active_spearman_mean"])
         and plugin["capacity_active_spearman_mean"] >= MIN_CAPACITY_RANK
-        and plugin["oracle_core_f1_mean"] >= MIN_CAPACITY_CORE_F1
+        and plugin["oracle_core_f1_adjusted_mean"] >= MIN_CAPACITY_CORE_F1
         and math.isfinite(plugin["capacity_null_fpr_mean"])
         and plugin["capacity_null_fpr_mean"] <= MAX_CAPACITY_NULL_FPR
     )
@@ -475,8 +535,9 @@ def _claim_gate(rows):
         "h1_main_dr_clipping_absent": True,
         "h1_min_confirmatory_seeds": MIN_CONFIRMATORY_SEEDS,
         "h1_gate_definition": (
-            f"centered Q Spearman>={MIN_Q_SPEARMAN}; active-C rank>="
-            f"{MIN_CAPACITY_RANK}, C top-k F1>={MIN_CAPACITY_CORE_F1}, and "
+            f"nonconstant-surface within-state Q Spearman>={MIN_Q_SPEARMAN}; "
+            f"active-C rank>={MIN_CAPACITY_RANK}, random-adjusted C top-k "
+            f"F1>={MIN_CAPACITY_CORE_F1}, and "
             f"C null FPR<={MAX_CAPACITY_NULL_FPR}; active-D Spearman>="
             f"{MIN_DIRECTION_SPEARMAN}, active-D sign agreement>="
             f"{MIN_DIRECTION_SIGN_AGREEMENT}, and D null FPR<="
@@ -488,7 +549,7 @@ def _claim_gate(rows):
     }
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--seeds",
@@ -505,6 +566,20 @@ def main():
     ap.add_argument("--tiny-proxy-train-episodes", type=int, default=40)
     ap.add_argument("--tiny-states", type=int, default=8)
     ap.add_argument("--max-steps", type=int, default=30)
+    ap.add_argument(
+        "--threshold-calibration", type=str, default=None,
+        help=(
+            "Frozen JSON emitted by calibrate_h1_oracle_thresholds.py. "
+            "It may contain oracle-derived thresholds only."
+        ),
+    )
+    ap.add_argument(
+        "--allow-development-thresholds", action="store_true",
+        help=(
+            "Permit default thresholds for a development smoke check only. "
+            "Never use this flag for confirmatory evidence."
+        ),
+    )
     ap.add_argument(
         "--quiet", action="store_true",
         help="Suppress per-batch diagnostics; keep one concise line per run.",
@@ -525,12 +600,35 @@ def main():
         "--aggregate_only", action="store_true",
         help="Do not train; rebuild the requested summary from existing JSON files.",
     )
-    args_cli = ap.parse_args()
+    args_cli = ap.parse_args(argv)
 
     if args_cli.aggregate_only and not args_cli.run_id:
         ap.error("--aggregate_only requires --run-id; stale runs are never guessed")
     if len(set(args_cli.seeds)) != len(args_cli.seeds):
         ap.error("--seeds must be unique; duplicate seeds are pseudo-replication")
+    if not args_cli.threshold_calibration and not args_cli.allow_development_thresholds:
+        ap.error(
+            "--threshold-calibration is required for H1 evidence; use "
+            "--allow-development-thresholds only for a non-confirmatory smoke check"
+        )
+    threshold_values = None
+    threshold_fingerprint = None
+    if args_cli.threshold_calibration:
+        threshold_path = os.path.abspath(args_cli.threshold_calibration)
+        threshold_values, threshold_fingerprint = _load_threshold_calibration(
+            threshold_path
+        )
+        with open(threshold_path, encoding="utf-8") as handle:
+            calibration_payload = json.load(handle)
+        development_seeds = {
+            int(seed) for seed in calibration_payload.get("development_seeds", [])
+        }
+        overlap = development_seeds.intersection(int(seed) for seed in args_cli.seeds)
+        if overlap and not args_cli.allow_development_thresholds:
+            ap.error(
+                "confirmatory H1 seeds overlap oracle-threshold development seeds: "
+                + ", ".join(map(str, sorted(overlap)))
+            )
 
     run_id = args_cli.run_id or (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -560,6 +658,11 @@ def main():
             manifest.get("run_id") != run_id
             or manifest.get("protocol_version") != PROTOCOL_VERSION
             or manifest.get("expected_attempts") != expected
+            or manifest.get("threshold_calibration", {}).get("fingerprint")
+            != threshold_fingerprint
+            or bool(manifest.get("threshold_calibration", {}).get(
+                "development_defaults", False
+            )) != bool(args_cli.allow_development_thresholds)
         ):
             raise RuntimeError(
                 "Run manifest identity or expected attempt matrix does not match"
@@ -573,6 +676,14 @@ def main():
             "expected_attempts": expected,
             "completed_attempts": [],
             "failed_attempts": [],
+            "threshold_calibration": {
+                "path": (
+                    None if args_cli.threshold_calibration is None
+                    else os.path.abspath(args_cli.threshold_calibration)
+                ),
+                "fingerprint": threshold_fingerprint,
+                "development_defaults": bool(args_cli.allow_development_thresholds),
+            },
         }
         _atomic_json(manifest_path, manifest)
     rows = []
@@ -580,18 +691,7 @@ def main():
     for seed in args_cli.seeds:
         for name, cfg_over in selected_variants:
             out_dir = ensure_dir(os.path.join(run_root, f"{name}_seed{seed}"))
-            cfg = RE.default_cfg()
-            cfg.update(cfg_over)
-            # The epsilon sweep must remain constant. Previously every variant
-            # annealed toward 0.05, so eps=0 was not an observational control.
-            cfg["forcer_anneal_to"] = float(cfg_over["eps"])
-            cfg["proxy_n_horizons"] = 1
-            # The smallest declared positive exploration rate is 0.01, whose
-            # exact marginal propensity floor is eps/13 and inverse is 1300.
-            # A 2000 ceiling therefore leaves every randomized arm untruncated
-            # while retaining a finite safety guard for the eps=0 control.
-            cfg["proxy_iw_clip"] = 2000.0
-            cfg["seed"] = int(seed)
+            cfg = build_h1_config(cfg_over, seed, threshold_values)
             args = make_args(
                 seed=seed, device=args_cli.device, result_dir=out_dir,
                 tiny_horizon=1,
@@ -610,9 +710,14 @@ def main():
                 "cfg_override": cfg_over,
                 "fixed": {
                     "proxy_n_horizons": 1,
+                    "causal_horizon": 1,
                     "proxy_iw_clip": 2000.0,
                     "tiny_horizon": 1,
                     "forcer_anneal_to": float(cfg_over["eps"]),
+                    "threshold_calibration_fingerprint": threshold_fingerprint,
+                    "development_thresholds": bool(
+                        args_cli.allow_development_thresholds
+                    ),
                 },
             }
             attempt_fingerprint = _fingerprint(attempt_config)
@@ -646,6 +751,10 @@ def main():
                         "variant": name,
                         "protocol_version": PROTOCOL_VERSION,
                         "config_fingerprint": attempt_fingerprint,
+                        "threshold_calibration_fingerprint": threshold_fingerprint,
+                        "development_thresholds": bool(
+                            args_cli.allow_development_thresholds
+                        ),
                         "attempt_complete": True,
                     })
                     _atomic_json(

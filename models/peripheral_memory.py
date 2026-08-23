@@ -89,7 +89,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from envs.causal_adapter import resolve_env_adapter
+from envs.causal_adapter import compact_relation_features, resolve_env_adapter
 
 from models.influence_signature import (
     N_SEMANTIC_ROLES,
@@ -1037,13 +1037,7 @@ class PeripheralMultiMemory(nn.Module):
         legacy_count = 0
 
         for j in ids:
-            pair = np.asarray(
-                adapter.relation_features(ego_id, j), dtype=np.float32
-            )
-            if pair.size < 5:
-                raise ValueError(
-                    "adapter pair_features must expose five base channels"
-                )
+            relation = compact_relation_features(adapter, ego_id, j, width=4)
             b = belief_state[j]
 
             action_j = int(np.clip(int(last_actions[j]), 0, self.action_dim - 1))
@@ -1098,10 +1092,7 @@ class PeripheralMultiMemory(nn.Module):
                     if context_validity is None
                     else context_validity.get(int(j), 0.0)
                 ),
-                float(pair[0]),
-                float(pair[1]),
-                float(pair[4]),
-                float(pair[2]),
+                *[float(value) for value in relation],
             ])
 
         self.signature_full_items_seen += int(full_count)

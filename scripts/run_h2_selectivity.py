@@ -55,7 +55,10 @@ from envs.causal_adapter import resolve_env_adapter
 # required observational comparator; NoTwoTimescale isolates scheduling only.
 # PureMeanField may still be requested explicitly as a reward control, but it
 # cannot define Eq. 33.
-MODELS = ["Final-CIGAMF", "CorrelationMeanField", "NoTwoTimescale"]
+MODELS = [
+    "Final-CIGAMF", "CorrelationMeanField", "NoTwoTimescale",
+    "FixedRateTracker", "NoDetector", "NoUncertainty", "FastTracker",
+]
 FACTORIAL_CELLS = {
     "S0B0": (False, False),
     "S0B1": (False, True),
@@ -63,13 +66,29 @@ FACTORIAL_CELLS = {
     "S1B1": (True, True),
 }
 MODES = list(FACTORIAL_CELLS)
-PROTOCOL_VERSION = "h2_factorial_frozen_policy_v5"
+PROTOCOL_VERSION = "h2_factorial_frozen_policy_v6"
 CHANGE_WINDOW_EVAL_INTERVALS = 2
 RECOVERY_F1_VALID_FLOOR = 0.50
 H2_EVALUATION_EGO_ROLES = ("collector",)
 H2_MANIPULATED_NEIGHBOR_ROLES = (
     "gatekeeper", "relay", "blocker", "controller", "drifter",
 )
+
+
+def _apply_tracker_control(model, cfg):
+    """Map tracking-control labels to isolated Final-CIGAMF mechanisms."""
+    model = str(model)
+    if model == "FixedRateTracker":
+        cfg["force_graph_update_every_episode"] = True
+        cfg["disable_drift_detector"] = True
+    elif model == "NoDetector":
+        cfg["disable_drift_detector"] = True
+    elif model == "NoUncertainty":
+        cfg["belief_uncertainty_scale"] = 0.0
+    elif model == "FastTracker":
+        cfg["force_graph_update_every_episode"] = True
+        cfg["slow_ratio"] = 1.0
+    return cfg
 
 
 def _utc_now():
@@ -578,6 +597,7 @@ def _pretrain_common_checkpoint(model, seed, episodes, device):
     RE.set_global_seed(seed)
     cfg = RE.default_cfg()
     cfg["seed"] = int(seed)
+    _apply_tracker_control(model, cfg)
     cfg["behavioral_adapter_lambda"] = 0.0
     cfg["freeze_policy_learning"] = False
     # Hold the environment in its initial regime during shared pretraining.
@@ -789,6 +809,7 @@ def run_one(
     RE.set_global_seed(seed)
     cfg = RE.default_cfg()
     cfg["seed"] = seed
+    _apply_tracker_control(model, cfg)
     if mode not in FACTORIAL_CELLS:
         raise ValueError(f"Unknown H2 factorial cell: {mode!r}")
     structural_factor, behavioral_factor = FACTORIAL_CELLS[mode]

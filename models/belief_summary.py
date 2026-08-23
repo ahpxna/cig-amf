@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from envs.causal_adapter import resolve_env_adapter
+from envs.causal_adapter import compact_relation_features, resolve_env_adapter
 import torch.nn.functional as F
 
 
@@ -82,12 +82,9 @@ Follow paper:
         j = int(j)
 
         b = belief_state[j]
-        pair = np.asarray(
-            resolve_env_adapter(env).relation_features(ego_id, j),
-            dtype=np.float32,
+        relation = compact_relation_features(
+            resolve_env_adapter(env), ego_id, j, width=3
         )
-        if pair.size < 5:
-            raise ValueError("adapter pair_features must expose five base channels")
 
         return np.array(
             [
@@ -96,9 +93,7 @@ Follow paper:
                 float(b["p_core"]),
                 float(b["in_core"]),
                 float(b["in_seed_core"]),
-                float(pair[0]),
-                float(pair[1]),
-                float(pair[4]),
+                *[float(value) for value in relation],
                 float(0.0 if pair_latent_norm is None else pair_latent_norm),
             ],
             dtype=np.float32,

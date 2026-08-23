@@ -40,9 +40,53 @@ VARIANTS = {
     "AbsD-Core": "behavioral_direction",
     "Random-Core": "random",
     "Correlation-Core": "observational_correlation",
+    "Attention-Core": "attention",
     "Oracle-C-Core": "oracle_capacity",
     "Full-Explicit": "full_explicit",
 }
+
+
+def _decision_probe(runner, n_states, seed):
+    """Evaluate policy/value outputs on a held-out common state bank."""
+    bank = runner.env.sample_state_bank(
+        n_states=int(n_states), burn_in=3, bank_seed=int(seed)
+    )
+    outer = runner.env.clone_state()
+    logits, values, actions = [], [], []
+    try:
+        for state in bank:
+            runner.env.restore_state(copy.deepcopy(state))
+            obs = runner.env._get_obs_all()
+            selected, cache = runner._select_actions_population(obs)
+            logits.append(np.asarray(cache["policy_logits"], dtype=np.float64))
+            values.append(np.asarray(
+                [cache["value_cache"][ego] for ego in range(runner.n_agents)],
+                dtype=np.float64,
+            ))
+            actions.append(np.asarray(
+                [selected[ego] for ego in range(runner.n_agents)], dtype=np.int64,
+            ))
+    finally:
+        runner.env.restore_state(outer)
+    return {
+        "logits": np.stack(logits, axis=0),
+        "values": np.stack(values, axis=0),
+        "actions": np.stack(actions, axis=0),
+    }
+
+
+def _decision_fidelity(probe, reference):
+    return {
+        "policy_logit_l2_to_full_explicit": float(np.mean(
+            (probe["logits"] - reference["logits"]) ** 2
+        ) ** 0.5),
+        "value_mae_to_full_explicit": float(np.mean(np.abs(
+            probe["values"] - reference["values"]
+        ))),
+        "action_agreement_to_full_explicit": float(np.mean(
+            probe["actions"] == reference["actions"]
+        )),
+    }
 
 
 def _atomic_json(path, data):
@@ -313,7 +357,7 @@ def _end_to_end_row(
         raise RuntimeError(
             f"{variant}/seed={seed} violated matched budget: {core_sizes}"
         )
-    return {
+    row = {
         "panel": "end_to_end",
         "variant": variant,
         "selector": selector,
@@ -335,6 +379,9 @@ def _end_to_end_row(
         "mean_f1": _mean(history.get("mean_f1", [])),
         "throughput_total": _mean(history.get("throughput_total_agent_steps_per_sec", [])),
     }
+    return row, _decision_probe(
+        runner, n_states=4, seed=int(seed) + 89009
+    )
 
 
 def main(argv=None):
@@ -398,11 +445,28 @@ def main(argv=None):
             state_bank,
             oracle_bank,
         ))
+        end_to_end = {}
         for variant in selected_variants:
-            rows.append(_end_to_end_row(
+            end_to_end[variant] = _end_to_end_row(
                 variant, seed, args.episodes, args.core_budget, args.device,
                 checkpoint, mean_oracle_capacity,
-            ))
+            )
+        reference = (
+            end_to_end["Full-Explicit"][1]
+            if "Full-Explicit" in end_to_end else None
+        )
+        for variant, (row, probe) in end_to_end.items():
+            if reference is None:
+                row.update({
+                    "policy_logit_l2_to_full_explicit": float("nan"),
+                    "value_mae_to_full_explicit": float("nan"),
+                    "action_agreement_to_full_explicit": float("nan"),
+                })
+                row["decision_fidelity_reference"] = "not_collected"
+            else:
+                row.update(_decision_fidelity(probe, reference))
+                row["decision_fidelity_reference"] = "Full-Explicit"
+            rows.append(row)
     path = os.path.join(out_root, "summary_paper_b_allocation.csv")
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(

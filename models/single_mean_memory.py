@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from envs.causal_adapter import resolve_env_adapter
+from envs.causal_adapter import compact_relation_features, resolve_env_adapter
 
 from models.influence_signature import SIGNATURE_DIM
 from models.peripheral_memory import (
@@ -248,14 +248,9 @@ class SingleMeanPeripheral(nn.Module):
         full_count = 0
         legacy_count = 0
         for neighbor_id in ids:
-            pair = np.asarray(
-                adapter.relation_features(ego_id, neighbor_id),
-                dtype=np.float32,
+            relation = compact_relation_features(
+                adapter, ego_id, neighbor_id, width=4
             )
-            if pair.size < 5:
-                raise ValueError(
-                    "adapter pair_features must expose five base channels"
-                )
             belief = belief_state[neighbor_id]
             signature = None
             if influence_signatures is not None:
@@ -296,10 +291,7 @@ class SingleMeanPeripheral(nn.Module):
                     if context_validity is None
                     else context_validity.get(neighbor_id, 0.0)
                 ),
-                float(pair[0]),
-                float(pair[1]),
-                float(pair[4]),
-                float(pair[2]),
+                *[float(value) for value in relation],
             ])
 
         self.signature_full_items_seen += full_count

@@ -6,7 +6,7 @@
 #   bash scripts/run_all.sh --claims-only
 #   bash scripts/run_all.sh --run-id 20260821_confirmatory
 #
-# Confirmatory mode uses eight paired H1 seeds and five paired H2/H3 seeds.
+# Confirmatory mode uses eight paired seeds for every hypothesis panel.
 # Runtime settings can be overridden without editing this file:
 #
 #   CIG_H1_SEEDS="0 1 2 3 4 5 6 7" CIG_RUN_SEEDS="0 1 2 3 4" bash scripts/run_all.sh
@@ -31,6 +31,10 @@ CIG_QUICK=0
 CIG_CLAIMS_ONLY=0
 CIG_RUN_ID=""
 CIG_DEVICE="${CIG_DEVICE:-cpu}"
+# A frozen oracle-only threshold artifact is mandatory for confirmatory H1.
+# Generate it with scripts/calibrate_h1_oracle_thresholds.py on development
+# oracle states that are disjoint from the confirmatory seed set.
+CIG_H1_THRESHOLD_CALIBRATION="${CIG_H1_THRESHOLD_CALIBRATION:-}"
 
 usage() {
   sed -n '2,18p' "$0"
@@ -96,7 +100,7 @@ else
   # Untouched confirmatory seeds.  Development seeds remain opt-in through
   # CIG_H1_SEEDS/CIG_RUN_SEEDS and are recorded as non-confirmatory metadata.
   CIG_DEFAULT_H1_SEEDS="101 102 103 104 105 106 107 108"
-  CIG_DEFAULT_H23_SEEDS="201 202 203 204 205"
+  CIG_DEFAULT_H23_SEEDS="201 202 203 204 205 206 207 208"
   CIG_H2_EPISODES="${CIG_H2_EPISODES:-400}"
   CIG_H3_EPISODES="${CIG_H3_EPISODES:-200}"
   CIG_LATENCY_TRAIN_EPISODES="${CIG_LATENCY_TRAIN_EPISODES:-200}"
@@ -109,6 +113,7 @@ CIG_H1_SEED_TEXT="${CIG_H1_SEEDS:-${CIG_RUN_SEEDS:-$CIG_DEFAULT_H1_SEEDS}}"
 CIG_LATENCY_ORACLE_STATES="${CIG_LATENCY_ORACLE_STATES:-12}"
 CIG_LATENCY_ORACLE_TRIALS="${CIG_LATENCY_ORACLE_TRIALS:-2}"
 CIG_H2_PRETRAIN_EPISODES="${CIG_H2_PRETRAIN_EPISODES:-60}"
+CIG_PAPER_B_SCALING_AGENTS="${CIG_PAPER_B_SCALING_AGENTS:-12 24 48}"
 read -r -a CIG_H1_SEED_ARRAY <<< "$CIG_H1_SEED_TEXT"
 read -r -a CIG_H23_SEED_ARRAY <<< "$CIG_H23_SEED_TEXT"
 if [ "${#CIG_H1_SEED_ARRAY[@]}" -eq 0 ] || [ "${#CIG_H23_SEED_ARRAY[@]}" -eq 0 ]; then
@@ -175,14 +180,31 @@ case "$CIG_PAPER_B_SELECTOR_STATES" in
     exit 2
     ;;
 esac
+for CIG_AGENT_COUNT in $CIG_PAPER_B_SCALING_AGENTS; do
+  case "$CIG_AGENT_COUNT" in
+    *[!0-9]*|""|0|1)
+      echo "CIG_PAPER_B_SCALING_AGENTS must contain integers greater than one." >&2
+      exit 2
+      ;;
+  esac
+done
 
 if [ "$CIG_QUICK" -eq 0 ]; then
+  if [ -z "$CIG_H1_THRESHOLD_CALIBRATION" ]; then
+    echo "Confirmatory H1 requires CIG_H1_THRESHOLD_CALIBRATION." >&2
+    echo "Generate an oracle-only artifact with calibrate_h1_oracle_thresholds.py." >&2
+    exit 2
+  fi
+  if [ ! -f "$CIG_H1_THRESHOLD_CALIBRATION" ]; then
+    echo "H1 threshold calibration file does not exist: $CIG_H1_THRESHOLD_CALIBRATION" >&2
+    exit 2
+  fi
   if [ "${#CIG_H1_SEED_ARRAY[@]}" -lt 8 ]; then
     echo "Confirmatory H1 requires at least 8 unique paired seeds." >&2
     exit 2
   fi
-  if [ "${#CIG_H23_SEED_ARRAY[@]}" -lt 5 ]; then
-    echo "Confirmatory H2/H3 require at least 5 unique paired seeds." >&2
+  if [ "${#CIG_H23_SEED_ARRAY[@]}" -lt 8 ]; then
+    echo "Confirmatory H2/H3 require at least 8 unique paired seeds." >&2
     exit 2
   fi
   if [ "$CIG_H2_EPISODES" -lt 400 ] || [ "$CIG_H3_EPISODES" -lt 200 ]; then
@@ -224,6 +246,8 @@ printf 'category\tlabel\texit_code\telapsed_seconds\tlog\n' > "$CIG_STATUS_TSV"
   printf 'latency_oracle_trials=%s\n' "$CIG_LATENCY_ORACLE_TRIALS"
   printf 'latency_train_episodes=%s\n' "$CIG_LATENCY_TRAIN_EPISODES"
   printf 'paper_b_selector_states=%s\n' "$CIG_PAPER_B_SELECTOR_STATES"
+  printf 'paper_b_scaling_agents=%s\n' "$CIG_PAPER_B_SCALING_AGENTS"
+  printf 'h1_threshold_calibration=%s\n' "$CIG_H1_THRESHOLD_CALIBRATION"
   printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || printf unknown)"
   git status --porcelain --untracked-files=normal 2>/dev/null > "$CIG_RUN_DIR/git_status_porcelain.txt"
   if [ ! -s "$CIG_RUN_DIR/git_status_porcelain.txt" ]; then
@@ -494,12 +518,18 @@ fi
 # 6. Paper hypotheses and faithful ablations.
 # ---------------------------------------------------------------------------
 echo "=== [6/9] H1/H2/H3 experiments ==="
+CIG_H1_ARGS=(--quiet)
+if [ "$CIG_QUICK" -eq 1 ]; then
+  CIG_H1_ARGS+=(--allow-development-thresholds)
+else
+  CIG_H1_ARGS+=(--threshold-calibration "$CIG_H1_THRESHOLD_CALIBRATION")
+fi
 run_logged "hypothesis" "H1 one-step causal identification and calibration" "60_h1.log" \
   "$CIG_PYTHON" scripts/run_h1_calibration.py \
   --seeds "${CIG_H1_SEED_ARRAY[@]}" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/h1" \
-  --quiet
+  "${CIG_H1_ARGS[@]}"
 run_logged "hypothesis" "Paper-A H2 factorial structural/behavioural selectivity" "61_h2.log" \
   "$CIG_PYTHON" scripts/run_h2_selectivity.py \
     --seeds "${CIG_H23_SEED_ARRAY[@]}" \
@@ -533,6 +563,13 @@ run_logged "representation" "Paper-B peripheral encoders under fixed core" "65_p
   --episodes "$CIG_H3_EPISODES" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/paper_b_periphery"
+run_logged "scalability" "Paper-B reward-compute-memory scaling" "66_paper_b_scaling.log" \
+  "$CIG_PYTHON" scripts/run_paper_b_scaling.py \
+  --seeds "${CIG_H23_SEED_ARRAY[@]}" \
+  --agent-counts $CIG_PAPER_B_SCALING_AGENTS \
+  --episodes "$CIG_H3_EPISODES" \
+  --device "$CIG_DEVICE" \
+  --out-root "$CIG_RUN_DIR/paper_b_scaling"
 
 # ---------------------------------------------------------------------------
 # 7. Diagnostic figure.

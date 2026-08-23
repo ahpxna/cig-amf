@@ -28,11 +28,11 @@ class FlatlandCIGAdapter:
     @property
     def obs_dim(self): return self.env.obs_dim
     @property
-    def relation_feature_dim(self): return 5
+    def relation_feature_dim(self): return 6
     @property
-    def pair_feature_dim(self): return 5
+    def pair_feature_dim(self): return 6
     @property
-    def context_item_dim(self): return 5 + self.max_action_dim + 4
+    def context_item_dim(self): return 6 + self.max_action_dim + 4
     def reset(self): return self.env.reset()
     def step(self, actions): return self.env.step(actions)
     def observation(self, observations, agent): return np.asarray(observations[int(agent)], dtype=np.float32)
@@ -51,9 +51,11 @@ class FlatlandCIGAdapter:
         rel = self.relation_features(ego, neighbour)
         return tuple(np.round(rel, 2).tolist())
     def weak_prior_score(self, ego, neighbour):
-        return float(1.0 / (1.0 + max(0.0, self.relation_features(ego, neighbour)[0])))
+        # The adapter's third channel is normalized distance to the first
+        # reachable shared conflict; no core module interprets this index.
+        return float(1.0 / (1.0 + max(0.0, self.relation_features(ego, neighbour)[2])))
     def feature_snapshot(self):
-        return {"relations": np.stack([[self.relation_features(i, j) if i != j else np.zeros(5)
+        return {"relations": np.stack([[self.relation_features(i, j) if i != j else np.zeros(6)
                                          for j in range(self.n_agents)] for i in range(self.n_agents)])}
     def pair_features_from_snapshot(self, snapshot, ego, target):
         return np.asarray(snapshot["relations"][int(ego), int(target)], dtype=np.float32)
@@ -121,9 +123,18 @@ class FlatlandCIGEnvironment:
     def valid_action_mask(self, agent):
         mask = np.zeros(5, dtype=bool)
         obj = self.rail_env.agents[int(agent)]
-        required = type(self.rail_env).action_required(
-            obj.state, obj.speed_counter.is_cell_exit(obj.speed_counter.max_speed)
-        )
+        action_required = getattr(self.rail_env, "action_required", None)
+        if callable(action_required):
+            try:
+                required = bool(action_required(obj))
+            except (TypeError, AttributeError):
+                required = bool(type(self.rail_env).action_required(
+                    obj.state, obj.speed_counter.is_cell_exit(obj.speed_counter.max_speed)
+                ))
+        else:
+            required = bool(type(self.rail_env).action_required(
+                obj.state, obj.speed_counter.is_cell_exit(obj.speed_counter.max_speed)
+            ))
         if not required:
             mask[0] = True
             return mask
@@ -139,14 +150,99 @@ class FlatlandCIGEnvironment:
                 allowed = True
             mask[action] = bool(allowed)
         return mask
+    def _reachable_rail_cells(self, agent, depth_limit=32):
+        """Bounded rail-topology trace keyed by reachable cell and distance."""
+        position = getattr(agent, "position", None)
+        if position is None:
+            return {}
+        direction = int(getattr(agent, "direction", 0))
+        frontier = [(int(position[0]), int(position[1]), direction, 0)]
+        visited = {}
+        moves = ((-1, 0), (0, 1), (1, 0), (0, -1))
+        rail = self.rail_env.rail
+        while frontier:
+            row, col, heading, depth = frontier.pop(0)
+            key = (row, col, heading)
+            if key in visited and visited[key] <= depth:
+                continue
+            visited[key] = depth
+            if depth >= int(depth_limit):
+                continue
+            try:
+                transitions = np.asarray(
+                    rail.get_transitions(row, col, heading), dtype=bool
+                ).reshape(-1)
+            except Exception:
+                transitions = np.zeros(4, dtype=bool)
+            for next_heading, active in enumerate(transitions[:4]):
+                if not active:
+                    continue
+                dr, dc = moves[next_heading]
+                frontier.append((row + dr, col + dc, next_heading, depth + 1))
+        cell_distance = {}
+        for (row, col, _heading), depth in visited.items():
+            cell = (row, col)
+            cell_distance[cell] = min(cell_distance.get(cell, depth), depth)
+        return cell_distance
+
+    def _distance_to_target(self, agent):
+        position = getattr(agent, "position", None)
+        target = getattr(agent, "target", None)
+        if position is None or target is None:
+            return float("inf")
+        cells = self._reachable_rail_cells(agent)
+        return float(cells.get(tuple(target), float("inf")))
+
     def relation_features(self, ego, neighbour):
-        a, b = self.rail_env.agents[int(ego)], self.rail_env.agents[int(neighbour)]
-        pa, pb = getattr(a, "position", None), getattr(b, "position", None)
-        if pa is None or pb is None: return np.zeros(5, dtype=np.float32)
-        distance = abs(float(pa[0] - pb[0])) + abs(float(pa[1] - pb[1]))
-        same_cell = float(tuple(pa) == tuple(pb))
-        same_target = float(getattr(a, "target", None) == getattr(b, "target", None))
-        return np.asarray([distance, same_cell, same_target, float(pa[0] - pb[0]), float(pa[1] - pb[1])], dtype=np.float32)
+        """Rail-topological xi_ij, not Cartesian/grid feature aliases.
+
+        Channels encode bounded route overlap, whether an overlapping route
+        visits a switch, distance to the first reachable conflict, relative
+        ETA, future route merge, and an upstream indicator. Their meanings are
+        adapter-local; downstream CIG-AMF modules treat the vector as opaque.
+        """
+        a = self.rail_env.agents[int(ego)]
+        b = self.rail_env.agents[int(neighbour)]
+        paths_a = self._reachable_rail_cells(a)
+        paths_b = self._reachable_rail_cells(b)
+        if not paths_a or not paths_b:
+            return np.zeros(6, dtype=np.float32)
+        shared = set(paths_a).intersection(paths_b)
+        denom = max(1, min(len(paths_a), len(paths_b)))
+        overlap = float(len(shared) / denom)
+        conflict_cells = sorted(
+            shared, key=lambda cell: (paths_a[cell] + paths_b[cell], cell)
+        )
+        first = conflict_cells[0] if conflict_cells else None
+        conflict_distance = (
+            float(paths_a[first] + paths_b[first]) / 64.0)
+            if first is not None else 1.0
+        )
+        shared_switch = 0.0
+        for row, col in shared:
+            try:
+                if int(np.asarray(self.rail_env.rail.get_full_transitions(row, col)).item()).bit_count() > 1:
+                    shared_switch = 1.0
+                    break
+            except Exception:
+                continue
+        eta_a, eta_b = self._distance_to_target(a), self._distance_to_target(b)
+        relative_eta = 0.0 if not np.isfinite(eta_a + eta_b) else float((eta_b - eta_a) / 32.0)
+        route_merge = float(any(paths_a[cell] > 0 and paths_b[cell] > 0 for cell in shared))
+        upstream = (
+            float(paths_b[first] < paths_a[first])
+            if first is not None else 0.0
+        )
+        return np.asarray(
+            [overlap, shared_switch, conflict_distance, relative_eta, route_merge, upstream],
+            dtype=np.float32,
+        )
+
+    def compact_relation_features(self, ego, neighbour, width):
+        raw = self.relation_features(ego, neighbour)
+        out = np.zeros((int(width),), dtype=np.float32)
+        out[:min(out.size, raw.size)] = raw[:min(out.size, raw.size)]
+        return out
     def clone_state(self):
         clone_from = getattr(type(self.rail_env), "clone_from", None)
         clone = clone_from(self.rail_env) if callable(clone_from) else copy.deepcopy(self.rail_env)

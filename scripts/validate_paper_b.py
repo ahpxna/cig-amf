@@ -16,15 +16,16 @@ except ModuleNotFoundError:
 
 EXPECTED_ALLOCATION = {
     "C-Core", "AbsD-Core", "Random-Core", "Correlation-Core",
-    "Oracle-C-Core", "Full-Explicit",
+    "Attention-Core", "Oracle-C-Core", "Full-Explicit",
 }
 EXPECTED_PAIR = {
     "Aggregate", "Explicit-FF-BC", "Recurrent-BC", "Recurrent-BC-CD",
-    "Recurrent-BC-CD-Contrastive",
+    "Recurrent-BC-CD-NoWarmStart", "Recurrent-BC-CD-Contrastive",
 }
 EXPECTED_PERIPHERY = {
-    "Semantic-Free", "Semantic-Only", "Unconstrained", "No-Aux", "Single-Mean",
+    "Full-Explicit", "Semantic-Free", "Semantic-Only", "Unconstrained", "No-Aux", "Single-Mean",
 }
+EXPECTED_SCALING = {"Full-Explicit", "Semantic-Free", "Single-Mean"}
 
 
 def _atomic_json(path, payload):
@@ -58,6 +59,13 @@ def _load_panel(root, directory, filename, expected_variants, expected_seeds):
             f"{directory} matrix mismatch: variants={sorted(variants)}, seeds={sorted(seeds)}"
         )
     return rows, manifest
+
+
+def _load_scaling(root, expected_seeds):
+    return _load_panel(
+        root, "paper_b_scaling", "summary_paper_b_scaling.csv",
+        EXPECTED_SCALING, expected_seeds,
+    )
 
 
 def _paired(rows, treatment, control, metric, panel=None):
@@ -95,6 +103,7 @@ def validate(run_root, expected_seeds, protocol_mode):
         run_root, "paper_b_periphery", "summary_paper_b_periphery.csv",
         EXPECTED_PERIPHERY, expected_seeds,
     )
+    scaling_rows, scaling_manifest = _load_scaling(run_root, expected_seeds)
     if protocol_mode == "quick":
         return {
             "paper": "B", "overall_status": "SMOKE_ONLY",
@@ -113,12 +122,28 @@ def validate(run_root, expected_seeds, protocol_mode):
         allocation, "C-Core", "AbsD-Core", "selector_oracle_ndcg_at_k",
         panel="selector_isolation",
     )
+    c_vs_attention = _paired(
+        allocation, "C-Core", "Attention-Core", "selector_oracle_f1",
+        panel="selector_isolation",
+    )
     oracle_vs_random = _paired(
         allocation, "Oracle-C-Core", "Random-Core", "selector_oracle_f1",
         panel="selector_isolation",
     )
     c_reward_vs_d = _paired(
         allocation, "C-Core", "AbsD-Core", "mean_reward", panel="end_to_end"
+    )
+    c_logit_vs_d = [-value for value in _paired(
+        allocation, "C-Core", "AbsD-Core",
+        "policy_logit_l2_to_full_explicit", panel="end_to_end",
+    )]
+    c_value_vs_d = [-value for value in _paired(
+        allocation, "C-Core", "AbsD-Core",
+        "value_mae_to_full_explicit", panel="end_to_end",
+    )]
+    c_action_vs_d = _paired(
+        allocation, "C-Core", "AbsD-Core",
+        "action_agreement_to_full_explicit", panel="end_to_end",
     )
     pair_retrieval = [
         -value for value in _paired(
@@ -130,18 +155,106 @@ def validate(run_root, expected_seeds, protocol_mode):
         pair_rows, "Recurrent-BC-CD-Contrastive", "Recurrent-BC",
         "latent_profile_distance_spearman",
     )
+    pair_logit = [-value for value in _paired(
+        pair_rows, "Recurrent-BC-CD-Contrastive", "Recurrent-BC",
+        "policy_logit_l2_to_cd_contrastive",
+    )]
+    pair_value = [-value for value in _paired(
+        pair_rows, "Recurrent-BC-CD-Contrastive", "Recurrent-BC",
+        "value_mae_to_cd_contrastive",
+    )]
+    pair_action = _paired(
+        pair_rows, "Recurrent-BC-CD-Contrastive", "Recurrent-BC",
+        "action_agreement_to_cd_contrastive",
+    )
+    warm_start_transient = [-value for value in _paired(
+        pair_rows, "Recurrent-BC-CD", "Recurrent-BC-CD-NoWarmStart",
+        "post_promotion_bc_loss",
+    )]
+    warm_start_events = [
+        min(
+            int(left["promotion_event_count"]), int(right["promotion_event_count"])
+        )
+        for left, right in zip(
+            sorted(
+                (row for row in pair_rows if row["variant"] == "Recurrent-BC-CD"),
+                key=lambda row: int(row["seed"]),
+            ),
+            sorted(
+                (row for row in pair_rows if row["variant"] == "Recurrent-BC-CD-NoWarmStart"),
+                key=lambda row: int(row["seed"]),
+            ),
+        )
+    ]
     periphery_reward = _paired(
         periphery_rows, "Semantic-Free", "Single-Mean", "mean_reward"
     )
+    periphery_logit = [-value for value in _paired(
+        periphery_rows, "Semantic-Free", "Single-Mean",
+        "policy_logit_l2_to_full_explicit",
+    )]
+    periphery_value = [-value for value in _paired(
+        periphery_rows, "Semantic-Free", "Single-Mean",
+        "value_mae_to_full_explicit",
+    )]
+    periphery_action = _paired(
+        periphery_rows, "Semantic-Free", "Single-Mean",
+        "action_agreement_to_full_explicit",
+    )
+    periphery_memory = [-value for value in _paired(
+        periphery_rows, "Semantic-Free", "Single-Mean",
+        "representation_memory_bytes",
+    )]
+    agent_counts = sorted({int(row["n_agents"]) for row in scaling_rows})
+    scaling_pareto = []
+    for n_agents in agent_counts:
+        by_variant = {}
+        for row in scaling_rows:
+            if int(row["n_agents"]) != n_agents:
+                continue
+            by_variant.setdefault(row["variant"], {})[int(row["seed"])] = row
+        if set(by_variant) != EXPECTED_SCALING:
+            raise ValueError(f"scaling variants missing at N={n_agents}")
+        semantic = by_variant["Semantic-Free"]
+        single = by_variant["Single-Mean"]
+        full = by_variant["Full-Explicit"]
+        if set(semantic) != set(single) or set(semantic) != set(full):
+            raise ValueError(f"scaling seeds are unpaired at N={n_agents}")
+        for seed in sorted(semantic):
+            scaling_pareto.append({
+                "n_agents": n_agents,
+                "seed": seed,
+                "reward_vs_single": float(semantic[seed]["mean_reward"]) - float(single[seed]["mean_reward"]),
+                "throughput_vs_full": float(semantic[seed]["throughput_total"]) - float(full[seed]["throughput_total"]),
+                "memory_vs_full": float(full[seed]["representation_memory_bytes"]) - float(semantic[seed]["representation_memory_bytes"]),
+            })
+    pareto_reward = [row["reward_vs_single"] for row in scaling_pareto]
+    pareto_throughput = [row["throughput_vs_full"] for row in scaling_pareto]
+    pareto_memory = [row["memory_vs_full"] for row in scaling_pareto]
     metrics = {
         "c_core_minus_absd_selector_f1": c_vs_d,
         "c_core_minus_absd_disagreement_f1": c_vs_d_disagreement,
         "c_core_minus_absd_selector_ndcg": c_vs_d_ndcg,
+        "c_core_minus_attention_selector_f1": c_vs_attention,
         "oracle_minus_random_selector_f1": oracle_vs_random,
         "c_core_minus_absd_reward": c_reward_vs_d,
+        "c_core_minus_absd_logit_fidelity_error": c_logit_vs_d,
+        "c_core_minus_absd_value_fidelity_error": c_value_vs_d,
+        "c_core_minus_absd_action_agreement": c_action_vs_d,
         "bc_minus_full_cd_retrieval_mae": pair_retrieval,
         "full_cd_minus_bc_latent_profile_geometry": pair_geometry,
+        "full_cd_minus_bc_logit_fidelity_error": pair_logit,
+        "full_cd_minus_bc_value_fidelity_error": pair_value,
+        "full_cd_minus_bc_action_agreement": pair_action,
+        "warm_start_minus_no_warm_post_promotion_bc_loss": warm_start_transient,
         "semantic_free_minus_single_mean_reward": periphery_reward,
+        "semantic_free_minus_single_mean_logit_fidelity_error": periphery_logit,
+        "semantic_free_minus_single_mean_value_fidelity_error": periphery_value,
+        "semantic_free_minus_single_mean_action_agreement": periphery_action,
+        "semantic_free_minus_single_mean_memory_bytes": periphery_memory,
+        "scaling_semantic_minus_single_reward": pareto_reward,
+        "scaling_semantic_minus_full_throughput": pareto_throughput,
+        "scaling_full_minus_semantic_memory_bytes": pareto_memory,
     }
     cis = {
         key: VC._bootstrap_mean_ci(value, seed=4100 + index)
@@ -154,11 +267,20 @@ def validate(run_root, expected_seeds, protocol_mode):
         "C_selector_beats_absD_when_profiles_disagree": cis[
             "c_core_minus_absd_disagreement_f1"
         ][0] > 0.0,
+        "C_selector_beats_attention_at_equal_budget": cis[
+            "c_core_minus_attention_selector_f1"
+        ][0] > 0.0,
         "oracle_selector_beats_random_at_equal_budget": cis[
             "oracle_minus_random_selector_f1"
         ][0] > 0.0,
         "C_allocation_improves_end_to_end_reward_over_absD": cis[
             "c_core_minus_absd_reward"
+        ][0] > 0.0,
+        "C_allocation_improves_policy_fidelity_over_absD": cis[
+            "c_core_minus_absd_logit_fidelity_error"
+        ][0] > 0.0 and cis["c_core_minus_absd_action_agreement"][0] > 0.0,
+        "C_allocation_improves_value_fidelity_over_absD": cis[
+            "c_core_minus_absd_value_fidelity_error"
         ][0] > 0.0,
         "CD_contrastive_latent_improves_profile_retrieval": cis[
             "bc_minus_full_cd_retrieval_mae"
@@ -166,9 +288,34 @@ def validate(run_root, expected_seeds, protocol_mode):
         "CD_contrastive_latent_aligns_with_profile_distance": cis[
             "full_cd_minus_bc_latent_profile_geometry"
         ][0] > 0.0,
+        "CD_contrastive_latent_improves_decision_fidelity": cis[
+            "full_cd_minus_bc_logit_fidelity_error"
+        ][0] > 0.0 and cis["full_cd_minus_bc_action_agreement"][0] > 0.0,
+        "CD_contrastive_latent_improves_value_fidelity": cis[
+            "full_cd_minus_bc_value_fidelity_error"
+        ][0] > 0.0,
+        "shadow_warm_start_reduces_post_promotion_transient": cis[
+            "warm_start_minus_no_warm_post_promotion_bc_loss"
+        ][0] > 0.0 and all(count > 0 for count in warm_start_events),
         "semantic_free_memory_improves_reward_over_single_mean": cis[
             "semantic_free_minus_single_mean_reward"
         ][0] > 0.0,
+        "semantic_free_memory_improves_policy_fidelity": cis[
+            "semantic_free_minus_single_mean_logit_fidelity_error"
+        ][0] > 0.0 and cis[
+            "semantic_free_minus_single_mean_action_agreement"
+        ][0] > 0.0,
+        "semantic_free_memory_improves_value_fidelity": cis[
+            "semantic_free_minus_single_mean_value_fidelity_error"
+        ][0] > 0.0,
+        "semantic_free_memory_uses_no_more_representation_memory": cis[
+            "semantic_free_minus_single_mean_memory_bytes"
+        ][0] >= 0.0,
+        "semantic_memory_reward_compute_pareto_over_scaling_panel": (
+            cis["scaling_semantic_minus_single_reward"][0] > 0.0
+            and cis["scaling_semantic_minus_full_throughput"][0] > 0.0
+            and cis["scaling_full_minus_semantic_memory_bytes"][0] >= 0.0
+        ),
     }
     supported = all(conditions.values())
     return {
@@ -177,6 +324,9 @@ def validate(run_root, expected_seeds, protocol_mode):
         "conditions": conditions,
         "paired_metrics": metrics,
         "paired_ci95": cis,
+        "warm_start_promotion_events": warm_start_events,
+        "scaling_agent_counts": agent_counts,
+        "scaling_manifest": scaling_manifest,
     }, VC.EXIT_SUPPORTED if supported else VC.EXIT_UNSUPPORTED
 
 

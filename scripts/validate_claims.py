@@ -216,11 +216,24 @@ def _h1_status(rows):
         "supported": supported,
         "conditions": conditions,
         "metrics": {
-            "q_spearman": float(main["q_spearman_mean"]),
+            "q_centered_mae": float(main["q_centered_mae_mean"]),
+            "q_centered_rmse": float(main["q_centered_rmse_mean"]),
+            "q_within_state_action_spearman_nonconstant": float(
+                main["q_within_state_action_spearman_mean"]
+            ),
+            "q_nonconstant_surface_count": float(
+                main["q_nonconstant_surface_count_mean"]
+            ),
             "capacity_rank_correlation": float(
                 main["capacity_rank_correlation_mean"]
             ),
             "capacity_core_f1": float(main["oracle_core_f1_mean"]),
+            "capacity_core_f1_random_baseline": float(
+                main["oracle_core_f1_random_baseline_mean"]
+            ),
+            "capacity_core_f1_adjusted": float(
+                main["oracle_core_f1_adjusted_mean"]
+            ),
             "capacity_active_spearman": float(
                 main["capacity_active_spearman_mean"]
             ),

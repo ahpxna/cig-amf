@@ -927,6 +927,7 @@ class FinalCIGAMFRunner:
             "proxy_context_excluding": {},
             "proxy_context_blocks": {},
             "value_cache": {},
+            "policy_logits": None,
             # [FIX-X1] Snapshot geometry at this timestep so replay_builder can
             # construct x_ij at sample creation time. It cannot be reconstructed
             # after the episode because env.positions then contains final state.
@@ -1013,6 +1014,7 @@ class FinalCIGAMFRunner:
             # n_agents per-step .item() synchronizations.
             values_np = values.detach().cpu().numpy()
             learned_probs_np = probs.detach().cpu().numpy()
+            logits_np = logits.detach().cpu().numpy()
 
         valid_action_masks = np.stack([
             self.env_adapter.valid_action_mask(agent)
@@ -1104,6 +1106,7 @@ class FinalCIGAMFRunner:
         cache["policy_probs"] = probs_np
         cache["learned_policy_probs"] = learned_probs_np
         cache["scripted_policy_probs"] = scripted_probs_np
+        cache["policy_logits"] = logits_np
         cache["behavioral_adapter"] = adapter_diagnostics
         cache["valid_action_masks"] = valid_action_masks
 
@@ -1692,6 +1695,7 @@ class FinalCIGAMFRunner:
         external_modes = {
             "behavioral_direction",
             "observational_correlation",
+            "attention",
             "random",
             "oracle_capacity",
             "full_explicit",
@@ -1851,6 +1855,7 @@ class FinalCIGAMFRunner:
                     neighbor_ids,
                     d_mu_arr,
                     association_matrix,
+                    belief_items=belief_items,
                 )
                 target_size = (
                     len(neighbor_ids)
@@ -1864,7 +1869,8 @@ class FinalCIGAMFRunner:
                     target_size=target_size,
                 )
 
-            self.pair_rel_module.warm_start_if_promoted(ego, promoted)
+            if bool(self.cfg.get("pair_warm_start", True)):
+                self.pair_rel_module.warm_start_if_promoted(ego, promoted)
 
             total_promoted += len(promoted)
             total_demoted += len(demoted)
@@ -1954,12 +1960,18 @@ class FinalCIGAMFRunner:
             self.matdet.update(last_influence_matrix)
             matrix_z = float(self.matdet.z_score())
 
-        fire_info = self.scheduler.evaluate_drift(
-            probe_z=probe_z,
-            matrix_z=matrix_z,
-            belief_modules=self.belief_modules,
-            drift_detector=self.drift,
-        )
+        if bool(self.cfg.get("disable_drift_detector", False)):
+            fire_info = {
+                "fired": False, "reason": "detector_disabled",
+                "n_inflated": 0, "probe_z": probe_z, "matrix_z": matrix_z,
+            }
+        else:
+            fire_info = self.scheduler.evaluate_drift(
+                probe_z=probe_z,
+                matrix_z=matrix_z,
+                belief_modules=self.belief_modules,
+                drift_detector=self.drift,
+            )
         if fire_info["fired"]:
             print(f"[DRIFT-FIRE] ep={self.scheduler.episode} reason={fire_info['reason']} n_inflated={fire_info['n_inflated']} "
                   f"probe_z={fire_info['probe_z']:.2f} matrix_z={fire_info['matrix_z']:.2f}")
@@ -2075,7 +2087,8 @@ class FinalCIGAMFRunner:
         return matrix
 
     def _external_selector_scores(
-        self, mode, ego, neighbor_ids, direction_values, association_matrix
+        self, mode, ego, neighbor_ids, direction_values, association_matrix,
+        belief_items=None,
     ):
         """Return scores for a non-C Paper-B selector ablation."""
         mode = str(mode).strip().lower()
@@ -2088,6 +2101,22 @@ class FinalCIGAMFRunner:
             return {
                 int(j): float(association_matrix[int(ego), int(j)])
                 for j in neighbor_ids
+            }
+        if mode == "attention":
+            if belief_items is None:
+                raise ValueError("attention selector requires current belief items")
+            items = torch.as_tensor(
+                np.asarray(belief_items, dtype=np.float32), device=self.device
+            )
+            if items.ndim != 2 or items.shape[0] != len(neighbor_ids):
+                raise ValueError("attention selector belief-item alignment failed")
+            with torch.no_grad():
+                encoded = self.belief_summary_builder.item_enc(items)
+                logits = self.belief_summary_builder.attn(encoded).squeeze(-1)
+                weights = torch.softmax(logits, dim=0).cpu().numpy()
+            return {
+                int(j): float(weights[index])
+                for index, j in enumerate(neighbor_ids)
             }
         if mode == "random":
             seed = int(self.cfg.get("seed", 0)) + 104729 * (int(ego) + 1)
@@ -2214,6 +2243,8 @@ class FinalCIGAMFRunner:
 
     def _should_update_graph_this_episode(self):
         """Return the graph-update cadence selected by the scheduler."""
+        if bool(self.cfg.get("force_graph_update_every_episode", False)):
+            return True
         return self.scheduler.should_update_graph()
 
     def run(self, n_episodes=100, eval_every=10):

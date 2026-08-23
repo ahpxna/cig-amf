@@ -1,4 +1,4 @@
-"""Validate Paper-A Q/C/D recovery, factorial selectivity, and gated latency."""
+"""Validate Paper-A Q/C/D recovery, selectivity, and each H3 contribution."""
 
 import argparse
 import json
@@ -91,20 +91,98 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
             "overall_status": "SMOKE_ONLY",
             "H1": {"status": "SMOKE_ONLY", "supported": False},
             "H2": {"status": "SMOKE_ONLY", "supported": False},
-            "latency": latency_status,
+            "H3a_latency": latency_status,
+            "H3b_tracking": {"status": "SMOKE_ONLY", "supported": False},
         }, VC.EXIT_SMOKE_ONLY
     h1 = VC._h1_status(h1_rows)
     h2 = VC._h2_status(h2_rows, h1_supported=h1["supported"])
-    supported = bool(h1["supported"] and h2["supported"])
+    # Recovery-latency support requires controls that isolate detector,
+    # uncertainty, and update-rate effects.  A three-arm H2 run is enough for
+    # selectivity but cannot adjudicate the tracking contribution.
+    required_tracking_models = {
+        "Final-CIGAMF", "FixedRateTracker", "NoDetector", "NoUncertainty",
+        "FastTracker",
+    }
+    observed_tracking_models = {str(row.get("model")) for row in h2_rows}
+    missing_tracking_models = sorted(required_tracking_models - observed_tracking_models)
+    tracking_deltas = {}
+    if not missing_tracking_models:
+        final_by_seed = {int(row["seed"]): row for row in h2_rows if row.get("model") == "Final-CIGAMF"}
+        for control in ("FixedRateTracker", "NoDetector", "NoUncertainty", "FastTracker"):
+            control_by_seed = {int(row["seed"]): row for row in h2_rows if row.get("model") == control}
+            if set(final_by_seed) != set(control_by_seed):
+                raise CR.ResultValidationError(
+                    f"H3b unpaired recovery rows for {control}"
+                )
+            final_latency = [
+                float(final_by_seed[seed]["recovery_latency"])
+                for seed in sorted(final_by_seed)
+            ]
+            control_latency = [
+                float(control_by_seed[seed]["recovery_latency"])
+                for seed in sorted(final_by_seed)
+            ]
+            if any(value < 0.0 for value in final_latency + control_latency):
+                raise CR.ResultValidationError(
+                    f"H3b recovery failed or was undefined for {control}"
+                )
+            deltas = [right - left for left, right in zip(final_latency, control_latency)]
+            tracking_deltas[control] = {
+                "control_minus_final": deltas,
+                "ci95": VC._bootstrap_mean_ci(
+                    deltas, seed=5200 + len(tracking_deltas)
+                ),
+            }
+    tracking_conditions = {
+        f"final_recovers_faster_than_{control}": metrics["ci95"][0] > 0.0
+        for control, metrics in tracking_deltas.items()
+    }
+    tracking_supported = bool(
+        not missing_tracking_models
+        and tracking_conditions
+        and all(tracking_conditions.values())
+    )
+    tracking_status = {
+        "status": "SUPPORTED" if tracking_supported else (
+            "NOT_EVALUATED" if missing_tracking_models else "NOT_SUPPORTED"
+        ),
+        "supported": tracking_supported,
+        "required_comparators": sorted(required_tracking_models),
+        "observed_comparators": sorted(observed_tracking_models),
+        "missing_comparators": missing_tracking_models,
+        "conditions": tracking_conditions,
+        "paired_recovery_latency": tracking_deltas,
+        "rule": (
+            "H3b requires matched fixed-rate, no-detector, no-uncertainty, "
+            "and fast-tracker controls; H2 selectivity rows alone cannot "
+            "support a tracking claim."
+        ),
+    }
+    h3_latency_supported = bool(latency_status["supported"])
+    h3_tracking_supported = bool(tracking_status["supported"])
+    supported = bool(
+        h1["supported"] and h2["supported"]
+        and h3_latency_supported and h3_tracking_supported
+    )
+    if supported:
+        overall_status = "SUPPORTED"
+    elif h1["supported"] and h2["supported"]:
+        overall_status = "CORE_SUPPORTED_H3_INCOMPLETE"
+    else:
+        overall_status = "NOT_SUPPORTED"
     return {
         "paper": "A",
-        "overall_status": "SUPPORTED" if supported else "NOT_SUPPORTED",
+        "overall_status": overall_status,
         "H1": h1,
         "H2": h2,
+        "H3a_latency": latency_status,
+        "H3b_tracking": tracking_status,
+        "full_hypothesis_set_supported": supported,
+        # Compatibility alias; it is not used to infer full Paper-A support.
         "latency": latency_status,
         "latency_policy": (
-            "Optional contribution; both oracle and learned gates must pass, "
-            "and either failure leaves Q/C/D unaffected."
+            "H3a is separately gated. An oracle or learned failure does not "
+            "invalidate Q/C/D, but it prevents a full Paper-A supported label."
         ),
     }, VC.EXIT_SUPPORTED if supported else VC.EXIT_UNSUPPORTED
 

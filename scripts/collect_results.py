@@ -41,8 +41,8 @@ H3_VARIANTS = {
     "Fixed-Cardinality",
     "NoMultiMemory-SingleMean",
 }
-H2_PROTOCOL_VERSION = "h2_factorial_frozen_policy_v5"
-H1_PROTOCOL_VERSION = "h1_qcd_crossfit_v3"
+H2_PROTOCOL_VERSION = "h2_factorial_frozen_policy_v6"
+H1_PROTOCOL_VERSION = "h1_qcd_crossfit_v4"
 
 SPECS = {
     "h1": {

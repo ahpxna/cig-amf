@@ -49,6 +49,10 @@ class CausalMultiAgentEnvAdapter(Protocol):
 
     def relation_features(self, ego: int, target: int) -> np.ndarray: ...
 
+    def compact_relation_features(
+        self, ego: int, target: int, width: int
+    ) -> np.ndarray: ...
+
     def neighbour_features(
         self, ego: int, neighbour: int, action: int
     ) -> np.ndarray: ...
@@ -183,6 +187,16 @@ class OmniArenaAdapter:
         """Observable domain relation xi_ij; pair_features is its Omni view."""
         return self.pair_features(ego, target)
 
+    def compact_relation_features(self, ego, target, width):
+        """Adapter-owned fixed-width view for memory and belief encoders."""
+        raw = self.pair_features(ego, target)
+        # Keep the historical Omni information budget, but model modules do
+        # not know that these channels originated from grid geometry.
+        selected = np.asarray([raw[0], raw[1], raw[4], raw[2]], dtype=np.float32)
+        out = np.zeros((int(width),), dtype=np.float32)
+        out[:min(out.size, selected.size)] = selected[:min(out.size, selected.size)]
+        return out
+
     def _mechanism_features(self, neighbour):
         neighbour = int(neighbour)
         zone = int(self.env.agent_zone[neighbour])
@@ -296,3 +310,27 @@ def resolve_env_adapter(
         "environment must expose causal_adapter or be wrapped by a "
         "CausalMultiAgentEnvAdapter"
     )
+
+
+def compact_relation_features(adapter, ego, target, width):
+    """Return an opaque fixed-width relation representation from an adapter.
+
+    This is the only bridge from variable-size domain relation vectors to
+    legacy fixed-width memory encoders. New adapters may provide a learned or
+    domain-specific projection; the fallback is shape-only pad/truncate and
+    never assigns semantics to positional channels in a model module.
+    """
+    provider = getattr(adapter, "compact_relation_features", None)
+    if callable(provider):
+        value = provider(int(ego), int(target), int(width))
+        value = np.asarray(value, dtype=np.float32).reshape(-1)
+        if value.shape != (int(width),):
+            raise ValueError(
+                "compact_relation_features must return shape "
+                f"{(int(width),)}, got {value.shape}"
+            )
+        return value
+    raw = np.asarray(adapter.relation_features(int(ego), int(target)), dtype=np.float32)
+    out = np.zeros((int(width),), dtype=np.float32)
+    out[:min(out.size, raw.size)] = raw[:min(out.size, raw.size)]
+    return out

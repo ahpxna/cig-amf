@@ -170,11 +170,16 @@ def default_cfg():
         # Fixed oracle truth cardinality.  Evaluation never adapts the target
         # core size to a model's predicted core, which would inflate F1.
         "ground_truth_core_k": 3,
-        # Prespecified oracle-active/null thresholds for H1 diagnostics.
-        "h1_capacity_active_threshold": 0.05,
-        "h1_capacity_prediction_threshold": 0.05,
-        "h1_direction_active_threshold": 0.02,
-        "h1_direction_prediction_threshold": 0.02,
+        # H1 thresholds are loaded from an oracle-only calibration artifact by
+        # the confirmatory launcher. These defaults exist only for isolated
+        # development calls and must not define a confirmatory analysis.
+        "h1_capacity_active_threshold": 0.01,
+        "h1_capacity_prediction_threshold": 0.01,
+        "h1_direction_active_threshold": 0.005,
+        "h1_direction_prediction_threshold": 0.005,
+        # A 4-of-5 overlap has a random F1 floor of .8, so H1 uses a small,
+        # fixed top-k rather than reusing the modelling core budget.
+        "h1_selector_top_k": 1,
         "h1_crossfit_folds": 5,
         "h1_crossfit_ridge": 1e-3,
         "h1_crossfit_iw_clip": None,
@@ -847,6 +852,10 @@ def make_runner(model_name, env, cfg, device):
         "NoBelief": "NoBelief",
         "NoMultiMemory": "NoMultiMemory",
         "NoTwoTimescale": "NoTwoTimescale",
+        "FixedRateTracker": "Final-CIGAMF",
+        "NoDetector": "Final-CIGAMF",
+        "NoUncertainty": "Final-CIGAMF",
+        "FastTracker": "Final-CIGAMF",
 
         # [FIX-O3] OracleCoreRunner and RandomCoreRunner had long existed in
         # baseline_runner.py but were ABSENT from this alias table. make_runner()
@@ -1377,6 +1386,7 @@ def _response_surface_calibration(proxy_q, oracle_q, neighbor_ids):
     learned_raw, oracle_raw = [], []
     learned_centered, oracle_centered = [], []
     within_state_ranks = []
+    nonconstant_count = 0
     for neighbor in neighbor_ids:
         p = np.asarray(proxy_q.get(int(neighbor), []), dtype=np.float64).reshape(-1)
         q = np.asarray(oracle_q.get(int(neighbor), []), dtype=np.float64).reshape(-1)
@@ -1391,8 +1401,13 @@ def _response_surface_calibration(proxy_q, oracle_q, neighbor_ids):
         oracle_raw.extend(q.tolist())
         learned_centered.extend(p_centered.tolist())
         oracle_centered.extend(q_centered.tolist())
-        rank, _p, _constant = safe_spearman(p, q)
-        within_state_ranks.append(float(rank))
+        # A rank over an oracle-constant response surface is undefined. It is
+        # not a model error and must not be converted to a zero that dilutes
+        # the action-ranking endpoint with null causal pairs.
+        if float(np.ptp(q)) > 1e-10:
+            rank, _p, _constant = safe_spearman(p, q)
+            within_state_ranks.append(float(rank))
+            nonconstant_count += 1
     if not learned_raw:
         return {"q_mae": 0.0, "q_rmse": 0.0, "q_spearman": 0.0, "q_constant_case": 1}
     learned_raw = np.asarray(learned_raw, dtype=np.float64)
@@ -1410,7 +1425,11 @@ def _response_surface_calibration(proxy_q, oracle_q, neighbor_ids):
         "q_constant_case": int(constant),
         "q_centered_mae": float(np.mean(np.abs(centered_diff))),
         "q_centered_rmse": float(np.sqrt(np.mean(centered_diff ** 2))),
-        "q_within_state_action_spearman": float(np.mean(within_state_ranks)),
+        "q_within_state_action_spearman": (
+            float(np.mean(within_state_ranks))
+            if within_state_ranks else float("nan")
+        ),
+        "q_nonconstant_surface_count": int(nonconstant_count),
         "q_raw_mae": float(np.mean(np.abs(raw_diff))),
         "q_raw_rmse": float(np.sqrt(np.mean(raw_diff ** 2))),
     }
@@ -2093,10 +2112,10 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                 oracle_scores["capacity"],
                 neighbor_ids,
                 oracle_threshold=tiny_cfg.get(
-                    "h1_capacity_active_threshold", 0.05
+                    "h1_capacity_active_threshold", 0.01
                 ),
                 prediction_threshold=tiny_cfg.get(
-                    "h1_capacity_prediction_threshold", 0.05
+                    "h1_capacity_prediction_threshold", 0.01
                 ),
             )
             direction_subsets = _active_null_calibration(
@@ -2104,15 +2123,15 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                 oracle_scores["direction"],
                 neighbor_ids,
                 oracle_threshold=tiny_cfg.get(
-                    "h1_direction_active_threshold", 0.02
+                    "h1_direction_active_threshold", 0.005
                 ),
                 prediction_threshold=tiny_cfg.get(
-                    "h1_direction_prediction_threshold", 0.02
+                    "h1_direction_prediction_threshold", 0.005
                 ),
                 signed=True,
             )
             top_k = int(max(
-                1, min(tiny_cfg.get("max_core_size", 4), len(neighbor_ids))
+                1, min(tiny_cfg.get("h1_selector_top_k", 1), len(neighbor_ids))
             ))
             core_f1 = oracle_core_f1_from_scores(
                 learned_scores=learned_scores["capacity"],
@@ -2127,6 +2146,11 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                 "ego_id": ego,
                 "top_k": top_k,
                 "oracle_core_f1": float(core_f1),
+                "oracle_core_f1_random_baseline": float(top_k / len(neighbor_ids)),
+                "oracle_core_f1_adjusted": float(
+                    (core_f1 - (top_k / len(neighbor_ids)))
+                    / max(1e-12, 1.0 - (top_k / len(neighbor_ids)))
+                ),
                 "dr_applied": int(score_meta["dr_applied"]),
                 "dr_applied_rows": int(score_meta["dr_applied_rows"]),
                 "dr_clipped_rows": int(score_meta["dr_clipped_rows"]),
@@ -2204,6 +2228,15 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
         "protocol_name": "logged_one_step_policy_contrast_v1",
         "protocol_match": True,
         "confirmatory_horizon": 1,
+        "causal_horizon": int(tiny_cfg.get("causal_horizon", 1)),
+        "proxy_n_horizons": int(tiny_cfg.get("proxy_n_horizons", 1)),
+        "h1_selector_top_k": int(tiny_cfg.get("h1_selector_top_k", 1)),
+        "h1_capacity_active_threshold": float(
+            tiny_cfg.get("h1_capacity_active_threshold", 0.01)
+        ),
+        "h1_direction_active_threshold": float(
+            tiny_cfg.get("h1_direction_active_threshold", 0.005)
+        ),
         "exploratory_h3_reported": False,
         "context_source": "action_time_trajectory_cache",
         "oracle_baseline": "uniform_action_policy",
@@ -2317,7 +2350,7 @@ def _evaluate_legacy_tiny_protocol(runner, tiny_env, args, tiny_cfg):
                 learned_scores["range"], oracle_scores["range"], neighbor_ids,
             )
             top_k = int(max(
-                1, min(tiny_cfg.get("max_core_size", 4), len(neighbor_ids))
+                1, min(tiny_cfg.get("h1_selector_top_k", 1), len(neighbor_ids))
             ))
             core_f1 = oracle_core_f1_from_scores(
                 learned_scores["magnitude"], oracle_scores["magnitude"],
@@ -2327,6 +2360,11 @@ def _evaluate_legacy_tiny_protocol(runner, tiny_env, args, tiny_cfg):
                 "seed": int(args.seed), "state_idx": int(state_idx),
                 "ego_id": ego, "top_k": top_k,
                 "oracle_core_f1": float(core_f1),
+                "oracle_core_f1_random_baseline": float(top_k / len(neighbor_ids)),
+                "oracle_core_f1_adjusted": float(
+                    (core_f1 - (top_k / len(neighbor_ids)))
+                    / max(1e-12, 1.0 - (top_k / len(neighbor_ids)))
+                ),
             }
             aggregate_row.update(cal)
             aggregate_row.update(signed_cal)
@@ -2465,8 +2503,11 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
         "q_centered_mae",
         "q_centered_rmse",
         "q_within_state_action_spearman",
+        "q_nonconstant_surface_count",
         "q_raw_mae",
         "q_raw_rmse",
+        "oracle_core_f1_random_baseline",
+        "oracle_core_f1_adjusted",
         "capacity_rank_correlation",
         "capacity_mae",
         "capacity_bias",
