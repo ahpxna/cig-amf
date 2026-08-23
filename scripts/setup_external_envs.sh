@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Clone pinned external benchmark sources.  Installation is intentionally
+# Clone pinned external benchmark sources. Installation is intentionally
 # separate so a frozen CIG-AMF environment stays reproducible.
 set -euo pipefail
 
@@ -7,18 +7,19 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${CIG_EXTERNAL_ENVS_DIR:-$ROOT/external_envs}"
 mkdir -p "$DEST"
 
-clone_if_missing() {
+clone_pinned() {
   local name="$1"
-  local url="$2"
+  local revision="$2"
+  local url="$3"
   if [ -d "$DEST/$name/.git" ]; then
-    echo "present: $name ($(git -C "$DEST/$name" rev-parse --short HEAD))"
+    git -C "$DEST/$name" fetch --depth 1 origin "$revision"
   else
-    git clone --depth 1 "$url" "$DEST/$name"
+    git clone --no-checkout "$url" "$DEST/$name"
   fi
+  git -C "$DEST/$name" checkout --detach "$revision"
+  printf '%s\t%s\n' "$name" "$(git -C "$DEST/$name" rev-parse HEAD)"
 }
 
-clone_if_missing flatland-rl https://github.com/flatland-association/flatland-rl.git
-clone_if_missing robotic-warehouse https://github.com/semitable/robotic-warehouse.git
-clone_if_missing CybORG https://github.com/cage-challenge/CybORG.git
-clone_if_missing CityFlow https://github.com/cityflow-project/CityFlow.git
-
+while IFS=$'\t' read -r name revision url; do
+  [ -z "$name" ] || clone_pinned "$name" "$revision" "$url"
+done < "$ROOT/scripts/external_env_revisions.tsv"

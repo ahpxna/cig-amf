@@ -9,6 +9,7 @@ are intentionally configured for small oracle state banks.
 from __future__ import annotations
 
 import copy
+import inspect
 from typing import Any
 
 import numpy as np
@@ -62,8 +63,10 @@ class FlatlandCIGAdapter:
 
 
 class FlatlandCIGEnvironment:
+    # Only training support is advertised until rail-specific intervention,
+    # fixed-rho oracle, and structural-disruption methods are implemented.
     capabilities = BenchmarkCapabilities(
-        "Flatland", True, True, True, True, True, True, True
+        "Flatland", True, True, True, True, False, False, False
     )
 
     def __init__(self, rail_env, observation_width: int = 256):
@@ -91,7 +94,16 @@ class FlatlandCIGEnvironment:
     def _normalise_obs(self, observations):
         return [flatten_observation(observations.get(i), self.obs_dim) for i in range(self.n_agents)]
     def reset(self, seed=None):
-        result = self.rail_env.reset(seed=seed) if seed is not None else self.rail_env.reset()
+        if seed is None:
+            result = self.rail_env.reset()
+        else:
+            parameters = inspect.signature(self.rail_env.reset).parameters
+            if "random_seed" in parameters:
+                result = self.rail_env.reset(random_seed=seed)
+            elif "seed" in parameters:
+                result = self.rail_env.reset(seed=seed)
+            else:
+                raise RuntimeError("unsupported Flatland reset API: no random_seed/seed parameter")
         observations = result[0] if isinstance(result, tuple) else result
         self._obs = self._normalise_obs(observations)
         return self._obs
@@ -107,13 +119,20 @@ class FlatlandCIGEnvironment:
         self._obs = self._normalise_obs(observations)
         return self._obs, [float(rewards.get(i, 0.0)) for i in range(self.n_agents)], done, dict(info)
     def valid_action_mask(self, agent):
-        # STOP/DO_NOTHING remain legal; rail transitions determine movement.
-        mask = np.zeros(5, dtype=bool); mask[0] = mask[4] = True
+        mask = np.zeros(5, dtype=bool)
         obj = self.rail_env.agents[int(agent)]
+        required = type(self.rail_env).action_required(
+            obj.state, obj.speed_counter.is_cell_exit(obj.speed_counter.max_speed)
+        )
+        if not required:
+            mask[0] = True
+            return mask
         position = getattr(obj, "position", None)
         direction = getattr(obj, "direction", 0)
-        if position is None: return mask
-        for action in (1, 2, 3):
+        if position is None:
+            mask[0] = True
+            return mask
+        for action in range(5):
             try:
                 allowed = self.rail_env.rail.apply_action_independent(action, (position, direction)) is not None
             except Exception:
@@ -128,8 +147,12 @@ class FlatlandCIGEnvironment:
         same_cell = float(tuple(pa) == tuple(pb))
         same_target = float(getattr(a, "target", None) == getattr(b, "target", None))
         return np.asarray([distance, same_cell, same_target, float(pa[0] - pb[0]), float(pa[1] - pb[1])], dtype=np.float32)
-    def clone_state(self): return copy.deepcopy((self.rail_env, self._obs, self.last_actions))
-    def restore_state(self, state): self.rail_env, self._obs, self.last_actions = copy.deepcopy(state)
+    def clone_state(self):
+        clone_from = getattr(type(self.rail_env), "clone_from", None)
+        clone = clone_from(self.rail_env) if callable(clone_from) else copy.deepcopy(self.rail_env)
+        return clone, copy.deepcopy(self._obs), list(self.last_actions), self._behaviour_override
+    def restore_state(self, state):
+        self.rail_env, self._obs, self.last_actions, self._behaviour_override = state
     def fixed_continuation_policy(self, agent):
         mask = self.valid_action_mask(agent)
         return int(2 if mask[2] else np.flatnonzero(mask)[0])

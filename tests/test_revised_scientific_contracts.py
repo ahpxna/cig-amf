@@ -75,7 +75,7 @@ class RevisedScientificContractTests(unittest.TestCase):
         runner = RE.make_runner("Final-CIGAMF", env, cfg, "cpu")
         trajectory, _, _ = runner.collect_episode()
         self.assertTrue(trajectory)
-        self.assertIn("proxy_context_items_excluding", trajectory[0])
+        self.assertIn("proxy_context_blocks", trajectory[0])
 
     def test_shared_ablation_uses_same_literal_context_contract(self):
         env = OmniArena(n_agents=6, n_zones=1, max_steps=2, seed=18)
@@ -430,7 +430,7 @@ class RevisedScientificContractTests(unittest.TestCase):
             trajectory = captured[-1]
             self.assertTrue(all(
                 "valid_action_masks" in step
-                and "proxy_context_items_excluding" in step
+                and "proxy_context_blocks" in step
                 and "forced_mask" in step
                 for step in trajectory
             ))

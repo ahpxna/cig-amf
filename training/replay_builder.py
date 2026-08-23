@@ -101,7 +101,7 @@ class MultiEgoReplayBuilder:
         out, masks = [], []
 
         for t in range(T):
-            row = {}
+            row, mask_row = {}, {}
             for ego in range(int(n_agents)):
                 per_lag = np.zeros((int(n_horizons),), dtype=np.float32)
                 valid = np.zeros((int(n_horizons),), dtype=np.float32)

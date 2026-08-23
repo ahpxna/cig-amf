@@ -1405,6 +1405,32 @@ class FinalCIGAMFRunner:
     # Policy update
     # ============================================================
 
+    def _vtrace_targets(self, trajectory):
+        """Compute V-trace critic targets and policy advantages from logged b."""
+        length = len(trajectory)
+        values = np.asarray([[float(step["value_cache"][ego]) for ego in range(self.n_agents)] for step in trajectory], dtype=np.float32)
+        rewards = np.asarray([step["rewards"] for step in trajectory], dtype=np.float32)
+        rho = np.ones_like(values)
+        for t, step in enumerate(trajectory):
+            behaviour = step.get("behaviour_probs")
+            target = step.get("learned_policy_probs", step.get("policy_probs"))
+            if behaviour is None or target is None:
+                continue
+            for ego, action in enumerate(step["actions"]):
+                rho[t, ego] = float(target[ego][int(action)]) / max(float(behaviour[ego][int(action)]), 1e-8)
+        rho_bar = np.minimum(rho, float(self.cfg.get("vtrace_rho_clip", 1.0)))
+        c_bar = np.minimum(rho, float(self.cfg.get("vtrace_c_clip", 1.0)))
+        targets, advantages = np.zeros_like(values), np.zeros_like(values)
+        next_target = np.zeros((self.n_agents,), dtype=np.float32)
+        next_value = np.zeros((self.n_agents,), dtype=np.float32)
+        gamma = float(self.cfg["discount"])
+        for t in reversed(range(length)):
+            delta = rho_bar[t] * (rewards[t] + gamma * next_value - values[t])
+            targets[t] = values[t] + delta + gamma * c_bar[t] * (next_target - next_value)
+            advantages[t] = rho_bar[t] * (rewards[t] + gamma * next_target - values[t])
+            next_target, next_value = targets[t], values[t]
+        return targets, advantages
+
     def update_policy(self, trajectory):
         """
         [docs/CIG-AMF_training_debug_master.md sections 2.2(b,c)] Two corrections:
@@ -1431,17 +1457,7 @@ class FinalCIGAMFRunner:
                 "adv_mean": 0.0, "adv_std": 0.0,
             }
 
-        returns = [[0.0 for _ in range(self.n_agents)] for _ in range(T)]
-        R = np.zeros(self.n_agents, dtype=np.float32)
-
-        for t in reversed(range(T)):
-            R = (
-                np.array(trajectory[t]["rewards"], dtype=np.float32)
-                + self.cfg["discount"] * R
-            )
-
-            for ego in range(self.n_agents):
-                returns[t][ego] = float(R[ego])
+        returns, vtrace_advantages = self._vtrace_targets(trajectory)
 
         total_loss = 0.0
         total_periph_aux_loss = 0.0
@@ -1476,7 +1492,7 @@ class FinalCIGAMFRunner:
                         ]
                     )
                 )
-                returns_batch.append(float(returns[t][ego]))
+                returns_batch.append(float(returns[t, ego]))
 
                 belief_tensors.append(
                     self._belief_summary_tensor_from_items(
@@ -1548,7 +1564,7 @@ class FinalCIGAMFRunner:
             )
 
             logp = dist.log_prob(action_t)
-            adv_raw = (ret_t - value).detach()
+            adv_raw = torch.tensor(vtrace_advantages[t], dtype=torch.float32, device=self.device).detach()
 
             adv_mean_acc.append(float(adv_raw.mean().item()))
             adv_std_acc.append(float(adv_raw.std(unbiased=False).item()))
@@ -1566,7 +1582,9 @@ class FinalCIGAMFRunner:
                 pi_obs.detach() / torch.clamp(b_obs, min=1e-8),
                 min=0.0, max=max(1.0, float(self.cfg.get("actor_importance_clip", 2.0))),
             )
-            policy_loss = -rho * logp * adv
+            # V-trace has already applied the clipped rho to the policy
+            # advantage; multiplying it again would double-correct forcing.
+            policy_loss = -logp * adv
             value_loss = F.mse_loss(value, ret_t, reduction="none")
             entropy = dist.entropy()
 
@@ -1699,8 +1717,6 @@ class FinalCIGAMFRunner:
             z_batch = []
             m_batch = []
             b_batch = []
-            context_items_batch = []
-            context_mask_batch = []
             context_block = self._raw_proxy_context_block(
                 ego, current_actions=actions
             )
@@ -1718,13 +1734,6 @@ class FinalCIGAMFRunner:
                 )
                 z_batch.append(raw_core)
                 m_batch.append(raw_periph)
-                context_items, context_mask = (
-                    self._raw_proxy_context_items_excluding(
-                        ego, j, current_actions=actions
-                    )
-                )
-                context_items_batch.append(context_items)
-                context_mask_batch.append(context_mask)
                 b_batch.append(belief_summary)
                 neighbor_ids.append(j)
 
@@ -1774,9 +1783,9 @@ class FinalCIGAMFRunner:
                 if policy_rows_valid:
                     policy_probs_j_batch = candidate_policy_rows
 
-            # score_batch_full accepts optional DR inputs without changing
-            # output when they are absent.
-            out = self.proxy.score_batch_full(
+            out = self.proxy.score_batch_from_context_block(
+                context_block=context_block,
+                target_ids=neighbor_ids,
                 obs_i_batch=obs_i_batch,
                 action_i_batch=action_i_batch,
                 observed_action_j_batch=action_j_batch,
@@ -1793,8 +1802,6 @@ class FinalCIGAMFRunner:
                     self.env_adapter.pair_features(ego, j)
                     for j in neighbor_ids
                 ],
-                context_items_batch=np.stack(context_items_batch, axis=0),
-                context_mask_batch=np.stack(context_mask_batch, axis=0),
                 valid_action_mask_batch=np.stack([
                     self.env_adapter.valid_action_mask(j)
                     for j in neighbor_ids

@@ -79,6 +79,15 @@ except ImportError:  # Rare torch <2.0 fallback; remain operational.
     _HAS_TORCH_FUNC = False
 
 
+def _splitmix64(value: int) -> int:
+    """Stable 64-bit mixer for independent immutable bootstrap membership."""
+    mask = (1 << 64) - 1
+    value = (int(value) + 0x9E3779B97F4A7C15) & mask
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask
+    return (value ^ (value >> 31)) & mask
+
+
 # =============================================================================
 # Proxy network
 # =============================================================================
@@ -212,6 +221,7 @@ class LocalCounterfactualProxyNet(nn.Module):
         pair_feat: torch.Tensor = None, # [..., B, pair_feat_dim] — x_ij (Eq 8)
         context_items: torch.Tensor = None, # [..., B, K, context_item_dim]
         context_mask: torch.Tensor = None,  # [..., B, K]
+        context_embedding: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         a_j is no longer an input. The network predicts every action of j
@@ -234,7 +244,10 @@ class LocalCounterfactualProxyNet(nn.Module):
                 )
             parts.append(pair_feat)
 
-        if context_items is not None:
+        if context_embedding is not None:
+            if context_embedding.shape[-1] != self.context_embed_dim:
+                raise ValueError("context_embedding dimension mismatch")
+        elif context_items is not None:
             if self.context_item_encoder is None:
                 raise ValueError("context items supplied to a proxy without an item encoder")
             if context_items.shape[-1] != self.context_item_dim:
@@ -784,11 +797,13 @@ class LocalCounterfactualProxyEnsemble:
 
         sample_id = int(self._next_sample_id)
         self._next_sample_id += 1
-        # Stateless integer mixing keeps membership immutable without a
-        # per-insertion RNG allocation on large replay streams.
+        # Each member receives an independent SplitMix64 stream keyed by its
+        # immutable sample ID. Linear congruential offsets are correlated and
+        # can make all members select the same replay population.
         membership = np.asarray([
-            (((sample_id * 1103515245 + self._bootstrap_seed + member * 12345)
-              & 0xFFFFFFFF) / float(0x100000000)) < self.bootstrap_ratio
+            (_splitmix64(
+                sample_id ^ (self._bootstrap_seed + (member + 1) * 0x9E3779B97F4A7C15)
+            ) / float(1 << 64)) < self.bootstrap_ratio
             for member in range(self.n_ensemble)
         ], dtype=bool)
         if not np.any(membership):
@@ -842,27 +857,28 @@ class LocalCounterfactualProxyEnsemble:
             if context_block is not None:
                 sample["context_block"] = context_block
                 sample["context_target_id"] = int(context_target_id)
-            elif context_items is None:
-                item_array = np.zeros(
-                    (1, self.context_item_dim), dtype=np.float32
-                )
-                mask_array = np.zeros((1,), dtype=np.float32)
             else:
-                item_array = np.asarray(context_items, dtype=np.float32)
-                if item_array.ndim != 2 or item_array.shape[1] != self.context_item_dim:
-                    raise ValueError(
-                        "context_items must have shape [K, "
-                        f"{self.context_item_dim}], received {item_array.shape}"
+                if context_items is None:
+                    item_array = np.zeros(
+                        (1, self.context_item_dim), dtype=np.float32
                     )
-                mask_array = (
-                    np.ones((item_array.shape[0],), dtype=np.float32)
-                    if context_mask is None
-                    else np.asarray(context_mask, dtype=np.float32).reshape(-1)
-                )
-                if mask_array.shape != (item_array.shape[0],):
-                    raise ValueError("context_mask must have one entry per context item")
-            sample["context_items"] = item_array.copy()
-            sample["context_mask"] = mask_array.copy()
+                    mask_array = np.zeros((1,), dtype=np.float32)
+                else:
+                    item_array = np.asarray(context_items, dtype=np.float32)
+                    if item_array.ndim != 2 or item_array.shape[1] != self.context_item_dim:
+                        raise ValueError(
+                            "context_items must have shape [K, "
+                            f"{self.context_item_dim}], received {item_array.shape}"
+                        )
+                    mask_array = (
+                        np.ones((item_array.shape[0],), dtype=np.float32)
+                        if context_mask is None
+                        else np.asarray(context_mask, dtype=np.float32).reshape(-1)
+                    )
+                    if mask_array.shape != (item_array.shape[0],):
+                        raise ValueError("context_mask must have one entry per context item")
+                sample["context_items"] = item_array.copy()
+                sample["context_mask"] = mask_array.copy()
 
         self.buffer.append(sample)
 
@@ -1997,6 +2013,7 @@ class LocalCounterfactualProxyEnsemble:
         context_items_batch=None,
         context_mask_batch=None,
         valid_action_mask_batch=None,
+        lag_preds_all_override=None,
     ) -> Dict[str, np.ndarray]:
         """
         Full version providing every field needed by influence_signature.py.
@@ -2071,12 +2088,14 @@ class LocalCounterfactualProxyEnsemble:
                 )
 
         # One forward pass over both alternative actions and ensemble members.
-        lag_preds_all = self._predict_all_actions(
-            obs=obs, action_i=a_i, z=z_arr, m=m_arr, belief=belief,
-            pair_feat=pair_feat_batch,   # [FIX-X1]
-            context_items=context_items_batch,
-            context_mask=context_mask_batch,
-        )  # [E, B, A, H] direct lag rewards
+        lag_preds_all = lag_preds_all_override
+        if lag_preds_all is None:
+            lag_preds_all = self._predict_all_actions(
+                obs=obs, action_i=a_i, z=z_arr, m=m_arr, belief=belief,
+                pair_feat=pair_feat_batch,
+                context_items=context_items_batch,
+                context_mask=context_mask_batch,
+            )
         preds_all = self._cumulative_from_lag(lag_preds_all)
 
         diagnostic_res = self._compute_effects(
@@ -2251,6 +2270,44 @@ class LocalCounterfactualProxyEnsemble:
             "dr_raw_inverse_max": float(diagnostic_res["dr_raw_inverse_max"]),
             "valid_action_mask": valid_action_mask.astype(np.float32),
         }
+
+    def score_batch_from_context_block(self, *, context_block, target_ids, **kwargs):
+        """Encode one ego's context once per ensemble member, then subtract.
+
+        This is the literal DeepSets ``S_i-e_ij`` path used by graph scoring.
+        It removes repeated nonlinear context encoding across all targets.
+        """
+        if self.context_item_dim <= 0:
+            return self.score_batch_full(**kwargs)
+        ids = np.asarray(context_block["neighbor_ids"], dtype=np.int64)
+        items = np.asarray(context_block["items"], dtype=np.float32)
+        targets = np.asarray(target_ids, dtype=np.int64)
+        positions = {int(agent): index for index, agent in enumerate(ids.tolist())}
+        if (items.ndim != 2 or items.shape[1] != self.context_item_dim
+                or any(int(target) not in positions for target in targets)):
+            raise ValueError("invalid ContextBlock/target pairing")
+        self._sync_stacked_to_models()
+        obs = self._to_float_tensor(kwargs["obs_i_batch"], self.obs_dim)
+        z = self._to_float_tensor(kwargs["z_core_excl_j_batch"], self.core_dim)
+        m = self._to_float_tensor(kwargs["m_periph_excl_j_batch"], self.periph_dim)
+        belief = self._to_float_tensor(kwargs["belief_summary_batch"], self.belief_dim)
+        action_i = self._one_hot(np.asarray(kwargs["action_i_batch"], dtype=np.int64))
+        pair = self._pair_feat_tensor(kwargs.get("pair_feat_batch"), len(targets))
+        raw = torch.tensor(items, dtype=torch.float32, device=self.device)
+        target_idx = torch.tensor([positions[int(t)] for t in targets], dtype=torch.long, device=self.device)
+        outputs = []
+        with torch.no_grad():
+            for model in self.models:
+                model.eval()
+                encoded = model.context_item_encoder(raw)
+                loo = encoded.sum(dim=0, keepdim=True) - encoded.index_select(0, target_idx)
+                outputs.append(model(
+                    obs, action_i, z, m, belief, pair_feat=pair,
+                    context_embedding=loo,
+                ))
+        return self.score_batch_full(
+            **kwargs, lag_preds_all_override=torch.stack(outputs, dim=0)
+        )
 
     def score_pair(
         self,

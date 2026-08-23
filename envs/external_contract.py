@@ -34,7 +34,9 @@ class BenchmarkCapabilities:
             "h2": ("clone_restore", "structural_intervention", "behavioural_intervention"),
             "latency": ("clone_restore", "fixed_continuation", "latency_oracle"),
         }
-        return all(bool(getattr(self, key)) for key in needs.get(panel, ()))
+        if panel not in needs:
+            raise ValueError(f"unknown external evaluation panel: {panel}")
+        return all(bool(getattr(self, key)) for key in needs[panel])
 
 
 class ExternalCIGEnvironment(Protocol):
@@ -74,4 +76,14 @@ def require_panel(env: ExternalCIGEnvironment, panel: str) -> None:
         raise RuntimeError(
             f"{env.capabilities.name} cannot run the {panel} panel under the "
             "CIG-AMF causal contract; do not emit that claim."
+        )
+    required_methods = {
+        "h1": ("clone_state", "restore_state", "fixed_continuation_policy", "oracle_lag_response"),
+        "h2": ("clone_state", "restore_state", "apply_structural_intervention", "apply_behavioural_intervention"),
+        "latency": ("clone_state", "restore_state", "fixed_continuation_policy", "oracle_lag_response"),
+    }
+    missing = [name for name in required_methods.get(panel, ()) if not callable(getattr(env, name, None))]
+    if missing:
+        raise RuntimeError(
+            f"{env.capabilities.name} advertises {panel} but lacks required methods: {missing}"
         )

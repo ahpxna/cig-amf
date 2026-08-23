@@ -325,45 +325,13 @@ class PairRelationalModule:
         pair = np.asarray(
             adapter.relation_features(ego_id, neighbor_id), dtype=np.float32
         )
-        if pair.size < 5:
-            raise ValueError("adapter pair_features must expose five base channels")
-        rel_row, rel_col, dist_norm, same_zone, zone_diff = pair[:5]
-        same_role = 0.0
-        ego_pair = np.asarray(
-            adapter.relation_features(neighbor_id, ego_id), dtype=np.float32
-        )
-        if pair.size > 5 and ego_pair.size == pair.size:
-            same_role = float(
-                np.argmax(pair[5:]) == np.argmax(ego_pair[5:])
-                and np.max(pair[5:]) > 0.0
-                and np.max(ego_pair[5:]) > 0.0
-            )
-
-        # Optional identity feature: normalized agent ID, an arbitrary label
-        # carrying no structural information. The seventh feature is active
-        # only with rel_feat_dim=7; the default value 6 truncates it to a no-op.
-        # The public role is already present in OmniArena's neighbour
-        # observation, so it is not duplicated as a separate relational
-        # channel here.
-        agent_id_norm = float(neighbor_id) / float(max(1, adapter.n_agents))
-
-        feats = [
-            rel_row,
-            rel_col,
-            dist_norm,
-            same_zone,
-            zone_diff,
-            same_role,
-            agent_id_norm,
-        ]
-
-        if len(feats) < self.rel_feat_dim:
-            feats = feats + [0.0 for _ in range(self.rel_feat_dim - len(feats))]
-
-        if len(feats) > self.rel_feat_dim:
-            feats = feats[: self.rel_feat_dim]
-
-        return np.asarray(feats, dtype=np.float32)
+        # xi_ij is an adapter-owned generic relation vector.  No model-level
+        # channel is interpreted as row, zone, distance, or role.  The fixed
+        # encoder width is a representation boundary only; adapter metadata is
+        # retained separately for diagnostics/visualisation.
+        out = np.zeros((self.rel_feat_dim,), dtype=np.float32)
+        out[:min(out.size, pair.size)] = pair[:min(out.size, pair.size)]
+        return out
 
     def _build_full_input_np(
         self,

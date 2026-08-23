@@ -117,6 +117,12 @@ if [ "${#CIG_H1_SEED_ARRAY[@]}" -eq 0 ] || [ "${#CIG_H23_SEED_ARRAY[@]}" -eq 0 ]
 fi
 
 if [ "$CIG_MODE" = "confirmatory" ] && [ "${CIG_ALLOW_DIRTY_CONFIRMATORY:-0}" != "1" ]; then
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    echo "Confirmatory mode requires a Git worktree." >&2; exit 2;
+  }
+  git rev-parse --verify HEAD >/dev/null 2>&1 || {
+    echo "Confirmatory mode requires a valid Git HEAD." >&2; exit 2;
+  }
   if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
     echo "Confirmatory mode requires a clean git worktree. Commit the frozen source first." >&2
     echo "Use --quick or CIG_ALLOW_DIRTY_CONFIRMATORY=1 only for non-confirmatory development." >&2
