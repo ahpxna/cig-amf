@@ -23,8 +23,8 @@ def _h2_rows():
                     "representation_learning_frozen": True,
                     "frozen_representation_unchanged": True,
                     "SR_C": sr,
-                    "capacity_beta_structural": 0.40,
-                    "capacity_beta_behavioral": 0.05,
+                    "capacity_beta_structural": 0.40 if model != "CorrelationMeanField" else 0.12,
+                    "capacity_beta_behavioral": 0.05 if model != "CorrelationMeanField" else 0.08,
                     "direction_beta_structural": 0.02,
                     "direction_beta_behavioral": 0.30,
                     "estimand_capacity_beta_structural": 0.50,
@@ -47,12 +47,12 @@ def _h2_rows():
 
 
 class H2ClaimGateTests(unittest.TestCase):
-    def test_requires_complete_recovery_and_scheduler_effect(self):
+    def test_requires_factor_selectivity_and_association_comparator(self):
         report = claims._h2_status(_h2_rows(), h1_supported=True)
         self.assertTrue(report["supported"])
         self.assertTrue(
             report["conditions"][
-                "two_timescale_scheduler_improves_recovery_coverage"
+                "causal_capacity_is_more_structurally_selective_than_correlation"
             ]
         )
 

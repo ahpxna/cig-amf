@@ -143,6 +143,9 @@ def _prepare_variant_runner(variant, seed, core_budget, device, checkpoint):
         for belief in runner.belief_modules.values():
             belief.max_core_size = len(belief.neighbor_ids)
             belief.set_fixed_core(belief.neighbor_ids)
+        runner.pair_rel_module.reconcile_core_sets(
+            {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()}
+        )
     return runner
 
 
@@ -261,6 +264,9 @@ def _isolation_rows(
                 for belief in runner.belief_modules.values():
                     belief.max_core_size = len(belief.neighbor_ids)
                     belief.set_fixed_core(belief.neighbor_ids)
+                runner.pair_rel_module.reconcile_core_sets(
+                    {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()}
+                )
             obs_all = runner.env._get_obs_all()
             action_dict, cache = runner._select_actions_population(obs_all)
             actions = [int(action_dict[agent]) for agent in range(runner.n_agents)]

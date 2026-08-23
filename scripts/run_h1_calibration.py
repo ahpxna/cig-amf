@@ -52,6 +52,7 @@ KEEP_KEYS = (
     "q_mae_mean", "q_rmse_mean", "q_spearman_mean",
     "q_centered_mae_mean", "q_centered_rmse_mean",
     "q_within_state_action_spearman_mean", "q_nonconstant_surface_count_mean",
+    "q_normalized_rmse_mean",
     "q_raw_mae_mean", "q_raw_rmse_mean",
     "capacity_rank_correlation_mean", "capacity_mae_mean",
     "capacity_bias_mean", "oracle_core_f1_mean",
@@ -59,8 +60,10 @@ KEEP_KEYS = (
     "direction_spearman_mean", "direction_mae_mean",
     "direction_bias_mean", "direction_sign_agreement_mean",
     "capacity_active_mae_mean", "capacity_active_spearman_mean",
+    "capacity_active_normalized_mae_mean", "capacity_active_pair_count_mean",
     "capacity_null_fpr_mean", "direction_active_mae_mean",
     "direction_active_spearman_mean", "direction_active_sign_agreement_mean",
+    "direction_active_normalized_mae_mean", "direction_active_pair_count_mean",
     "direction_null_fpr_mean",
     "direction_crossfit_aipw_signed_mae_mean",
     "direction_crossfit_aipw_signed_spearman_mean",
@@ -68,6 +71,8 @@ KEEP_KEYS = (
     "direction_row_aipw_signed_mae_mean",
     "direction_row_aipw_signed_spearman_mean",
     "direction_row_aipw_sign_agreement_mean",
+    "support_poor_pair_count_mean", "support_poor_capacity_mae_mean",
+    "support_poor_direction_mae_mean",
 )
 
 PROTOCOL_VERSION = "h1_qcd_crossfit_v4"
@@ -86,6 +91,9 @@ MIN_DIRECTION_SPEARMAN = 0.30
 MIN_DIRECTION_SIGN_AGREEMENT = 0.60
 MAX_CAPACITY_NULL_FPR = 0.20
 MAX_DIRECTION_NULL_FPR = 0.20
+MAX_Q_NORMALIZED_RMSE = 1.0
+MAX_CAPACITY_NORMALIZED_MAE = 1.0
+MAX_DIRECTION_NORMALIZED_MAE = 1.0
 
 
 def _utc_now():
@@ -198,15 +206,18 @@ def _variant_means(rows, variant):
         "q_spearman_mean", "q_mae_mean", "q_rmse_mean",
         "q_centered_mae_mean", "q_centered_rmse_mean",
         "q_within_state_action_spearman_mean", "q_nonconstant_surface_count_mean",
+        "q_normalized_rmse_mean",
         "capacity_rank_correlation_mean", "capacity_mae_mean",
         "capacity_bias_mean", "oracle_core_f1_mean",
         "oracle_core_f1_random_baseline_mean", "oracle_core_f1_adjusted_mean",
         "direction_spearman_mean", "direction_mae_mean",
         "direction_bias_mean", "direction_sign_agreement_mean",
         "capacity_active_mae_mean", "capacity_active_spearman_mean",
+        "capacity_active_normalized_mae_mean", "capacity_active_pair_count_mean",
         "capacity_null_fpr_mean", "direction_active_mae_mean",
         "direction_active_spearman_mean",
         "direction_active_sign_agreement_mean", "direction_null_fpr_mean",
+        "direction_active_normalized_mae_mean", "direction_active_pair_count_mean",
         "direction_row_aipw_signed_spearman_mean",
         "direction_row_aipw_signed_mae_mean",
         "direction_row_aipw_sign_agreement_mean",
@@ -214,6 +225,8 @@ def _variant_means(rows, variant):
         "direction_crossfit_aipw_signed_mae_mean",
         "direction_crossfit_aipw_sign_agreement_mean",
         "realised_forcing_rate", "heldout_policy_return_mean_per_agent",
+        "support_poor_pair_count_mean", "support_poor_capacity_mae_mean",
+        "support_poor_direction_mae_mean",
     ):
         fallback = aliases.get(key)
         vals = [
@@ -238,6 +251,13 @@ def _variant_means(rows, variant):
     out["dr_clipping_absent_all_seeds"] = bool(
         selected
         and all(bool(row.get("dr_clipping_absent", False)) for row in selected)
+    )
+    truthy = lambda value: str(value).strip().lower() in {"1", "true", "yes"}
+    out["capacity_active_support_all_seeds"] = bool(
+        selected and all(truthy(row.get("capacity_active_support_pass", False)) for row in selected)
+    )
+    out["direction_active_support_all_seeds"] = bool(
+        selected and all(truthy(row.get("direction_active_support_pass", False)) for row in selected)
     )
     return out
 
@@ -421,6 +441,24 @@ def _forcing_reporting(rows):
         ),
     )
     cost_summary = _paired_bootstrap_summary(cost_pairs, seed_offset=2)
+    support_poor_capacity = _paired_bootstrap_summary(
+        _paired_differences(
+            rows, "plugin_eps000", "plugin_eps005",
+            lambda no_forcing, forcing: (
+                float(no_forcing["support_poor_capacity_mae_mean"])
+                - float(forcing["support_poor_capacity_mae_mean"])
+            ),
+        ), seed_offset=3,
+    )
+    support_poor_direction = _paired_bootstrap_summary(
+        _paired_differences(
+            rows, "plugin_eps000", "plugin_eps005",
+            lambda no_forcing, forcing: (
+                float(no_forcing["support_poor_direction_mae_mean"])
+                - float(forcing["support_poor_direction_mae_mean"])
+            ),
+        ), seed_offset=4,
+    )
     endpoints = [
         row for row in rows
         if row.get("variant") in ("plugin_eps000", "plugin_eps005")
@@ -446,6 +484,15 @@ def _forcing_reporting(rows):
         ),
         "forcing_return_cost_paired_bootstrap": cost_summary,
         "forcing_return_cost_measured": return_endpoint_complete,
+        "support_poor_endpoint": {
+            "subset": "pre-forcing observed-action natural policy mass below frozen threshold",
+            "capacity_mae_eps0_minus_eps005": support_poor_capacity,
+            "direction_mae_eps0_minus_eps005": support_poor_direction,
+            "prediction_pass": bool(
+                support_poor_capacity["ci95_low"] > 0.0
+                or support_poor_direction["ci95_low"] > 0.0
+            ),
+        },
         "reporting_complete": bool(
             realised_rate_complete and return_endpoint_complete
         ),
@@ -484,10 +531,15 @@ def _claim_gate(rows):
         math.isfinite(plugin["q_within_state_action_spearman_mean"])
         and plugin["q_nonconstant_surface_count_mean"] > 0.0
         and plugin["q_within_state_action_spearman_mean"] >= MIN_Q_SPEARMAN
+        and math.isfinite(plugin["q_normalized_rmse_mean"])
+        and plugin["q_normalized_rmse_mean"] <= MAX_Q_NORMALIZED_RMSE
     )
     capacity_recovery = bool(
         math.isfinite(plugin["capacity_active_spearman_mean"])
         and plugin["capacity_active_spearman_mean"] >= MIN_CAPACITY_RANK
+        and plugin["capacity_active_support_all_seeds"]
+        and math.isfinite(plugin["capacity_active_normalized_mae_mean"])
+        and plugin["capacity_active_normalized_mae_mean"] <= MAX_CAPACITY_NORMALIZED_MAE
         and plugin["oracle_core_f1_adjusted_mean"] >= MIN_CAPACITY_CORE_F1
         and math.isfinite(plugin["capacity_null_fpr_mean"])
         and plugin["capacity_null_fpr_mean"] <= MAX_CAPACITY_NULL_FPR
@@ -495,6 +547,9 @@ def _claim_gate(rows):
     direction_recovery = bool(
         math.isfinite(plugin["direction_active_spearman_mean"])
         and plugin["direction_active_spearman_mean"] >= MIN_DIRECTION_SPEARMAN
+        and plugin["direction_active_support_all_seeds"]
+        and math.isfinite(plugin["direction_active_normalized_mae_mean"])
+        and plugin["direction_active_normalized_mae_mean"] <= MAX_DIRECTION_NORMALIZED_MAE
         and math.isfinite(plugin["direction_active_sign_agreement_mean"])
         and plugin["direction_active_sign_agreement_mean"]
         >= MIN_DIRECTION_SIGN_AGREEMENT
@@ -564,7 +619,7 @@ def main(argv=None):
         default=None, help="Optional subset for protocol smoke checks.",
     )
     ap.add_argument("--tiny-proxy-train-episodes", type=int, default=40)
-    ap.add_argument("--tiny-states", type=int, default=8)
+    ap.add_argument("--tiny-states", type=int, default=32)
     ap.add_argument("--max-steps", type=int, default=30)
     ap.add_argument(
         "--threshold-calibration", type=str, default=None,

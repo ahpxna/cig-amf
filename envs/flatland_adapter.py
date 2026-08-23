@@ -215,7 +215,7 @@ class FlatlandCIGEnvironment:
         )
         first = conflict_cells[0] if conflict_cells else None
         conflict_distance = (
-            float(paths_a[first] + paths_b[first]) / 64.0)
+            float(paths_a[first] + paths_b[first]) / 64.0
             if first is not None else 1.0
         )
         shared_switch = 0.0

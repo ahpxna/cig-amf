@@ -92,9 +92,9 @@ class PairRelationalModule:
     """
     Pair-specific relational module.
 
-    Maintains:
-        full_states[(i, j)]   = z_ij
-        shadow_states[(i, j)] = s_ij
+    Maintains a two-tier state allocation:
+        full_states[(i, j)]   = z_ij only while j is in ego i's explicit core
+        shadow_states[(i, j)] = s_ij for every directed pair
 
     Required public methods:
         clone_full_states_np()
@@ -145,9 +145,9 @@ class PairRelationalModule:
         self.grad_clip = float(grad_clip)
         self.shadow_loss_weight = float(shadow_loss_weight)
         self.state_mode = str(state_mode).strip().lower()
-        if self.state_mode not in {"recurrent", "feedforward", "aggregate"}:
+        if self.state_mode not in {"recurrent", "feedforward", "aggregate", "pooled"}:
             raise ValueError(
-                "state_mode must be recurrent, feedforward, or aggregate"
+                "state_mode must be recurrent, feedforward, aggregate, or pooled"
             )
 
         # Backward compatibility: some older versions use max_bc_buffer.
@@ -195,6 +195,11 @@ class PairRelationalModule:
         self.full_states = {}
         self.shadow_states = {}
 
+        # A shadow state is cheap enough to keep for every candidate pair.
+        # Full states are allocated lazily by ``reconcile_core_sets``.  This
+        # is the computational contract of Paper B: core selection controls
+        # expensive recurrent modelling, rather than only downstream use of
+        # an already-computed latent.
         for i in range(self.n_agents):
             for j in range(self.n_agents):
                 if i == j:
@@ -202,19 +207,20 @@ class PairRelationalModule:
 
                 pair = (int(i), int(j))
 
-                self.full_states[pair] = torch.zeros(
-                    1,
-                    self.hidden_dim,
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-
                 self.shadow_states[pair] = torch.zeros(
                     1,
                     self.shadow_dim,
                     dtype=torch.float32,
                     device=self.device,
                 )
+
+        self.active_core_pairs = set()
+        self.pooled_states = {
+            int(j): torch.zeros(
+                1, self.shadow_dim, dtype=torch.float32, device=self.device,
+            )
+            for j in range(self.n_agents)
+        }
 
         self.bc_buffer = deque(maxlen=self.bc_buffer_size)
 
@@ -446,7 +452,7 @@ class PairRelationalModule:
 
     def step_population(self, obs_all, actions, env):
         """
-        Update z_ij and s_ij for every directed pair at the current timestep.
+        Update s_ij for every directed pair and z_ij only for active cores.
 
         Runner requirements:
             env must be at the pre-step snapshot.
@@ -471,23 +477,10 @@ class PairRelationalModule:
                     action_j = self._get_from_container(actions, j)
                     rel_feat = self._rel_features_np(ego, j, env)
 
-                    x_full_np = self._build_full_input_np(
-                        obs_i=obs_i,
-                        obs_j=obs_j,
-                        action_i=action_i,
-                        action_j=action_j,
-                        rel_feat=rel_feat,
-                    )
-
                     x_shadow_np = self._build_shadow_input_np(
                         obs_j=obs_j,
                         action_j=action_j,
                         rel_feat=rel_feat,
-                    )
-
-                    x_full = self._to_tensor_2d(
-                        x_full_np,
-                        expected_dim=self.full_encoder.input_dim,
                     )
 
                     x_shadow = self._to_tensor_2d(
@@ -495,16 +488,36 @@ class PairRelationalModule:
                         expected_dim=self.shadow_encoder.input_dim,
                     )
 
-                    h_prev = self.full_states[pair]
-                    if self.state_mode == "feedforward":
-                        h_prev = torch.zeros_like(h_prev)
                     s_prev = self.shadow_states[pair]
-
-                    h_next = self.full_encoder(x_full, h_prev)
                     s_next = self.shadow_encoder(x_shadow, s_prev)
-
-                    self.full_states[pair] = h_next.detach()
                     self.shadow_states[pair] = s_next.detach()
+
+                    # Peripheral candidates retain only s_ij.  Do not even
+                    # materialise x_full for them: the saved encoder work is
+                    # the intended O(N k d_full) allocation benefit.
+                    if pair in self.active_core_pairs and self.state_mode != "pooled":
+                        x_full_np = self._build_full_input_np(
+                            obs_i=obs_i,
+                            obs_j=obs_j,
+                            action_i=action_i,
+                            action_j=action_j,
+                            rel_feat=rel_feat,
+                        )
+                        x_full = self._to_tensor_2d(
+                            x_full_np,
+                            expected_dim=self.full_encoder.input_dim,
+                        )
+                        h_prev = self.full_states.get(pair)
+                        if h_prev is None:
+                            h_prev = torch.zeros(
+                                1, self.hidden_dim, dtype=torch.float32,
+                                device=self.device,
+                            )
+                        if self.state_mode == "feedforward":
+                            h_prev = torch.zeros_like(h_prev)
+                        self.full_states[pair] = self.full_encoder(
+                            x_full, h_prev
+                        ).detach()
 
             if self.state_mode == "aggregate":
                 # Remove ego identity from the relational state while
@@ -513,8 +526,10 @@ class PairRelationalModule:
                     pairs = [
                         (ego, neighbor)
                         for ego in range(self.n_agents)
-                        if ego != neighbor
+                        if ego != neighbor and (ego, neighbor) in self.full_states
                     ]
+                    if not pairs:
+                        continue
                     shared = torch.mean(
                         torch.cat([self.full_states[pair] for pair in pairs], dim=0),
                         dim=0,
@@ -522,6 +537,18 @@ class PairRelationalModule:
                     )
                     for pair in pairs:
                         self.full_states[pair] = shared.detach().clone()
+
+            if self.state_mode == "pooled":
+                # Genuine aggregate-only baseline: a neighbour gets one
+                # cheap shared state, not a hidden ego-specific full state.
+                for neighbor in range(self.n_agents):
+                    states = [
+                        self.shadow_states[(ego, neighbor)]
+                        for ego in range(self.n_agents) if ego != neighbor
+                    ]
+                    self.pooled_states[neighbor] = torch.mean(
+                        torch.cat(states, dim=0), dim=0, keepdim=True
+                    ).detach()
 
     # ============================================================
     # Warm-start and summaries
@@ -550,21 +577,62 @@ class PairRelationalModule:
 
                 pair = (ego_id, j)
 
-                if pair not in self.shadow_states:
+                if pair not in self.shadow_states or pair in self.full_states:
                     continue
 
                 s = self.shadow_states[pair]
                 z = self.shadow_to_full(s)
 
                 self.full_states[pair] = z.detach()
+                self.active_core_pairs.add(pair)
                 count += 1
 
         return int(count)
+
+    def reconcile_core_sets(self, core_sets, warm_start=True):
+        """Synchronize allocated full states with the current directed cores.
+
+        ``core_sets`` maps ego id to its selected neighbours.  A newly active
+        pair receives either a shadow-to-full warm start or a zero state.  A
+        demoted pair is evicted immediately, so it can no longer consume full
+        recurrent updates or leak a live full state into the next promotion.
+        """
+        target = {
+            (int(ego), int(neighbor))
+            for ego, neighbors in dict(core_sets).items()
+            for neighbor in list(neighbors or [])
+            if int(ego) != int(neighbor)
+        }
+        target &= set(self.shadow_states)
+        previous = set(self.active_core_pairs)
+        promoted = target - previous
+        demoted = previous - target
+        with torch.no_grad():
+            for pair in demoted:
+                self.full_states.pop(pair, None)
+            for pair in promoted:
+                if self.state_mode == "pooled":
+                    continue
+                if bool(warm_start):
+                    z = self.shadow_to_full(self.shadow_states[pair])
+                else:
+                    z = torch.zeros(
+                        1, self.hidden_dim, dtype=torch.float32,
+                        device=self.device,
+                    )
+                self.full_states[pair] = z.detach()
+        self.active_core_pairs = target
+        return promoted, demoted
 
     def get_pair_latent(self, ego_id, neighbor_id):
         pair = (int(ego_id), int(neighbor_id))
 
         if pair not in self.full_states:
+            if self.state_mode == "pooled" and int(neighbor_id) in self.pooled_states:
+                with torch.no_grad():
+                    return self.shadow_to_full(
+                        self.pooled_states[int(neighbor_id)]
+                    ).detach().cpu().numpy().reshape(-1).astype(np.float32)
             return np.zeros((self.hidden_dim,), dtype=np.float32)
 
         return (
@@ -606,7 +674,10 @@ class PairRelationalModule:
         ids = [
             int(j)
             for j in list(core_set)
-            if int(j) != ego_id and (ego_id, int(j)) in self.full_states
+            if int(j) != ego_id and (
+                (ego_id, int(j)) in self.full_states
+                or (self.state_mode == "pooled" and (ego_id, int(j)) in self.active_core_pairs)
+            )
         ]
 
         if len(ids) == 0:
@@ -647,7 +718,10 @@ class PairRelationalModule:
         core_ids = [
             int(j)
             for j in list(core_set or [])
-            if int(j) != ego_id and (ego_id, int(j)) in self.full_states
+            if int(j) != ego_id and (
+                (ego_id, int(j)) in self.full_states
+                or (self.state_mode == "pooled" and (ego_id, int(j)) in self.active_core_pairs)
+            )
         ]
 
         out = {}
@@ -764,13 +838,11 @@ class PairRelationalModule:
                         dtype=np.float32,
                     ).reshape(-1)
                 else:
+                    state = self.full_states.get(pair)
                     h_prev = (
-                        self.full_states[pair]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .reshape(-1)
-                        .astype(np.float32)
+                        state.detach().cpu().numpy().reshape(-1).astype(np.float32)
+                        if state is not None
+                        else np.zeros((self.hidden_dim,), dtype=np.float32)
                     )
 
                 if s_prev_snapshot is not None and pair in s_prev_snapshot:
@@ -807,6 +879,7 @@ class PairRelationalModule:
                         "x_full": x_full.astype(np.float32),
                         "x_shadow": x_shadow.astype(np.float32),
                         "h_prev": h_prev.astype(np.float32),
+                        "full_active": bool(pair in self.full_states),
                         "s_prev": s_prev.astype(np.float32),
                         "target_action": int(target_action_j),
                         "cd_target": (
@@ -980,14 +1053,24 @@ class PairRelationalModule:
                 target_t,
             ) = self._bc_batch_to_tensors(batch)
 
-            recurrent_state = (
-                torch.zeros_like(h_prev_t)
-                if self.state_mode == "feedforward"
-                else h_prev_t
+            full_active = torch.tensor(
+                [bool(sample.get("full_active", False)) for sample in batch],
+                dtype=torch.bool, device=self.device,
             )
-            z_next = self.full_encoder(x_full_t, recurrent_state)
-            logits_full = self.bc_head(z_next)
-            full_loss = F.cross_entropy(logits_full, target_t)
+            if bool(full_active.any()):
+                recurrent_state = (
+                    torch.zeros_like(h_prev_t[full_active])
+                    if self.state_mode == "feedforward"
+                    else h_prev_t[full_active]
+                )
+                z_next = self.full_encoder(
+                    x_full_t[full_active], recurrent_state
+                )
+                logits_full = self.bc_head(z_next)
+                full_loss = F.cross_entropy(logits_full, target_t[full_active])
+            else:
+                z_next = None
+                full_loss = torch.zeros((), dtype=torch.float32, device=self.device)
 
             s_next = self.shadow_encoder(x_shadow_t, s_prev_t)
             z_from_shadow = self.shadow_to_full(s_next)
@@ -998,6 +1081,7 @@ class PairRelationalModule:
 
             heads_loss_val = None
             if heads is not None:
+                active_indices = torch.nonzero(full_active, as_tuple=False).reshape(-1)
                 ego_ids_batch = [int(s["ego_id"]) for s in batch]
                 nb_ids_batch = [int(s["neighbor_id"]) for s in batch]
 
@@ -1010,7 +1094,11 @@ class PairRelationalModule:
 
                 # [E2] Use z_next with gradients intact so full_encoder must
                 # encode ego information in z_ij; see this method's docstring.
-                labelled = [sample.get("cd_target") is not None for sample in batch]
+                labelled = [
+                    sample.get("cd_target") is not None
+                    and bool(sample.get("full_active", False))
+                    for sample in batch
+                ]
                 if any(labelled):
                     labelled_idx = [index for index, valid in enumerate(labelled) if valid]
                     cd_vals = [batch[index]["cd_target"] for index in labelled_idx]
@@ -1022,7 +1110,11 @@ class PairRelationalModule:
                         np.asarray(cd_vals, dtype=np.float32),
                         dtype=torch.float32, device=self.device,
                     )
-                    selected_z = z_next[labelled_idx]
+                    batch_to_active = {
+                        int(batch_idx): int(active_idx)
+                        for active_idx, batch_idx in enumerate(active_indices.tolist())
+                    }
+                    selected_z = z_next[[batch_to_active[index] for index in labelled_idx]]
                     selected_ego = ego_t[labelled_idx]
                     selected_nb = nb_t[labelled_idx]
                     inf_loss = heads.influence_loss(selected_z, cd_t)
@@ -1110,13 +1202,18 @@ class PairRelationalModule:
             full_norms.append(
                 float(torch.norm(self.full_states[pair]).detach().cpu().item())
             )
+        for pair in self.shadow_states:
             shadow_norms.append(
                 float(torch.norm(self.shadow_states[pair]).detach().cpu().item())
             )
 
         return {
             "n_agents": int(self.n_agents),
-            "n_pairs": int(len(self.full_states)),
+            "n_candidate_pairs": int(len(self.shadow_states)),
+            "n_full_core_pairs": int(len(self.full_states)),
+            "n_pairs": int(len(self.shadow_states)),
+            "full_state_bytes": int(len(self.full_states) * self.hidden_dim * 4),
+            "shadow_state_bytes": int(len(self.shadow_states) * self.shadow_dim * 4),
             "hidden_dim": int(self.hidden_dim),
             "shadow_dim": int(self.shadow_dim),
             "bc_buffer_size": int(len(self.bc_buffer)),

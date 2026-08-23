@@ -209,6 +209,7 @@ class PeripheralMultiMemory(nn.Module):
         allow_legacy_items: bool = False,
         mu_floor: float = 0.02,
         beta_floor: float = 0.05,
+        beta_mode: str = "capacity",
         semantic_mass: float = 0.5,
         eps: float = 1e-6,
     ):
@@ -276,6 +277,9 @@ class PeripheralMultiMemory(nn.Module):
         self.uniform_mix = float(uniform_mix)
         self.mu_floor = float(mu_floor)
         self.beta_floor = float(beta_floor)
+        self.beta_mode = str(beta_mode).strip().lower()
+        if self.beta_mode not in {"capacity", "abs_direction", "attention"}:
+            raise ValueError("beta_mode must be capacity, abs_direction, or attention")
         self.semantic_mass = float(np.clip(semantic_mass, 0.0, 1.0))
         self.eps = float(eps)
 
@@ -293,6 +297,11 @@ class PeripheralMultiMemory(nn.Module):
             # centered output preserves signed directions for cosine-based
             # specialization while retaining a nonlinear hidden layer.
             nn.LayerNorm(self.memory_dim),
+        )
+        self.importance_attention = nn.Sequential(
+            nn.Linear(self.item_dim, self.item_hidden),
+            nn.ReLU(),
+            nn.Linear(self.item_hidden, 1),
         )
 
         # ---------------------------------------------------------------
@@ -578,7 +587,17 @@ class PeripheralMultiMemory(nn.Module):
         )
         confidence = 1.0 / (1.0 + sigma + self.eps)  # [N]
 
-        beta = (capacity + self.mu_floor) * confidence  # [N]
+        if self.beta_mode == "capacity":
+            beta = (capacity + self.mu_floor) * confidence
+        elif self.beta_mode == "abs_direction":
+            direction = torch.abs(items[:, ITEM_DIRECTION])
+            beta = (direction + self.mu_floor) * confidence
+        else:
+            # This is an observational aggregate comparator, never a core
+            # selection signal.
+            beta = torch.softmax(
+                self.importance_attention(items).squeeze(-1), dim=0
+            )
 
         return torch.clamp(beta, min=self.eps)
 

@@ -413,7 +413,7 @@ class H2ProtocolTests(unittest.TestCase):
                 {
                     **attempt,
                     "run_id": "h1-run",
-                    "protocol_version": "h1_qcd_crossfit_v3",
+                    "protocol_version": "h1_qcd_crossfit_v4",
                     "config_fingerprint": "abc123",
                     "attempt_complete": True,
                     "q_spearman_mean": 0.1,
@@ -428,7 +428,7 @@ class H2ProtocolTests(unittest.TestCase):
             self._write_csv(h1_summary, h1_rows)
             h1_manifest = {
                 "run_id": "h1-run",
-                "protocol_version": "h1_qcd_crossfit_v3",
+                "protocol_version": "h1_qcd_crossfit_v4",
                 "status": "complete",
                 "expected_attempts": h1_attempts,
                 "completed_attempts": h1_attempts,
@@ -442,7 +442,7 @@ class H2ProtocolTests(unittest.TestCase):
             with open(os.path.join(h1_dir, "latest_complete_run.json"), "w", encoding="utf-8") as f:
                 json.dump({
                     "run_id": "h1-run",
-                    "protocol_version": "h1_qcd_crossfit_v3",
+                    "protocol_version": "h1_qcd_crossfit_v4",
                     "summary_path": h1_summary,
                     "manifest_path": h1_manifest_path,
                 }, f)

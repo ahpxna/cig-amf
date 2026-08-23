@@ -25,6 +25,7 @@ class H3NoMultiMemoryRunner(FinalCIGAMFRunner):
             out_dim=self.periph_dim,
             mu_floor=cfg.get("periph_mu_floor", 0.02),
             beta_floor=cfg.get("periph_beta_floor", 0.05),
+            beta_mode=cfg.get("periph_beta_mode", "capacity"),
             signature_mode=cfg.get("periph_signature_mode", "full"),
             require_full_signature=cfg.get(
                 "periph_require_full_signature", False

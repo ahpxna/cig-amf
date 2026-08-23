@@ -177,6 +177,13 @@ def default_cfg():
         "h1_capacity_prediction_threshold": 0.01,
         "h1_direction_active_threshold": 0.005,
         "h1_direction_prediction_threshold": 0.005,
+        "h1_min_active_pairs": 30,
+        # Normalized magnitude gates.  They are prespecified calibration
+        # checks, complementary to rank/selectivity endpoints.
+        "h1_max_q_normalized_rmse": 1.0,
+        "h1_max_capacity_normalized_mae": 1.0,
+        "h1_max_direction_normalized_mae": 1.0,
+        "h1_support_poor_threshold": 0.15,
         # A 4-of-5 overlap has a random F1 floor of .8, so H1 uses a small,
         # fixed top-k rather than reusing the modelling core budget.
         "h1_selector_top_k": 1,
@@ -1432,6 +1439,12 @@ def _response_surface_calibration(proxy_q, oracle_q, neighbor_ids):
         "q_nonconstant_surface_count": int(nonconstant_count),
         "q_raw_mae": float(np.mean(np.abs(raw_diff))),
         "q_raw_rmse": float(np.sqrt(np.mean(raw_diff ** 2))),
+        # Sufficient statistics are retained so the H1 runner can compute a
+        # seed-level normalized RMSE without averaging incomparable local
+        # ratios across ego-state groups.
+        "q_centered_sq_error_sum": float(np.sum(centered_diff ** 2)),
+        "q_centered_oracle_sq_sum": float(np.sum(oracle_centered ** 2)),
+        "q_centered_value_count": int(centered_diff.size),
     }
 
 
@@ -1485,6 +1498,63 @@ def _active_null_calibration(
             else float("nan")
         )
     return result
+
+
+def _pooled_active_pair_metrics(
+    pair_rows,
+    capacity_threshold,
+    direction_threshold,
+    min_active_pairs,
+):
+    """Adjudicate C/D over pooled held-out active pairs for one seed.
+
+    Each tiny ego-state contains only five neighbours.  Rank correlation
+    within each tiny group is therefore usually undefined under sparse causal
+    signal.  H1's active-rank endpoint is a seed-level pooled-pair statistic;
+    within-state top-k remains a separate structural-ranking endpoint.
+    """
+    def _metrics(learned_key, oracle_key, threshold, signed):
+        learned = np.asarray([float(row[learned_key]) for row in pair_rows], dtype=np.float64)
+        oracle = np.asarray([float(row[oracle_key]) for row in pair_rows], dtype=np.float64)
+        magnitude = np.abs(oracle) if signed else oracle
+        active = magnitude > float(threshold)
+        count = int(np.count_nonzero(active))
+        if count == 0:
+            return {
+                "active_pair_count": 0,
+                "active_spearman": float("nan"),
+                "active_mae": float("nan"),
+                "active_normalized_mae": float("nan"),
+                "active_sign_agreement": float("nan") if signed else None,
+                "support_pass": False,
+            }
+        selected_learned = learned[active]
+        selected_oracle = oracle[active]
+        mae = float(np.mean(np.abs(selected_learned - selected_oracle)))
+        denom = float(np.mean(np.abs(selected_oracle))) + 1e-12
+        result = {
+            "active_pair_count": count,
+            "active_spearman": (
+                float(safe_spearman(selected_learned, selected_oracle)[0])
+                if count >= 2 else float("nan")
+            ),
+            "active_mae": mae,
+            "active_normalized_mae": float(mae / denom),
+            "support_pass": bool(count >= int(min_active_pairs)),
+        }
+        if signed:
+            result["active_sign_agreement"] = float(np.mean(
+                np.sign(selected_learned) == np.sign(selected_oracle)
+            ))
+        return result
+
+    capacity = _metrics(
+        "learned_score", "oracle_score", capacity_threshold, signed=False
+    )
+    direction = _metrics(
+        "learned_signed", "oracle_signed", direction_threshold, signed=True
+    )
+    return {"capacity": capacity, "direction": direction}
 
 
 def _tiny_train_cfg_from_base(cfg):
@@ -2209,6 +2279,9 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                     "oracle_signed": float(oracle_scores["direction"][j]),
                     "learned_range": float(learned_scores["capacity"][j]),
                     "oracle_range": float(oracle_scores["capacity"][j]),
+                    "natural_action_support": float(
+                        step["policy_probs"][j][int(step["actions"][j])]
+                    ),
                     "abs_error": float(abs(
                         learned_scores["capacity"][j]
                         - oracle_scores["capacity"][j]
@@ -2217,9 +2290,42 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                         learned_scores["signed"][j]
                         - oracle_scores["signed"][j]
                     ),
+                    "capacity_abs_error": float(abs(
+                        learned_scores["capacity"][j] - oracle_scores["capacity"][j]
+                    )),
+                    "direction_abs_error": float(abs(
+                        learned_scores["direction"][j] - oracle_scores["direction"][j]
+                    )),
                     "proxy_sigma": float(sigmas[j]),
                     "dr_applied": int(score_meta["dr_applied"]),
                 })
+
+    pooled_active = _pooled_active_pair_metrics(
+        rows,
+        capacity_threshold=float(tiny_cfg.get("h1_capacity_active_threshold", 0.01)),
+        direction_threshold=float(tiny_cfg.get("h1_direction_active_threshold", 0.005)),
+        min_active_pairs=int(tiny_cfg.get("h1_min_active_pairs", 30)),
+    )
+    q_sq_error = float(sum(
+        float(row.get("q_centered_sq_error_sum", 0.0))
+        for row in aggregate_rows
+    ))
+    q_sq_oracle = float(sum(
+        float(row.get("q_centered_oracle_sq_sum", 0.0))
+        for row in aggregate_rows
+    ))
+    q_value_count = int(sum(
+        int(row.get("q_centered_value_count", 0))
+        for row in aggregate_rows
+    ))
+    q_normalized_rmse = float(
+        math.sqrt(q_sq_error / max(q_sq_oracle, 1e-12))
+    ) if q_value_count > 0 else float("nan")
+    support_poor_threshold = float(tiny_cfg.get("h1_support_poor_threshold", 0.15))
+    support_poor_rows = [
+        row for row in rows
+        if float(row.get("natural_action_support", 1.0)) < support_poor_threshold
+    ]
 
     dr_requested = bool(runner.proxy.use_doubly_robust)
     coverage = runner.proxy.get_action_coverage_diagnostics()
@@ -2231,6 +2337,8 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
         "causal_horizon": int(tiny_cfg.get("causal_horizon", 1)),
         "proxy_n_horizons": int(tiny_cfg.get("proxy_n_horizons", 1)),
         "h1_selector_top_k": int(tiny_cfg.get("h1_selector_top_k", 1)),
+        "h1_min_active_pairs": int(tiny_cfg.get("h1_min_active_pairs", 30)),
+        "h1_support_poor_threshold": support_poor_threshold,
         "h1_capacity_active_threshold": float(
             tiny_cfg.get("h1_capacity_active_threshold", 0.01)
         ),
@@ -2284,6 +2392,54 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
             forcing_stats["total_agent_steps"]
         ),
         "forcing_total_forced": int(forcing_stats["total_forced"]),
+        # H1 active C/D ranks are pooled across the evaluation bank.  The
+        # historical state-local columns remain diagnostics only.
+        "capacity_active_pair_count_mean": int(
+            pooled_active["capacity"]["active_pair_count"]
+        ),
+        "capacity_active_spearman_mean": float(
+            pooled_active["capacity"]["active_spearman"]
+        ),
+        "capacity_active_mae_mean": float(
+            pooled_active["capacity"]["active_mae"]
+        ),
+        "capacity_active_normalized_mae_mean": float(
+            pooled_active["capacity"]["active_normalized_mae"]
+        ),
+        "capacity_active_support_pass": bool(
+            pooled_active["capacity"]["support_pass"]
+        ),
+        "direction_active_pair_count_mean": int(
+            pooled_active["direction"]["active_pair_count"]
+        ),
+        "direction_active_spearman_mean": float(
+            pooled_active["direction"]["active_spearman"]
+        ),
+        "direction_active_mae_mean": float(
+            pooled_active["direction"]["active_mae"]
+        ),
+        "direction_active_normalized_mae_mean": float(
+            pooled_active["direction"]["active_normalized_mae"]
+        ),
+        "direction_active_sign_agreement_mean": float(
+            pooled_active["direction"]["active_sign_agreement"]
+        ),
+        "direction_active_support_pass": bool(
+            pooled_active["direction"]["support_pass"]
+        ),
+        "q_normalized_rmse_mean": q_normalized_rmse,
+        "q_centered_sq_error_sum": q_sq_error,
+        "q_centered_oracle_sq_sum": q_sq_oracle,
+        "q_centered_value_count": q_value_count,
+        "support_poor_pair_count_mean": int(len(support_poor_rows)),
+        "support_poor_capacity_mae_mean": (
+            float(np.mean([row["capacity_abs_error"] for row in support_poor_rows]))
+            if support_poor_rows else float("nan")
+        ),
+        "support_poor_direction_mae_mean": (
+            float(np.mean([row["direction_abs_error"] for row in support_poor_rows]))
+            if support_poor_rows else float("nan")
+        ),
         **policy_return_metadata,
     }
     metadata["alignment_protocol_gate_pass"] = bool(
@@ -2551,6 +2707,9 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
             summary[f"{key}_min"] = 0.0
             summary[f"{key}_max"] = 0.0
 
+    # Pool-wide H1 active-rank and normalized-error endpoints deliberately
+    # replace state-local averages with the same legacy field names.
+    summary.update(protocol_metadata)
     save_json(summary, os.path.join(out_dir, "tiny_oracle_summary.json"))
 
     print("")
@@ -2617,7 +2776,7 @@ def parse_args():
         default="8,16,24,48",
     )
 
-    parser.add_argument("--tiny_states", type=int, default=8)
+    parser.add_argument("--tiny_states", type=int, default=32)
     parser.add_argument("--tiny_burn_in", type=int, default=4)
     parser.add_argument("--tiny_horizon", type=int, default=3)
     parser.add_argument("--tiny_proxy_train_episodes", type=int, default=40)

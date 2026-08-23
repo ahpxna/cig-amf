@@ -2203,11 +2203,16 @@ class SharedAblationBase:
             else:
                 promoted, demoted = update_result
 
-            self.pair_rel_module.warm_start_if_promoted(ego, promoted)
-
             total_promoted += len(promoted)
             total_demoted += len(demoted)
 
+        self.pair_rel_module.reconcile_core_sets(
+            {
+                ego: module.get_core_set()
+                for ego, module in self.belief_modules.items()
+            },
+            warm_start=bool(self.cfg.get("pair_warm_start", True)),
+        )
         return int(total_promoted), int(total_demoted)
 
     def update_graph_modules(self, trajectory):

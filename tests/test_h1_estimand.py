@@ -266,11 +266,17 @@ class H1ClaimGateTests(unittest.TestCase):
                     "q_spearman_mean": 0.70,
                     "q_mae_mean": 0.10,
                     "q_rmse_mean": 0.15,
+                    "q_within_state_action_spearman_mean": 0.70,
+                    "q_nonconstant_surface_count_mean": 32.0,
+                    "q_normalized_rmse_mean": 0.25,
                     "capacity_rank_correlation_mean": 0.85,
                     "capacity_mae_mean": 0.10,
                     "capacity_bias_mean": 0.02,
                     "capacity_active_mae_mean": 0.08,
                     "capacity_active_spearman_mean": 0.75,
+                    "capacity_active_normalized_mae_mean": 0.25,
+                    "capacity_active_pair_count_mean": 40.0,
+                    "capacity_active_support_pass": True,
                     "capacity_null_fpr_mean": 0.05,
                     "oracle_core_f1_mean": 0.80,
                     "direction_spearman_mean": signed_rank,
@@ -279,6 +285,9 @@ class H1ClaimGateTests(unittest.TestCase):
                     "direction_sign_agreement_mean": 0.90,
                     "direction_active_mae_mean": 0.08,
                     "direction_active_spearman_mean": 0.72,
+                    "direction_active_normalized_mae_mean": 0.25,
+                    "direction_active_pair_count_mean": 40.0,
+                    "direction_active_support_pass": True,
                     "direction_active_sign_agreement_mean": 0.90,
                     "direction_null_fpr_mean": 0.05,
                     "direction_row_aipw_signed_spearman_mean": (
@@ -292,6 +301,13 @@ class H1ClaimGateTests(unittest.TestCase):
                     "dr_clipping_absent": True,
                     "realised_forcing_rate": forcing_rate,
                     "heldout_policy_return_mean_per_agent": heldout_return,
+                    "support_poor_pair_count_mean": 32.0,
+                    "support_poor_capacity_mae_mean": (
+                        0.40 if variant == "plugin_eps000" else 0.20
+                    ),
+                    "support_poor_direction_mae_mean": (
+                        0.40 if variant == "plugin_eps000" else 0.20
+                    ),
                     "policy_return_endpoint_measured": True,
                 })
         return rows

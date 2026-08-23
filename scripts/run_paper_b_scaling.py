@@ -25,7 +25,10 @@ import run_experiment as RE
 from runners.h3_ablation_runner import H3NoMultiMemoryRunner
 
 
-VARIANTS = ("Full-Explicit", "Semantic-Free", "Single-Mean")
+VARIANTS = (
+    "PureMeanField", "Attention-Mean", "Full-Explicit", "Semantic-Free",
+    "Single-Mean",
+)
 
 
 def _atomic_json(path, payload):
@@ -49,15 +52,23 @@ def _mean(values):
 
 
 def _model_bytes(runner):
+    if not hasattr(runner, "pair_rel_module"):
+        modules = (runner.policy_value, runner.actor, runner.critic)
+        return int(sum(
+            parameter.numel() * parameter.element_size()
+            for module in modules for parameter in module.parameters()
+        ))
     modules = (runner.policy_value, runner.pair_rel_module.full_encoder,
                runner.periph_module, runner.belief_summary_builder)
     parameters = sum(
         parameter.numel() * parameter.element_size()
         for module in modules for parameter in module.parameters()
     )
-    state = runner.n_agents * max(0, runner.n_agents - 1) * (
-        runner.pair_rel_module.hidden_dim + runner.pair_rel_module.shadow_dim
-    ) * 4
+    # Measure actual state allocation after the run, not an old all-pair
+    # full-state formula.  Shadow is maintained for candidates; full z only
+    # exists for selected core pairs.
+    stats = runner.pair_rel_module.get_debug_stats()
+    state = int(stats["full_state_bytes"] + stats["shadow_state_bytes"])
     return int(parameters + state)
 
 
@@ -74,7 +85,11 @@ def _runner(variant, n_agents, seed, device, core_budget):
         task_mode="behavioral_drift", n_agents=int(n_agents), max_steps=30,
         phase_length=40, seed=int(seed),
     )
-    if variant == "Single-Mean":
+    if variant == "PureMeanField":
+        return RE.make_runner("PureMeanField", env, cfg, device)
+    if variant in {"Single-Mean", "Attention-Mean"}:
+        if variant == "Attention-Mean":
+            cfg["periph_beta_mode"] = "attention"
         return H3NoMultiMemoryRunner(env, cfg, device=device)
     runner = RE.make_runner("Final-CIGAMF", env, cfg, device)
     if variant == "Full-Explicit":
@@ -82,6 +97,9 @@ def _runner(variant, n_agents, seed, device, core_budget):
         for belief in runner.belief_modules.values():
             belief.max_core_size = len(belief.neighbor_ids)
             belief.set_fixed_core(belief.neighbor_ids)
+        runner.pair_rel_module.reconcile_core_sets(
+            {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()}
+        )
     return runner
 
 

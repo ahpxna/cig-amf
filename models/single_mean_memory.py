@@ -23,6 +23,7 @@ from models.peripheral_memory import (
     ITEM_ABS_MU,
     ITEM_ACTION,
     ITEM_CONTEXT_STD,
+    ITEM_DIRECTION,
     ITEM_SIGMA_CAPACITY,
     LEGACY_ITEM_DIM,
 )
@@ -45,6 +46,7 @@ class SingleMeanPeripheral(nn.Module):
         allow_legacy_items: bool = True,
         mu_floor: float = 0.02,
         beta_floor: float = 0.05,
+        beta_mode: str = "capacity",
         eps: float = 1e-6,
     ):
         super().__init__()
@@ -61,6 +63,9 @@ class SingleMeanPeripheral(nn.Module):
         self.allow_legacy_items = bool(allow_legacy_items)
         self.mu_floor = float(mu_floor)
         self.beta_floor = float(beta_floor)
+        self.beta_mode = str(beta_mode).strip().lower()
+        if self.beta_mode not in {"capacity", "abs_direction", "attention"}:
+            raise ValueError("beta_mode must be capacity, abs_direction, or attention")
         self.eps = float(eps)
 
         self.signature_full_items_seen = 0
@@ -73,6 +78,11 @@ class SingleMeanPeripheral(nn.Module):
             nn.ReLU(),
             nn.Linear(self.item_hidden, self.memory_dim),
             nn.LayerNorm(self.memory_dim),
+        )
+        self.importance_attention = nn.Sequential(
+            nn.Linear(self.item_dim, self.item_hidden),
+            nn.ReLU(),
+            nn.Linear(self.item_hidden, 1),
         )
         self.out_proj = nn.Sequential(
             nn.Linear(self.memory_dim, self.out_dim),
@@ -153,10 +163,15 @@ class SingleMeanPeripheral(nn.Module):
             if self.signature_mode == "scalar"
             else torch.clamp(items[:, ITEM_SIGMA_CAPACITY], min=0.0)
         )
-        beta = (
-            (torch.abs(mu) + self.mu_floor)
-            / (1.0 + sigma + self.eps)
-        )
+        confidence = 1.0 / (1.0 + sigma + self.eps)
+        if self.beta_mode == "capacity":
+            beta = (torch.abs(mu) + self.mu_floor) * confidence
+        elif self.beta_mode == "abs_direction":
+            beta = (torch.abs(items[:, ITEM_DIRECTION]) + self.mu_floor) * confidence
+        else:
+            beta = torch.softmax(
+                self.importance_attention(items).squeeze(-1), dim=0
+            )
         return torch.clamp(beta, min=self.eps)
 
     def _encode_and_weight(self, items: torch.Tensor):

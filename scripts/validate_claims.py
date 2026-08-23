@@ -38,7 +38,7 @@ EXIT_SMOKE_ONLY = 11
 EXIT_INVALID = 20
 
 MIN_H1_CONFIRMATORY_SEEDS = H1.MIN_CONFIRMATORY_SEEDS
-MIN_H23_CONFIRMATORY_SEEDS = 5
+MIN_H23_CONFIRMATORY_SEEDS = 8
 MIN_H2_CONFIRMATORY_EPISODES = 400
 MIN_H3_CONFIRMATORY_EPISODES = 200
 H2_MATCHED_WINDOW_INTERVALS = 2
@@ -209,6 +209,9 @@ def _h1_status(rows):
             claim["h1_support_integrity_pass"]
         ),
         "forcing_return_cost_reported": bool(forcing["reporting_complete"]),
+        "H1d_forcing_improves_support_poor_endpoint": bool(
+            forcing["support_poor_endpoint"]["prediction_pass"]
+        ),
     }
     supported = bool(claim["h1_claim_gate_pass"] and all(conditions.values()))
     return {
@@ -224,6 +227,7 @@ def _h1_status(rows):
             "q_nonconstant_surface_count": float(
                 main["q_nonconstant_surface_count_mean"]
             ),
+            "q_normalized_rmse": float(main["q_normalized_rmse_mean"]),
             "capacity_rank_correlation": float(
                 main["capacity_rank_correlation_mean"]
             ),
@@ -237,6 +241,12 @@ def _h1_status(rows):
             "capacity_active_spearman": float(
                 main["capacity_active_spearman_mean"]
             ),
+            "capacity_active_pair_count": float(
+                main["capacity_active_pair_count_mean"]
+            ),
+            "capacity_active_normalized_mae": float(
+                main["capacity_active_normalized_mae_mean"]
+            ),
             "capacity_null_fpr": float(main["capacity_null_fpr_mean"]),
             "direction_spearman": float(main["direction_spearman_mean"]),
             "direction_sign_agreement": float(
@@ -244,6 +254,12 @@ def _h1_status(rows):
             ),
             "direction_active_spearman": float(
                 main["direction_active_spearman_mean"]
+            ),
+            "direction_active_pair_count": float(
+                main["direction_active_pair_count_mean"]
+            ),
+            "direction_active_normalized_mae": float(
+                main["direction_active_normalized_mae_mean"]
             ),
             "direction_active_sign_agreement": float(
                 main["direction_active_sign_agreement_mean"]
@@ -264,9 +280,7 @@ def _h2_status(rows, h1_supported):
     grouped = _by_group(rows, "model")
     final = grouped["Final-CIGAMF"]
     correlation = grouped["CorrelationMeanField"]
-    no_two = grouped["NoTwoTimescale"]
-
-    required_rows = final + correlation + no_two
+    required_rows = final + correlation
     evaluable = all(
         _boolean(row.get("claim_evaluable", False))
         and int(float(row.get("episodes", 0))) >= MIN_H2_CONFIRMATORY_EPISODES
@@ -314,17 +328,23 @@ def _h2_status(rows, h1_supported):
         estimand_direction_behav, seed=2205
     )
 
-    final_recovery = [
-        _h2_joint_recovery_trigger_coverage(row) for row in final
+    correlation_capacity_struct = values(correlation, "capacity_beta_structural")
+    correlation_capacity_behav = values(correlation, "capacity_beta_behavioral")
+    correlation_selectivity = [
+        structural - abs(behavioural)
+        for structural, behavioural in zip(
+            correlation_capacity_struct, correlation_capacity_behav
+        )
     ]
-    no_two_recovery = [
-        _h2_joint_recovery_trigger_coverage(row) for row in no_two
+    correlation_selectivity_delta = [
+        final_value - association_value
+        for final_value, association_value in zip(
+            capacity_selectivity, correlation_selectivity
+        )
     ]
-    scheduler_delta = [
-        final_value - control_value
-        for final_value, control_value in zip(final_recovery, no_two_recovery)
-    ]
-    scheduler_ci = _bootstrap_mean_ci(scheduler_delta, seed=2206)
+    correlation_selectivity_ci = _bootstrap_mean_ci(
+        correlation_selectivity_delta, seed=2206
+    )
     behavioral_false_trigger_rate = values(final, "behavioral_false_trigger_rate")
 
     mechanism_conditions = {
@@ -349,8 +369,8 @@ def _h2_status(rows, h1_supported):
         "behavioral_only_false_trigger_rate_reported": all(
             rate >= 0.0 for rate in behavioral_false_trigger_rate
         ),
-        "two_timescale_scheduler_improves_recovery_coverage": (
-            scheduler_ci[0] > 0.0
+        "causal_capacity_is_more_structurally_selective_than_correlation": (
+            correlation_selectivity_ci[0] > 0.0
         ),
     }
     mechanism_supported = all(mechanism_conditions.values())
@@ -381,9 +401,12 @@ def _h2_status(rows, h1_supported):
             "fixed_estimand_direction_behavioral_ci95": estimand_direction_behav_ci,
             "behavioral_only_false_trigger_rate": behavioral_false_trigger_rate,
             "final_recovery_latency_mean": _mean(final, "recovery_latency"),
-            "final_joint_recovery_trigger_coverage": final_recovery,
-            "no_two_timescale_joint_recovery_trigger_coverage": no_two_recovery,
-            "paired_final_minus_no_two_recovery_coverage_ci95": scheduler_ci,
+            "correlation_capacity_structural_minus_abs_behavioral": (
+                correlation_selectivity
+            ),
+            "causal_minus_correlation_capacity_selectivity_ci95": (
+                correlation_selectivity_ci
+            ),
             "correlation_capacity_beta_structural_mean": _mean(
                 correlation, "capacity_beta_structural"
             ),

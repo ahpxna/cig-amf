@@ -19,13 +19,16 @@ EXPECTED_ALLOCATION = {
     "Attention-Core", "Oracle-C-Core", "Full-Explicit",
 }
 EXPECTED_PAIR = {
-    "Aggregate", "Explicit-FF-BC", "Recurrent-BC", "Recurrent-BC-CD",
+    "Full-Explicit-Reference", "Shared-Neighbor-State", "Pooled-Neighbor", "Explicit-FF-BC", "Recurrent-BC", "Recurrent-BC-CD",
     "Recurrent-BC-CD-NoWarmStart", "Recurrent-BC-CD-Contrastive",
 }
 EXPECTED_PERIPHERY = {
     "Full-Explicit", "Semantic-Free", "Semantic-Only", "Unconstrained", "No-Aux", "Single-Mean",
+    "Attention-Mean", "AbsD-Pooling",
 }
-EXPECTED_SCALING = {"Full-Explicit", "Semantic-Free", "Single-Mean"}
+EXPECTED_SCALING = {
+    "PureMeanField", "Attention-Mean", "Full-Explicit", "Semantic-Free", "Single-Mean",
+}
 
 
 def _atomic_json(path, payload):
@@ -126,6 +129,14 @@ def validate(run_root, expected_seeds, protocol_mode):
         allocation, "C-Core", "Attention-Core", "selector_oracle_f1",
         panel="selector_isolation",
     )
+    c_vs_random = _paired(
+        allocation, "C-Core", "Random-Core", "selector_oracle_f1",
+        panel="selector_isolation",
+    )
+    c_vs_correlation = _paired(
+        allocation, "C-Core", "Correlation-Core", "selector_oracle_f1",
+        panel="selector_isolation",
+    )
     oracle_vs_random = _paired(
         allocation, "Oracle-C-Core", "Random-Core", "selector_oracle_f1",
         panel="selector_isolation",
@@ -157,15 +168,15 @@ def validate(run_root, expected_seeds, protocol_mode):
     )
     pair_logit = [-value for value in _paired(
         pair_rows, "Recurrent-BC-CD-Contrastive", "Recurrent-BC",
-        "policy_logit_l2_to_cd_contrastive",
+        "policy_logit_l2_to_full_explicit",
     )]
     pair_value = [-value for value in _paired(
         pair_rows, "Recurrent-BC-CD-Contrastive", "Recurrent-BC",
-        "value_mae_to_cd_contrastive",
+        "value_mae_to_full_explicit",
     )]
     pair_action = _paired(
         pair_rows, "Recurrent-BC-CD-Contrastive", "Recurrent-BC",
-        "action_agreement_to_cd_contrastive",
+        "action_agreement_to_full_explicit",
     )
     warm_start_transient = [-value for value in _paired(
         pair_rows, "Recurrent-BC-CD", "Recurrent-BC-CD-NoWarmStart",
@@ -205,8 +216,18 @@ def validate(run_root, expected_seeds, protocol_mode):
         periphery_rows, "Semantic-Free", "Single-Mean",
         "representation_memory_bytes",
     )]
+    semantic_vs_unconstrained = _paired(
+        periphery_rows, "Semantic-Free", "Unconstrained", "mean_reward"
+    )
+    capacity_vs_absd_pooling = _paired(
+        periphery_rows, "Semantic-Free", "AbsD-Pooling", "mean_reward"
+    )
+    semantic_vs_attention_mean = _paired(
+        periphery_rows, "Semantic-Free", "Attention-Mean", "mean_reward"
+    )
     agent_counts = sorted({int(row["n_agents"]) for row in scaling_rows})
     scaling_pareto = []
+    semantic_frontier_flags = []
     for n_agents in agent_counts:
         by_variant = {}
         for row in scaling_rows:
@@ -218,24 +239,51 @@ def validate(run_root, expected_seeds, protocol_mode):
         semantic = by_variant["Semantic-Free"]
         single = by_variant["Single-Mean"]
         full = by_variant["Full-Explicit"]
-        if set(semantic) != set(single) or set(semantic) != set(full):
+        pure = by_variant["PureMeanField"]
+        if set(semantic) != set(single) or set(semantic) != set(full) or set(semantic) != set(pure):
             raise ValueError(f"scaling seeds are unpaired at N={n_agents}")
         for seed in sorted(semantic):
+            points = {
+                variant: {
+                    "reward": float(values[seed]["mean_reward"]),
+                    "throughput": float(values[seed]["throughput_total"]),
+                    "memory": float(values[seed]["representation_memory_bytes"]),
+                }
+                for variant, values in by_variant.items()
+            }
+            subject = points["Semantic-Free"]
+            dominated = any(
+                other != "Semantic-Free"
+                and candidate["reward"] >= subject["reward"]
+                and candidate["throughput"] >= subject["throughput"]
+                and candidate["memory"] <= subject["memory"]
+                and (
+                    candidate["reward"] > subject["reward"]
+                    or candidate["throughput"] > subject["throughput"]
+                    or candidate["memory"] < subject["memory"]
+                )
+                for other, candidate in points.items()
+            )
+            semantic_frontier_flags.append(0.0 if dominated else 1.0)
             scaling_pareto.append({
                 "n_agents": n_agents,
                 "seed": seed,
                 "reward_vs_single": float(semantic[seed]["mean_reward"]) - float(single[seed]["mean_reward"]),
                 "throughput_vs_full": float(semantic[seed]["throughput_total"]) - float(full[seed]["throughput_total"]),
                 "memory_vs_full": float(full[seed]["representation_memory_bytes"]) - float(semantic[seed]["representation_memory_bytes"]),
+                "reward_vs_pure_mean_field": float(semantic[seed]["mean_reward"]) - float(pure[seed]["mean_reward"]),
             })
     pareto_reward = [row["reward_vs_single"] for row in scaling_pareto]
     pareto_throughput = [row["throughput_vs_full"] for row in scaling_pareto]
     pareto_memory = [row["memory_vs_full"] for row in scaling_pareto]
+    pareto_pure_mean = [row["reward_vs_pure_mean_field"] for row in scaling_pareto]
     metrics = {
         "c_core_minus_absd_selector_f1": c_vs_d,
         "c_core_minus_absd_disagreement_f1": c_vs_d_disagreement,
         "c_core_minus_absd_selector_ndcg": c_vs_d_ndcg,
         "c_core_minus_attention_selector_f1": c_vs_attention,
+        "c_core_minus_random_selector_f1": c_vs_random,
+        "c_core_minus_correlation_selector_f1": c_vs_correlation,
         "oracle_minus_random_selector_f1": oracle_vs_random,
         "c_core_minus_absd_reward": c_reward_vs_d,
         "c_core_minus_absd_logit_fidelity_error": c_logit_vs_d,
@@ -252,9 +300,14 @@ def validate(run_root, expected_seeds, protocol_mode):
         "semantic_free_minus_single_mean_value_fidelity_error": periphery_value,
         "semantic_free_minus_single_mean_action_agreement": periphery_action,
         "semantic_free_minus_single_mean_memory_bytes": periphery_memory,
+        "semantic_free_minus_unconstrained_reward": semantic_vs_unconstrained,
+        "capacity_pooling_minus_absD_pooling_reward": capacity_vs_absd_pooling,
+        "semantic_free_minus_attention_mean_reward": semantic_vs_attention_mean,
         "scaling_semantic_minus_single_reward": pareto_reward,
         "scaling_semantic_minus_full_throughput": pareto_throughput,
         "scaling_full_minus_semantic_memory_bytes": pareto_memory,
+        "scaling_semantic_minus_pure_mean_field_reward": pareto_pure_mean,
+        "scaling_semantic_pareto_nondominated": semantic_frontier_flags,
     }
     cis = {
         key: VC._bootstrap_mean_ci(value, seed=4100 + index)
@@ -269,6 +322,12 @@ def validate(run_root, expected_seeds, protocol_mode):
         ][0] > 0.0,
         "C_selector_beats_attention_at_equal_budget": cis[
             "c_core_minus_attention_selector_f1"
+        ][0] > 0.0,
+        "C_selector_beats_random_at_equal_budget": cis[
+            "c_core_minus_random_selector_f1"
+        ][0] > 0.0,
+        "C_selector_beats_correlation_at_equal_budget": cis[
+            "c_core_minus_correlation_selector_f1"
         ][0] > 0.0,
         "oracle_selector_beats_random_at_equal_budget": cis[
             "oracle_minus_random_selector_f1"
@@ -311,11 +370,21 @@ def validate(run_root, expected_seeds, protocol_mode):
         "semantic_free_memory_uses_no_more_representation_memory": cis[
             "semantic_free_minus_single_mean_memory_bytes"
         ][0] >= 0.0,
-        "semantic_memory_reward_compute_pareto_over_scaling_panel": (
-            cis["scaling_semantic_minus_single_reward"][0] > 0.0
-            and cis["scaling_semantic_minus_full_throughput"][0] > 0.0
-            and cis["scaling_full_minus_semantic_memory_bytes"][0] >= 0.0
+        "semantic_routing_beats_unconstrained_soft_slots": cis[
+            "semantic_free_minus_unconstrained_reward"
+        ][0] > 0.0,
+        "capacity_pooling_beats_absD_weighted_pooling": cis[
+            "capacity_pooling_minus_absD_pooling_reward"
+        ][0] > 0.0,
+        "semantic_memory_beats_attention_weighted_aggregate": cis[
+            "semantic_free_minus_attention_mean_reward"
+        ][0] > 0.0,
+        "semantic_memory_extends_reward_compute_pareto_frontier": (
+            cis["scaling_semantic_pareto_nondominated"][0] > 0.5
         ),
+        "semantic_memory_beats_pure_mean_field_on_scaling_panel": cis[
+            "scaling_semantic_minus_pure_mean_field_reward"
+        ][0] > 0.0,
     }
     supported = all(conditions.values())
     return {

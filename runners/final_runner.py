@@ -177,6 +177,7 @@ class FinalCIGAMFRunner:
             out_dim=self.periph_dim,
             mu_floor=cfg.get("periph_mu_floor", 0.02),
             beta_floor=cfg.get("periph_beta_floor", 0.05),
+            beta_mode=cfg.get("periph_beta_mode", "capacity"),
             semantic_mass=cfg.get("periph_semantic_mass", 0.5),
             use_uniform_mix=cfg.get("periph_use_uniform_mix", True),
             uniform_mix=cfg.get("periph_uniform_mix", 0.25),
@@ -1869,12 +1870,16 @@ class FinalCIGAMFRunner:
                     target_size=target_size,
                 )
 
-            if bool(self.cfg.get("pair_warm_start", True)):
-                self.pair_rel_module.warm_start_if_promoted(ego, promoted)
-
             total_promoted += len(promoted)
             total_demoted += len(demoted)
 
+        self.pair_rel_module.reconcile_core_sets(
+            {
+                ego: module.get_core_set()
+                for ego, module in self.belief_modules.items()
+            },
+            warm_start=bool(self.cfg.get("pair_warm_start", True)),
+        )
         self._latest_direction_matrix = direction_matrix
         return int(total_promoted), int(total_demoted), influence_matrix
 

@@ -33,7 +33,13 @@ from models.ego_conditioned_latent import pair_specificity_score
 
 
 VARIANTS = {
-    "Aggregate": {"pair_state_mode": "aggregate", "heads_w_influence": 0.0,
+    "Full-Explicit-Reference": {
+        "pair_state_mode": "recurrent", "heads_w_influence": 1.0,
+        "heads_w_contrastive": 1.0, "full_explicit_reference": True,
+    },
+    "Shared-Neighbor-State": {"pair_state_mode": "aggregate", "heads_w_influence": 0.0,
+                  "heads_w_contrastive": 0.0},
+    "Pooled-Neighbor": {"pair_state_mode": "pooled", "heads_w_influence": 0.0,
                   "heads_w_contrastive": 0.0},
     "Explicit-FF-BC": {"pair_state_mode": "feedforward", "heads_w_influence": 0.0,
                        "heads_w_contrastive": 0.0},
@@ -150,13 +156,13 @@ def _latent_profile_geometry(runner):
 
 def _decision_fidelity(probe, reference):
     return {
-        "policy_logit_l2_to_cd_contrastive": float(np.mean(
+        "policy_logit_l2_to_full_explicit": float(np.mean(
             (probe["logits"] - reference["logits"]) ** 2
         ) ** 0.5),
-        "value_mae_to_cd_contrastive": float(np.mean(np.abs(
+        "value_mae_to_full_explicit": float(np.mean(np.abs(
             probe["values"] - reference["values"]
         ))),
-        "action_agreement_to_cd_contrastive": float(np.mean(
+        "action_agreement_to_full_explicit": float(np.mean(
             probe["actions"] == reference["actions"]
         )),
     }
@@ -201,23 +207,54 @@ def _run_variant(
     RE.set_global_seed(seed)
     cfg = _base_cfg(seed, core_budget)
     cfg.update(VARIANTS[name])
+    if bool(cfg.get("full_explicit_reference", False)):
+        cfg["core_selection_mode"] = "full_explicit"
     runner = RE.make_runner("Final-CIGAMF", _env(seed), cfg, device)
     _restore_frozen_learning_checkpoint(runner, checkpoint)
     runner.oracle_capacity_scores_by_ego = oracle_capacity
     runner.pair_rel_module.state_mode = cfg["pair_state_mode"]
+    if bool(cfg.get("full_explicit_reference", False)):
+        for belief in runner.belief_modules.values():
+            belief.max_core_size = len(belief.neighbor_ids)
+            belief.set_fixed_core(belief.neighbor_ids)
+        runner.pair_rel_module.reconcile_core_sets(
+            {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()},
+            warm_start=bool(cfg.get("pair_warm_start", True)),
+        )
+    else:
+        for ego, belief in runner.belief_modules.items():
+            scores = oracle_capacity.get(int(ego), {})
+            ranked = sorted(
+                belief.neighbor_ids,
+                key=lambda neighbor: float(scores.get(int(neighbor), 0.0)),
+                reverse=True,
+            )
+            belief.set_fixed_core(ranked[:int(core_budget)])
+        runner.pair_rel_module.reconcile_core_sets(
+            {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()},
+            warm_start=bool(cfg.get("pair_warm_start", True)),
+        )
     history = runner.run(n_episodes=int(episodes), eval_every=10)
     specificity = pair_specificity_score(runner.pair_rel_module, runner.n_agents)
     core_sizes = [
         len(module.get_core_set()) for module in runner.belief_modules.values()
     ]
-    if any(size != int(core_budget) for size in core_sizes):
+    expected_size = (
+        runner.n_agents - 1 if bool(cfg.get("full_explicit_reference", False))
+        else int(core_budget)
+    )
+    if any(size != expected_size for size in core_sizes):
         raise RuntimeError(f"{name}/seed={seed} violated fixed oracle core")
     row = {
         "variant": name,
         "seed": int(seed),
         "episodes": int(episodes),
         "core_budget": int(core_budget),
-        "core_contract": "oracle_fixed_equal_budget",
+        "core_contract": (
+            "full_explicit_reference"
+            if bool(cfg.get("full_explicit_reference", False))
+            else "oracle_fixed_equal_budget"
+        ),
         "checkpoint_sha256": checkpoint["sha256"],
         "pair_state_mode": cfg["pair_state_mode"],
         "w_cd": float(cfg["heads_w_influence"]),
@@ -266,14 +303,14 @@ def main(argv=None):
                 name, seed, args.episodes, args.core_budget, args.device,
                 checkpoint, oracle_capacity,
             )
-        reference_name = "Recurrent-BC-CD-Contrastive"
+        reference_name = "Full-Explicit-Reference"
         reference = variants.get(reference_name, (None, None))[1]
         for name, (row, probe) in variants.items():
             if reference is None:
                 row.update({
-                    "policy_logit_l2_to_cd_contrastive": float("nan"),
-                    "value_mae_to_cd_contrastive": float("nan"),
-                    "action_agreement_to_cd_contrastive": float("nan"),
+                    "policy_logit_l2_to_full_explicit": float("nan"),
+                    "value_mae_to_full_explicit": float("nan"),
+                    "action_agreement_to_full_explicit": float("nan"),
                 })
                 row["decision_fidelity_reference"] = "not_collected"
             else:

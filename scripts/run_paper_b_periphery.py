@@ -48,6 +48,14 @@ VARIANTS = {
         "periph_lb_coeff": 0.0, "periph_orth_coeff": 0.0,
     },
     "Single-Mean": {"runner": "single", "num_memory_slots": 6},
+    "Attention-Mean": {
+        "runner": "single", "num_memory_slots": 6,
+        "periph_beta_mode": "attention",
+    },
+    "AbsD-Pooling": {
+        "runner": "multi", "num_memory_slots": 6,
+        "periph_beta_mode": "abs_direction",
+    },
 }
 
 
@@ -70,9 +78,9 @@ def _representation_memory_bytes(runner):
         parameter.numel() * parameter.element_size()
         for parameter in runner.periph_module.parameters()
     )
-    pair_state_bytes = (
-        runner.n_agents * max(0, runner.n_agents - 1)
-        * runner.pair_rel_module.hidden_dim * 4
+    state_stats = runner.pair_rel_module.get_debug_stats()
+    pair_state_bytes = int(
+        state_stats["full_state_bytes"] + state_stats["shadow_state_bytes"]
     )
     return int(periph_bytes + pair_state_bytes)
 
@@ -149,6 +157,9 @@ def _seed_oracle_core(runner, core_budget, table, full_explicit=False):
         belief.set_fixed_core(
             belief.neighbor_ids if full_explicit else ranked[:int(core_budget)]
         )
+    runner.pair_rel_module.reconcile_core_sets(
+        {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()}
+    )
 
 
 def _oracle_capacity_table(seed, checkpoint, core_budget, device, n_states=2):
