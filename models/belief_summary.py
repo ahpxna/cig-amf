@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 import torch.nn as nn
+
+from envs.causal_adapter import resolve_env_adapter
 import torch.nn.functional as F
 
 
@@ -79,13 +81,13 @@ Follow paper:
         ego_id = int(ego_id)
         j = int(j)
 
-        pi = env.positions[ego_id]
-        pj = env.positions[j]
-
         b = belief_state[j]
-
-        grid_den = max(1, int(env.grid_size))
-        zone_den = max(1, int(env.n_zones) - 1)
+        pair = np.asarray(
+            resolve_env_adapter(env).pair_features(ego_id, j),
+            dtype=np.float32,
+        )
+        if pair.size < 5:
+            raise ValueError("adapter pair_features must expose five base channels")
 
         return np.array(
             [
@@ -94,9 +96,9 @@ Follow paper:
                 float(b["p_core"]),
                 float(b["in_core"]),
                 float(b["in_seed_core"]),
-                float((pj[0] - pi[0]) / grid_den),
-                float((pj[1] - pi[1]) / grid_den),
-                float((env.agent_zone[j] - env.agent_zone[ego_id]) / zone_den),
+                float(pair[0]),
+                float(pair[1]),
+                float(pair[4]),
                 float(0.0 if pair_latent_norm is None else pair_latent_norm),
             ],
             dtype=np.float32,

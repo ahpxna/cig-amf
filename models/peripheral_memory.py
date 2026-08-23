@@ -89,6 +89,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from envs.causal_adapter import resolve_env_adapter
+
 from models.influence_signature import (
     N_SEMANTIC_ROLES,
     ROLE_ANOMALOUS,
@@ -1024,9 +1026,7 @@ class PeripheralMultiMemory(nn.Module):
         if len(ids) == 0:
             return np.zeros((0, self.item_dim), dtype=np.float32)
 
-        pi = env.positions[ego_id]
-        grid_den = max(1, int(env.grid_size))
-        zone_den = max(1, int(env.n_zones) - 1)
+        adapter = resolve_env_adapter(env)
 
         last_actions = getattr(
             env, "last_actions", [0] * int(env.n_agents)
@@ -1037,7 +1037,13 @@ class PeripheralMultiMemory(nn.Module):
         legacy_count = 0
 
         for j in ids:
-            pj = env.positions[j]
+            pair = np.asarray(
+                adapter.pair_features(ego_id, j), dtype=np.float32
+            )
+            if pair.size < 5:
+                raise ValueError(
+                    "adapter pair_features must expose five base channels"
+                )
             b = belief_state[j]
 
             action_j = int(np.clip(int(last_actions[j]), 0, self.action_dim - 1))
@@ -1092,10 +1098,10 @@ class PeripheralMultiMemory(nn.Module):
                     if context_validity is None
                     else context_validity.get(int(j), 0.0)
                 ),
-                float((pj[0] - pi[0]) / grid_den),
-                float((pj[1] - pi[1]) / grid_den),
-                float((env.agent_zone[j] - env.agent_zone[ego_id]) / zone_den),
-                float(abs(pj[0] - pi[0]) + abs(pj[1] - pi[1])) / grid_den,
+                float(pair[0]),
+                float(pair[1]),
+                float(pair[4]),
+                float(pair[2]),
             ])
 
         self.signature_full_items_seen += int(full_count)

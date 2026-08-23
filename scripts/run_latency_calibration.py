@@ -14,7 +14,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from envs.omni_arena import OmniArena
-from models.structural_proxy import build_pair_feat
 import run_experiment as RE
 try:
     from run_latency_oracle import _rank_correlation
@@ -102,6 +101,12 @@ def run(seed, train_episodes, states, horizon, trials, device):
                 )
                 for source in sources
             ]
+            context_item_pairs = [
+                runner._raw_proxy_context_items_excluding(
+                    ego, source, current_actions=actions
+                )
+                for source in sources
+            ]
             out = runner.proxy.score_batch_full(
                 obs_i_batch=[env.get_obs_of_ego(obs_all, ego) for _ in sources],
                 action_i_batch=[actions[ego] for _ in sources],
@@ -110,12 +115,19 @@ def run(seed, train_episodes, states, horizon, trials, device):
                 m_periph_excl_j_batch=[context[1] for context in contexts],
                 belief_summary_batch=[belief_summary for _ in sources],
                 pair_feat_batch=[
-                    build_pair_feat(
-                        env.positions, env.agent_zone, env.grid_size, env.n_zones,
-                        ego, source, agent_role=env.agent_role,
-                    )
+                    runner.env_adapter.pair_features(ego, source)
                     for source in sources
                 ],
+                context_items_batch=np.stack(
+                    [pair[0] for pair in context_item_pairs], axis=0
+                ),
+                context_mask_batch=np.stack(
+                    [pair[1] for pair in context_item_pairs], axis=0
+                ),
+                valid_action_mask_batch=np.stack([
+                    runner.env_adapter.valid_action_mask(source)
+                    for source in sources
+                ], axis=0),
             )
             for source_index, source in enumerate(sources):
                 oracle = _oracle_spectrum(

@@ -8,9 +8,8 @@ import torch.nn.functional as F
 
 from models.structural_proxy import (
     LocalCounterfactualProxyEnsemble,
-    build_pair_feat,   # [FIX-X1]
-    PAIR_FEAT_DIM,
 )
+from envs.causal_adapter import resolve_env_adapter
 from models.belief_layer import BayesLightBeliefState
 from models.core_behavior import PairRelationalModule
 from models.peripheral_memory import PeripheralMultiMemory
@@ -60,11 +59,17 @@ def _scripted_execution_distribution(env, agent_id, action_dim):
     return np.full(int(action_dim), 1.0 / float(action_dim), dtype=np.float32)
 
 
-def _adapt_executed_policy(env, cfg, learned_probs):
+def _adapt_executed_policy(env, cfg, learned_probs, valid_action_masks=None):
     """Controlled H2 action-policy intervention for non-causal baselines."""
     learned = np.asarray(learned_probs, dtype=np.float32)
     n_agents, action_dim = learned.shape
-    learned = np.clip(learned, 0.0, None)
+    if valid_action_masks is None:
+        valid = np.ones_like(learned, dtype=bool)
+    else:
+        valid = np.asarray(valid_action_masks, dtype=bool)
+        if valid.shape != learned.shape or np.any(valid.sum(axis=1) == 0):
+            raise ValueError("invalid baseline action masks")
+    learned = np.where(valid, np.clip(learned, 0.0, None), 0.0)
     learned = learned / np.clip(learned.sum(axis=1, keepdims=True), 1e-12, None)
     requested = float(cfg.get("behavioral_adapter_lambda", 0.0))
     active = requested > 0.0 and (
@@ -76,6 +81,8 @@ def _adapt_executed_policy(env, cfg, learned_probs):
         [_scripted_execution_distribution(env, agent, action_dim) for agent in range(n_agents)],
         axis=0,
     )
+    scripted = np.where(valid, scripted, 0.0)
+    scripted = scripted / np.clip(scripted.sum(axis=1, keepdims=True), 1e-12, None)
     target_ids = cfg.get("behavioral_adapter_target_agents")
     target_roles = cfg.get("behavioral_adapter_target_roles")
     target_mask = np.zeros(n_agents, dtype=bool)
@@ -98,6 +105,8 @@ def _adapt_executed_policy(env, cfg, learned_probs):
         executed[target_mask] = (
             (1.0 - lam) * learned[target_mask] + lam * scripted[target_mask]
         )
+    executed = np.where(valid, executed, 0.0)
+    executed = executed / np.clip(executed.sum(axis=1, keepdims=True), 1e-12, None)
     executed = executed / np.clip(executed.sum(axis=1, keepdims=True), 1e-12, None)
     eps = 1e-12
     kl = np.sum(executed * (np.log(np.clip(executed, eps, 1.0))
@@ -141,12 +150,13 @@ class PureMeanFieldRunner:
 
     def __init__(self, env, cfg, device="cpu"):
         self.env = env
+        self.env_adapter = resolve_env_adapter(env)
         self.cfg = dict(cfg)
         self.device = device
 
-        self.n_agents = int(env.n_agents)
-        self.obs_dim = int(env.get_obs_dim())
-        self.action_dim = int(env.get_action_dim())
+        self.n_agents = int(self.env_adapter.n_agents)
+        self.obs_dim = int(self.env_adapter.obs_dim)
+        self.action_dim = int(self.env_adapter.max_action_dim)
 
         self.hidden = int(cfg.get("policy_hidden", 160))
         self.discount = float(cfg.get("discount", 0.95))
@@ -241,7 +251,7 @@ class PureMeanFieldRunner:
         mf_batch = []
 
         for ego in range(self.n_agents):
-            obs_batch.append(self.env.get_obs_of_ego(obs_all, ego))
+            obs_batch.append(self.env_adapter.observation(obs_all, ego))
             mf_batch.append(self._neighbor_mean_action(last_actions, ego))
 
         obs_t = torch.tensor(np.stack(obs_batch), dtype=torch.float32, device=self.device)
@@ -249,13 +259,23 @@ class PureMeanFieldRunner:
 
         with torch.no_grad():
             logits, values = self._forward(obs_t, mf_t)
+            valid_action_masks = np.stack([
+                self.env_adapter.valid_action_mask(agent)
+                for agent in range(self.n_agents)
+            ], axis=0)
+            valid_t = torch.tensor(
+                valid_action_masks, dtype=torch.bool, device=logits.device
+            )
+            logits = logits.masked_fill(~valid_t, -torch.inf)
             probs = torch.softmax(logits, dim=-1)
             learned_probs = probs.detach().cpu().numpy()
 
         executed_probs, diagnostics = _adapt_executed_policy(
-            self.env, self.cfg, learned_probs
+            self.env, self.cfg, learned_probs,
+            valid_action_masks=valid_action_masks,
         )
         self._last_execution_policy_probs = executed_probs
+        self._last_valid_action_masks = valid_action_masks
         sampled = [
             int(np.random.choice(self.action_dim, p=executed_probs[ego]))
             for ego in range(self.n_agents)
@@ -267,7 +287,7 @@ class PureMeanFieldRunner:
         return actions, values_np, mf_batch
 
     def collect_episode(self):
-        obs_all = self.env.reset()
+        obs_all = self.env_adapter.reset()
 
         done = False
         trajectory = []
@@ -278,9 +298,9 @@ class PureMeanFieldRunner:
         while not done:
             actions, values_np, mf_batch = self._select_actions_population(obs_all)
 
-            env_snapshot_before_step = self.env.clone_state()
-            next_obs_all, rewards, done, info = self.env.step(actions)
-            env_snapshot_after_step = self.env.clone_state()
+            env_snapshot_before_step = self.env_adapter.clone_state()
+            next_obs_all, rewards, done, info = self.env_adapter.step(actions)
+            env_snapshot_after_step = self.env_adapter.clone_state()
 
             rewards = np.array(rewards, dtype=np.float32)
             ep_reward += rewards
@@ -295,6 +315,9 @@ class PureMeanFieldRunner:
                     "execution_policy_probs": np.asarray(
                         getattr(self, "_last_execution_policy_probs", []),
                         dtype=np.float32,
+                    ),
+                    "valid_action_masks": np.asarray(
+                        self._last_valid_action_masks, dtype=bool
                     ),
                     "env_snapshot_before_step": env_snapshot_before_step,
                     "env_snapshot_after_step": env_snapshot_after_step,
@@ -353,7 +376,7 @@ class PureMeanFieldRunner:
             returns_batch = []
 
             for ego in range(self.n_agents):
-                obs_batch.append(self.env.get_obs_of_ego(step["obs_all"], ego))
+                obs_batch.append(self.env_adapter.observation(step["obs_all"], ego))
                 mf_batch.append(step["mean_field_context"][ego])
                 actions_batch.append(int(step["actions"][ego]))
                 returns_batch.append(float(returns[t][ego]))
@@ -364,6 +387,12 @@ class PureMeanFieldRunner:
             ret_t = torch.tensor(returns_batch, dtype=torch.float32, device=self.device)
 
             logits, value = self._forward(obs_t, mf_t)
+            valid_t = torch.tensor(
+                np.asarray(step["valid_action_masks"], dtype=bool),
+                dtype=torch.bool,
+                device=logits.device,
+            )
+            logits = logits.masked_fill(~valid_t, -torch.inf)
             probs = torch.softmax(logits, dim=-1)
             dist = torch.distributions.Categorical(probs=probs)
 
@@ -1270,6 +1299,7 @@ class SharedAblationBase:
         use_two_timescale=True,
     ):
         self.env = env
+        self.env_adapter = resolve_env_adapter(env)
         self.cfg = dict(cfg)
         self.device = device
         self.name = str(name)
@@ -1278,9 +1308,9 @@ class SharedAblationBase:
         self.use_multi_memory = bool(use_multi_memory)
         self.use_two_timescale = bool(use_two_timescale)
 
-        self.n_agents = int(env.n_agents)
-        self.obs_dim = int(env.get_obs_dim())
-        self.action_dim = int(env.get_action_dim())
+        self.n_agents = int(self.env_adapter.n_agents)
+        self.obs_dim = int(self.env_adapter.obs_dim)
+        self.action_dim = int(self.env_adapter.max_action_dim)
 
         self.core_dim = int(cfg["core_dim"])
         self.periph_dim = int(cfg["periph_dim"])
@@ -1293,6 +1323,12 @@ class SharedAblationBase:
                 "causal_horizon and proxy_n_horizons must be identical: "
                 f"received {causal_horizon} and {proxy_horizon}"
             )
+        proxy_pair_feat_dim = cfg.get("proxy_pair_feat_dim")
+        if proxy_pair_feat_dim is None:
+            proxy_pair_feat_dim = self.env_adapter.pair_feature_dim
+        proxy_context_item_dim = cfg.get("proxy_context_item_dim")
+        if proxy_context_item_dim is None:
+            proxy_context_item_dim = self.env_adapter.context_item_dim
 
         self.proxy = LocalCounterfactualProxyEnsemble(
             obs_dim=self.obs_dim,
@@ -1300,7 +1336,8 @@ class SharedAblationBase:
             core_dim=self.core_dim,
             periph_dim=self.periph_dim,
             belief_dim=self.belief_dim,
-            pair_feat_dim=cfg.get("proxy_pair_feat_dim", PAIR_FEAT_DIM),  # [FIX-X1]
+            pair_feat_dim=proxy_pair_feat_dim,
+            context_item_dim=proxy_context_item_dim,
             n_ensemble=cfg["n_ensemble"],
             lr=cfg["proxy_lr"],
             buffer_size=cfg.get("proxy_buffer_size", 200000),
@@ -1344,6 +1381,12 @@ class SharedAblationBase:
             use_uniform_mix=cfg.get("periph_use_uniform_mix", True),
             uniform_mix=cfg.get("periph_uniform_mix", 0.25),
             lb_coeff=cfg.get("periph_lb_coeff", 0.5),
+            orth_coeff=cfg.get("periph_orth_coeff", 1e-2),
+            # Shared legacy ablations do not own an influence-signature
+            # tracker. Their peripheral input is therefore explicitly marked
+            # as derived rather than being misreported as a full 5D treatment.
+            require_full_signature=False,
+            allow_legacy_items=True,
         ).to(device)
 
         self.single_periph_proj = nn.Sequential(
@@ -1478,31 +1521,13 @@ class SharedAblationBase:
             return BayesLightBeliefState(**common_kwargs)
 
     def _compute_weak_prior_scores(self, ego):
-        role_bonus = {
-            "hauler": 0.20,
-            "processor": 0.26,
-            "dispatcher": 0.24,
-            "sweeper": 0.10,
-            "spoiler": 0.08,
-        }
-
-        pi = self.env.positions[int(ego)]
-        zi = self.env.agent_zone[int(ego)]
         scores = {}
 
         for j in range(self.n_agents):
             if j == ego:
                 continue
 
-            pj = self.env.positions[int(j)]
-            zj = self.env.agent_zone[int(j)]
-            dist = abs(pj[0] - pi[0]) + abs(pj[1] - pi[1])
-
-            proximity = 1.0 / (1.0 + float(dist))
-            same_zone = 0.25 if int(zi) == int(zj) else 0.0
-            role_term = role_bonus.get(self.env.agent_role[int(j)], 0.0)
-
-            scores[j] = float(proximity + same_zone + role_term)
+            scores[j] = float(self.env_adapter.weak_prior_score(ego, j))
 
         return scores
 
@@ -1686,48 +1711,58 @@ class SharedAblationBase:
         memory, and pair latents may not.  This prevents an ablation from
         reintroducing the ``proxy -> partition -> proxy`` feedback path.
         """
+        adapter = getattr(self, "env_adapter", None)
+        if adapter is None:
+            adapter = resolve_env_adapter(self.env, action_dim=self.action_dim)
+        table, mask = self._raw_proxy_context_items_excluding(
+            ego, exclude_j, current_actions=current_actions
+        )
+        active = table[np.asarray(mask, dtype=bool)]
+        if active.size == 0:
+            summary = np.zeros(
+                2 * int(adapter.context_item_dim) + 1,
+                dtype=np.float32,
+            )
+        else:
+            summary = np.concatenate([
+                active.sum(axis=0), np.square(active).sum(axis=0), [len(active)]
+            ]).astype(np.float32)
+        return self._split_raw_context(summary)
+
+    def _raw_proxy_context_items_excluding(
+        self, ego, exclude_j, current_actions=None
+    ):
+        """Return adapter-provided items for literal leave-one-out DeepSets."""
+        adapter = getattr(self, "env_adapter", None)
+        if adapter is None:
+            adapter = resolve_env_adapter(self.env, action_dim=self.action_dim)
         ego = int(ego)
         exclude_j = int(exclude_j)
-        pos_i = self.env.positions[ego]
-        zone_i = int(self.env.agent_zone[ego])
-        grid = max(1.0, float(getattr(self.env, "grid_size", 1)))
-        zones = max(1.0, float(getattr(self.env, "n_zones", 1) - 1))
         action_source = (
             current_actions
             if current_actions is not None
             else getattr(self.env, "last_actions", {})
         )
         rows = []
-
         for other in range(self.n_agents):
             if other in (ego, exclude_j):
                 continue
-            pos = self.env.positions[other]
-            drow = (float(pos[0]) - float(pos_i[0])) / grid
-            dcol = (float(pos[1]) - float(pos_i[1])) / grid
-            distance = abs(drow) + abs(dcol)
-            zone_delta = (float(self.env.agent_zone[other]) - zone_i) / zones
-            same_zone = float(int(self.env.agent_zone[other]) == zone_i)
             try:
                 action_index = int(action_source[other])
             except (KeyError, IndexError, TypeError):
                 action_index = 0
-            action_onehot = np.zeros(self.action_dim, dtype=np.float32)
-            action_onehot[int(np.clip(action_index, 0, self.action_dim - 1))] = 1.0
             rows.append(
-                [drow, dcol, distance, same_zone, zone_delta, *action_onehot.tolist()]
+                adapter.neighbour_features(ego, other, action_index)
             )
-
-        table = np.asarray(rows, dtype=np.float32)
-        if table.size == 0:
-            summary = np.zeros(2 * (5 + self.action_dim) + 1, dtype=np.float32)
-        else:
-            summary = np.concatenate(
-                [table.sum(axis=0), np.square(table).sum(axis=0), [len(table)]],
-                axis=0,
-            ).astype(np.float32)
-
-        return self._split_raw_context(summary)
+        if not rows:
+            return (
+                np.zeros((1, adapter.context_item_dim), dtype=np.float32),
+                np.zeros((1,), dtype=np.float32),
+            )
+        table = np.stack(rows, axis=0).astype(np.float32)
+        if table.shape[1] != adapter.context_item_dim:
+            raise RuntimeError("environment adapter context item dimension mismatch")
+        return table, np.ones((table.shape[0],), dtype=np.float32)
 
     def _periph_context_excluding(self, ego, exclude_j):
         if not self.use_multi_memory:
@@ -1762,12 +1797,11 @@ class SharedAblationBase:
             "core_context_excluding": {},
             "periph_context_excluding": {},
             "proxy_context_excluding": {},
+            "proxy_context_items_excluding": {},
             "value_cache": {},
             # [FIX-X1] Match final_runner by capturing geometry at this
             # timestep so replay_builder constructs time-aligned x_ij.
-            "geom_snapshot": _ordered_geometry_snapshot(
-                self.env, self.n_agents
-            ),
+            "geom_snapshot": self.env_adapter.feature_snapshot(),
         }
 
         obs_batch = []
@@ -1799,6 +1833,7 @@ class SharedAblationBase:
             cache["core_context_excluding"][ego] = {}
             cache["periph_context_excluding"][ego] = {}
             cache["proxy_context_excluding"][ego] = {}
+            cache["proxy_context_items_excluding"][ego] = {}
 
             for j in range(self.n_agents):
                 if j == ego:
@@ -1817,8 +1852,11 @@ class SharedAblationBase:
                     ego,
                     j,
                 )
+                cache["proxy_context_items_excluding"][ego][j] = (
+                    self._raw_proxy_context_items_excluding(ego, j)
+                )
 
-            obs_batch.append(self.env.get_obs_of_ego(obs_all, ego))
+            obs_batch.append(self.env_adapter.observation(obs_all, ego))
             core_batch.append(core_summary_np)
             periph_batch.append(periph_summary_np)
             belief_batch.append(belief_summary_np)
@@ -1830,6 +1868,14 @@ class SharedAblationBase:
 
         with torch.no_grad():
             logits, values = self.policy_value(obs_t, core_t, periph_t, belief_t)
+            valid_action_masks = np.stack([
+                self.env_adapter.valid_action_mask(agent)
+                for agent in range(self.n_agents)
+            ], axis=0)
+            valid_t = torch.tensor(
+                valid_action_masks, dtype=torch.bool, device=logits.device
+            )
+            logits = logits.masked_fill(~valid_t, -torch.inf)
             probs = torch.softmax(logits, dim=-1)
             dist = torch.distributions.Categorical(probs=probs)
             sampled = dist.sample().detach().cpu().numpy()
@@ -1847,11 +1893,18 @@ class SharedAblationBase:
                             ego, j, current_actions=actions_list
                         )
                     )
+                    cache["proxy_context_items_excluding"][ego][j] = (
+                        self._raw_proxy_context_items_excluding(
+                            ego, j, current_actions=actions_list
+                        )
+                    )
+
+        cache["valid_action_masks"] = valid_action_masks
 
         return actions, cache
 
     def collect_episode(self):
-        obs_all = self.env.reset()
+        obs_all = self.env_adapter.reset()
 
         if self.scheduler.in_warmup():
             for ego in range(self.n_agents):
@@ -1873,11 +1926,11 @@ class SharedAblationBase:
             actions_dict, cache = self._select_actions_population(obs_all)
             actions_list = [actions_dict[a] for a in range(self.n_agents)]
 
-            env_snapshot_before_step = self.env.clone_state()
+            env_snapshot_before_step = self.env_adapter.clone_state()
             h_snapshot_before_latent_update = self.pair_rel_module.clone_full_states_np()
 
-            next_obs_all, rewards, done, info = self.env.step(actions_list)
-            env_snapshot_after_step = self.env.clone_state()
+            next_obs_all, rewards, done, info = self.env_adapter.step(actions_list)
+            env_snapshot_after_step = self.env_adapter.clone_state()
 
             rewards = np.array(rewards, dtype=np.float32)
             ep_reward += rewards
@@ -1895,6 +1948,10 @@ class SharedAblationBase:
                     "core_context_excluding": cache["core_context_excluding"],
                     "periph_context_excluding": cache["periph_context_excluding"],
                     "proxy_context_excluding": cache["proxy_context_excluding"],
+                    "proxy_context_items_excluding": cache[
+                        "proxy_context_items_excluding"
+                    ],
+                    "valid_action_masks": cache["valid_action_masks"],
                     "value_cache": cache["value_cache"],
                     "geom_snapshot": cache["geom_snapshot"],   # [FIX-X1]
                     "env_snapshot_before_step": env_snapshot_before_step,
@@ -1909,7 +1966,7 @@ class SharedAblationBase:
                 and prev_actions is not None
                 and prev_env_snapshot_before_step is not None
             ):
-                self.env.restore_state(prev_env_snapshot_before_step)
+                self.env_adapter.restore_state(prev_env_snapshot_before_step)
 
                 self.pair_rel_module.add_bc_transition(
                     observations={a: prev_obs_all[a] for a in range(self.n_agents)},
@@ -1919,9 +1976,9 @@ class SharedAblationBase:
                     h_prev_snapshot=prev_h_snapshot,
                 )
 
-                self.env.restore_state(env_snapshot_after_step)
+                self.env_adapter.restore_state(env_snapshot_after_step)
 
-            self.env.restore_state(env_snapshot_before_step)
+            self.env_adapter.restore_state(env_snapshot_before_step)
 
             self.pair_rel_module.step_population(
                 obs_all=obs_all,
@@ -1929,7 +1986,7 @@ class SharedAblationBase:
                 env=self.env,
             )
 
-            self.env.restore_state(env_snapshot_after_step)
+            self.env_adapter.restore_state(env_snapshot_after_step)
 
             prev_obs_all = [x.copy() for x in obs_all]
             prev_actions = list(actions_list)
@@ -1967,7 +2024,7 @@ class SharedAblationBase:
             periph_tensors = []
 
             for ego in range(self.n_agents):
-                obs_i = self.env.get_obs_of_ego(step["obs_all"], ego)
+                obs_i = self.env_adapter.observation(step["obs_all"], ego)
 
                 obs_batch.append(obs_i)
                 core_batch.append(step["core_summary_cache"][ego])
@@ -1998,6 +2055,16 @@ class SharedAblationBase:
             periph_t = torch.stack(periph_tensors, dim=0)
 
             logits, value = self.policy_value(obs_t, core_t, periph_t, belief_t)
+            valid_rows = step.get("valid_action_masks")
+            if valid_rows is not None:
+                valid_t = torch.tensor(
+                    np.asarray(valid_rows, dtype=bool),
+                    dtype=torch.bool,
+                    device=logits.device,
+                )
+                if valid_t.shape != logits.shape or not bool(valid_t.any(dim=1).all()):
+                    raise ValueError("trajectory valid-action masks are malformed")
+                logits = logits.masked_fill(~valid_t, -torch.inf)
             probs = torch.softmax(logits, dim=-1)
             dist = torch.distributions.Categorical(probs=probs)
 
@@ -2058,7 +2125,7 @@ class SharedAblationBase:
         total_demoted = 0
 
         for ego in range(self.n_agents):
-            obs_i = self.env.get_obs_of_ego(obs_all, ego)
+            obs_i = self.env_adapter.observation(obs_all, ego)
             action_i = int(actions[ego])
 
             belief_items = self._build_belief_items_for_ego(ego)
@@ -2070,6 +2137,8 @@ class SharedAblationBase:
             z_batch = []
             m_batch = []
             b_batch = []
+            context_items_batch = []
+            context_mask_batch = []
             neighbor_ids = []
 
             for j in range(self.n_agents):
@@ -2084,6 +2153,13 @@ class SharedAblationBase:
                 )
                 z_batch.append(raw_core)
                 m_batch.append(raw_periph)
+                context_items, context_mask = (
+                    self._raw_proxy_context_items_excluding(
+                        ego, j, current_actions=actions
+                    )
+                )
+                context_items_batch.append(context_items)
+                context_mask_batch.append(context_mask)
                 b_batch.append(belief_summary)
                 neighbor_ids.append(j)
 
@@ -2129,14 +2205,15 @@ class SharedAblationBase:
                 # as Final-CIGAMF. Otherwise the comparison confounds the effect
                 # of x_ij with the effect of the ablated mechanism.
                 pair_feat_batch=[
-                    build_pair_feat(
-                        self.env.positions, self.env.agent_zone,
-                        getattr(self.env, "grid_size", 1),
-                        getattr(self.env, "n_zones", 1), ego, j,
-                        agent_role=getattr(self.env, "agent_role", None),
-                    )
+                    self.env_adapter.pair_features(ego, j)
                     for j in neighbor_ids
                 ],
+                context_items_batch=np.stack(context_items_batch, axis=0),
+                context_mask_batch=np.stack(context_mask_batch, axis=0),
+                valid_action_mask_batch=np.stack([
+                    self.env_adapter.valid_action_mask(j)
+                    for j in neighbor_ids
+                ], axis=0),
             )
 
             # C is the standardized response range and is the only signal
@@ -2210,7 +2287,7 @@ class SharedAblationBase:
 
         for idx in step_indices:
             step = trajectory[int(idx)]
-            self.env.restore_state(step["env_snapshot_before_step"])
+            self.env_adapter.restore_state(step["env_snapshot_before_step"])
             observed_returns = h_returns[int(idx)] if h_returns is not None else None
             behaviour_probs = step.get("behaviour_probs") if isinstance(step, dict) else None
 
@@ -2223,7 +2300,7 @@ class SharedAblationBase:
             promoted += int(p_i)
             demoted += int(d_i)
 
-        self.env.restore_state(trajectory[-1]["env_snapshot_after_step"])
+        self.env_adapter.restore_state(trajectory[-1]["env_snapshot_after_step"])
 
         residual = self.proxy.get_latest_residual()
         triggered = int(self.scheduler.record_structural_residual(residual))

@@ -773,6 +773,8 @@ def _matched_change_interval_mask(finite_rows, change_episodes, n_intervals):
 def run_one(
     model, mode, seed, episodes, eval_every, device, out_root, run_id,
     frozen_checkpoint=None,
+    cached_pre_estimand_panel=None,
+    cached_estimand_panel=None,
 ):
     out_dir = os.path.join(out_root, f"{model}_{mode}_seed{seed}")
     os.mkdir(out_dir)
@@ -825,22 +827,26 @@ def run_one(
         min(40, max(0, int(episodes) // 2))
     )
     intervention_episode = intervention_after_episodes + 1
-    pre_estimand_panel = _fixed_estimand_panel(
-        env,
-        structural_factor=False,
-        behavioral_factor=False,
-        seed=seed,
-        horizon=int(cfg["causal_horizon"]),
-        discount=float(cfg["discount"]),
-    )
-    estimand_panel = _fixed_estimand_panel(
-        env,
-        structural_factor=structural_factor,
-        behavioral_factor=behavioral_factor,
-        seed=seed,
-        horizon=int(cfg["causal_horizon"]),
-        discount=float(cfg["discount"]),
-    )
+    pre_estimand_panel = copy.deepcopy(cached_pre_estimand_panel)
+    if pre_estimand_panel is None:
+        pre_estimand_panel = _fixed_estimand_panel(
+            env,
+            structural_factor=False,
+            behavioral_factor=False,
+            seed=seed,
+            horizon=int(cfg["causal_horizon"]),
+            discount=float(cfg["discount"]),
+        )
+    estimand_panel = copy.deepcopy(cached_estimand_panel)
+    if estimand_panel is None:
+        estimand_panel = _fixed_estimand_panel(
+            env,
+            structural_factor=structural_factor,
+            behavioral_factor=behavioral_factor,
+            seed=seed,
+            horizon=int(cfg["causal_horizon"]),
+            discount=float(cfg["discount"]),
+        )
 
     evaluation_egos = _agents_with_roles(env, H2_EVALUATION_EGO_ROLES)
     manipulated_agents = _agents_with_roles(env, H2_MANIPULATED_NEIGHBOR_ROLES)
@@ -1241,6 +1247,92 @@ def _resolve_out_root(value):
     return os.path.abspath(value if os.path.isabs(value) else os.path.join(ROOT, value))
 
 
+def _cached_estimand_panels(seed, run_dir):
+    """Compute model-independent H2 oracle panels once per seed.
+
+    The cloned-state all-action panel depends on the environment seed and the
+    factorial cell, not on a learned model. Reusing the serialized panel keeps
+    every comparator on exactly the same oracle states and removes repeated
+    rollout work from the model loop.
+    """
+    cfg = RE.default_cfg()
+    cache_path = os.path.join(run_dir, f"oracle_panels_seed{int(seed)}.json")
+    if os.path.exists(cache_path):
+        with open(cache_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if (
+            payload.get("protocol_version") == PROTOCOL_VERSION
+            and int(payload.get("seed", -1)) == int(seed)
+            and int(payload.get("horizon", -1)) == int(cfg["causal_horizon"])
+            and np.isclose(float(payload.get("discount", -1.0)), float(cfg["discount"]))
+        ):
+            def _restore_integer_keys(panel):
+                panel = copy.deepcopy(panel)
+                panel["capacity_mean_by_ego"] = {
+                    int(ego): {
+                        int(target): float(value)
+                        for target, value in targets.items()
+                    }
+                    for ego, targets in panel.get(
+                        "capacity_mean_by_ego", {}
+                    ).items()
+                }
+                panel["oracle_core_by_ego"] = {
+                    int(ego): [int(target) for target in targets]
+                    for ego, targets in panel.get(
+                        "oracle_core_by_ego", {}
+                    ).items()
+                }
+                return panel
+
+            return (
+                _restore_integer_keys(payload["pre"]),
+                {
+                    mode: _restore_integer_keys(panel)
+                    for mode, panel in payload["cells"].items()
+                },
+            )
+
+    env = RE.make_main_env(
+        task_mode="S0B0",
+        n_agents=24,
+        max_steps=30,
+        phase_length=40,
+        seed=int(seed),
+        structural_factor=False,
+        behavioral_factor=False,
+    )
+    common = dict(
+        env=env,
+        seed=int(seed),
+        horizon=int(cfg["causal_horizon"]),
+        discount=float(cfg["discount"]),
+    )
+    pre = _fixed_estimand_panel(
+        structural_factor=False, behavioral_factor=False, **common
+    )
+    cells = {"S0B0": copy.deepcopy(pre)}
+    cells.update({
+        mode: _fixed_estimand_panel(
+            structural_factor=structural,
+            behavioral_factor=behavioral,
+            **common,
+        )
+        for mode, (structural, behavioral) in FACTORIAL_CELLS.items()
+        if mode != "S0B0"
+    })
+    payload = {
+        "protocol_version": PROTOCOL_VERSION,
+        "seed": int(seed),
+        "horizon": int(cfg["causal_horizon"]),
+        "discount": float(cfg["discount"]),
+        "pre": pre,
+        "cells": cells,
+    }
+    _atomic_write_json(cache_path, payload)
+    return pre, cells
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
@@ -1326,6 +1418,9 @@ def main(argv=None):
     try:
         rows = []
         for seed in args.seeds:
+            pre_estimand_panel, estimand_panels = _cached_estimand_panels(
+                seed=seed, run_dir=run_dir
+            )
             for model in args.models:
                 checkpoint = _pretrain_common_checkpoint(
                     model=model,
@@ -1345,6 +1440,8 @@ def main(argv=None):
                         out_root=run_dir,
                         run_id=run_id,
                         frozen_checkpoint=checkpoint,
+                        cached_pre_estimand_panel=pre_estimand_panel,
+                        cached_estimand_panel=estimand_panels[mode],
                     )
                     attempt["completed_attempts"].append({
                         "model": model,

@@ -1,6 +1,6 @@
 import numpy as np
 
-from models.structural_proxy import build_pair_feat  # [FIX-X1]
+from envs.causal_adapter import resolve_env_adapter
 
 
 class MultiEgoReplayBuilder:
@@ -8,19 +8,18 @@ class MultiEgoReplayBuilder:
 
     The conditioning set matches the paper:
 
-        r_hat_ij(s_i, a_i, a_j, H_i^{-j}) -> R_i^(H), where H is a raw
-        leave-one-out observable-set summary independent of the learned
-        core/peripheral partition.
+        r_hat_ij(s_i, a_i, a_j, H_i^{-j}) -> g_i^[0:H], where H is the
+        leave-one-out sum of learned per-neighbour embeddings and is
+        independent of the learned core/peripheral partition.
 
     For every time step t, ego i, and neighbor j:
         sample_ij^t = (
             obs_i^t,
             a_i^t,
             a_j^t,
-            z_{i,C_i \\ {j}}^t,
-            m_{i,P_i \\ {j}}^t,
-            b_i^t,
-            R_i^{(H)}(t)
+            x_ij^t,
+            {x_ik^t : k != i,j},
+            [r_i^t, ..., r_i^{t+H-1}]
         )
 
     Important invariants:
@@ -164,6 +163,7 @@ class MultiEgoReplayBuilder:
             return 0
 
         n_agents = int(env.n_agents)
+        env_adapter = resolve_env_adapter(env)
         h_returns = self.build_h_step_returns(trajectory, n_agents)
         # The network predicts direct lag rewards, not cumulative returns.
         n_horizons_for_push = getattr(proxy_ensemble, "n_horizons", self.horizon)
@@ -175,6 +175,14 @@ class MultiEgoReplayBuilder:
 
         for t, step in enumerate(trajectory):
             self._require_step_fields(step)
+            if (
+                int(getattr(proxy_ensemble, "context_item_dim", 0)) > 0
+                and "proxy_context_items_excluding" not in step
+            ):
+                raise KeyError(
+                    "literal DeepSets proxy requires action-time "
+                    "proxy_context_items_excluding"
+                )
 
             obs_all = step["obs_all"]
             actions = step["actions"]
@@ -188,7 +196,7 @@ class MultiEgoReplayBuilder:
             behaviour_probs = step.get("behaviour_probs")
 
             for ego in range(n_agents):
-                obs_i = env.get_obs_of_ego(obs_all, ego)
+                obs_i = env_adapter.observation(obs_all, ego)
                 action_i = int(actions[ego])
 
                 for j in range(n_agents):
@@ -202,10 +210,8 @@ class MultiEgoReplayBuilder:
                     if geom is None:
                         pair_feat = None
                     else:
-                        pair_feat = build_pair_feat(
-                            geom["positions"], geom["agent_zone"],
-                            geom["grid_size"], geom["n_zones"], ego, j,
-                            agent_role=geom.get("agent_role"),
+                        pair_feat = env_adapter.pair_features_from_snapshot(
+                            geom, ego, j
                         )
 
                     try:
@@ -216,6 +222,12 @@ class MultiEgoReplayBuilder:
                             "proxy_context_excluding[ego][neighbor]."
                         )
                     belief_summary = step["belief_summary_cache"][ego]
+                    try:
+                        context_items, context_mask = step[
+                            "proxy_context_items_excluding"
+                        ][ego][j]
+                    except (KeyError, TypeError, ValueError):
+                        context_items, context_mask = None, None
                     target_h = h_returns[t][ego]
                     target_lags = lag_rewards[t][ego]
 
@@ -267,6 +279,8 @@ class MultiEgoReplayBuilder:
                         ),
                         episode_id=step.get("episode_id"),
                         timestep=step.get("timestep", t),
+                        context_items=context_items,
+                        context_mask=context_mask,
                     )
 
                     pushed += 1

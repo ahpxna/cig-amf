@@ -70,6 +70,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from envs.causal_adapter import OmniArenaAdapter, PUBLIC_ROLES
+
 try:
     from torch.func import functional_call, stack_module_state, vmap
     _HAS_TORCH_FUNC = True
@@ -85,8 +87,8 @@ class LocalCounterfactualProxyNet(nn.Module):
     """
     One ensemble member.
 
-    Input matching the paper's conditioning set in Eq. 5:
-        obs_i, a_i, a_j, Z_i^{-j}, M_i^{-j}, B_i
+    Conditioning input:
+        obs_i, a_i, x_ij, sum_{k != i,j} phi_ctx(x_ik)
 
     Output:
         [B, n_horizons] predictions of direct rewards at lags 0, ..., H-1
@@ -111,6 +113,7 @@ class LocalCounterfactualProxyNet(nn.Module):
         use_belief_input: bool = False,
         dropout: float = 0.0,
         pair_feat_dim: int = 0,
+        context_item_dim: int = 0,
     ):
         super().__init__()
 
@@ -133,9 +136,9 @@ class LocalCounterfactualProxyNet(nn.Module):
         self.use_belief_input = bool(use_belief_input)
         self.context_input_dim = self.core_dim + self.periph_dim
         self.context_embed_dim = max(16, self.hidden // 2)
-        # The runner supplies leave-one-out sums of augmented per-neighbour
-        # features [x, x^2, 1]. An affine per-item phi commutes with this sum;
-        # the learned MLP below is the permutation-invariant set readout.
+        # This summary encoder is retained only for explicit legacy calls that
+        # omit raw context items. Confirmatory runners use context_item_encoder:
+        # each item passes through phi before the leave-one-out sum.
         self.context_set_encoder = nn.Sequential(
             nn.Linear(self.context_input_dim, self.context_embed_dim),
             nn.ReLU(),
@@ -158,6 +161,16 @@ class LocalCounterfactualProxyNet(nn.Module):
         # pair_feat_dim = 0 preserves legacy behaviour.
         # -------------------------------------------------------------------
         self.pair_feat_dim = int(pair_feat_dim)
+        self.context_item_dim = int(context_item_dim)
+        self.context_item_encoder = (
+            nn.Sequential(
+                nn.Linear(self.context_item_dim, self.context_embed_dim),
+                nn.ReLU(),
+                nn.Linear(self.context_embed_dim, self.context_embed_dim),
+                nn.ReLU(),
+            )
+            if self.context_item_dim > 0 else None
+        )
 
         self.in_dim = (
             self.obs_dim
@@ -197,6 +210,8 @@ class LocalCounterfactualProxyNet(nn.Module):
         m_periph_excl_j: torch.Tensor,  # [..., B, periph_dim]
         belief_summary: torch.Tensor,   # [..., B, belief_dim]
         pair_feat: torch.Tensor = None, # [..., B, pair_feat_dim] — x_ij (Eq 8)
+        context_items: torch.Tensor = None, # [..., B, K, context_item_dim]
+        context_mask: torch.Tensor = None,  # [..., B, K]
     ) -> torch.Tensor:
         """
         a_j is no longer an input. The network predicts every action of j
@@ -219,10 +234,31 @@ class LocalCounterfactualProxyNet(nn.Module):
                 )
             parts.append(pair_feat)
 
-        raw_set_summary = torch.cat(
-            [z_core_excl_j, m_periph_excl_j], dim=-1
-        )
-        parts.append(self.context_set_encoder(raw_set_summary))
+        if context_items is not None:
+            if self.context_item_encoder is None:
+                raise ValueError("context items supplied to a proxy without an item encoder")
+            if context_items.shape[-1] != self.context_item_dim:
+                raise ValueError(
+                    f"context item dim must be {self.context_item_dim}; "
+                    f"received {context_items.shape[-1]}"
+                )
+            item_embeddings = self.context_item_encoder(context_items)
+            if context_mask is None:
+                context_mask = torch.ones(
+                    context_items.shape[:-1],
+                    dtype=item_embeddings.dtype,
+                    device=item_embeddings.device,
+                )
+            item_embeddings = item_embeddings * context_mask.unsqueeze(-1).to(
+                item_embeddings.dtype
+            )
+            context_embedding = item_embeddings.sum(dim=-2)
+        else:
+            raw_set_summary = torch.cat(
+                [z_core_excl_j, m_periph_excl_j], dim=-1
+            )
+            context_embedding = self.context_set_encoder(raw_set_summary)
+        parts.append(context_embedding)
 
         if self.use_belief_input:
             parts.append(belief_summary)
@@ -309,7 +345,7 @@ class LocalCounterfactualProxyEnsemble:
         not change with the randomly observed action.
 
     "range"  (Pieroth ICML 2024-style control baseline)
-        w = max_a f(s,a) - min_a f(s,a), always >= 0
+        w = max_{a valid} f(s,a) - min_{a valid} f(s,a), always >= 0
 
     "mean_abs"  (v1 form retained for before/after ablation)
         w = mean_{a != a_obs} |f(s,a) - f(s,a_obs)|
@@ -372,6 +408,8 @@ class LocalCounterfactualProxyEnsemble:
         use_vmap_ensemble: bool = True,
         compile_ensemble: bool = False,
         pair_feat_dim: int = 0,
+        context_item_dim: int = 0,
+        debug_verbose: bool = False,
     ):
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
@@ -380,6 +418,8 @@ class LocalCounterfactualProxyEnsemble:
         self.belief_dim = int(belief_dim)
         # [FIX-X1] x_ij from Eq. 8; zero disables it for legacy behaviour.
         self.pair_feat_dim = int(pair_feat_dim)
+        self.context_item_dim = int(context_item_dim)
+        self.debug_verbose = bool(debug_verbose)
         self.n_ensemble = int(n_ensemble)
         self.hidden = int(hidden)
         self.lr = float(lr)
@@ -428,6 +468,7 @@ class LocalCounterfactualProxyEnsemble:
                     periph_dim=self.periph_dim,
                     belief_dim=self.belief_dim,
                     pair_feat_dim=self.pair_feat_dim,   # [FIX-X1]
+                    context_item_dim=self.context_item_dim,
                     hidden=self.hidden,
                     n_horizons=self.n_horizons,
                     discount=self.discount,
@@ -548,7 +589,10 @@ class LocalCounterfactualProxyEnsemble:
             list(self._stacked_params.values()), lr=self.lr
         )
 
-        def _fmodel(params, buffers, obs_i, a_i_oh, z, m, belief, pair_feat):
+        def _fmodel(
+            params, buffers, obs_i, a_i_oh, z, m, belief, pair_feat,
+            context_items, context_mask,
+        ):
             return functional_call(
                 self._base_model,
                 (params, buffers),
@@ -560,6 +604,8 @@ class LocalCounterfactualProxyEnsemble:
                     m_periph_excl_j=m,
                     belief_summary=belief,
                     pair_feat=pair_feat,   # [FIX-X1]
+                    context_items=context_items,
+                    context_mask=context_mask,
                 ),
             )
 
@@ -568,11 +614,14 @@ class LocalCounterfactualProxyEnsemble:
         # operations without an explicit policy. [FIX-X1] also adds pair_feat
         # as the eighth _fmodel input dimension.
         self._vmap_forward_shared = vmap(
-            _fmodel, in_dims=(0, 0, None, None, None, None, None, None),
+            _fmodel,
+            in_dims=(0, 0, None, None, None, None, None, None, None, None),
             randomness="different",
         )
+        context_in_dim = 0 if self.context_item_dim > 0 else None
         self._vmap_forward_per_member = vmap(
-            _fmodel, in_dims=(0, 0, 0, 0, 0, 0, 0, 0),
+            _fmodel,
+            in_dims=(0, 0, 0, 0, 0, 0, 0, 0, context_in_dim, context_in_dim),
             randomness="different",
         )
 
@@ -684,6 +733,8 @@ class LocalCounterfactualProxyEnsemble:
         policy_probs_j=None,
         episode_id=None,
         timestep=None,
+        context_items=None,
+        context_mask=None,
     ):
         """
         Add one supervised sample.
@@ -760,6 +811,28 @@ class LocalCounterfactualProxyEnsemble:
             "episode_id": episode_id,
             "timestep": timestep,
         }
+        if self.context_item_dim > 0:
+            if context_items is None:
+                item_array = np.zeros(
+                    (1, self.context_item_dim), dtype=np.float32
+                )
+                mask_array = np.zeros((1,), dtype=np.float32)
+            else:
+                item_array = np.asarray(context_items, dtype=np.float32)
+                if item_array.ndim != 2 or item_array.shape[1] != self.context_item_dim:
+                    raise ValueError(
+                        "context_items must have shape [K, "
+                        f"{self.context_item_dim}], received {item_array.shape}"
+                    )
+                mask_array = (
+                    np.ones((item_array.shape[0],), dtype=np.float32)
+                    if context_mask is None
+                    else np.asarray(context_mask, dtype=np.float32).reshape(-1)
+                )
+                if mask_array.shape != (item_array.shape[0],):
+                    raise ValueError("context_mask must have one entry per context item")
+            sample["context_items"] = item_array.copy()
+            sample["context_mask"] = mask_array.copy()
 
         self.buffer.append(sample)
 
@@ -866,6 +939,28 @@ class LocalCounterfactualProxyEnsemble:
             axis=0,
         )                                                            # [B, n_horizons]
 
+        context_items_t = None
+        context_mask_t = None
+        if self.context_item_dim > 0:
+            item_rows = [
+                np.asarray(b["context_items"], dtype=np.float32) for b in batch
+            ]
+            max_items = max(row.shape[0] for row in item_rows)
+            padded_items = np.zeros(
+                (len(batch), max_items, self.context_item_dim), dtype=np.float32
+            )
+            padded_mask = np.zeros((len(batch), max_items), dtype=np.float32)
+            for index, (row, sample) in enumerate(zip(item_rows, batch)):
+                padded_items[index, :row.shape[0]] = row
+                mask = np.asarray(sample["context_mask"], dtype=np.float32)
+                padded_mask[index, :row.shape[0]] = mask
+            context_items_t = torch.tensor(
+                padded_items, dtype=torch.float32, device=self.device
+            )
+            context_mask_t = torch.tensor(
+                padded_mask, dtype=torch.float32, device=self.device
+            )
+
         return (
             torch.tensor(obs, dtype=torch.float32, device=self.device),
             self._one_hot(action_i),
@@ -877,6 +972,31 @@ class LocalCounterfactualProxyEnsemble:
             torch.tensor(target_multi, dtype=torch.float32, device=self.device),
             torch.tensor(pair_feat, dtype=torch.float32, device=self.device),
             torch.tensor(b_obs, dtype=torch.float32, device=self.device),
+            context_items_t,
+            context_mask_t,
+        )
+
+    def _discounted_return_residual(self, prediction, target):
+        """Absolute error of the discounted H-step return for each row."""
+        if prediction.shape != target.shape or prediction.shape[-1] != self.n_horizons:
+            raise ValueError(
+                "proxy residual horizon mismatch: "
+                f"prediction={tuple(prediction.shape)}, target={tuple(target.shape)}, "
+                f"expected H={self.n_horizons}"
+            )
+        weights = torch.pow(
+            torch.as_tensor(
+                self.discount, dtype=prediction.dtype, device=prediction.device
+            ),
+            torch.arange(
+                self.n_horizons,
+                dtype=prediction.dtype,
+                device=prediction.device,
+            ),
+        )
+        return torch.abs(
+            torch.sum(prediction * weights, dim=-1)
+            - torch.sum(target * weights, dim=-1)
         )
 
     def _sample_for_member(self, buf_list: list, member_idx: int, n: int,
@@ -991,13 +1111,15 @@ class LocalCounterfactualProxyEnsemble:
             obs_l, ai_l, aj_l, z_l, m_l, bl_l, tgt_l = [], [], [], [], [], [], []
             pf_l = []   # [FIX-X1] x_ij per member
             bobs_l = []  # [FIX-HC1] b_j(a_j|s) per member
+            ctx_l, ctx_mask_l = [], []
 
             for b in member_batches:
                 (obs_t, a_i_oh, a_j_idx, z_t, m_t, belief_t, target_multi_t,
-                 pf_t, bobs_t) = (
+                 pf_t, bobs_t, context_items_t, context_mask_t) = (
                     self._batch_to_tensors(b)
                 )
                 pf_l.append(pf_t); bobs_l.append(bobs_t)
+                ctx_l.append(context_items_t); ctx_mask_l.append(context_mask_t)
                 obs_l.append(obs_t)
                 ai_l.append(a_i_oh)
                 aj_l.append(a_j_idx)
@@ -1015,11 +1137,18 @@ class LocalCounterfactualProxyEnsemble:
             tgt_e = torch.stack(tgt_l, dim=0)    # [E, B, H]
             pf_e = torch.stack(pf_l, dim=0)      # [E, B, pair_feat_dim]
             bobs_e = torch.stack(bobs_l, dim=0)  # [E, B]
+            ctx_e = (
+                torch.stack(ctx_l, dim=0) if self.context_item_dim > 0 else None
+            )
+            ctx_mask_e = (
+                torch.stack(ctx_mask_l, dim=0)
+                if self.context_item_dim > 0 else None
+            )
 
             # One vmap operation runs n_ensemble forwards in parallel on GPU.
             preds_all = self._vmap_forward_per_member(
                 self._stacked_params, self._stacked_buffers,
-                obs_e, ai_e, z_e, m_e, bel_e, pf_e,   # [FIX-X1]
+                obs_e, ai_e, z_e, m_e, bel_e, pf_e, ctx_e, ctx_mask_e,
             )  # [E, B, A, H]
 
             E_, B_, A_, H_ = preds_all.shape
@@ -1068,8 +1197,8 @@ class LocalCounterfactualProxyEnsemble:
 
             with torch.no_grad():
                 res = torch.mean(
-                    torch.abs(preds[:, :, -1] - tgt_e[:, :, -1]), dim=1
-                )  # [E] residual at the final horizon, matching v1 R^(H).
+                    self._discounted_return_residual(preds, tgt_e), dim=1
+                )  # [E] discounted H-return residual.
                 # [FIX-HC2] res_forced vs res_control lost diagnostic value
                 # after the TARNet refactor. a_j is no longer input; forcing
                 # only changes the gathered head, not R_i^(H) prediction
@@ -1095,12 +1224,13 @@ class LocalCounterfactualProxyEnsemble:
                 self.last_head_spread_ratio = float((hs_p50 / mu_scale).item())
                 self.last_min_head_frac = min_head_frac
                 self.last_forced_frac = float(fm.float().mean().item())
-                print(
-                    f"[HEAD-SPREAD] p50={hs_p50.item():.4e} p90={hs_p90.item():.4e} "
-                    f"p50/|mu|={self.last_head_spread_ratio:.3f} "
-                    f"(gate >0.10) min_head_frac={min_head_frac:.3f} "
-                    f"(gate >0.05) forced_frac={self.last_forced_frac:.3f}"
-                )
+                if self.debug_verbose:
+                    print(
+                        f"[HEAD-SPREAD] p50={hs_p50.item():.4e} p90={hs_p90.item():.4e} "
+                        f"p50/|mu|={self.last_head_spread_ratio:.3f} "
+                        f"(gate >0.10) min_head_frac={min_head_frac:.3f} "
+                        f"(gate >0.05) forced_frac={self.last_forced_frac:.3f}"
+                    )
             per_step_residuals.append(res)
 
             self.last_train_batch_count += 1
@@ -1115,7 +1245,7 @@ class LocalCounterfactualProxyEnsemble:
             ho_batch = random.sample(list(self.buffer), int(holdout_size))
 
             (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target, ho_pf,
-             _ho_bobs) = (
+             _ho_bobs, ho_ctx, ho_ctx_mask) = (
                 self._batch_to_tensors(ho_batch)
             )
 
@@ -1125,6 +1255,7 @@ class LocalCounterfactualProxyEnsemble:
                 stacked_all = self._vmap_forward_shared(
                     self._stacked_params, self._stacked_buffers,
                     ho_obs, ho_ai, ho_z, ho_m, ho_b, ho_pf,
+                    ho_ctx, ho_ctx_mask,
                 )  # [E,B,A,H] from one vmap over data shared by all members.
 
                 E_, B_, A_, H_ = stacked_all.shape
@@ -1133,7 +1264,7 @@ class LocalCounterfactualProxyEnsemble:
                 pred_mean = stacked.mean(dim=0)  # [B, H]
 
                 holdout_residual_t = torch.mean(
-                    torch.abs(pred_mean[:, -1] - ho_target[:, -1])
+                    self._discounted_return_residual(pred_mean, ho_target)
                 )
 
                 # [L3] Diagnose genuine ensemble disagreement. A value near
@@ -1144,7 +1275,8 @@ class LocalCounterfactualProxyEnsemble:
                     )  # One synchronization for the complete holdout evaluation.
 
         if len(per_step_losses) == 0:
-            print("[TRAIN-DEBUG] all n_steps were skipped; per_step_losses is empty")
+            if self.debug_verbose:
+                print("[TRAIN-DEBUG] all training steps were skipped")
             self.latest_loss = 0.0
             self.latest_residual = 0.0
             self.latest_train_residual = 0.0
@@ -1189,7 +1321,7 @@ class LocalCounterfactualProxyEnsemble:
                     continue
 
                 (obs_t, a_i_oh, a_j_idx, z_t, m_t, belief_t, target_multi_t,
-                 pf_t, _bobs_t) = (
+                 pf_t, _bobs_t, context_items_t, context_mask_t) = (
                     self._batch_to_tensors(batch)
                 )
 
@@ -1202,6 +1334,8 @@ class LocalCounterfactualProxyEnsemble:
                     m_periph_excl_j=m_t,
                     belief_summary=belief_t,
                     pair_feat=pf_t,
+                    context_items=context_items_t,
+                    context_mask=context_mask_t,
                 )
 
                 B_, A_, H_ = pred_all.shape
@@ -1218,7 +1352,9 @@ class LocalCounterfactualProxyEnsemble:
                 all_losses.append(loss.detach())
 
                 with torch.no_grad():
-                    res = torch.mean(torch.abs(pred[:, -1] - target_multi_t[:, -1]))
+                    res = torch.mean(
+                        self._discounted_return_residual(pred, target_multi_t)
+                    )
                 train_residuals.append(res)
 
             self.last_train_batch_count += 1
@@ -1228,7 +1364,7 @@ class LocalCounterfactualProxyEnsemble:
         if holdout_size > 0 and len(self.buffer) > holdout_size:
             ho_batch = random.sample(list(self.buffer), int(holdout_size))
             (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target, ho_pf,
-             _ho_bobs2) = (
+             _ho_bobs2, ho_ctx, ho_ctx_mask) = (
                 self._batch_to_tensors(ho_batch)
             )
 
@@ -1240,6 +1376,7 @@ class LocalCounterfactualProxyEnsemble:
                         obs_i=ho_obs, action_i_onehot=ho_ai,
                         z_core_excl_j=ho_z, m_periph_excl_j=ho_m,
                         belief_summary=ho_b, pair_feat=ho_pf,
+                        context_items=ho_ctx, context_mask=ho_ctx_mask,
                     )
                     B_, A_, H_ = pred_all.shape
                     idx = ho_aj.view(B_, 1, 1).expand(B_, 1, H_)
@@ -1247,9 +1384,9 @@ class LocalCounterfactualProxyEnsemble:
 
                 stacked = torch.stack(preds, dim=0)
                 pred_mean = stacked.mean(dim=0)
-                holdout_residual = float(
-                    torch.mean(torch.abs(pred_mean[:, -1] - ho_target[:, -1]))
-                )
+                holdout_residual = float(torch.mean(
+                    self._discounted_return_residual(pred_mean, ho_target)
+                ))
 
 
                 if stacked.shape[0] > 1:
@@ -1289,6 +1426,8 @@ class LocalCounterfactualProxyEnsemble:
         m,         # [B, periph_dim]
         belief,    # [B, belief_dim]
         pair_feat=None,   # [B, pair_feat_dim] — x_ij (FIX-X1)
+        context_items=None,
+        context_mask=None,
     ) -> torch.Tensor:
         """
         Predict returns for every possible action of j and every ensemble
@@ -1313,6 +1452,9 @@ class LocalCounterfactualProxyEnsemble:
 
         a_i_oh = self._one_hot(np.asarray(action_i).reshape(-1))  # [B, A]
         pf_t = self._pair_feat_tensor(pair_feat, B)   # [FIX-X1]
+        ctx_t, ctx_mask_t = self._context_item_tensors(
+            context_items, context_mask, B
+        )
 
         self._ensemble_train_mode(False)
 
@@ -1321,15 +1463,18 @@ class LocalCounterfactualProxyEnsemble:
                 out = self._vmap_forward_shared(
                     self._stacked_params, self._stacked_buffers,
                     obs_t, a_i_oh, z_t, m_t, belief_t, pf_t,
+                    ctx_t, ctx_mask_t,
                 )  # [E, B, A, n_horizons]
             else:
                 out = self._predict_all_actions_loop(
-                    obs_t, a_i_oh, z_t, m_t, belief_t, pf_t)
+                    obs_t, a_i_oh, z_t, m_t, belief_t, pf_t,
+                    ctx_t, ctx_mask_t)
 
         return out  # [E, B, A, n_horizons]
 
     def _predict_all_actions_loop(
         self, obs, a_i_oh, z, m, belief, pair_feat=None,
+        context_items=None, context_mask=None,
     ) -> torch.Tensor:
         """Per-model Python loop used for torch <2.0 fallback and as the T1
         reference. It is excluded from the hot path when vmap is active."""
@@ -1340,6 +1485,7 @@ class LocalCounterfactualProxyEnsemble:
                 obs_i=obs, action_i_onehot=a_i_oh,
                 z_core_excl_j=z, m_periph_excl_j=m,
                 belief_summary=belief, pair_feat=pair_feat,
+                context_items=context_items, context_mask=context_mask,
             )
             outs.append(pred)
         return torch.stack(outs, dim=0)
@@ -1358,6 +1504,7 @@ class LocalCounterfactualProxyEnsemble:
 
     def _predict_all_actions_reference(
         self, obs, action_i, z, m, belief, pair_feat=None,
+        context_items=None, context_mask=None,
     ) -> torch.Tensor:
         """
         Slow reference required by GPU_OPTIMIZATION_CONTRACT.md section 3. It
@@ -1376,10 +1523,14 @@ class LocalCounterfactualProxyEnsemble:
 
         a_i_oh = self._one_hot(np.asarray(action_i).reshape(-1))
         pf_t = self._pair_feat_tensor(pair_feat, int(obs_t.shape[0]))
+        ctx_t, ctx_mask_t = self._context_item_tensors(
+            context_items, context_mask, int(obs_t.shape[0])
+        )
 
         with torch.no_grad():
             out = self._predict_all_actions_loop(
-                obs_t, a_i_oh, z_t, m_t, belief_t, pf_t)
+                obs_t, a_i_oh, z_t, m_t, belief_t, pf_t,
+                ctx_t, ctx_mask_t)
 
         return out  # [E, B, A, n_horizons]
 
@@ -1404,6 +1555,32 @@ class LocalCounterfactualProxyEnsemble:
             )
         return torch.tensor(arr, dtype=torch.float32, device=self.device)
 
+    def _context_item_tensors(self, context_items, context_mask, batch_size):
+        if self.context_item_dim <= 0 or context_items is None:
+            return None, None
+        items = np.asarray(context_items, dtype=np.float32)
+        if (
+            items.ndim != 3
+            or items.shape[0] != int(batch_size)
+            or items.shape[2] != self.context_item_dim
+        ):
+            raise ValueError(
+                "context_items must have shape "
+                f"[{batch_size}, K, {self.context_item_dim}], got {items.shape}"
+            )
+        if context_mask is None:
+            mask = np.ones(items.shape[:2], dtype=np.float32)
+        else:
+            mask = np.asarray(context_mask, dtype=np.float32)
+            if mask.shape != items.shape[:2]:
+                raise ValueError(
+                    f"context_mask must have shape {items.shape[:2]}, got {mask.shape}"
+                )
+        return (
+            torch.tensor(items, dtype=torch.float32, device=self.device),
+            torch.tensor(mask, dtype=torch.float32, device=self.device),
+        )
+
     # =====================================================================
     # Effect computation.
     # =====================================================================
@@ -1413,6 +1590,7 @@ class LocalCounterfactualProxyEnsemble:
         preds_all: torch.Tensor,        # [E, B, A, n_horizons]
         action_j_obs: np.ndarray,       # [B]
         policy_probs_j: Optional[np.ndarray] = None,   # [B, A]
+        valid_action_mask: Optional[np.ndarray] = None,  # [B, A]
         observed_returns: Optional[np.ndarray] = None,  # [B]
         behaviour_probs_obs: Optional[np.ndarray] = None,  # [B]
         mode: Optional[str] = None,
@@ -1431,6 +1609,28 @@ class LocalCounterfactualProxyEnsemble:
         E, B, A, H = preds_all.shape
         target_prob_obs = None
 
+        if valid_action_mask is None:
+            valid = torch.ones(B, A, dtype=torch.bool, device=self.device)
+        else:
+            valid_arr = np.asarray(valid_action_mask, dtype=bool)
+            if valid_arr.shape != (B, A) or np.any(valid_arr.sum(axis=1) == 0):
+                raise ValueError(
+                    "valid_action_mask must have shape "
+                    f"{(B, A)} and retain at least one action per row"
+                )
+            valid = torch.tensor(valid_arr, dtype=torch.bool, device=self.device)
+
+        def _normalize_over_valid(weights):
+            weights = torch.where(valid, weights, torch.zeros_like(weights))
+            row_sum = weights.sum(dim=1, keepdim=True)
+            fallback = valid.to(weights.dtype)
+            fallback = fallback / fallback.sum(dim=1, keepdim=True)
+            return torch.where(
+                row_sum > self.eps,
+                weights / torch.clamp(row_sum, min=self.eps),
+                fallback,
+            )
+
         idx_obs = torch.tensor(
             np.asarray(action_j_obs, dtype=np.int64).reshape(-1),
             dtype=torch.long,
@@ -1440,6 +1640,8 @@ class LocalCounterfactualProxyEnsemble:
         idx_exp = (
             idx_obs.view(1, B, 1, 1).expand(E, B, 1, H)
         )  # [E, B, 1, H]
+        if not bool(torch.all(torch.gather(valid, 1, idx_obs.view(B, 1)))):
+            raise ValueError("observed_action_j contains an invalid action")
 
         f_obs = torch.gather(preds_all, dim=2, index=idx_exp).squeeze(2)
         # f_obs: [E, B, H]
@@ -1449,9 +1651,7 @@ class LocalCounterfactualProxyEnsemble:
         # ---------------------------------------------------------------
         if mode == "signed_aristocrat":
             if policy_probs_j is None:
-                w = torch.full(
-                    (B, A), 1.0 / float(A), dtype=torch.float32, device=self.device
-                )
+                w = valid.to(torch.float32)
             else:
                 w_arr = np.asarray(policy_probs_j, dtype=np.float32)
                 if w_arr.shape != (B, A):
@@ -1466,7 +1666,7 @@ class LocalCounterfactualProxyEnsemble:
                     dtype=torch.float32,
                     device=self.device,
                 )  # [B, A]
-                w = w / torch.clamp(w.sum(dim=1, keepdim=True), min=self.eps)
+            w = _normalize_over_valid(w)
 
             baseline = torch.einsum("ebah,ba->ebh", preds_all, w)
             effect_per_h = f_obs - baseline  # [E, B, H]
@@ -1482,16 +1682,19 @@ class LocalCounterfactualProxyEnsemble:
             if cand.numel() == 0:
                 cand = torch.arange(A, dtype=torch.long, device=self.device)
 
-            cand_preds = preds_all[:, :, cand, :]      # [E, B, n_cand, H]
-            cand_mean = cand_preds.mean(dim=2)         # [E, B, H]
+            candidate_mask = torch.zeros(A, dtype=torch.bool, device=self.device)
+            candidate_mask[cand] = True
+            row_candidates = valid & candidate_mask.view(1, A)
+            empty = row_candidates.sum(dim=1) == 0
+            row_candidates[empty] = valid[empty]
+            q = row_candidates.to(torch.float32)
+            q = q / q.sum(dim=1, keepdim=True)
+            cand_mean = torch.einsum("ebah,ba->ebh", preds_all, q)
 
             effect_per_h = cand_mean - f_obs           # [E, B, H]
             # q(a_obs|s) for the uniform candidate-action intervention.
             # It is zero when the factual action is outside the candidate set.
-            target_prob_obs = (
-                (idx_obs.view(B, 1) == cand.view(1, -1)).any(dim=1).float()
-                / float(cand.numel())
-            )
+            target_prob_obs = torch.gather(q, 1, idx_obs.view(B, 1)).squeeze(1)
 
         elif mode == "signed_policy_contrast":
             if policy_probs_j is None:
@@ -1513,9 +1716,7 @@ class LocalCounterfactualProxyEnsemble:
             pi_full = torch.tensor(
                 pi_full_arr, dtype=torch.float32, device=self.device,
             )
-            pi_full = pi_full / torch.clamp(
-                pi_full.sum(dim=1, keepdim=True), min=self.eps
-            )
+            pi_full = _normalize_over_valid(pi_full)
             cand = torch.tensor(
                 [a for a in self.candidate_actions if 0 <= a < A],
                 dtype=torch.long,
@@ -1523,26 +1724,31 @@ class LocalCounterfactualProxyEnsemble:
             )
             if cand.numel() == 0:
                 cand = torch.arange(A, dtype=torch.long, device=self.device)
-            q_mean = preds_all[:, :, cand, :].mean(dim=2)
+            candidate_mask = torch.zeros(A, dtype=torch.bool, device=self.device)
+            candidate_mask[cand] = True
+            row_candidates = valid & candidate_mask.view(1, A)
+            empty = row_candidates.sum(dim=1) == 0
+            row_candidates[empty] = valid[empty]
+            q = row_candidates.to(torch.float32)
+            q = q / q.sum(dim=1, keepdim=True)
+            q_mean = torch.einsum("ebah,ba->ebh", preds_all, q)
             pi_mean = torch.einsum("ebah,ba->ebh", preds_all, pi_full)
             effect_per_h = pi_mean - q_mean
-            target_prob_obs = (
-                (idx_obs.view(B, 1) == cand.view(1, -1)).any(dim=1).float()
-                / float(cand.numel())
-            )
+            target_prob_obs = torch.gather(q, 1, idx_obs.view(B, 1)).squeeze(1)
             policy_prob_obs = torch.gather(
                 pi_full, 1, idx_obs.view(B, 1)
             ).squeeze(1)
 
         elif mode == "range":
-            max_f = preds_all.max(dim=2).values        # [E, B, H]
-            min_f = preds_all.min(dim=2).values        # [E, B, H]
+            expanded_valid = valid.view(1, B, A, 1)
+            max_f = preds_all.masked_fill(~expanded_valid, -torch.inf).max(dim=2).values
+            min_f = preds_all.masked_fill(~expanded_valid, torch.inf).min(dim=2).values
             effect_per_h = max_f - min_f               # [E, B, H]
 
         elif mode == "mean_abs":
             diff = torch.abs(preds_all - f_obs.unsqueeze(2))  # [E, B, A, H]
 
-            mask = torch.ones(B, A, dtype=torch.float32, device=self.device)
+            mask = valid.to(torch.float32)
             mask.scatter_(1, idx_obs.view(B, 1), 0.0)          # [B, A]
 
             denom = torch.clamp(mask.sum(dim=1), min=1.0)      # [B]
@@ -1690,6 +1896,9 @@ class LocalCounterfactualProxyEnsemble:
         observed_returns_batch=None,
         behaviour_probs_obs_batch=None,
         pair_feat_batch=None,
+        context_items_batch=None,
+        context_mask_batch=None,
+        valid_action_mask_batch=None,
     ):
         """
         Preserve the v1 signature for immediate legacy-runner compatibility.
@@ -1709,6 +1918,9 @@ class LocalCounterfactualProxyEnsemble:
             observed_returns_batch=observed_returns_batch,
             behaviour_probs_obs_batch=behaviour_probs_obs_batch,
             pair_feat_batch=pair_feat_batch,
+            context_items_batch=context_items_batch,
+            context_mask_batch=context_mask_batch,
+            valid_action_mask_batch=valid_action_mask_batch,
         )
 
         return out["mu"], out["sigma"]
@@ -1725,6 +1937,9 @@ class LocalCounterfactualProxyEnsemble:
         observed_returns_batch=None,
         behaviour_probs_obs_batch=None,
         pair_feat_batch=None,
+        context_items_batch=None,
+        context_mask_batch=None,
+        valid_action_mask_batch=None,
     ) -> Dict[str, np.ndarray]:
         """
         Full version providing every field needed by influence_signature.py.
@@ -1770,6 +1985,9 @@ class LocalCounterfactualProxyEnsemble:
                 "dr_applied_rows": 0,
                 "dr_clipped_rows": 0,
                 "dr_raw_inverse_max": 0.0,
+                "valid_action_mask": np.zeros(
+                    (0, self.action_dim), dtype=np.float32
+                ),
             }
 
         obs = np.asarray(obs_i_batch, dtype=np.float32)
@@ -1778,11 +1996,29 @@ class LocalCounterfactualProxyEnsemble:
         belief = np.asarray(belief_summary_batch, dtype=np.float32)
         a_i = np.asarray(action_i_batch, dtype=np.int64).reshape(-1)
         a_j = np.asarray(observed_action_j_batch, dtype=np.int64).reshape(-1)
+        if valid_action_mask_batch is None:
+            valid_action_mask = np.ones(
+                (B, self.action_dim), dtype=bool
+            )
+        else:
+            valid_action_mask = np.asarray(
+                valid_action_mask_batch, dtype=bool
+            )
+            if (
+                valid_action_mask.shape != (B, self.action_dim)
+                or np.any(valid_action_mask.sum(axis=1) == 0)
+            ):
+                raise ValueError(
+                    "valid_action_mask_batch must have shape "
+                    f"{(B, self.action_dim)} and retain one action per row"
+                )
 
         # One forward pass over both alternative actions and ensemble members.
         lag_preds_all = self._predict_all_actions(
             obs=obs, action_i=a_i, z=z_arr, m=m_arr, belief=belief,
             pair_feat=pair_feat_batch,   # [FIX-X1]
+            context_items=context_items_batch,
+            context_mask=context_mask_batch,
         )  # [E, B, A, H] direct lag rewards
         preds_all = self._cumulative_from_lag(lag_preds_all)
 
@@ -1790,6 +2026,7 @@ class LocalCounterfactualProxyEnsemble:
             preds_all=preds_all,
             action_j_obs=a_j,
             policy_probs_j=policy_probs_j_batch,
+            valid_action_mask=valid_action_mask,
             observed_returns=observed_returns_batch,
             behaviour_probs_obs=behaviour_probs_obs_batch,
             mode=self.effect_mode,
@@ -1801,6 +2038,7 @@ class LocalCounterfactualProxyEnsemble:
             preds_all=preds_all,
             action_j_obs=a_j,
             policy_probs_j=policy_probs_j_batch,
+            valid_action_mask=valid_action_mask,
             mode=self.effect_mode,
         )
 
@@ -1838,6 +2076,7 @@ class LocalCounterfactualProxyEnsemble:
         res_range = self._compute_effects(
             preds_all=preds_all,
             action_j_obs=a_j,
+            valid_action_mask=valid_action_mask,
             mode="range",
         )
         c_effect = res_range["effect"]
@@ -1868,8 +2107,12 @@ class LocalCounterfactualProxyEnsemble:
                 torch.var(lag_preds_all, dim=0, unbiased=True) + self.eps
             )
         )
+        valid_lag = torch.tensor(
+            valid_action_mask, dtype=torch.bool, device=self.device
+        ).view(1, B, self.action_dim, 1)
         c_lag_members = (
-            lag_preds_all.max(dim=2).values - lag_preds_all.min(dim=2).values
+            lag_preds_all.masked_fill(~valid_lag, -torch.inf).max(dim=2).values
+            - lag_preds_all.masked_fill(~valid_lag, torch.inf).min(dim=2).values
         )  # [E,B,H]
         c_lag_mu = torch.mean(c_lag_members, dim=0)
         c_lag_sigma = (
@@ -1949,6 +2192,7 @@ class LocalCounterfactualProxyEnsemble:
             "dr_applied_rows": int(diagnostic_res["dr_applied_rows"]),
             "dr_clipped_rows": int(diagnostic_res["dr_clipped_rows"]),
             "dr_raw_inverse_max": float(diagnostic_res["dr_raw_inverse_max"]),
+            "valid_action_mask": valid_action_mask.astype(np.float32),
         }
 
     def score_pair(
@@ -2027,9 +2271,6 @@ class LocalCounterfactualProxyEnsemble:
 # [FIX-X1] x_ij — pair features for Equation 8
 # =========================================================================
 
-PUBLIC_ROLES = (
-    "collector", "gatekeeper", "relay", "blocker", "controller", "drifter"
-)
 PAIR_FEAT_DIM = 5 + len(PUBLIC_ROLES)
 
 
@@ -2060,32 +2301,6 @@ def build_pair_feat(
     final_runner scoring path. Divergent x_ij definitions cause silent,
     difficult-to-detect train/serve skew.
     """
-    import numpy as _np
-
-    g = float(max(1, grid_size))
-    pi = positions[int(ego)]
-    pj = positions[int(j)]
-    drow = (float(pj[0]) - float(pi[0])) / g
-    dcol = (float(pj[1]) - float(pi[1])) / g
-    dist = (abs(float(pj[0]) - float(pi[0])) + abs(float(pj[1]) - float(pi[1]))) / g
-    zi = int(agent_zone[int(ego)])
-    zj = int(agent_zone[int(j)])
-    same_zone = 1.0 if zi == zj else 0.0
-    zone_diff = (zj - zi) / float(max(1, int(n_zones) - 1))
-
-    role_onehot = _np.zeros((len(PUBLIC_ROLES),), dtype=_np.float32)
-    if agent_role is not None:
-        try:
-            raw_role = agent_role[int(j)]
-            role_onehot[PUBLIC_ROLES.index(str(raw_role))] = 1.0
-        except (KeyError, IndexError, TypeError, ValueError):
-            pass
-
-    return _np.concatenate(
-        [
-            _np.asarray(
-                [drow, dcol, dist, same_zone, zone_diff], dtype=_np.float32
-            ),
-            role_onehot,
-        ]
+    return OmniArenaAdapter._pair_features_from_tables(
+        positions, agent_zone, grid_size, n_zones, ego, j, agent_role
     )

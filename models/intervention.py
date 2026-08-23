@@ -24,7 +24,9 @@ IMPORTANT CONSEQUENCE: PROPENSITY IS EXACT
 Before the forcing indicator is realised, the marginal behaviour policy of
 agent j at step t is the mixture
 
-    b_j(a | s) = eps * (1/|A|) + (1 - eps) * pi_j(a | s).
+    b_j(a | s) = eps / |A_valid(s)| + (1 - eps) * pi_j(a | s)
+
+for valid actions; invalid actions retain probability zero.
 
 b_j is KNOWN EXACTLY because pi_j is the learner's own network and eps is a
 chosen constant. Propensity normally has to be estimated in off-policy
@@ -36,7 +38,7 @@ contexts.
 
 Epsilon forcing also guarantees the POSITIVITY/OVERLAP assumption:
 
-    b_j(a | s) >= eps / |A| > 0  for every a.
+    b_j(a | s) >= eps / |A_valid(s)| > 0  for every valid a.
 
 Without this guarantee, a counterfactual action a'_j that j never takes would
 force the model to extrapolate into a region with no data, making the estimate
@@ -241,6 +243,7 @@ class EpsilonForcedActionController:
         self,
         actions: List[int],
         policy_probs: np.ndarray,
+        valid_action_masks: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Randomly force a subset of agents and return effective propensities.
@@ -252,6 +255,9 @@ class EpsilonForcedActionController:
             policy_probs:
                 np.ndarray shape [n_agents, action_dim].
                 pi_j(a | s) for every agent and every action.
+            valid_action_masks:
+                Optional boolean matrix with the same shape. Forcing and the
+                logged propensity are normalized over valid actions only.
 
         Returns:
             forced_mask:
@@ -269,6 +275,17 @@ class EpsilonForcedActionController:
                 f"policy_probs must have shape [{self.n_agents}, {self.action_dim}]; "
                 f"received {probs.shape}"
             )
+        if valid_action_masks is None:
+            valid = np.ones_like(probs, dtype=bool)
+        else:
+            valid = np.asarray(valid_action_masks, dtype=bool)
+            if valid.shape != probs.shape or np.any(valid.sum(axis=1) == 0):
+                raise ValueError(
+                    "valid_action_masks must match policy_probs and retain at "
+                    "least one action per agent"
+                )
+        probs = np.where(valid, np.clip(probs, 0.0, None), 0.0)
+        probs = probs / np.clip(probs.sum(axis=1, keepdims=True), 1e-8, None)
 
         # ---- 1. Decide which agents are forced ---------------------------
         # eps_vec is uniform unless set_priority enables uncertainty-based
@@ -327,7 +344,8 @@ class EpsilonForcedActionController:
 
         # ---- 2. Force uniformly random actions ---------------------------
         for j in np.flatnonzero(forced_mask):
-            actions[int(j)] = int(self.rng.randint(0, self.action_dim))
+            candidates = np.flatnonzero(valid[int(j)])
+            actions[int(j)] = int(self.rng.choice(candidates))
 
         # ---- 3. Compute effective propensities ---------------------------
         # The returned value is the MARGINAL propensity before the forcing
@@ -335,11 +353,8 @@ class EpsilonForcedActionController:
         # b = eps * uniform + (1-eps) * pi. Conditional on F=1 the action
         # distribution is pure uniform; conditional on F=0 it is pi. Mixing
         # those two notions after observing F would yield the wrong weight.
-        uniform = np.full(
-            (self.n_agents, self.action_dim),
-            1.0 / float(self.action_dim),
-            dtype=np.float32,
-        )  # [n_agents, action_dim]
+        uniform = valid.astype(np.float32)
+        uniform = uniform / uniform.sum(axis=1, keepdims=True)
 
         # Each agent has its own eps and hence its own propensity. Record the
         # eps actually used; otherwise DR divides by the wrong quantity and

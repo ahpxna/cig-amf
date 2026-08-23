@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from envs.causal_adapter import resolve_env_adapter
+
 from models.influence_signature import SIGNATURE_DIM
 from models.peripheral_memory import (
     FULL_ITEM_DIM,
@@ -240,15 +242,20 @@ class SingleMeanPeripheral(nn.Module):
         if not ids:
             return np.zeros((0, self.item_dim), dtype=np.float32)
 
-        ego_pos = env.positions[ego_id]
-        grid_den = max(1, int(env.grid_size))
-        zone_den = max(1, int(env.n_zones) - 1)
+        adapter = resolve_env_adapter(env)
         last_actions = getattr(env, "last_actions", [0] * int(env.n_agents))
         rows = []
         full_count = 0
         legacy_count = 0
         for neighbor_id in ids:
-            neighbor_pos = env.positions[neighbor_id]
+            pair = np.asarray(
+                adapter.pair_features(ego_id, neighbor_id),
+                dtype=np.float32,
+            )
+            if pair.size < 5:
+                raise ValueError(
+                    "adapter pair_features must expose five base channels"
+                )
             belief = belief_state[neighbor_id]
             signature = None
             if influence_signatures is not None:
@@ -289,16 +296,10 @@ class SingleMeanPeripheral(nn.Module):
                     if context_validity is None
                     else context_validity.get(neighbor_id, 0.0)
                 ),
-                float((neighbor_pos[0] - ego_pos[0]) / grid_den),
-                float((neighbor_pos[1] - ego_pos[1]) / grid_den),
-                float(
-                    (env.agent_zone[neighbor_id] - env.agent_zone[ego_id])
-                    / zone_den
-                ),
-                float(
-                    abs(neighbor_pos[0] - ego_pos[0])
-                    + abs(neighbor_pos[1] - ego_pos[1])
-                ) / grid_den,
+                float(pair[0]),
+                float(pair[1]),
+                float(pair[4]),
+                float(pair[2]),
             ])
 
         self.signature_full_items_seen += full_count

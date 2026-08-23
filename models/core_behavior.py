@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from envs.causal_adapter import resolve_env_adapter
+
 
 class PairRelationalEncoder(nn.Module):
     """
@@ -319,30 +321,23 @@ class PairRelationalModule:
         ego_id = int(ego_id)
         neighbor_id = int(neighbor_id)
 
-        grid_den = max(1, int(getattr(env, "grid_size", 1)))
-        zone_den = max(1, int(getattr(env, "n_zones", 1)) - 1)
-
-        pi = env.positions[ego_id]
-        pj = env.positions[neighbor_id]
-
-        rel_row = float((pj[0] - pi[0]) / grid_den)
-        rel_col = float((pj[1] - pi[1]) / grid_den)
-
-        dist = float(abs(pj[0] - pi[0]) + abs(pj[1] - pi[1]))
-        dist_norm = dist / grid_den
-
-        zi = int(env.agent_zone[ego_id])
-        zj = int(env.agent_zone[neighbor_id])
-
-        same_zone = 1.0 if zi == zj else 0.0
-        zone_diff = float((zj - zi) / zone_den)
-
+        adapter = resolve_env_adapter(env)
+        pair = np.asarray(
+            adapter.pair_features(ego_id, neighbor_id), dtype=np.float32
+        )
+        if pair.size < 5:
+            raise ValueError("adapter pair_features must expose five base channels")
+        rel_row, rel_col, dist_norm, same_zone, zone_diff = pair[:5]
         same_role = 0.0
-        if hasattr(env, "agent_role"):
-            try:
-                same_role = 1.0 if env.agent_role[ego_id] == env.agent_role[neighbor_id] else 0.0
-            except Exception:
-                same_role = 0.0
+        ego_pair = np.asarray(
+            adapter.pair_features(neighbor_id, ego_id), dtype=np.float32
+        )
+        if pair.size > 5 and ego_pair.size == pair.size:
+            same_role = float(
+                np.argmax(pair[5:]) == np.argmax(ego_pair[5:])
+                and np.max(pair[5:]) > 0.0
+                and np.max(ego_pair[5:]) > 0.0
+            )
 
         # Optional identity feature: normalized agent ID, an arbitrary label
         # carrying no structural information. The seventh feature is active
@@ -350,7 +345,7 @@ class PairRelationalModule:
         # The public role is already present in OmniArena's neighbour
         # observation, so it is not duplicated as a separate relational
         # channel here.
-        agent_id_norm = float(neighbor_id) / float(max(1, getattr(env, "n_agents", 1)))
+        agent_id_norm = float(neighbor_id) / float(max(1, adapter.n_agents))
 
         feats = [
             rel_row,

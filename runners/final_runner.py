@@ -3,10 +3,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from envs.causal_adapter import resolve_env_adapter
 from models.structural_proxy import (
     LocalCounterfactualProxyEnsemble,
-    build_pair_feat,      # [FIX-X1]
-    PAIR_FEAT_DIM,
 )
 from models.belief_layer import BayesLightBeliefState
 from models.core_behavior import PairRelationalModule
@@ -99,12 +98,13 @@ class FinalCIGAMFRunner:
 
     def __init__(self, env, cfg, device="cpu"):
         self.env = env
+        self.env_adapter = resolve_env_adapter(env)
         self.cfg = dict(cfg)
         self.device = device
 
-        self.n_agents = int(env.n_agents)
-        self.obs_dim = int(env.get_obs_dim())
-        self.action_dim = int(env.get_action_dim())
+        self.n_agents = int(self.env_adapter.n_agents)
+        self.obs_dim = int(self.env_adapter.obs_dim)
+        self.action_dim = int(self.env_adapter.max_action_dim)
 
         self.core_dim = int(cfg["core_dim"])
         self.periph_dim = int(cfg["periph_dim"])
@@ -117,6 +117,12 @@ class FinalCIGAMFRunner:
                 "causal_horizon and proxy_n_horizons must be identical: "
                 f"received {causal_horizon} and {proxy_horizon}"
             )
+        proxy_pair_feat_dim = cfg.get("proxy_pair_feat_dim")
+        if proxy_pair_feat_dim is None:
+            proxy_pair_feat_dim = self.env_adapter.pair_feature_dim
+        proxy_context_item_dim = cfg.get("proxy_context_item_dim")
+        if proxy_context_item_dim is None:
+            proxy_context_item_dim = self.env_adapter.context_item_dim
 
         self.proxy = LocalCounterfactualProxyEnsemble(
             obs_dim=self.obs_dim,
@@ -144,7 +150,9 @@ class FinalCIGAMFRunner:
             seed=cfg.get("seed", 0),
             # [FIX-X1] x_ij from Eq. 8. Set zero for the legacy no-x_ij
             # ablation, the configuration that failed H1 over eight seeds.
-            pair_feat_dim=cfg.get("proxy_pair_feat_dim", PAIR_FEAT_DIM),
+            pair_feat_dim=proxy_pair_feat_dim,
+            context_item_dim=proxy_context_item_dim,
+            debug_verbose=cfg.get("debug_verbose", False),
         )
 
         self.pair_rel_module = PairRelationalModule(
@@ -407,31 +415,13 @@ class FinalCIGAMFRunner:
         This prior only seeds the core during warm-up. In Stage 1, learned
         beliefs determine the core/peripheral partition.
         """
-        role_bonus = {
-            "hauler": 0.20,
-            "processor": 0.26,
-            "dispatcher": 0.24,
-            "sweeper": 0.10,
-            "spoiler": 0.08,
-        }
-
-        pi = self.env.positions[int(ego)]
-        zi = self.env.agent_zone[int(ego)]
         scores = {}
 
         for j in range(self.n_agents):
             if j == ego:
                 continue
 
-            pj = self.env.positions[int(j)]
-            zj = self.env.agent_zone[int(j)]
-            dist = abs(pj[0] - pi[0]) + abs(pj[1] - pi[1])
-
-            proximity = 1.0 / (1.0 + float(dist))
-            same_zone = 0.25 if int(zi) == int(zj) else 0.0
-            role_term = role_bonus.get(self.env.agent_role[int(j)], 0.0)
-
-            scores[j] = float(proximity + same_zone + role_term)
+            scores[j] = float(self.env_adapter.weak_prior_score(ego, j))
 
         return scores
 
@@ -676,12 +666,33 @@ class FinalCIGAMFRunner:
         the path is ``proxy -> partition -> policy`` rather than a feedback
         loop from an earlier partition into the proxy target.
         """
+        adapter = getattr(self, "env_adapter", None)
+        if adapter is None:
+            adapter = resolve_env_adapter(self.env, action_dim=self.action_dim)
+        table, mask = self._raw_proxy_context_items_excluding(
+            ego, exclude_j, current_actions=current_actions
+        )
+        active = table[np.asarray(mask, dtype=bool)]
+        if active.size == 0:
+            summary = np.zeros(
+                2 * int(adapter.context_item_dim) + 1,
+                dtype=np.float32,
+            )
+        else:
+            summary = np.concatenate([
+                active.sum(axis=0), np.square(active).sum(axis=0), [len(active)]
+            ]).astype(np.float32)
+        return self._split_raw_context(summary)
+
+    def _raw_proxy_context_items_excluding(
+        self, ego, exclude_j, current_actions=None
+    ):
+        """Return raw neighbour items for literal leave-one-out DeepSets."""
+        adapter = getattr(self, "env_adapter", None)
+        if adapter is None:
+            adapter = resolve_env_adapter(self.env, action_dim=self.action_dim)
         ego = int(ego)
         exclude_j = int(exclude_j)
-        pos_i = self.env.positions[ego]
-        zone_i = int(self.env.agent_zone[ego])
-        grid = max(1.0, float(getattr(self.env, "grid_size", 1)))
-        zones = max(1.0, float(getattr(self.env, "n_zones", 1) - 1))
         action_source = (
             current_actions
             if current_actions is not None
@@ -691,31 +702,25 @@ class FinalCIGAMFRunner:
         for other in range(self.n_agents):
             if other in (ego, exclude_j):
                 continue
-            pos = self.env.positions[other]
-            drow = (float(pos[0]) - float(pos_i[0])) / grid
-            dcol = (float(pos[1]) - float(pos_i[1])) / grid
-            distance = (abs(drow) + abs(dcol))
-            zone_delta = (float(self.env.agent_zone[other]) - zone_i) / zones
-            same_zone = float(int(self.env.agent_zone[other]) == zone_i)
             try:
                 action_index = int(action_source[other])
             except (KeyError, IndexError, TypeError):
                 action_index = 0
-            action_onehot = np.zeros(self.action_dim, dtype=np.float32)
-            action_onehot[int(np.clip(action_index, 0, self.action_dim - 1))] = 1.0
             rows.append(
-                [drow, dcol, distance, same_zone, zone_delta, *action_onehot.tolist()]
+                adapter.neighbour_features(ego, other, action_index)
             )
-
-        table = np.asarray(rows, dtype=np.float32)
-        if table.size == 0:
-            summary = np.zeros(2 * (5 + self.action_dim) + 1, dtype=np.float32)
-        else:
-            summary = np.concatenate(
-                [table.sum(axis=0), np.square(table).sum(axis=0), [len(table)]],
-                axis=0,
-            ).astype(np.float32)
-        return self._split_raw_context(summary)
+        if not rows:
+            return (
+                np.zeros((1, adapter.context_item_dim), dtype=np.float32),
+                np.zeros((1,), dtype=np.float32),
+            )
+        table = np.stack(rows, axis=0).astype(np.float32)
+        if table.shape[1] != adapter.context_item_dim:
+            raise RuntimeError(
+                "environment adapter context item dimension mismatch: "
+                f"declared {adapter.context_item_dim}, got {table.shape[1]}"
+            )
+        return table, np.ones((table.shape[0],), dtype=np.float32)
 
     # ============================================================
     # Action selection
@@ -744,7 +749,7 @@ class FinalCIGAMFRunner:
 
         return np.full(self.action_dim, 1.0 / float(self.action_dim), dtype=np.float32)
 
-    def _execution_policy_adapter(self, learned_probs):
+    def _execution_policy_adapter(self, learned_probs, valid_action_masks=None):
         """Mix learned and scripted policy distributions for controlled H2.
 
         The returned distribution is the policy that is actually sampled
@@ -759,9 +764,27 @@ class FinalCIGAMFRunner:
             raise ValueError(
                 f"learned policy matrix must have shape {expected}, got {learned.shape}"
             )
-        learned = np.stack(
-            [_safe_distribution(row, self.action_dim) for row in learned], axis=0
-        )
+        if valid_action_masks is None:
+            valid = np.ones_like(learned, dtype=bool)
+        else:
+            valid = np.asarray(valid_action_masks, dtype=bool)
+            if valid.shape != expected or np.any(valid.sum(axis=1) == 0):
+                raise ValueError(
+                    "valid_action_masks must match the policy matrix and "
+                    "retain at least one action per agent"
+                )
+
+        def _masked_distribution(row, mask):
+            masked = np.where(mask, np.asarray(row, dtype=np.float32), 0.0)
+            total = float(masked.sum())
+            if not np.isfinite(total) or total <= 0.0:
+                masked = mask.astype(np.float32)
+            return masked / float(masked.sum())
+
+        learned = np.stack([
+            _masked_distribution(row, valid[agent])
+            for agent, row in enumerate(learned)
+        ], axis=0)
 
         configured_lambda = float(self.cfg.get("behavioral_adapter_lambda", 0.0))
         active_mode = str(getattr(self.env, "mode", ""))
@@ -777,6 +800,10 @@ class FinalCIGAMFRunner:
             [self._behavioural_execution_distribution(agent) for agent in range(self.n_agents)],
             axis=0,
         )
+        scripted = np.stack([
+            _masked_distribution(row, valid[agent])
+            for agent, row in enumerate(scripted)
+        ], axis=0)
         target_ids = self.cfg.get("behavioral_adapter_target_agents")
         target_roles = self.cfg.get("behavioral_adapter_target_roles")
         target_mask = np.zeros(self.n_agents, dtype=bool)
@@ -803,9 +830,10 @@ class FinalCIGAMFRunner:
                 (1.0 - lam) * learned[target_mask]
                 + lam * scripted[target_mask]
             )
-        executed = np.stack(
-            [_safe_distribution(row, self.action_dim) for row in executed], axis=0
-        )
+        executed = np.stack([
+            _masked_distribution(row, valid[agent])
+            for agent, row in enumerate(executed)
+        ], axis=0)
 
         # Population means make the manipulation auditable without retaining
         # raw policy tensors in every H2 summary row.
@@ -856,23 +884,13 @@ class FinalCIGAMFRunner:
             "core_context_excluding": {},
             "periph_context_excluding": {},
             "proxy_context_excluding": {},
+            "proxy_context_items_excluding": {},
             "value_cache": {},
             # [FIX-X1] Snapshot geometry at this timestep so replay_builder can
             # construct x_ij at sample creation time. It cannot be reconstructed
             # after the episode because env.positions then contains final state.
             # Cost is negligible: 24 coordinates and 24 zone IDs per timestep.
-            "geom_snapshot": {
-                "positions": [list(self.env.positions[i]) for i in range(self.env.n_agents)],
-                "agent_zone": [
-                    int(self.env.agent_zone[i]) for i in range(self.n_agents)
-                ],
-                "agent_role": (
-                    [str(self.env.agent_role[i]) for i in range(self.n_agents)]
-                    if hasattr(self.env, "agent_role") else None
-                ),
-                "grid_size": int(getattr(self.env, "grid_size", 1)),
-                "n_zones": int(getattr(self.env, "n_zones", 1)),
-            },
+            "geom_snapshot": self.env_adapter.feature_snapshot(),
         }
 
         obs_batch = []
@@ -897,6 +915,7 @@ class FinalCIGAMFRunner:
             cache["core_context_excluding"][ego] = {}
             cache["periph_context_excluding"][ego] = {}
             cache["proxy_context_excluding"][ego] = {}
+            cache["proxy_context_items_excluding"][ego] = {}
 
             for j in range(self.n_agents):
                 if j == ego:
@@ -915,8 +934,11 @@ class FinalCIGAMFRunner:
                     ego,
                     j,
                 )
+                cache["proxy_context_items_excluding"][ego][j] = (
+                    self._raw_proxy_context_items_excluding(ego, j)
+                )
 
-            obs_batch.append(self.env.get_obs_of_ego(obs_all, ego))
+            obs_batch.append(self.env_adapter.observation(obs_all, ego))
             core_batch.append(core_summary_np)
             periph_batch.append(periph_summary_np)
             belief_batch.append(belief_summary_np)
@@ -959,8 +981,13 @@ class FinalCIGAMFRunner:
             values_np = values.detach().cpu().numpy()
             learned_probs_np = probs.detach().cpu().numpy()
 
+        valid_action_masks = np.stack([
+            self.env_adapter.valid_action_mask(agent)
+            for agent in range(self.n_agents)
+        ], axis=0)
         probs_np, scripted_probs_np, adapter_diagnostics = self._execution_policy_adapter(
-            learned_probs_np
+            learned_probs_np,
+            valid_action_masks=valid_action_masks,
         )
 
         # Sample from the actually executed pre-forcing policy.  Sampling from
@@ -983,16 +1010,16 @@ class FinalCIGAMFRunner:
         forced_mask, effective_probs = self.forcer.apply(
             actions=actions_list,
             policy_probs=probs_np,
+            valid_action_masks=valid_action_masks,
         )
 
         # ------------------------------------------------------------------
         # [VERIFY-F1] Verify that forced actions survive into the trajectory.
         #
-        # Observed min_head_frac was 0.001-0.005, but uniform forcing over six
-        # actions gives a theoretical lower bound forced_frac/|A| of
-        # 0.013-0.033. A 15-30x deficit is impossible in a correct pipeline and
-        # implies that the buffer stores pre-override a_j or applies override
-        # after append.
+        # The forced-action histogram must be uniform over each state's valid
+        # action set. A severe deficit on an action that is valid throughout a
+        # diagnostic run indicates that replay stored the pre-override action
+        # or applied the override after append.
         #
         # Code order appears correct because apply mutates before packing, but
         # inspection alone cannot establish this runtime property. Measure
@@ -1034,6 +1061,11 @@ class FinalCIGAMFRunner:
                             ego, j, current_actions=actions_list
                         )
                     )
+                    cache["proxy_context_items_excluding"][ego][j] = (
+                        self._raw_proxy_context_items_excluding(
+                            ego, j, current_actions=actions_list
+                        )
+                    )
 
         cache["forced_mask"] = forced_mask
         cache["behaviour_probs"] = effective_probs
@@ -1044,6 +1076,7 @@ class FinalCIGAMFRunner:
         cache["learned_policy_probs"] = learned_probs_np
         cache["scripted_policy_probs"] = scripted_probs_np
         cache["behavioral_adapter"] = adapter_diagnostics
+        cache["valid_action_masks"] = valid_action_masks
 
         return actions, cache
 
@@ -1084,7 +1117,7 @@ class FinalCIGAMFRunner:
         - This preserves meaning:
               z_ij at context t -> predict a_j at t+1.
         """
-        obs_all = self.env.reset()
+        obs_all = self.env_adapter.reset()
 
         if self.scheduler.in_warmup():
             for ego in range(self.n_agents):
@@ -1107,11 +1140,11 @@ class FinalCIGAMFRunner:
             actions_dict, cache = self._select_actions_population(obs_all)
             actions_list = [actions_dict[a] for a in range(self.n_agents)]
 
-            env_snapshot_before_step = self.env.clone_state()
+            env_snapshot_before_step = self.env_adapter.clone_state()
             h_snapshot_before_latent_update = self.pair_rel_module.clone_full_states_np()
 
-            next_obs_all, rewards, done, info = self.env.step(actions_list)
-            env_snapshot_after_step = self.env.clone_state()
+            next_obs_all, rewards, done, info = self.env_adapter.step(actions_list)
+            env_snapshot_after_step = self.env_adapter.clone_state()
 
             rewards = np.array(rewards, dtype=np.float32)
             ep_reward += rewards
@@ -1127,6 +1160,7 @@ class FinalCIGAMFRunner:
                     "learned_policy_probs": cache.get("learned_policy_probs"),
                     "scripted_policy_probs": cache.get("scripted_policy_probs"),
                     "behavioral_adapter": cache.get("behavioral_adapter", {}),
+                    "valid_action_masks": cache.get("valid_action_masks"),
                     "belief_summary_cache": cache["belief_summary_cache"],
                     "core_summary_cache": cache["core_summary_cache"],
                     "periph_inputs_cache": cache["periph_inputs_cache"],
@@ -1134,6 +1168,9 @@ class FinalCIGAMFRunner:
                     "core_context_excluding": cache["core_context_excluding"],
                     "periph_context_excluding": cache["periph_context_excluding"],
                     "proxy_context_excluding": cache["proxy_context_excluding"],
+                    "proxy_context_items_excluding": cache[
+                        "proxy_context_items_excluding"
+                    ],
                     "value_cache": cache["value_cache"],
                     "geom_snapshot": cache["geom_snapshot"],   # [FIX-X1]
                     "forced_mask": cache["forced_mask"],
@@ -1155,7 +1192,7 @@ class FinalCIGAMFRunner:
                 and prev_actions is not None
                 and prev_env_snapshot_before_step is not None
             ):
-                self.env.restore_state(prev_env_snapshot_before_step)
+                self.env_adapter.restore_state(prev_env_snapshot_before_step)
 
                 self.pair_rel_module.add_bc_transition(
                     observations={a: prev_obs_all[a] for a in range(self.n_agents)},
@@ -1172,7 +1209,7 @@ class FinalCIGAMFRunner:
                     ),
                 )
 
-                self.env.restore_state(env_snapshot_after_step)
+                self.env_adapter.restore_state(env_snapshot_after_step)
 
                 # [ReciprocityTracker] Diagnostic only; never feed this into
                 # action selection. Use z_ij/s_ij at t, the same context as
@@ -1187,7 +1224,7 @@ class FinalCIGAMFRunner:
                         prev_forced_mask=prev_forced_mask,
                     )
 
-            self.env.restore_state(env_snapshot_before_step)
+            self.env_adapter.restore_state(env_snapshot_before_step)
 
             if not representation_frozen:
                 self.pair_rel_module.step_population(
@@ -1196,7 +1233,7 @@ class FinalCIGAMFRunner:
                     env=self.env,
                 )
 
-            self.env.restore_state(env_snapshot_after_step)
+            self.env_adapter.restore_state(env_snapshot_after_step)
 
             prev_obs_all = [x.copy() for x in obs_all]
             prev_actions = list(actions_list)
@@ -1256,15 +1293,15 @@ class FinalCIGAMFRunner:
             # The forcer is targeted: per-agent epsilon differs and smoke test
             # section 5 measured 6.1x concentration, so forced-agent identity
             # is nonuniform. Conditional on forcing, the chosen action must be
-            # uniform over |A|; this determines the min_head_frac lower bound.
-            print(
-                f"[VERIFY-F1] forced_seen={self._vf1_n_forced} "
-                f"actually_changed={self._vf1_n_changed} "
-                f"({100.0*self._vf1_n_changed/max(1,self._vf1_n_forced):.1f}%; "
-                f"expected ~{100.0*(1-1.0/self.action_dim):.0f}% because a "
-                f"forced action matches the old action with probability 1/|A|) "
-                f"hist_action_forced={np.round(h, 3).tolist()}"
-            )
+            # uniform over the current valid-action set.
+            if self.cfg.get("debug_verbose", False):
+                print(
+                    f"[VERIFY-F1] forced_seen={self._vf1_n_forced} "
+                    f"actually_changed={self._vf1_n_changed} "
+                    f"({100.0*self._vf1_n_changed/max(1,self._vf1_n_forced):.1f}%; "
+                    "the match rate depends on the state-specific valid-action set) "
+                    f"hist_action_forced={np.round(h, 3).tolist()}"
+                )
             self._vf1_n_forced = 0
             self._vf1_n_changed = 0
             self._vf1_hist = np.zeros(int(self.action_dim), dtype=np.int64)
@@ -1391,7 +1428,7 @@ class FinalCIGAMFRunner:
             periph_tensors = []
 
             for ego in range(self.n_agents):
-                obs_i = self.env.get_obs_of_ego(step["obs_all"], ego)
+                obs_i = self.env_adapter.observation(step["obs_all"], ego)
 
                 obs_batch.append(obs_i)
                 core_batch.append(step["core_summary_cache"][ego])
@@ -1442,7 +1479,16 @@ class FinalCIGAMFRunner:
                 periph_t,
                 belief_t,
             )
-
+            valid_rows = step.get("valid_action_masks")
+            if valid_rows is not None:
+                valid_t = torch.tensor(
+                    np.asarray(valid_rows, dtype=bool),
+                    dtype=torch.bool,
+                    device=logits.device,
+                )
+                if valid_t.shape != logits.shape or not bool(valid_t.any(dim=1).all()):
+                    raise ValueError("trajectory valid-action masks are malformed")
+                logits = logits.masked_fill(~valid_t, -torch.inf)
             probs = torch.softmax(logits, dim=-1)
             dist = torch.distributions.Categorical(probs=probs)
 
@@ -1583,7 +1629,7 @@ class FinalCIGAMFRunner:
         )
 
         for ego in range(self.n_agents):
-            obs_i = self.env.get_obs_of_ego(obs_all, ego)
+            obs_i = self.env_adapter.observation(obs_all, ego)
             action_i = int(actions[ego])
 
             belief_items = self._build_belief_items_for_ego(ego)
@@ -1595,6 +1641,8 @@ class FinalCIGAMFRunner:
             z_batch = []
             m_batch = []
             b_batch = []
+            context_items_batch = []
+            context_mask_batch = []
             neighbor_ids = []
 
             for j in range(self.n_agents):
@@ -1609,6 +1657,13 @@ class FinalCIGAMFRunner:
                 )
                 z_batch.append(raw_core)
                 m_batch.append(raw_periph)
+                context_items, context_mask = (
+                    self._raw_proxy_context_items_excluding(
+                        ego, j, current_actions=actions
+                    )
+                )
+                context_items_batch.append(context_items)
+                context_mask_batch.append(context_mask)
                 b_batch.append(belief_summary)
                 neighbor_ids.append(j)
 
@@ -1674,14 +1729,15 @@ class FinalCIGAMFRunner:
                 # using the same function as the push path to prevent
                 # train/serve skew.
                 pair_feat_batch=[
-                    build_pair_feat(
-                        self.env.positions, self.env.agent_zone,
-                        getattr(self.env, "grid_size", 1),
-                        getattr(self.env, "n_zones", 1), ego, j,
-                        agent_role=getattr(self.env, "agent_role", None),
-                    )
+                    self.env_adapter.pair_features(ego, j)
                     for j in neighbor_ids
                 ],
+                context_items_batch=np.stack(context_items_batch, axis=0),
+                context_mask_batch=np.stack(context_mask_batch, axis=0),
+                valid_action_mask_batch=np.stack([
+                    self.env_adapter.valid_action_mask(j)
+                    for j in neighbor_ids
+                ], axis=0),
             )
             c_mu_arr = out.get("c_mu", out.get("mu_range"))
             c_sigma_arr = out.get("c_sigma", out["sigma"])
@@ -1764,9 +1820,10 @@ class FinalCIGAMFRunner:
                 "promoted": 0,
                 "demoted": 0,
             }
-        print(f"[GRAPH-DEBUG] should_update_graph={self.scheduler.should_update_graph()} " f"buffer_len={len(self.proxy.buffer)} n_steps_cfg={self.cfg['proxy_train_steps']}")
-        st = self.scheduler.get_status()
-        print(f"[SCHED-DEBUG] episode={st['episode']} freq_used={self.scheduler._accel_freq() if self.scheduler.accel_remaining>0 else self.scheduler._base_freq()} " f"accel_remaining={st['accel_remaining']} trigger_count={st['trigger_count']} last_trigger_ep={st['last_trigger_episode']}")
+        if self.cfg.get("debug_verbose", False):
+            print(f"[GRAPH-DEBUG] should_update_graph={self.scheduler.should_update_graph()} " f"buffer_len={len(self.proxy.buffer)} n_steps_cfg={self.cfg['proxy_train_steps']}")
+            st = self.scheduler.get_status()
+            print(f"[SCHED-DEBUG] episode={st['episode']} freq_used={self.scheduler._accel_freq() if self.scheduler.accel_remaining>0 else self.scheduler._base_freq()} " f"accel_remaining={st['accel_remaining']} trigger_count={st['trigger_count']} last_trigger_ep={st['last_trigger_episode']}")
         proxy_loss = self.proxy.train_step(
             n_steps=self.cfg["proxy_train_steps"],
             batch_size=self.cfg["proxy_batch_size"],
@@ -1794,7 +1851,7 @@ class FinalCIGAMFRunner:
 
         for idx in step_indices:
             step = trajectory[int(idx)]
-            self.env.restore_state(step["env_snapshot_before_step"])
+            self.env_adapter.restore_state(step["env_snapshot_before_step"])
             observed_returns = h_returns[int(idx)] if h_returns is not None else None
             behaviour_probs = step.get("behaviour_probs") if isinstance(step, dict) else None
             policy_probs = step.get("policy_probs") if isinstance(step, dict) else None
@@ -1810,7 +1867,7 @@ class FinalCIGAMFRunner:
             demoted += int(d_i)
             last_influence_matrix = w_i
 
-        self.env.restore_state(trajectory[-1]["env_snapshot_after_step"])
+        self.env_adapter.restore_state(trajectory[-1]["env_snapshot_after_step"])
 
         residual = self.proxy.get_latest_residual()
 
@@ -1983,34 +2040,8 @@ class FinalCIGAMFRunner:
         raise ValueError(f"unknown external core selector {mode!r}")
 
     def _signature_context_key(self, ego, neighbor):
-        """Return a coarse, pre-treatment interaction-context category."""
-        ego = int(ego)
-        neighbor = int(neighbor)
-        zi = int(self.env.agent_zone[ego])
-        zj = int(self.env.agent_zone[neighbor])
-        pi = self.env.positions[ego]
-        pj = self.env.positions[neighbor]
-        distance = abs(int(pi[0]) - int(pj[0])) + abs(int(pi[1]) - int(pj[1]))
-        distance_bin = 0 if distance <= 2 else (1 if distance <= 5 else 2)
-        role_table = getattr(self.env, "agent_role", {})
-        try:
-            role = str(role_table[neighbor])
-        except (KeyError, IndexError, TypeError):
-            role = "unknown"
-        gate_open = int(bool(getattr(self.env, "gate_open", {}).get(zj, False)))
-        unavailable = int(
-            not bool(getattr(self.env, "resource_available", {}).get(zj, True))
-        )
-        carrying = int(bool(getattr(self.env, "carrying", {}).get(zj, False)))
-        lane_b = int(
-            str(getattr(self.env, "active_lane", {}).get(zj, "A")) == "B"
-        )
-        mechanism_state = (
-            gate_open | (unavailable << 1) | (carrying << 2) | (lane_b << 3)
-        )
-        return (
-            int(zi == zj), int(distance_bin), zi, role, int(mechanism_state)
-        )
+        """Return the adapter-defined pre-treatment interaction category."""
+        return self.env_adapter.context_key(int(ego), int(neighbor))
 
     def evaluate_episode_snapshot(
         self,

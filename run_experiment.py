@@ -147,6 +147,7 @@ def default_cfg():
         "bc_batch_size": 256,
 
         "policy_lr": 7e-4,
+        "debug_verbose": False,
 
         "k0_warmup": 30,
         "slow_ratio": 0.15,
@@ -246,7 +247,9 @@ def default_cfg():
         # one-hot vector. Set this to zero
         # to reproduce the old configuration, where f_theta is blind to
         # neighbour identity, for the H1 ablation.
-        "proxy_pair_feat_dim": 11,
+        # None delegates feature dimensionality to the environment adapter.
+        # Set 0 only for the explicit neighbour-blind H1 ablation.
+        "proxy_pair_feat_dim": None,
         "proxy_ensemble_dropout": 0.0,
         # Controlled H2 behavioural manipulation.  The active policy becomes
         # (1-lambda)*pi_learned + lambda*pi_scripted before epsilon forcing.
@@ -1661,6 +1664,12 @@ def _score_learned_proxy_for_state(runner, tiny_env, state, ego, neighbor_ids):
         }
         z_excluding = {j: raw_excluding[j][0] for j in raw_excluding}
         m_excluding = {j: raw_excluding[j][1] for j in raw_excluding}
+        raw_item_excluding = {
+            int(j): runner._raw_proxy_context_items_excluding(
+                int(ego), int(j), current_actions=current_actions
+            )
+            for j in neighbor_ids if int(j) != int(ego)
+        }
     else:
         z_excluding = _core_context_excluding_all_compat(runner=runner, ego=int(ego))
         m_excluding = _periph_context_excluding_all_compat(runner=runner, ego=int(ego))
@@ -1689,14 +1698,19 @@ def _score_learned_proxy_for_state(runner, tiny_env, state, ego, neighbor_ids):
             # that measures Spearman correlation against the oracle, so omitting
             # x_ij here removes it at the most important measurement site.
             pair_feat_batch=[
-                build_pair_feat(
-                    tiny_env.positions, tiny_env.agent_zone,
-                    getattr(tiny_env, "grid_size", 1),
-                    getattr(tiny_env, "n_zones", 1), int(ego), int(j),
-                    agent_role=getattr(tiny_env, "agent_role", None),
-                )
+                runner.env_adapter.pair_features(int(ego), int(j))
                 for j in neighbor_ids
             ],
+            context_items_batch=np.stack([
+                raw_item_excluding[j][0] for j in neighbor_ids
+            ], axis=0),
+            context_mask_batch=np.stack([
+                raw_item_excluding[j][1] for j in neighbor_ids
+            ], axis=0),
+            valid_action_mask_batch=np.stack([
+                runner.env_adapter.valid_action_mask(int(j))
+                for j in neighbor_ids
+            ], axis=0),
         )
 
         for k, j in enumerate(neighbor_ids):
@@ -1730,8 +1744,10 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
     """
     required = (
         "obs_all", "actions", "rewards", "proxy_context_excluding",
+        "proxy_context_items_excluding",
         "belief_summary_cache", "geom_snapshot",
-        "behaviour_probs", "policy_probs", "env_snapshot_before_step",
+        "behaviour_probs", "policy_probs", "valid_action_masks",
+        "env_snapshot_before_step",
     )
     missing = [name for name in required if step.get(name) is None]
     if missing:
@@ -1776,12 +1792,20 @@ def _score_h1_logged_step(runner, tiny_env, step, ego, neighbor_ids):
             observed_returns_batch=[observed_return for _ in neighbor_ids],
             behaviour_probs_obs_batch=behaviour_obs,
             pair_feat_batch=[
-                build_pair_feat(
-                    geom["positions"], geom["agent_zone"], geom["grid_size"],
-                    geom["n_zones"], ego, j, agent_role=geom.get("agent_role"),
-                )
+                runner.env_adapter.pair_features_from_snapshot(geom, ego, j)
                 for j in neighbor_ids
             ],
+            context_items_batch=np.stack([
+                step["proxy_context_items_excluding"][ego][j][0]
+                for j in neighbor_ids
+            ], axis=0),
+            context_mask_batch=np.stack([
+                step["proxy_context_items_excluding"][ego][j][1]
+                for j in neighbor_ids
+            ], axis=0),
+            valid_action_mask_batch=np.stack([
+                step["valid_action_masks"][j] for j in neighbor_ids
+            ], axis=0),
         )
     finally:
         if old_effect_mode is not None:
