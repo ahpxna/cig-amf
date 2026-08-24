@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Clone/migrate pinned external benchmarks into one canonical repository root and
-# optionally install them into an isolated Python 3.10-3.12 runtime.
+# optionally install them into an isolated Python 3.11-3.12 runtime.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,9 +20,9 @@ usage: $0 [--install] [--recreate-runtime]
 
 --install            install pinned benchmark packages into the isolated
                      external_envs/runtime environment
---recreate-runtime   recreate only the managed external runtime
+--recreate-runtime   recreate and reinstall the managed external runtime
 
-For installation use Python 3.10-3.12 (3.12 recommended):
+For installation use Python 3.11-3.12 (3.12 recommended):
   CIG_EXTERNAL_PYTHON=/path/to/python3.12 $0 --install --recreate-runtime
 EOF
 }
@@ -30,7 +30,7 @@ EOF
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --install) INSTALL=1 ;;
-    --recreate-runtime) RECREATE=1 ;;
+    --recreate-runtime) RECREATE=1; INSTALL=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
@@ -110,18 +110,18 @@ choose_external_python() {
   if [ -n "${CIG_EXTERNAL_PYTHON:-}" ]; then
     candidates="$CIG_EXTERNAL_PYTHON"
   else
-    candidates="python3.12 python3.11 python3.10"
+    candidates="python3.12 python3.11"
   fi
   for candidate in $candidates; do
     resolved="$(command -v "$candidate" 2>/dev/null || true)"
     [ -n "$resolved" ] || continue
     version="$($resolved -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-    ok="$($resolved -c 'import sys; print(int(sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12))')"
+    ok="$($resolved -c 'import sys; print(int(sys.version_info.major == 3 and 11 <= sys.version_info.minor <= 12))')"
     if [ "$ok" = "1" ]; then
       printf '%s\n' "$resolved"
       return 0
     fi
-    echo "[external-runtime] skipping $resolved (Python $version; need 3.10-3.12)" >&2
+    echo "[external-runtime] skipping $resolved (Python $version; need 3.11-3.12)" >&2
   done
   return 1
 }
@@ -150,7 +150,7 @@ EOF
     "$BASE_PYTHON" -m venv "$RUNTIME"
   fi
   RUNTIME_PY="$RUNTIME/bin/python"
-  if ! "$RUNTIME_PY" -c 'import sys; raise SystemExit(0 if sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12 else 1)'; then
+  if ! "$RUNTIME_PY" -c 'import sys; raise SystemExit(0 if sys.version_info.major == 3 and 11 <= sys.version_info.minor <= 12 else 1)'; then
     echo "managed runtime has an unsupported Python; rerun with --recreate-runtime" >&2
     exit 5
   fi

@@ -20,13 +20,11 @@ if str(ROOT) not in sys.path:
 
 from envs.external.runtime import ensure_output_file_parent, maybe_reexec_in_external_runtime
 
-import numpy as np
-
-from envs.external.registry import SPECS, build_environment, repo_path
-from envs.external_contract import require_panel
+ENVIRONMENTS = ("cityflow", "cyborg", "flatland", "rware")
 
 
 def _static_panel_support(environment, panel):
+    from envs.external.registry import SPECS
     spec = SPECS[environment]
     cap = spec.capabilities
     if not cap.supports(panel):
@@ -43,6 +41,7 @@ def _static_panel_support(environment, panel):
 
 
 def _runtime_smoke(env):
+    import numpy as np
     observations = env.reset(seed=123)
     if len(observations) != int(env.n_agents):
         raise RuntimeError("reset did not return one observation per agent")
@@ -68,6 +67,7 @@ def _runtime_smoke(env):
 
 
 def _h1_smoke(env):
+    import numpy as np
     if env.n_agents < 2:
         raise RuntimeError("H1 smoke requires at least two agents")
     env.reset(seed=321)
@@ -92,7 +92,7 @@ def _h1_smoke(env):
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--environment", choices=sorted(SPECS), required=True)
+    parser.add_argument("--environment", choices=ENVIRONMENTS, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--panels", nargs="+", default=["training", "h1", "h2", "latency"])
     parser.add_argument("--agent-count", type=int, default=6)
@@ -102,6 +102,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not args.manifest_only:
         maybe_reexec_in_external_runtime(require_ready=True)
+
+    # Registry/adapters are intentionally imported after the optional runtime
+    # handoff so external execution does not depend on the caller interpreter.
+    from envs.external.registry import SPECS, build_environment, repo_path
+    from envs.external_contract import require_panel
 
     decisions = {panel: _static_panel_support(args.environment, panel) for panel in args.panels}
     runtime = {}

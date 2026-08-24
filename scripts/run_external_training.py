@@ -1,6 +1,6 @@
 """Run actual Final-CIGAMF training on one normalized external benchmark."""
 from __future__ import annotations
-import argparse, csv, json, os, time
+import argparse, csv, json, math, os, time
 from pathlib import Path
 import sys
 
@@ -9,21 +9,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from envs.external.runtime import ensure_directory, maybe_reexec_in_external_runtime
 
-import numpy as np
-
-import run_experiment as RE
-from envs.external.registry import SPECS, build_environment
-from envs.external_contract import require_panel
+ENVIRONMENTS = ("cityflow", "cyborg", "flatland", "rware")
 
 
 def _finite_mean(values):
-    vals = [float(v) for v in values if np.isfinite(v)]
-    return float(np.mean(vals)) if vals else None
+    vals = [float(v) for v in values if math.isfinite(float(v))]
+    return float(sum(vals) / len(vals)) if vals else None
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--environment", choices=sorted(SPECS), required=True)
+    parser.add_argument("--environment", choices=ENVIRONMENTS, required=True)
     parser.add_argument("--seeds", type=int, nargs="+", default=[0])
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--agent-count", type=int, default=6)
@@ -37,6 +33,15 @@ def main(argv=None):
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     maybe_reexec_in_external_runtime(require_ready=True)
+
+    # Heavy project/external dependencies are imported only after the managed
+    # external-runtime handoff. This prevents a lean/main interpreter from
+    # failing on torch/numpy before it has a chance to re-exec.
+    import numpy as np
+    import run_experiment as RE
+    from envs.external.registry import build_environment
+    from envs.external_contract import require_panel
+
     if args.episodes <= 0 or args.max_steps <= 0 or not args.seeds:
         parser.error("episodes, max-steps and seeds must be positive")
     if len(set(args.seeds)) != len(args.seeds):

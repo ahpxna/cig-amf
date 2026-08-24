@@ -7,7 +7,8 @@ from envs.external.runtime import ensure_directory, ensure_output_file_parent, e
 
 class ExternalRuntimeHardeningTests(unittest.TestCase):
     def test_external_python_guard_rejects_python_314_for_numpy1_stack(self):
-        self.assertTrue(external_python_supported((3, 10)))
+        self.assertFalse(external_python_supported((3, 10)))
+        self.assertTrue(external_python_supported((3, 11)))
         self.assertTrue(external_python_supported((3, 12)))
         self.assertFalse(external_python_supported((3, 13)))
         self.assertFalse(external_python_supported((3, 14)))

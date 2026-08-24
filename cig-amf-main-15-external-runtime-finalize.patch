@@ -1,0 +1,232 @@
+diff --git a/envs/external/runtime.py b/envs/external/runtime.py
+index 98479b2..65eda8a 100644
+--- a/envs/external/runtime.py
++++ b/envs/external/runtime.py
+@@ -2,7 +2,7 @@
+ 
+ The CIG-AMF main environment and the pinned external benchmarks intentionally
+ have incompatible dependency constraints (notably Flatland's ``numpy<2``).
+-External benchmark commands therefore run in a managed Python 3.10-3.12 venv
++External benchmark commands therefore run in a managed Python 3.11-3.12 venv
+ under ``external_envs/runtime`` and never silently fall back to the main venv.
+ """
+ from __future__ import annotations
+@@ -40,13 +40,13 @@ def runtime_ready() -> bool:
+ 
+ def external_python_supported(version: Tuple[int, int]) -> bool:
+     major, minor = int(version[0]), int(version[1])
+-    return major == 3 and 10 <= minor <= 12
++    return major == 3 and 11 <= minor <= 12
+ 
+ 
+ def setup_hint() -> str:
+     return (
+         "external benchmark runtime is not ready.\n"
+-        "Create it with Python 3.10-3.12 (Python 3.12 recommended):\n"
++        "Create it with Python 3.11-3.12 (Python 3.12 recommended):\n"
+         "  CIG_EXTERNAL_PYTHON=/path/to/python3.12 "
+         "bash scripts/setup_external_envs.sh --install --recreate-runtime\n"
+         f"Expected managed runtime: {runtime_dir()}"
+diff --git a/requirements-external.txt b/requirements-external.txt
+index bedf80f..d75b9d4 100644
+--- a/requirements-external.txt
++++ b/requirements-external.txt
+@@ -1,5 +1,5 @@
+ # Shared isolated runtime for the pinned external benchmark repositories.
+-# Python 3.10-3.12 only: pinned Flatland requires numpy<2, and NumPy 1.26.x
++# Python 3.11-3.12 only: pinned Flatland requires numpy<2, and NumPy 1.26.x
+ # should be installed from a wheel rather than source-built in experiment setup.
+ numpy==1.26.4
+ scipy==1.17.0
+diff --git a/scripts/run_external_suite.py b/scripts/run_external_suite.py
+index 11497c4..1f25f1e 100644
+--- a/scripts/run_external_suite.py
++++ b/scripts/run_external_suite.py
+@@ -20,13 +20,11 @@ if str(ROOT) not in sys.path:
+ 
+ from envs.external.runtime import ensure_output_file_parent, maybe_reexec_in_external_runtime
+ 
+-import numpy as np
+-
+-from envs.external.registry import SPECS, build_environment, repo_path
+-from envs.external_contract import require_panel
++ENVIRONMENTS = ("cityflow", "cyborg", "flatland", "rware")
+ 
+ 
+ def _static_panel_support(environment, panel):
++    from envs.external.registry import SPECS
+     spec = SPECS[environment]
+     cap = spec.capabilities
+     if not cap.supports(panel):
+@@ -43,6 +41,7 @@ def _static_panel_support(environment, panel):
+ 
+ 
+ def _runtime_smoke(env):
++    import numpy as np
+     observations = env.reset(seed=123)
+     if len(observations) != int(env.n_agents):
+         raise RuntimeError("reset did not return one observation per agent")
+@@ -68,6 +67,7 @@ def _runtime_smoke(env):
+ 
+ 
+ def _h1_smoke(env):
++    import numpy as np
+     if env.n_agents < 2:
+         raise RuntimeError("H1 smoke requires at least two agents")
+     env.reset(seed=321)
+@@ -92,7 +92,7 @@ def _h1_smoke(env):
+ 
+ def main(argv=None):
+     parser = argparse.ArgumentParser()
+-    parser.add_argument("--environment", choices=sorted(SPECS), required=True)
++    parser.add_argument("--environment", choices=ENVIRONMENTS, required=True)
+     parser.add_argument("--out", type=Path, required=True)
+     parser.add_argument("--panels", nargs="+", default=["training", "h1", "h2", "latency"])
+     parser.add_argument("--agent-count", type=int, default=6)
+@@ -103,6 +103,11 @@ def main(argv=None):
+     if not args.manifest_only:
+         maybe_reexec_in_external_runtime(require_ready=True)
+ 
++    # Registry/adapters are intentionally imported after the optional runtime
++    # handoff so external execution does not depend on the caller interpreter.
++    from envs.external.registry import SPECS, build_environment, repo_path
++    from envs.external_contract import require_panel
++
+     decisions = {panel: _static_panel_support(args.environment, panel) for panel in args.panels}
+     runtime = {}
+     construction_error = None
+diff --git a/scripts/run_external_training.py b/scripts/run_external_training.py
+index 552f428..0450d50 100644
+--- a/scripts/run_external_training.py
++++ b/scripts/run_external_training.py
+@@ -1,6 +1,6 @@
+ """Run actual Final-CIGAMF training on one normalized external benchmark."""
+ from __future__ import annotations
+-import argparse, csv, json, os, time
++import argparse, csv, json, math, os, time
+ from pathlib import Path
+ import sys
+ 
+@@ -9,21 +9,17 @@ if str(ROOT) not in sys.path:
+     sys.path.insert(0, str(ROOT))
+ from envs.external.runtime import ensure_directory, maybe_reexec_in_external_runtime
+ 
+-import numpy as np
+-
+-import run_experiment as RE
+-from envs.external.registry import SPECS, build_environment
+-from envs.external_contract import require_panel
++ENVIRONMENTS = ("cityflow", "cyborg", "flatland", "rware")
+ 
+ 
+ def _finite_mean(values):
+-    vals = [float(v) for v in values if np.isfinite(v)]
+-    return float(np.mean(vals)) if vals else None
++    vals = [float(v) for v in values if math.isfinite(float(v))]
++    return float(sum(vals) / len(vals)) if vals else None
+ 
+ 
+ def main(argv=None):
+     parser = argparse.ArgumentParser()
+-    parser.add_argument("--environment", choices=sorted(SPECS), required=True)
++    parser.add_argument("--environment", choices=ENVIRONMENTS, required=True)
+     parser.add_argument("--seeds", type=int, nargs="+", default=[0])
+     parser.add_argument("--episodes", type=int, default=5)
+     parser.add_argument("--agent-count", type=int, default=6)
+@@ -37,6 +33,15 @@ def main(argv=None):
+     parser.add_argument("--out", type=Path, required=True)
+     args = parser.parse_args(argv)
+     maybe_reexec_in_external_runtime(require_ready=True)
++
++    # Heavy project/external dependencies are imported only after the managed
++    # external-runtime handoff. This prevents a lean/main interpreter from
++    # failing on torch/numpy before it has a chance to re-exec.
++    import numpy as np
++    import run_experiment as RE
++    from envs.external.registry import build_environment
++    from envs.external_contract import require_panel
++
+     if args.episodes <= 0 or args.max_steps <= 0 or not args.seeds:
+         parser.error("episodes, max-steps and seeds must be positive")
+     if len(set(args.seeds)) != len(args.seeds):
+diff --git a/scripts/setup_external_envs.sh b/scripts/setup_external_envs.sh
+index 92df1b8..586ff61 100644
+--- a/scripts/setup_external_envs.sh
++++ b/scripts/setup_external_envs.sh
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env bash
+ # Clone/migrate pinned external benchmarks into one canonical repository root and
+-# optionally install them into an isolated Python 3.10-3.12 runtime.
++# optionally install them into an isolated Python 3.11-3.12 runtime.
+ set -euo pipefail
+ 
+ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+@@ -20,9 +20,9 @@ usage: $0 [--install] [--recreate-runtime]
+ 
+ --install            install pinned benchmark packages into the isolated
+                      external_envs/runtime environment
+---recreate-runtime   recreate only the managed external runtime
++--recreate-runtime   recreate and reinstall the managed external runtime
+ 
+-For installation use Python 3.10-3.12 (3.12 recommended):
++For installation use Python 3.11-3.12 (3.12 recommended):
+   CIG_EXTERNAL_PYTHON=/path/to/python3.12 $0 --install --recreate-runtime
+ EOF
+ }
+@@ -30,7 +30,7 @@ EOF
+ while [ "$#" -gt 0 ]; do
+   case "$1" in
+     --install) INSTALL=1 ;;
+-    --recreate-runtime) RECREATE=1 ;;
++    --recreate-runtime) RECREATE=1; INSTALL=1 ;;
+     -h|--help) usage; exit 0 ;;
+     *) usage; exit 2 ;;
+   esac
+@@ -110,18 +110,18 @@ choose_external_python() {
+   if [ -n "${CIG_EXTERNAL_PYTHON:-}" ]; then
+     candidates="$CIG_EXTERNAL_PYTHON"
+   else
+-    candidates="python3.12 python3.11 python3.10"
++    candidates="python3.12 python3.11"
+   fi
+   for candidate in $candidates; do
+     resolved="$(command -v "$candidate" 2>/dev/null || true)"
+     [ -n "$resolved" ] || continue
+     version="$($resolved -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+-    ok="$($resolved -c 'import sys; print(int(sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12))')"
++    ok="$($resolved -c 'import sys; print(int(sys.version_info.major == 3 and 11 <= sys.version_info.minor <= 12))')"
+     if [ "$ok" = "1" ]; then
+       printf '%s\n' "$resolved"
+       return 0
+     fi
+-    echo "[external-runtime] skipping $resolved (Python $version; need 3.10-3.12)" >&2
++    echo "[external-runtime] skipping $resolved (Python $version; need 3.11-3.12)" >&2
+   done
+   return 1
+ }
+@@ -150,7 +150,7 @@ EOF
+     "$BASE_PYTHON" -m venv "$RUNTIME"
+   fi
+   RUNTIME_PY="$RUNTIME/bin/python"
+-  if ! "$RUNTIME_PY" -c 'import sys; raise SystemExit(0 if sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12 else 1)'; then
++  if ! "$RUNTIME_PY" -c 'import sys; raise SystemExit(0 if sys.version_info.major == 3 and 11 <= sys.version_info.minor <= 12 else 1)'; then
+     echo "managed runtime has an unsupported Python; rerun with --recreate-runtime" >&2
+     exit 5
+   fi
+diff --git a/tests/test_external_runtime_hardening.py b/tests/test_external_runtime_hardening.py
+index 343cc96..599b2d2 100644
+--- a/tests/test_external_runtime_hardening.py
++++ b/tests/test_external_runtime_hardening.py
+@@ -7,7 +7,8 @@ from envs.external.runtime import ensure_directory, ensure_output_file_parent, e
+ 
+ class ExternalRuntimeHardeningTests(unittest.TestCase):
+     def test_external_python_guard_rejects_python_314_for_numpy1_stack(self):
+-        self.assertTrue(external_python_supported((3, 10)))
++        self.assertFalse(external_python_supported((3, 10)))
++        self.assertTrue(external_python_supported((3, 11)))
+         self.assertTrue(external_python_supported((3, 12)))
+         self.assertFalse(external_python_supported((3, 13)))
+         self.assertFalse(external_python_supported((3, 14)))
+diff --git a/tests/test_external_runtime_hardening.py.rej b/tests/test_external_runtime_hardening.py.rej
+deleted file mode 100644
+index e69de29..0000000

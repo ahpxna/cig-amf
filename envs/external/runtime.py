@@ -2,7 +2,7 @@
 
 The CIG-AMF main environment and the pinned external benchmarks intentionally
 have incompatible dependency constraints (notably Flatland's ``numpy<2``).
-External benchmark commands therefore run in a managed Python 3.10-3.12 venv
+External benchmark commands therefore run in a managed Python 3.11-3.12 venv
 under ``external_envs/runtime`` and never silently fall back to the main venv.
 """
 from __future__ import annotations
@@ -40,13 +40,13 @@ def runtime_ready() -> bool:
 
 def external_python_supported(version: Tuple[int, int]) -> bool:
     major, minor = int(version[0]), int(version[1])
-    return major == 3 and 10 <= minor <= 12
+    return major == 3 and 11 <= minor <= 12
 
 
 def setup_hint() -> str:
     return (
         "external benchmark runtime is not ready.\n"
-        "Create it with Python 3.10-3.12 (Python 3.12 recommended):\n"
+        "Create it with Python 3.11-3.12 (Python 3.12 recommended):\n"
         "  CIG_EXTERNAL_PYTHON=/path/to/python3.12 "
         "bash scripts/setup_external_envs.sh --install --recreate-runtime\n"
         f"Expected managed runtime: {runtime_dir()}"
