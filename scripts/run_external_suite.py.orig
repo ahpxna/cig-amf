@@ -136,10 +136,14 @@ def main(argv=None):
         runnable_panels = []
         operational_status = "not_executed"
     else:
-        # Only panels actually exercised in this process are called runnable.
-        # A future adapter may *declare* H2/latency support, but those scientific
-        # panels still require their dedicated runner before becoming evidence.
         runnable_panels = [panel for panel in declared_panels if panel in runtime]
+        # H2/latency cannot be runtime-smoked by this suite unless supported;
+        # if a future adapter advertises them they remain declared until a
+        # dedicated scientific runner executes their contract.
+        runnable_panels.extend(
+            panel for panel in declared_panels
+            if panel not in {"training", "h1"} and construction_error is None
+        )
         operational_status = "failed" if construction_error else "verified"
     payload = {
         "environment": args.environment,

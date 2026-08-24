@@ -1,0 +1,17 @@
+@@ -36,3 +36,16 @@
+ resolved through `envs.external.registry`.  Use `scripts/setup_external_envs.sh`
+ and `scripts/external_env_manager.py status` rather than adding ad-hoc
+ `sys.path` entries or cloning benchmark copies elsewhere in the project.
++
++### Python environments for external benchmarks
++
++Pinned external benchmarks are intentionally isolated from the main CIG-AMF
++environment. Run `scripts/setup_external_envs.sh --install` with Python 3.12;
++the managed runtime lives at `external_envs/runtime/` and external runners
++switch to it automatically. See `RUN_GUIDE.md` for macOS commands.
++
++
++External benchmark commands are fail-closed with respect to dependency isolation:
++actual suite/training execution requires the managed `external_envs/runtime` and
++never falls back to the main CIG environment. Use `scripts/external_env_manager.py
++status` to inspect per-benchmark `operational_ready` before launching experiments.

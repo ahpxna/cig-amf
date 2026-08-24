@@ -1,0 +1,21 @@
+@@ -7,6 +7,9 @@
+ ROOT = Path(__file__).resolve().parents[1]
+ if str(ROOT) not in sys.path:
+     sys.path.insert(0, str(ROOT))
++from envs.external.runtime import ensure_directory, maybe_reexec_in_external_runtime
++maybe_reexec_in_external_runtime(require_ready=True)
++
+ import numpy as np
+ 
+ import run_experiment as RE
+@@ -38,7 +41,9 @@
+         parser.error("episodes, max-steps and seeds must be positive")
+     if len(set(args.seeds)) != len(args.seeds):
+         parser.error("seeds must be unique")
+-    args.out.mkdir(parents=True, exist_ok=True)
++    migrated = ensure_directory(args.out)
++    if migrated is not None:
++        print(f"[EXTERNAL-OUT] preserved legacy output file as {migrated}", file=sys.stderr)
+     rows = []
+     for seed in args.seeds:
+         RE.set_global_seed(int(seed))

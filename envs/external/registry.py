@@ -7,6 +7,8 @@ import json
 import os
 import sys
 
+from envs.external.runtime import runtime_metadata
+
 from envs.external.rware import RWARECIGEnvironment
 from envs.external.cyborg import CybORGCIGEnvironment
 from envs.external.cityflow import CityFlowCIGEnvironment
@@ -53,9 +55,31 @@ def ensure_repo_on_path(key):
         sys.path.insert(0, text)
     return path
 
+def _require_runtime_import(key):
+    """Fail with the setup-time import error before constructing an adapter."""
+    if os.environ.get("CIG_EXTERNAL_RUNTIME_ACTIVE") != "1":
+        return
+    spec = SPECS[str(key)]
+    metadata = runtime_metadata().get("metadata", {})
+    record = metadata.get("imports", {}).get(spec.repo_dir)
+    if not isinstance(record, dict):
+        raise RuntimeError(
+            f"external runtime has no import verification for {spec.repo_dir}; "
+            "rerun scripts/setup_external_envs.sh --install"
+        )
+    if not bool(record.get("ok")):
+        detail = record.get("error", "unknown import failure")
+        raise RuntimeError(
+            f"external runtime is not operational for {key}: {detail}. "
+            "Rerun scripts/setup_external_envs.sh --install and inspect "
+            "scripts/external_env_manager.py status."
+        )
+
+
 def build_environment(key, **kwargs):
     key = str(key)
     spec = SPECS[key]
+    _require_runtime_import(key)
     repo = ensure_repo_on_path(key)
     module = importlib.import_module(spec.module)
     factory = getattr(module, spec.factory)
