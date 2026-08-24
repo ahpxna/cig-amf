@@ -179,3 +179,26 @@ Legacy external-suite outputs such as `results/external_flatland` may be JSON
 files from older code.  If a new command needs the same path as a directory,
 the runner preserves the old file as `*.legacy-file` and creates the directory
 rather than raising `FileExistsError`.
+
+## External benchmark runtime (canonical workflow)
+
+Third-party benchmark repositories are managed only under `external_envs/repos/`.
+Root-level legacy clones are migrated by `scripts/setup_external_envs.sh`; clean
+duplicates at the same revision are removed, while dirty/divergent clones are
+preserved under `external_envs/legacy_repos/`.
+
+Do not install pinned external dependencies into the main CIG environment.
+Flatland pins `numpy<2`, so use an isolated Python 3.12 runtime on macOS:
+
+```bash
+brew install python@3.12
+CIG_EXTERNAL_PYTHON="$(brew --prefix python@3.12)/bin/python3.12" \
+  bash scripts/setup_external_envs.sh --install --recreate-runtime
+python scripts/external_env_manager.py status
+```
+
+`run_external_suite.py` and `run_external_training.py` require that managed
+runtime and re-exec into it before constructing a benchmark. `--manifest-only`
+remains dependency-free and does not instantiate a benchmark. Main `pytest`
+explicitly excludes `external_envs/`; upstream repository tests must be run in
+the managed external runtime, never as part of the CIG-AMF unit suite.

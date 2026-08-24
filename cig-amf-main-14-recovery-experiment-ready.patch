@@ -1,0 +1,1839 @@
+diff --git a/README.md b/README.md
+index 8d5c3db..a1a0ac3 100644
+--- a/README.md
++++ b/README.md
+@@ -43,3 +43,12 @@ Pinned external benchmarks are intentionally isolated from the main CIG-AMF
+ environment. Run `scripts/setup_external_envs.sh --install` with Python 3.12;
+ the managed runtime lives at `external_envs/runtime/` and external runners
+ switch to it automatically. See `RUN_GUIDE.md` for macOS commands.
++
++### External benchmark isolation
++
++Pinned Flatland, RWARE, CybORG and CityFlow checkouts live under
++`external_envs/repos/` and execute through the isolated
++`external_envs/runtime/` environment. This keeps benchmark-specific dependency
++constraints out of the main CIG-AMF Python environment and prevents third-party
++test suites from being collected by the project's `pytest` run. See
++`RUN_GUIDE.md` for setup and verification commands.
+diff --git a/README.md.orig b/README.md.orig
+deleted file mode 100644
+index 8d5c3db..0000000
+--- a/README.md.orig
++++ /dev/null
+@@ -1,45 +0,0 @@
+-# CIG-AMF
+-
+-CIG-AMF is a research codebase for two linked MARL studies:
+-
+-1. **Paper A — Causal Influence Spectrum**: interventional response recovery,
+-   structural capacity `C`, behavioural direction `D`, optional gated latency,
+-   and regime-wise structural tracking.
+-2. **Paper B — CIG-AMF**: capacity-aware allocation of explicit pair modelling
+-   and direction-aware peripheral compression.
+-
+-The confirmatory code path is deliberately fail-closed.  A green unit suite is
+-not sufficient by itself: H1 requires oracle-only threshold/support artifacts,
+-H2 requires a provenance-bound Page-CUSUM calibration, and Paper-B claim
+-validation requires all allocation/representation/scaling panels.
+-
+-## First checks
+-
+-```bash
+-python -m pip install -r requirements.txt
+-python -m compileall -q .
+-python -m pytest -q
+-python smoke_test.py
+-python test_bc_loss_control.py
+-```
+-
+-For the full protocol and artifact-generation order, read `RUN_GUIDE.md`.
+-
+-## External benchmark status
+-
+-External adapters are capability-gated.  A benchmark is not counted as causal
+-validation unless its adapter exposes the operations required by that claim
+-(e.g. clone/restore plus the relevant intervention oracle).  Do not reinterpret
+-an unavailable capability as a negative experimental result.
+-
+-External repositories are centralized under `external_envs/repos/` and are
+-resolved through `envs.external.registry`.  Use `scripts/setup_external_envs.sh`
+-and `scripts/external_env_manager.py status` rather than adding ad-hoc
+-`sys.path` entries or cloning benchmark copies elsewhere in the project.
+-
+-### Python environments for external benchmarks
+-
+-Pinned external benchmarks are intentionally isolated from the main CIG-AMF
+-environment. Run `scripts/setup_external_envs.sh --install` with Python 3.12;
+-the managed runtime lives at `external_envs/runtime/` and external runners
+-switch to it automatically. See `RUN_GUIDE.md` for macOS commands.
+diff --git a/README.md.rej b/README.md.rej
+deleted file mode 100644
+index 2833003..0000000
+--- a/README.md.rej
++++ /dev/null
+@@ -1,17 +0,0 @@
+-@@ -36,3 +36,16 @@
+- resolved through `envs.external.registry`.  Use `scripts/setup_external_envs.sh`
+- and `scripts/external_env_manager.py status` rather than adding ad-hoc
+- `sys.path` entries or cloning benchmark copies elsewhere in the project.
+-+
+-+### Python environments for external benchmarks
+-+
+-+Pinned external benchmarks are intentionally isolated from the main CIG-AMF
+-+environment. Run `scripts/setup_external_envs.sh --install` with Python 3.12;
+-+the managed runtime lives at `external_envs/runtime/` and external runners
+-+switch to it automatically. See `RUN_GUIDE.md` for macOS commands.
+-+
+-+
+-+External benchmark commands are fail-closed with respect to dependency isolation:
+-+actual suite/training execution requires the managed `external_envs/runtime` and
+-+never falls back to the main CIG environment. Use `scripts/external_env_manager.py
+-+status` to inspect per-benchmark `operational_ready` before launching experiments.
+diff --git a/RUN_GUIDE.md b/RUN_GUIDE.md
+index 6da8bf8..275f908 100644
+--- a/RUN_GUIDE.md
++++ b/RUN_GUIDE.md
+@@ -179,3 +179,26 @@ Legacy external-suite outputs such as `results/external_flatland` may be JSON
+ files from older code.  If a new command needs the same path as a directory,
+ the runner preserves the old file as `*.legacy-file` and creates the directory
+ rather than raising `FileExistsError`.
++
++## External benchmark runtime (canonical workflow)
++
++Third-party benchmark repositories are managed only under `external_envs/repos/`.
++Root-level legacy clones are migrated by `scripts/setup_external_envs.sh`; clean
++duplicates at the same revision are removed, while dirty/divergent clones are
++preserved under `external_envs/legacy_repos/`.
++
++Do not install pinned external dependencies into the main CIG environment.
++Flatland pins `numpy<2`, so use an isolated Python 3.12 runtime on macOS:
++
++```bash
++brew install python@3.12
++CIG_EXTERNAL_PYTHON="$(brew --prefix python@3.12)/bin/python3.12" \
++  bash scripts/setup_external_envs.sh --install --recreate-runtime
++python scripts/external_env_manager.py status
++```
++
++`run_external_suite.py` and `run_external_training.py` require that managed
++runtime and re-exec into it before constructing a benchmark. `--manifest-only`
++remains dependency-free and does not instantiate a benchmark. Main `pytest`
++explicitly excludes `external_envs/`; upstream repository tests must be run in
++the managed external runtime, never as part of the CIG-AMF unit suite.
+diff --git a/RUN_GUIDE.md.orig b/RUN_GUIDE.md.orig
+deleted file mode 100644
+index 6da8bf8..0000000
+--- a/RUN_GUIDE.md.orig
++++ /dev/null
+@@ -1,181 +0,0 @@
+-# CIG-AMF Run Guide
+-
+-## 1. Validate the code path
+-
+-```bash
+-python -m compileall -q .
+-python -m pytest -q
+-python smoke_test.py
+-python test_bc_loss_control.py
+-bash scripts/run_all.sh --quick
+-```
+-
+-`--quick` is a protocol-path smoke check only.  Scientific gates that fail due
+-to deliberately tiny budgets are not confirmatory evidence.
+-
+-## 2. H1 oracle support and thresholds
+-
+-Generate oracle-only pair rows with `scripts/collect_h1_oracle_support.py`.
+-Then certify support and freeze thresholds from development seeds only:
+-
+-```bash
+-python scripts/validate_h1_oracle_support.py ... --out h1_support.json
+-python scripts/calibrate_h1_oracle_thresholds.py ... --out h1_thresholds.json
+-```
+-
+-The confirmatory H1 seeds must be disjoint from both development seed sets.
+-The loaders verify artifact protocol, source SHA-256 digests, support metadata,
+-and target-policy metadata.
+-
+-## 3. H2 Page-CUSUM calibration
+-
+-Use at least 40 independent no-change development trajectories.  Collection
+-pretrains the same H2 common-policy protocol, restores its monitoring-ready
+-witness, freezes policy/representation learning, and records a canonical null
+-contract hash.
+-
+-```bash
+-python scripts/collect_cusum_no_change.py \
+-  --seeds <development seeds> \
+-  --pretrain-episodes 60 --episodes 200 --max-steps 30 \
+-  --out cusum_null.json
+-
+-python scripts/calibrate_cusum_threshold.py \
+-  --no-change-z-json cusum_null.json \
+-  --allowance 0.5 --false-alarm-target 0.05 \
+-  --development-seeds <same development seeds> \
+-  --out cusum_calibration.json
+-```
+-
+-The H2 launcher rejects malformed ranges, protocol mismatches, source hash
+-mismatches, contract mismatches, insufficient trajectories, and seed overlap.
+-A separate held-out no-change validation bank is recommended for reporting the
+-final empirical false-alarm rate.
+-
+-## 4. Paper B panels
+-
+-The Paper-B allocation runner now uses two distinct branch points:
+-
+-* selector isolation: selector-neutral **full-explicit pretraining**;
+-* end-to-end: a **common untrained initialization** for every selector.
+-
+-Decision fidelity in selector isolation is measured only after the selector is
+-committed and pair allocation has been reconciled.
+-
+-Run the additional adaptive-budget panel:
+-
+-```bash
+-python scripts/run_paper_b_adaptive_budget.py \
+-  --seeds 0 1 2 3 4 --episodes 200 --k-min 2 --k-max 5
+-```
+-
+-The scaling panel reports reward, throughput, representation memory,
+-Full-Explicit policy/value/action fidelity, and mean/p50/p95 inference latency.
+-
+-## 5. Confirmatory orchestration
+-
+-Set the frozen artifacts used by `scripts/run_all.sh`:
+-
+-```bash
+-export CIG_H1_THRESHOLD_CALIBRATION=/abs/path/h1_thresholds.json
+-export CIG_H1_ORACLE_SUPPORT=/abs/path/h1_support.json
+-export CIG_CUSUM_CALIBRATION=/abs/path/cusum_calibration.json
+-bash scripts/run_all.sh --run-id <unique-id>
+-```
+-
+-Do not reuse stale result directories.  Regenerate `SOURCE_MANIFEST.json`
+-after any source change:
+-
+-```bash
+-python scripts/build_source_manifest.py --out SOURCE_MANIFEST.json
+-```
+-
+-## 6. External benchmark repository and adapter workflow
+-
+-All pinned third-party repositories are managed under one root:
+-
+-```text
+-external_envs/
+-  manifest.json
+-  repos/
+-    flatland-rl/
+-    robotic-warehouse/
+-    CybORG/
+-    CityFlow/
+-```
+-
+-Existing clones from the old `external_envs/<repo>` layout are migrated in
+-place the next time setup is run.
+-
+-Clone/verify the pinned sources:
+-
+-```bash
+-bash scripts/setup_external_envs.sh
+-python scripts/external_env_manager.py status
+-```
+-
+-Install each pinned repository into the active Python environment when the
+-native/system prerequisites are available:
+-
+-```bash
+-bash scripts/setup_external_envs.sh --install
+-```
+-
+-Before a long external experiment, run the executable adapter contract check:
+-
+-```bash
+-python scripts/run_external_suite.py \
+-  --environment flatland \
+-  --panels training h1 h2 latency \
+-  --out results/external_flatland_contract.json
+-```
+-
+-Repeat with `rware`, `cyborg`, and `cityflow`.  A blocked H2 or latency panel is
+-intentional unless that environment has a scientifically defined structural /
+-behavioural intervention or a ground-truth latency oracle.  Do not enable a
+-capability flag merely to make the manifest green.
+-
+-Actual Final-CIGAMF architecture-generalization training is separate from the
+-capability manifest:
+-
+-```bash
+-python scripts/run_external_training.py \
+-  --environment rware --seeds 0 1 2 3 4 \
+-  --episodes 100 --agent-count 6 --max-steps 60 \
+-  --out results/external_rware_training
+-```
+-
+-For CityFlow, pass `--config-path /abs/path/to/config.json` when automatic
+-example-config discovery is not appropriate.  External training evidence is
+-an architecture/generalization result; it is not automatically an H1/H2 or
+-latency claim.
+-
+-## External benchmark runtime isolation
+-
+-Do **not** install the pinned external repositories directly into the main CIG
+-virtual environment.  The pinned Flatland revision requires `numpy<2`, while
+-the confirmatory CIG environment is validated separately.  External packages
+-are installed into `external_envs/runtime/` and external commands automatically
+-re-exec there once the runtime is marked ready.
+-
+-On macOS, use Python 3.12 for the external runtime:
+-
+-```bash
+-brew install python@3.12
+-CIG_EXTERNAL_PYTHON="$(brew --prefix python@3.12)/bin/python3.12" \
+-  bash scripts/setup_external_envs.sh --install --recreate-runtime
+-python scripts/external_env_manager.py status
+-```
+-
+-If the main CIG environment already runs the project but only lacks pytest,
+-install the test-only dependency set without perturbing NumPy/Torch:
+-
+-```bash
+-python -m pip install -r requirements-test.txt
+-python -m pytest -q
+-```
+-
+-Legacy external-suite outputs such as `results/external_flatland` may be JSON
+-files from older code.  If a new command needs the same path as a directory,
+-the runner preserves the old file as `*.legacy-file` and creates the directory
+-rather than raising `FileExistsError`.
+diff --git a/RUN_GUIDE.md.rej b/RUN_GUIDE.md.rej
+deleted file mode 100644
+index 8629348..0000000
+--- a/RUN_GUIDE.md.rej
++++ /dev/null
+@@ -1,55 +0,0 @@
+-@@ -149,3 +149,54 @@
+- example-config discovery is not appropriate.  External training evidence is
+- an architecture/generalization result; it is not automatically an H1/H2 or
+- latency claim.
+-+
+-+## External benchmark runtime isolation
+-+
+-+Do **not** install the pinned external repositories directly into the main CIG
+-+virtual environment.  The pinned Flatland revision requires `numpy<2`, while
+-+the confirmatory CIG environment is validated separately.  External packages
+-+are installed into `external_envs/runtime/` and external commands automatically
+-+re-exec there once the runtime is marked ready.
+-+
+-+On macOS, use Python 3.12 for the external runtime:
+-+
+-+```bash
+-+brew install python@3.12
+-+CIG_EXTERNAL_PYTHON="$(brew --prefix python@3.12)/bin/python3.12" \
+-+  bash scripts/setup_external_envs.sh --install --recreate-runtime
+-+python scripts/external_env_manager.py status
+-+```
+-+
+-+If the main CIG environment already runs the project but only lacks pytest,
+-+install the test-only dependency set without perturbing NumPy/Torch:
+-+
+-+```bash
+-+python -m pip install -r requirements-test.txt
+-+python -m pytest -q
+-+```
+-+
+-+Legacy external-suite outputs such as `results/external_flatland` may be JSON
+-+files from older code.  If a new command needs the same path as a directory,
+-+the runner preserves the old file as `*.legacy-file` and creates the directory
+-+rather than raising `FileExistsError`.
+-+
+-+### External runtime fail-closed bootstrap
+-+
+-+External benchmark execution never falls back to the main CIG environment.
+-+`run_external_training.py` and non-manifest `run_external_suite.py` require the
+-+managed `external_envs/runtime` environment and re-exec there before importing
+-+benchmark dependencies. If the runtime is absent or a selected repository did
+-+not import successfully during setup, the command stops with the recorded setup
+-+error instead of leaking into the main environment.
+-+
+-+After changing or recreating the external runtime, run:
+-+
+-+```bash
+-+python scripts/external_env_manager.py status
+-+```
+-+
+-+Each repository reports `runtime_import` and `operational_ready`. A benchmark is
+-+ready for experiment execution only when its pinned revision matches and its
+-+runtime import probe is successful. RWARE obtains `gymnasium` from its pinned
+-+package metadata; do not install `gymnasium` into the main CIG environment as a
+-+workaround for a missing external runtime.
+diff --git a/envs/external/registry.py b/envs/external/registry.py
+index dd2213c..2031a23 100644
+--- a/envs/external/registry.py
++++ b/envs/external/registry.py
+@@ -1,14 +1,13 @@
+-"""Single registry for pinned external repositories, factories and capabilities."""
++"""Single canonical registry for pinned external benchmark repositories."""
+ from __future__ import annotations
++
+ from dataclasses import dataclass
+-from pathlib import Path
+ import importlib
+-import json
+ import os
++from pathlib import Path
+ import sys
+ 
+ from envs.external.runtime import runtime_metadata
+-
+ from envs.external.rware import RWARECIGEnvironment
+ from envs.external.cyborg import CybORGCIGEnvironment
+ from envs.external.cityflow import CityFlowCIGEnvironment
+@@ -18,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
+ DEFAULT_EXTERNAL_ROOT = ROOT / "external_envs"
+ REPOS_DIRNAME = "repos"
+ 
++
+ @dataclass(frozen=True)
+ class ExternalSpec:
+     key: str
+@@ -26,6 +26,7 @@ class ExternalSpec:
+     factory: str
+     capabilities: object
+ 
++
+ SPECS = {
+     "flatland": ExternalSpec("flatland", "flatland-rl", "envs.external.registry", "make_flatland", FlatlandCIGEnvironment.capabilities),
+     "rware": ExternalSpec("rware", "robotic-warehouse", "envs.external.rware", "make_rware_environment", RWARECIGEnvironment.capabilities),
+@@ -33,32 +34,43 @@ SPECS = {
+     "cityflow": ExternalSpec("cityflow", "CityFlow", "envs.external.cityflow", "make_cityflow_environment", CityFlowCIGEnvironment.capabilities),
+ }
+ 
+-def external_root():
++
++def external_root() -> Path:
+     root = Path(os.environ.get("CIG_EXTERNAL_ENVS_DIR", DEFAULT_EXTERNAL_ROOT)).resolve()
+-    # Accept either .../external_envs or .../external_envs/repos as the override
+-    # without accidentally creating repos/repos.
+     return root.parent if root.name == REPOS_DIRNAME else root
+ 
+-def repo_path(key):
++
++def repo_path(key: str) -> Path:
++    """Return the one supported checkout path; legacy root-level clones are ignored."""
+     spec = SPECS[str(key)]
+-    root = external_root()
+-    canonical = root / REPOS_DIRNAME / spec.repo_dir
+-    legacy = root / spec.repo_dir
+-    return canonical if canonical.exists() or not legacy.exists() else legacy
++    return external_root() / REPOS_DIRNAME / spec.repo_dir
++
+ 
+-def ensure_repo_on_path(key):
++def legacy_repo_path(key: str) -> Path:
++    return external_root() / SPECS[str(key)].repo_dir
++
++
++def ensure_repo_on_path(key: str) -> Path:
+     path = repo_path(key)
+     if not path.exists():
+-        raise FileNotFoundError(f"external repository not installed: {path}; run scripts/setup_external_envs.sh")
++        legacy = legacy_repo_path(key)
++        detail = f" Legacy checkout detected at {legacy}." if legacy.exists() else ""
++        raise FileNotFoundError(
++            f"canonical external repository not installed: {path}.{detail} "
++            "Run scripts/setup_external_envs.sh to migrate/clone pinned repositories."
++        )
+     text = str(path)
+     if text not in sys.path:
+         sys.path.insert(0, text)
+     return path
+ 
+-def _require_runtime_import(key):
+-    """Fail with the setup-time import error before constructing an adapter."""
++
++def _require_runtime_import(key: str) -> None:
+     if os.environ.get("CIG_EXTERNAL_RUNTIME_ACTIVE") != "1":
+-        return
++        raise RuntimeError(
++            "external benchmark construction attempted outside the managed runtime; "
++            "run through scripts/run_external_suite.py or scripts/run_external_training.py"
++        )
+     spec = SPECS[str(key)]
+     metadata = runtime_metadata().get("metadata", {})
+     record = metadata.get("imports", {}).get(spec.repo_dir)
+@@ -76,7 +88,7 @@ def _require_runtime_import(key):
+         )
+ 
+ 
+-def build_environment(key, **kwargs):
++def build_environment(key: str, **kwargs):
+     key = str(key)
+     spec = SPECS[key]
+     _require_runtime_import(key)
+@@ -85,28 +97,33 @@ def build_environment(key, **kwargs):
+     factory = getattr(module, spec.factory)
+     return factory(repo_path=repo, **kwargs)
+ 
++
+ def make_flatland(seed=0, n_agents=6, observation_width=256, max_steps=60, **_):
+     del max_steps
+     from flatland.envs.rail_env import RailEnv
+     from flatland.envs.rail_generators import sparse_rail_generator
+     from flatland.envs.line_generators import sparse_line_generator
++
+     rail = RailEnv(
+-        width=25, height=25,
+-        rail_generator=sparse_rail_generator(
+-            max_num_cities=3, seed=int(seed), grid_mode=False
+-        ),
++        width=25,
++        height=25,
++        rail_generator=sparse_rail_generator(max_num_cities=3, seed=int(seed), grid_mode=False),
+         line_generator=sparse_line_generator(),
+-        number_of_agents=int(n_agents), random_seed=int(seed),
++        number_of_agents=int(n_agents),
++        random_seed=int(seed),
+     )
+     env = FlatlandCIGEnvironment(rail, observation_width=observation_width)
+     env.reset(seed=int(seed))
+     return env
+ 
+-def registry_payload():
++
++def registry_payload() -> dict:
+     return {
+         key: {
+             "repo": str(repo_path(key)),
++            "legacy_repo": str(legacy_repo_path(key)),
+             "exists": repo_path(key).exists(),
++            "legacy_exists": legacy_repo_path(key).exists(),
+             "capabilities": vars(spec.capabilities),
+         }
+         for key, spec in SPECS.items()
+diff --git a/envs/external/runtime.py b/envs/external/runtime.py
+index 29a3b0d..98479b2 100644
+--- a/envs/external/runtime.py
++++ b/envs/external/runtime.py
+@@ -1,19 +1,17 @@
+-"""External-runtime isolation and filesystem helpers.
++"""Isolation helpers for pinned external benchmark runtimes.
+ 
+-Pinned benchmark repositories can have dependency constraints that intentionally
+-conflict with the main CIG-AMF research environment.  In particular, the pinned
+-Flatland revision requires ``numpy<2``.  Keep those dependencies in a managed
+-runtime under ``external_envs/runtime`` and re-exec external commands there.
++The CIG-AMF main environment and the pinned external benchmarks intentionally
++have incompatible dependency constraints (notably Flatland's ``numpy<2``).
++External benchmark commands therefore run in a managed Python 3.10-3.12 venv
++under ``external_envs/runtime`` and never silently fall back to the main venv.
+ """
+ from __future__ import annotations
+ 
+ import json
+ import os
+ from pathlib import Path
+-import shutil
+ import sys
+-from typing import Iterable, Optional, Tuple
+-
++from typing import Optional, Tuple
+ 
+ ROOT = Path(__file__).resolve().parents[2]
+ DEFAULT_EXTERNAL_ROOT = ROOT / "external_envs"
+@@ -41,20 +39,14 @@ def runtime_ready() -> bool:
+ 
+ 
+ def external_python_supported(version: Tuple[int, int]) -> bool:
+-    """Return whether the shared external runtime is in the supported ABI band.
+-
+-    NumPy 1.26.x, required by the pinned Flatland ``numpy<2`` contract, has a
+-    reliable wheel path through Python 3.12.  We therefore fail early on newer
+-    interpreters rather than attempting a source build inside experiment setup.
+-    """
+     major, minor = int(version[0]), int(version[1])
+     return major == 3 and 10 <= minor <= 12
+ 
+ 
+-def _setup_hint() -> str:
++def setup_hint() -> str:
+     return (
+         "external benchmark runtime is not ready.\n"
+-        "Create it with a Python 3.10-3.12 interpreter (Python 3.12 recommended):\n"
++        "Create it with Python 3.10-3.12 (Python 3.12 recommended):\n"
+         "  CIG_EXTERNAL_PYTHON=/path/to/python3.12 "
+         "bash scripts/setup_external_envs.sh --install --recreate-runtime\n"
+         f"Expected managed runtime: {runtime_dir()}"
+@@ -62,146 +54,34 @@ def _setup_hint() -> str:
+ 
+ 
+ def maybe_reexec_in_external_runtime(*, require_ready: bool = False) -> None:
+-    """Re-exec the current external command in the managed runtime.
++    """Re-exec this command in the managed external runtime when available.
+ 
+-    When ``require_ready`` is true, never fall back to the main CIG environment.
+-    External repositories intentionally have dependency constraints that can
+-    conflict with the project runtime (notably Flatland ``numpy<2``), so an
+-    implicit fallback can produce misleading errors such as a missing
+-    ``gymnasium`` from RWARE or a NumPy source-build attempt on Python 3.14.
++    ``require_ready=True`` is the correct mode for any command that imports or
++    constructs an external benchmark.  It prevents accidental execution inside
++    the main CIG environment, which otherwise yields misleading missing-package
++    errors and can trigger incompatible dependency resolution.
+     """
+-    if os.environ.get("CIG_EXTERNAL_RUNTIME_ACTIVE") == "1":
++    active = os.environ.get("CIG_EXTERNAL_RUNTIME_ACTIVE") == "1"
++    if active:
+         if require_ready and not runtime_ready():
+-            raise SystemExit(_setup_hint())
++            raise SystemExit(setup_hint())
+         return
+-    target = runtime_python()
++
+     if not runtime_ready():
+         if require_ready:
+-            raise SystemExit(_setup_hint())
++            raise SystemExit(setup_hint())
+         return
+-    try:
+-        same = target.resolve() == Path(sys.executable).resolve()
+-    except OSError:
+-        same = False
+-    if same:
+-        return
+-    env = os.environ.copy()
+-    env["CIG_EXTERNAL_RUNTIME_ACTIVE"] = "1"
+-    env["CIG_EXTERNAL_RUNTIME_PYTHON"] = str(target)
+-    os.execve(str(target), [str(target), *sys.argv], env)
+-
+-
+-def _next_legacy_path(path: Path) -> Path:
+-    base = path.with_name(path.name + ".legacy-file")
+-    if not base.exists():
+-        return base
+-    for idx in range(1, 10000):
+-        candidate = path.with_name(path.name + f".legacy-file.{idx}")
+-        if not candidate.exists():
+-            return candidate
+-    raise RuntimeError(f"could not allocate a legacy path for {path}")
+-
+-
+-def ensure_directory(path: Path) -> Optional[Path]:
+-    """Ensure ``path`` is a directory, preserving any legacy file collision.
+-
+-    Older external-suite invocations accepted a JSON *file* such as
+-    ``results/external_flatland``.  Newer commands use that same stem as a
+-    directory.  Preserve the old file under a deterministic ``.legacy-file``
+-    name instead of crashing with ``FileExistsError`` or deleting evidence.
+-    """
+-    path = Path(path)
+-    migrated = None
+-    if path.exists() and not path.is_dir():
+-        migrated = _next_legacy_path(path)
+-        path.replace(migrated)
+-    path.mkdir(parents=True, exist_ok=True)
+-    return migrated
+-
+-
+-def ensure_output_file_parent(path: Path) -> Optional[Path]:
+-    return ensure_directory(Path(path).parent)
+-
+-
+-def runtime_metadata() -> dict:
+-    metadata_path = runtime_dir() / "runtime.json"
+-    payload = {
+-        "path": str(runtime_dir()),
+-        "python": str(runtime_python()),
+-        "ready": runtime_ready(),
+-    }
+-    if metadata_path.is_file():
+-        try:
+-            payload["metadata"] = json.loads(metadata_path.read_text(encoding="utf-8"))
+-        except (OSError, ValueError, TypeError):
+-            payload["metadata_error"] = "invalid runtime.json"
+-    return payload
+-"""External-runtime isolation and filesystem helpers.
+-
+-Pinned benchmark repositories can have dependency constraints that intentionally
+-conflict with the main CIG-AMF research environment.  In particular, the pinned
+-Flatland revision requires ``numpy<2``.  Keep those dependencies in a managed
+-runtime under ``external_envs/runtime`` and re-exec external commands there.
+-"""
+-from __future__ import annotations
+-
+-import json
+-import os
+-from pathlib import Path
+-import shutil
+-import sys
+-from typing import Iterable, Optional, Tuple
+-
+-
+-ROOT = Path(__file__).resolve().parents[2]
+-DEFAULT_EXTERNAL_ROOT = ROOT / "external_envs"
+-RUNTIME_DIRNAME = "runtime"
+-READY_MARKER = ".cig-external-runtime-ready"
+-
+-
+-def external_root() -> Path:
+-    root = Path(os.environ.get("CIG_EXTERNAL_ENVS_DIR", DEFAULT_EXTERNAL_ROOT)).resolve()
+-    return root.parent if root.name == "repos" else root
+-
+-
+-def runtime_dir() -> Path:
+-    return external_root() / RUNTIME_DIRNAME
+-
+-
+-def runtime_python() -> Path:
+-    name = "python.exe" if os.name == "nt" else "python"
+-    subdir = "Scripts" if os.name == "nt" else "bin"
+-    return runtime_dir() / subdir / name
+-
+-
+-def runtime_ready() -> bool:
+-    return runtime_python().is_file() and (runtime_dir() / READY_MARKER).is_file()
+-
+ 
+-def external_python_supported(version: Tuple[int, int]) -> bool:
+-    """Return whether the shared external runtime is in the supported ABI band.
+-
+-    NumPy 1.26.x, required by the pinned Flatland ``numpy<2`` contract, has a
+-    reliable wheel path through Python 3.12.  We therefore fail early on newer
+-    interpreters rather than attempting a source build inside experiment setup.
+-    """
+-    major, minor = int(version[0]), int(version[1])
+-    return major == 3 and 10 <= minor <= 12
+-
+-
+-def maybe_reexec_in_external_runtime() -> None:
+-    """Re-exec the current external command in the managed runtime if ready."""
+-    if os.environ.get("CIG_EXTERNAL_RUNTIME_ACTIVE") == "1":
+-        return
+     target = runtime_python()
+-    if not runtime_ready():
+-        return
+     try:
+         same = target.resolve() == Path(sys.executable).resolve()
+     except OSError:
+         same = False
+     if same:
++        os.environ["CIG_EXTERNAL_RUNTIME_ACTIVE"] = "1"
++        os.environ["CIG_EXTERNAL_RUNTIME_PYTHON"] = str(target)
+         return
++
+     env = os.environ.copy()
+     env["CIG_EXTERNAL_RUNTIME_ACTIVE"] = "1"
+     env["CIG_EXTERNAL_RUNTIME_PYTHON"] = str(target)
+@@ -220,13 +100,7 @@ def _next_legacy_path(path: Path) -> Path:
+ 
+ 
+ def ensure_directory(path: Path) -> Optional[Path]:
+-    """Ensure ``path`` is a directory, preserving any legacy file collision.
+-
+-    Older external-suite invocations accepted a JSON *file* such as
+-    ``results/external_flatland``.  Newer commands use that same stem as a
+-    directory.  Preserve the old file under a deterministic ``.legacy-file``
+-    name instead of crashing with ``FileExistsError`` or deleting evidence.
+-    """
++    """Ensure ``path`` is a directory while preserving a colliding legacy file."""
+     path = Path(path)
+     migrated = None
+     if path.exists() and not path.is_dir():
+diff --git a/pytest.ini b/pytest.ini
+new file mode 100644
+index 0000000..6125dd9
+--- /dev/null
++++ b/pytest.ini
+@@ -0,0 +1,12 @@
++[pytest]
++# Third-party benchmark repositories are managed fixtures, not part of the
++# CIG-AMF unit-test tree.  Never collect their upstream tests in the main venv.
++norecursedirs =
++    external_envs
++    Old
++    results
++    .git
++    .venv
++    venv
++    cig-env
++    __pycache__
+diff --git a/requirements-external.txt.rej b/requirements-external.txt.rej
+deleted file mode 100644
+index b4d6d9c..0000000
+--- a/requirements-external.txt.rej
++++ /dev/null
+@@ -1,11 +0,0 @@
+-@@ -0,0 +1,10 @@
+-+# Shared isolated runtime for the pinned external benchmark repositories.
+-+# Python 3.10-3.12 only: pinned Flatland requires numpy<2, and NumPy 1.26.x
+-+# should be installed from a wheel rather than source-built in experiment setup.
+-+numpy==1.26.4
+-+scipy==1.17.0
+-+pandas==2.2.3
+-+matplotlib==3.10.8
+-+pytest==9.0.2
+-+cython>=3.2.9
+-+torch==2.10.0
+diff --git a/requirements-test.txt.rej b/requirements-test.txt.rej
+deleted file mode 100644
+index c561b77..0000000
+--- a/requirements-test.txt.rej
++++ /dev/null
+@@ -1,4 +0,0 @@
+-@@ -0,0 +1,3 @@
+-+# Test-only dependency set for an already-working CIG-AMF environment.
+-+# Use this when the main environment already has NumPy/Torch but lacks pytest.
+-+pytest==9.0.2
+diff --git a/scripts/external_env_manager.py b/scripts/external_env_manager.py
+index f7d43a4..c6b065e 100644
+--- a/scripts/external_env_manager.py
++++ b/scripts/external_env_manager.py
+@@ -1,14 +1,17 @@
+-"""Inspect the single external-repository root and verify pinned revisions."""
++"""Inspect canonical external repositories and managed runtime readiness."""
+ from __future__ import annotations
+-import argparse, json, subprocess
++
++import argparse
++import json
+ from pathlib import Path
++import subprocess
+ import sys
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ if str(ROOT) not in sys.path:
+     sys.path.insert(0, str(ROOT))
+ 
+-from envs.external.registry import SPECS, external_root, repo_path, registry_payload
++from envs.external.registry import SPECS, external_root, legacy_repo_path, repo_path
+ from envs.external.runtime import runtime_metadata
+ 
+ 
+@@ -17,7 +20,9 @@ def _git_head(path: Path):
+         return None
+     result = subprocess.run(
+         ["git", "-C", str(path), "rev-parse", "HEAD"],
+-        text=True, capture_output=True, check=False,
++        text=True,
++        capture_output=True,
++        check=False,
+     )
+     return result.stdout.strip() if result.returncode == 0 else None
+ 
+@@ -26,7 +31,8 @@ def _expected_revisions():
+     path = Path(__file__).resolve().parent / "external_env_revisions.tsv"
+     rows = {}
+     for line in path.read_text(encoding="utf-8").splitlines():
+-        if not line.strip(): continue
++        if not line.strip():
++            continue
+         name, revision, url = line.split("\t")
+         rows[name] = {"revision": revision, "url": url}
+     return rows
+@@ -34,23 +40,40 @@ def _expected_revisions():
+ 
+ def status_payload():
+     expected = _expected_revisions()
+-    payload = {"root": str(external_root()), "runtime": runtime_metadata(), "repositories": {}}
++    runtime = runtime_metadata()
++    import_records = runtime.get("metadata", {}).get("imports", {})
++    payload = {
++        "root": str(external_root()),
++        "canonical_repositories_root": str(external_root() / "repos"),
++        "runtime": runtime,
++        "repositories": {},
++    }
+     for key, spec in SPECS.items():
+         path = repo_path(key)
++        legacy = legacy_repo_path(key)
+         head = _git_head(path)
+         pin = expected.get(spec.repo_dir, {})
++        import_record = import_records.get(spec.repo_dir)
++        runtime_import_ok = bool(isinstance(import_record, dict) and import_record.get("ok"))
+         payload["repositories"][key] = {
+             "repo_dir": spec.repo_dir,
+             "path": str(path),
++            "legacy_path": str(legacy),
+             "exists": path.exists(),
++            "legacy_exists": legacy.exists(),
+             "head": head,
+             "expected_revision": pin.get("revision"),
+             "revision_match": bool(head and head == pin.get("revision")),
++            "runtime_import": import_record,
++            "operational_ready": bool(runtime.get("ready") and runtime_import_ok),
+             "capabilities": vars(spec.capabilities),
+         }
+     payload["all_pins_match"] = all(
+         item["revision_match"] for item in payload["repositories"].values()
+     )
++    payload["legacy_duplicates_present"] = any(
++        item["legacy_exists"] for item in payload["repositories"].values()
++    )
+     return payload
+ 
+ 
+diff --git a/scripts/external_env_manager.py.rej b/scripts/external_env_manager.py.rej
+deleted file mode 100644
+index f23d8f1..0000000
+--- a/scripts/external_env_manager.py.rej
++++ /dev/null
+@@ -1,45 +0,0 @@
+-@@ -9,6 +9,7 @@
+-     sys.path.insert(0, str(ROOT))
+- 
+- from envs.external.registry import SPECS, external_root, repo_path, registry_payload
+-+from envs.external.runtime import runtime_metadata
+- 
+- 
+- def _git_head(path: Path):
+-@@ -33,11 +34,14 @@
+- 
+- def status_payload():
+-     expected = _expected_revisions()
+--    payload = {"root": str(external_root()), "repositories": {}}
+-+    runtime = runtime_metadata()
+-+    payload = {"root": str(external_root()), "runtime": runtime, "repositories": {}}
+-+    runtime_imports = runtime.get("metadata", {}).get("imports", {})
+-     for key, spec in SPECS.items():
+-         path = repo_path(key)
+-         head = _git_head(path)
+-         pin = expected.get(spec.repo_dir, {})
+-+        import_record = runtime_imports.get(spec.repo_dir, {})
+-         payload["repositories"][key] = {
+-             "repo_dir": spec.repo_dir,
+-             "path": str(path),
+-@@ -45,11 +49,20 @@
+-             "head": head,
+-             "expected_revision": pin.get("revision"),
+-             "revision_match": bool(head and head == pin.get("revision")),
+-+            "runtime_import": import_record,
+-+            "operational_ready": bool(
+-+                runtime.get("ready")
+-+                and head and head == pin.get("revision")
+-+                and isinstance(import_record, dict) and import_record.get("ok")
+-+            ),
+-             "capabilities": vars(spec.capabilities),
+-         }
+-     payload["all_pins_match"] = all(
+-         item["revision_match"] for item in payload["repositories"].values()
+-     )
+-+    payload["all_external_operational"] = all(
+-+        item["operational_ready"] for item in payload["repositories"].values()
+-+    )
+-     return payload
+- 
+- 
+diff --git a/scripts/run_external_suite.py b/scripts/run_external_suite.py
+index 920932c..11497c4 100644
+--- a/scripts/run_external_suite.py
++++ b/scripts/run_external_suite.py
+@@ -19,7 +19,6 @@ if str(ROOT) not in sys.path:
+     sys.path.insert(0, str(ROOT))
+ 
+ from envs.external.runtime import ensure_output_file_parent, maybe_reexec_in_external_runtime
+-maybe_reexec_in_external_runtime()
+ 
+ import numpy as np
+ 
+@@ -101,6 +100,8 @@ def main(argv=None):
+     parser.add_argument("--config-path")
+     parser.add_argument("--manifest-only", action="store_true")
+     args = parser.parse_args(argv)
++    if not args.manifest_only:
++        maybe_reexec_in_external_runtime(require_ready=True)
+ 
+     decisions = {panel: _static_panel_support(args.environment, panel) for panel in args.panels}
+     runtime = {}
+diff --git a/scripts/run_external_suite.py.orig b/scripts/run_external_suite.py.orig
+deleted file mode 100644
+index 8d3973f..0000000
+--- a/scripts/run_external_suite.py.orig
++++ /dev/null
+@@ -1,177 +0,0 @@
+-"""Executable capability audit for pinned external CIG-AMF benchmarks.
+-
+-The suite validates both declarative capabilities and the methods/runtime path
+-required by the selected panel.  It does not silently promote a smoke test into
+-paper evidence: training smoke is architecture validation only, and H2/latency
+-remain blocked unless the adapter declares those scientific contracts.
+-"""
+-from __future__ import annotations
+-
+-import argparse
+-import copy
+-import json
+-from pathlib import Path
+-import sys
+-
+-
+-ROOT = Path(__file__).resolve().parents[1]
+-if str(ROOT) not in sys.path:
+-    sys.path.insert(0, str(ROOT))
+-
+-from envs.external.runtime import ensure_output_file_parent, maybe_reexec_in_external_runtime
+-maybe_reexec_in_external_runtime()
+-
+-import numpy as np
+-
+-from envs.external.registry import SPECS, build_environment, repo_path
+-from envs.external_contract import require_panel
+-
+-
+-def _static_panel_support(environment, panel):
+-    spec = SPECS[environment]
+-    cap = spec.capabilities
+-    if not cap.supports(panel):
+-        return False, "capability flag is disabled"
+-    cls_methods = {
+-        "training": ("clone_state", "restore_state", "reset", "step", "valid_action_mask"),
+-        "h1": ("clone_state", "restore_state", "fixed_continuation_policy", "oracle_lag_response"),
+-        "h2": ("clone_state", "restore_state", "apply_structural_intervention", "apply_behavioural_intervention"),
+-        "latency": ("clone_state", "restore_state", "fixed_continuation_policy", "oracle_lag_response"),
+-    }
+-    # The runtime object is authoritative; static method checks are performed
+-    # after construction because some wrappers delegate methods through a base.
+-    return True, ""
+-
+-
+-def _runtime_smoke(env):
+-    observations = env.reset(seed=123)
+-    if len(observations) != int(env.n_agents):
+-        raise RuntimeError("reset did not return one observation per agent")
+-    masks = [np.asarray(env.valid_action_mask(i), dtype=bool) for i in range(env.n_agents)]
+-    if any(mask.shape != (env.get_action_dim(),) or not np.any(mask) for mask in masks):
+-        raise RuntimeError("invalid state-dependent action mask")
+-    before = env.clone_state()
+-    actions = [int(np.flatnonzero(mask)[0]) for mask in masks]
+-    next_obs, rewards, done, info = env.step(actions)
+-    if len(next_obs) != env.n_agents or len(rewards) != env.n_agents:
+-        raise RuntimeError("step did not return a population transition")
+-    env.restore_state(copy.deepcopy(before))
+-    restored = env._get_obs_all()
+-    if len(restored) != env.n_agents:
+-        raise RuntimeError("clone/restore did not restore a population state")
+-    return {
+-        "n_agents": int(env.n_agents),
+-        "action_dim": int(env.get_action_dim()),
+-        "obs_dim": int(env.get_obs_dim()),
+-        "one_step_done": bool(done),
+-        "reward_mean": float(np.mean(np.asarray(rewards, dtype=np.float64))),
+-    }
+-
+-
+-def _h1_smoke(env):
+-    if env.n_agents < 2:
+-        raise RuntimeError("H1 smoke requires at least two agents")
+-    env.reset(seed=321)
+-    source = 1
+-    mask = np.asarray(env.valid_action_mask(source), dtype=bool)
+-    valid = np.flatnonzero(mask)
+-    if valid.size < 2:
+-        raise RuntimeError("H1 smoke requires a source with at least two valid actions")
+-    response = env.oracle_lag_response(
+-        ego_id=0, agent_j=source, intervention_action=int(valid[-1]),
+-        horizon=2, n_trials=1, forced_step=0,
+-        continuation_policy=env.fixed_continuation_policy, discount=0.95,
+-    )
+-    required = {"per_lag_response", "discounted_response", "response_mass"}
+-    if not required.issubset(response):
+-        raise RuntimeError("oracle_lag_response returned an incomplete record")
+-    return {
+-        "discounted_response": float(response["discounted_response"]),
+-        "response_mass": float(response["response_mass"]),
+-    }
+-
+-
+-def main(argv=None):
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument("--environment", choices=sorted(SPECS), required=True)
+-    parser.add_argument("--out", type=Path, required=True)
+-    parser.add_argument("--panels", nargs="+", default=["training", "h1", "h2", "latency"])
+-    parser.add_argument("--agent-count", type=int, default=6)
+-    parser.add_argument("--max-steps", type=int, default=30)
+-    parser.add_argument("--config-path")
+-    parser.add_argument("--manifest-only", action="store_true")
+-    args = parser.parse_args(argv)
+-
+-    decisions = {panel: _static_panel_support(args.environment, panel) for panel in args.panels}
+-    runtime = {}
+-    construction_error = None
+-    env = None
+-    if not args.manifest_only and any(ok for ok, _ in decisions.values()):
+-        try:
+-            env = build_environment(
+-                args.environment, seed=0, n_agents=args.agent_count,
+-                max_steps=args.max_steps, config_path=args.config_path,
+-            )
+-            if decisions.get("training", (False,))[0]:
+-                require_panel(env, "training")
+-                runtime["training"] = _runtime_smoke(env)
+-            if decisions.get("h1", (False,))[0]:
+-                require_panel(env, "h1")
+-                runtime["h1"] = _h1_smoke(env)
+-        except Exception as exc:
+-            construction_error = f"{type(exc).__name__}: {exc}"
+-            # Construction/runtime failure invalidates all panels that would
+-            # depend on this adapter instance; fail closed.
+-            for panel, (ok, _) in list(decisions.items()):
+-                if ok:
+-                    decisions[panel] = (False, "runtime adapter check failed: " + construction_error)
+-
+-    cap = SPECS[args.environment].capabilities
+-    declared_panels = [panel for panel, (ok, _) in decisions.items() if ok]
+-    repository_exists = repo_path(args.environment).exists()
+-    if args.manifest_only:
+-        # Manifest mode reports declared support only.  It must not call a
+-        # panel runtime-runnable when the pinned repository has not been
+-        # constructed and smoke-tested in this process.
+-        runnable_panels = []
+-        operational_status = "not_executed"
+-    else:
+-        runnable_panels = [panel for panel in declared_panels if panel in runtime]
+-        # H2/latency cannot be runtime-smoked by this suite unless supported;
+-        # if a future adapter advertises them they remain declared until a
+-        # dedicated scientific runner executes their contract.
+-        runnable_panels.extend(
+-            panel for panel in declared_panels
+-            if panel not in {"training", "h1"} and construction_error is None
+-        )
+-        operational_status = "failed" if construction_error else "verified"
+-    payload = {
+-        "environment": args.environment,
+-        "repository": str(repo_path(args.environment)),
+-        "repository_exists": repository_exists,
+-        "capabilities": vars(cap),
+-        "requested_panels": args.panels,
+-        "declared_supported_panels": declared_panels,
+-        "runnable_panels": runnable_panels,
+-        "blocked_panels": [panel for panel, (ok, _) in decisions.items() if not ok],
+-        "blocked_reasons": {panel: reason for panel, (ok, reason) in decisions.items() if not ok},
+-        "runtime_smoke": runtime,
+-        "construction_error": construction_error,
+-        "operational_status": operational_status,
+-        "manifest_only": bool(args.manifest_only),
+-        "rule": "blocked panels must not generate paper evidence",
+-        "training_scope": "architecture generalization; not causal identification",
+-    }
+-    migrated = ensure_output_file_parent(args.out)
+-    if migrated is not None:
+-        print(f"[EXTERNAL-OUT] preserved legacy output file as {migrated}", file=sys.stderr)
+-    args.out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+-    print(json.dumps(payload, sort_keys=True))
+-    # A blocked scientific panel is not an operational failure. Runtime adapter
+-    # failures are operational and return nonzero so experiment automation can
+-    # stop before treating the environment as ready.
+-    raise SystemExit(2 if construction_error else 0)
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/scripts/run_external_suite.py.rej b/scripts/run_external_suite.py.rej
+deleted file mode 100644
+index 5cf37e2..0000000
+--- a/scripts/run_external_suite.py.rej
++++ /dev/null
+@@ -1,29 +0,0 @@
+-@@ -13,12 +13,16 @@
+- from pathlib import Path
+- import sys
+- 
+--import numpy as np
+- 
+- ROOT = Path(__file__).resolve().parents[1]
+- if str(ROOT) not in sys.path:
+-     sys.path.insert(0, str(ROOT))
+- 
+-+from envs.external.runtime import ensure_output_file_parent, maybe_reexec_in_external_runtime
+-+maybe_reexec_in_external_runtime(require_ready=("--manifest-only" not in sys.argv))
+-+
+-+import numpy as np
+-+
+- from envs.external.registry import SPECS, build_environment, repo_path
+- from envs.external_contract import require_panel
+- 
+-@@ -162,7 +162,9 @@
+-         "rule": "blocked panels must not generate paper evidence",
+-         "training_scope": "architecture generalization; not causal identification",
+-     }
+--    args.out.parent.mkdir(parents=True, exist_ok=True)
+-+    migrated = ensure_output_file_parent(args.out)
+-+    if migrated is not None:
+-+        print(f"[EXTERNAL-OUT] preserved legacy output file as {migrated}", file=sys.stderr)
+-     args.out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+-     print(json.dumps(payload, sort_keys=True))
+-     # A blocked scientific panel is not an operational failure. Runtime adapter
+diff --git a/scripts/run_external_training.py b/scripts/run_external_training.py
+index b70b048..552f428 100644
+--- a/scripts/run_external_training.py
++++ b/scripts/run_external_training.py
+@@ -8,7 +8,6 @@ ROOT = Path(__file__).resolve().parents[1]
+ if str(ROOT) not in sys.path:
+     sys.path.insert(0, str(ROOT))
+ from envs.external.runtime import ensure_directory, maybe_reexec_in_external_runtime
+-maybe_reexec_in_external_runtime()
+ 
+ import numpy as np
+ 
+@@ -37,6 +36,7 @@ def main(argv=None):
+     )
+     parser.add_argument("--out", type=Path, required=True)
+     args = parser.parse_args(argv)
++    maybe_reexec_in_external_runtime(require_ready=True)
+     if args.episodes <= 0 or args.max_steps <= 0 or not args.seeds:
+         parser.error("episodes, max-steps and seeds must be positive")
+     if len(set(args.seeds)) != len(args.seeds):
+diff --git a/scripts/run_external_training.py.orig b/scripts/run_external_training.py.orig
+deleted file mode 100644
+index b70b048..0000000
+--- a/scripts/run_external_training.py.orig
++++ /dev/null
+@@ -1,104 +0,0 @@
+-"""Run actual Final-CIGAMF training on one normalized external benchmark."""
+-from __future__ import annotations
+-import argparse, csv, json, os, time
+-from pathlib import Path
+-import sys
+-
+-ROOT = Path(__file__).resolve().parents[1]
+-if str(ROOT) not in sys.path:
+-    sys.path.insert(0, str(ROOT))
+-from envs.external.runtime import ensure_directory, maybe_reexec_in_external_runtime
+-maybe_reexec_in_external_runtime()
+-
+-import numpy as np
+-
+-import run_experiment as RE
+-from envs.external.registry import SPECS, build_environment
+-from envs.external_contract import require_panel
+-
+-
+-def _finite_mean(values):
+-    vals = [float(v) for v in values if np.isfinite(v)]
+-    return float(np.mean(vals)) if vals else None
+-
+-
+-def main(argv=None):
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument("--environment", choices=sorted(SPECS), required=True)
+-    parser.add_argument("--seeds", type=int, nargs="+", default=[0])
+-    parser.add_argument("--episodes", type=int, default=5)
+-    parser.add_argument("--agent-count", type=int, default=6)
+-    parser.add_argument("--max-steps", type=int, default=60)
+-    parser.add_argument("--config-path")
+-    parser.add_argument("--device", default="cpu")
+-    parser.add_argument(
+-        "--profile", choices=("full", "quick"), default="full",
+-        help="full uses the paper architecture; quick uses smoke_cfg only for wiring checks",
+-    )
+-    parser.add_argument("--out", type=Path, required=True)
+-    args = parser.parse_args(argv)
+-    if args.episodes <= 0 or args.max_steps <= 0 or not args.seeds:
+-        parser.error("episodes, max-steps and seeds must be positive")
+-    if len(set(args.seeds)) != len(args.seeds):
+-        parser.error("seeds must be unique")
+-    migrated = ensure_directory(args.out)
+-    if migrated is not None:
+-        print(f"[EXTERNAL-OUT] preserved legacy output file as {migrated}", file=sys.stderr)
+-    rows = []
+-    for seed in args.seeds:
+-        RE.set_global_seed(int(seed))
+-        env = build_environment(
+-            args.environment, seed=seed, n_agents=args.agent_count,
+-            max_steps=args.max_steps, config_path=args.config_path,
+-        )
+-        require_panel(env, "training")
+-        cfg = RE.default_cfg() if args.profile == "full" else RE.smoke_cfg()
+-        cfg.update({
+-            "seed": int(seed), "k0_warmup": 0,
+-            "causal_horizon": min(4, max(1, args.max_steps // 4)),
+-            "proxy_n_horizons": min(4, max(1, args.max_steps // 4)),
+-            "max_core_size": min(3, max(1, env.n_agents - 1)),
+-            "min_core_size": 1,
+-            "seed_core_top_k": min(3, max(1, env.n_agents - 1)),
+-            "belief_adaptive_k_min": 1,
+-            "periph_require_full_signature": True,
+-            "periph_allow_legacy_items": False,
+-        })
+-        runner = RE.make_runner("Final-CIGAMF", env, cfg, args.device)
+-        started = time.perf_counter()
+-        history = runner.run(n_episodes=args.episodes, eval_every=1)
+-        elapsed = time.perf_counter() - started
+-        rows.append({
+-            "environment": args.environment,
+-            "profile": args.profile,
+-            "seed": int(seed),
+-            "episodes": int(args.episodes),
+-            "n_agents": int(env.n_agents),
+-            "action_dim": int(env.get_action_dim()),
+-            "obs_dim": int(env.get_obs_dim()),
+-            "mean_reward": _finite_mean(history.get("mean_reward", [])),
+-            "final_reward": float(history.get("mean_reward", [float("nan")])[-1]),
+-            "mean_core_size": _finite_mean(history.get("mean_core_size", [])),
+-            "throughput_total": _finite_mean(history.get("throughput_total_agent_steps_per_sec", [])),
+-            "elapsed_seconds": elapsed,
+-        })
+-    csv_path = args.out / "summary_external_training.csv"
+-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+-        writer.writeheader(); writer.writerows(rows)
+-    manifest = {
+-        "experiment": "external_final_cigamf_training_v1",
+-        "environment": args.environment,
+-        "seeds": args.seeds,
+-        "episodes": args.episodes,
+-        "profile": args.profile,
+-        "summary": str(csv_path),
+-        "paper_evidence_scope": "architecture_generalization_only",
+-        "not_an_h1_h2_or_latency_claim": True,
+-    }
+-    (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+-    print(csv_path)
+-
+-
+-if __name__ == "__main__":
+-    main()
+diff --git a/scripts/run_external_training.py.rej b/scripts/run_external_training.py.rej
+deleted file mode 100644
+index ba22ec8..0000000
+--- a/scripts/run_external_training.py.rej
++++ /dev/null
+@@ -1,21 +0,0 @@
+-@@ -7,6 +7,9 @@
+- ROOT = Path(__file__).resolve().parents[1]
+- if str(ROOT) not in sys.path:
+-     sys.path.insert(0, str(ROOT))
+-+from envs.external.runtime import ensure_directory, maybe_reexec_in_external_runtime
+-+maybe_reexec_in_external_runtime(require_ready=True)
+-+
+- import numpy as np
+- 
+- import run_experiment as RE
+-@@ -38,7 +41,9 @@
+-         parser.error("episodes, max-steps and seeds must be positive")
+-     if len(set(args.seeds)) != len(args.seeds):
+-         parser.error("seeds must be unique")
+--    args.out.mkdir(parents=True, exist_ok=True)
+-+    migrated = ensure_directory(args.out)
+-+    if migrated is not None:
+-+        print(f"[EXTERNAL-OUT] preserved legacy output file as {migrated}", file=sys.stderr)
+-     rows = []
+-     for seed in args.seeds:
+-         RE.set_global_seed(int(seed))
+diff --git a/scripts/setup_external_envs.sh b/scripts/setup_external_envs.sh
+old mode 100644
+new mode 100755
+index 9f136ab..92df1b8
+--- a/scripts/setup_external_envs.sh
++++ b/scripts/setup_external_envs.sh
+@@ -1,7 +1,6 @@
+ #!/usr/bin/env bash
+-# Manage all pinned external benchmark repositories under one canonical root.
+-# Optional installation is isolated from the main CIG environment because the
+-# pinned Flatland revision requires numpy<2.
++# Clone/migrate pinned external benchmarks into one canonical repository root and
++# optionally install them into an isolated Python 3.10-3.12 runtime.
+ set -euo pipefail
+ 
+ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+@@ -10,6 +9,7 @@ if [ "$(basename "$EXTERNAL_ROOT")" = "repos" ]; then
+   EXTERNAL_ROOT="$(dirname "$EXTERNAL_ROOT")"
+ fi
+ DEST="$EXTERNAL_ROOT/repos"
++LEGACY_ARCHIVE="$EXTERNAL_ROOT/legacy_repos"
+ RUNTIME="$EXTERNAL_ROOT/runtime"
+ INSTALL=0
+ RECREATE=0
+@@ -18,13 +18,12 @@ usage() {
+   cat >&2 <<EOF
+ usage: $0 [--install] [--recreate-runtime]
+ 
+---install            create/update the isolated external runtime and install all
+-                     pinned benchmark packages there
+---recreate-runtime   delete only the managed external_envs/runtime venv first
++--install            install pinned benchmark packages into the isolated
++                     external_envs/runtime environment
++--recreate-runtime   recreate only the managed external runtime
+ 
+-Interpreter selection for --install:
+-  CIG_EXTERNAL_PYTHON=/path/to/python3.12 $0 --install
+-Otherwise python3.12, python3.11, then python3.10 are auto-detected.
++For installation use Python 3.10-3.12 (3.12 recommended):
++  CIG_EXTERNAL_PYTHON=/path/to/python3.12 $0 --install --recreate-runtime
+ EOF
+ }
+ 
+@@ -39,19 +38,62 @@ while [ "$#" -gt 0 ]; do
+ done
+ mkdir -p "$DEST"
+ 
+-clone_pinned() {
+-  local name="$1" revision="$2" url="$3"
+-  local legacy="$EXTERNAL_ROOT/$name" target="$DEST/$name"
+-  if [ ! -e "$target" ] && [ -d "$legacy/.git" ]; then
++archive_dirty_legacy() {
++  name="$1"
++  legacy="$2"
++  mkdir -p "$LEGACY_ARCHIVE"
++  stamp="$(date +%Y%m%d-%H%M%S)"
++  target="$LEGACY_ARCHIVE/${name}-${stamp}"
++  suffix=0
++  while [ -e "$target" ]; do
++    suffix=$((suffix + 1))
++    target="$LEGACY_ARCHIVE/${name}-${stamp}-${suffix}"
++  done
++  mv "$legacy" "$target"
++  echo "[external-repos] preserved dirty/ divergent legacy checkout: $target" >&2
++}
++
++reconcile_legacy() {
++  name="$1"
++  legacy="$EXTERNAL_ROOT/$name"
++  target="$DEST/$name"
++  [ -d "$legacy" ] || return 0
++  [ "$legacy" != "$target" ] || return 0
++
++  if [ ! -e "$target" ]; then
+     mv "$legacy" "$target"
++    echo "[external-repos] migrated $name -> $target" >&2
++    return 0
++  fi
++
++  # Both paths exist. Remove only an unmodified duplicate at the same commit;
++  # otherwise preserve it under legacy_repos instead of losing user changes.
++  if [ -d "$legacy/.git" ] && [ -d "$target/.git" ]; then
++    legacy_head="$(git -C "$legacy" rev-parse HEAD 2>/dev/null || true)"
++    target_head="$(git -C "$target" rev-parse HEAD 2>/dev/null || true)"
++    legacy_dirty="$(git -C "$legacy" status --porcelain 2>/dev/null || true)"
++    if [ -n "$legacy_head" ] && [ "$legacy_head" = "$target_head" ] && [ -z "$legacy_dirty" ]; then
++      rm -rf "$legacy"
++      echo "[external-repos] removed duplicate clean legacy checkout: $legacy" >&2
++      return 0
++    fi
+   fi
++  archive_dirty_legacy "$name" "$legacy"
++}
++
++clone_pinned() {
++  name="$1"; revision="$2"; url="$3"
++  reconcile_legacy "$name"
++  target="$DEST/$name"
+   if [ -d "$target/.git" ]; then
+     git -C "$target" fetch --depth 1 origin "$revision"
++  elif [ -e "$target" ]; then
++    echo "ERROR: canonical path exists but is not a git checkout: $target" >&2
++    exit 3
+   else
+     git clone --no-checkout "$url" "$target"
+   fi
+   git -C "$target" checkout --detach "$revision"
+-  local actual
+   actual="$(git -C "$target" rev-parse HEAD)"
+   if [ "$actual" != "$revision" ]; then
+     echo "revision mismatch for $name: expected $revision got $actual" >&2
+@@ -60,22 +102,19 @@ clone_pinned() {
+   printf '%s\t%s\t%s\n' "$name" "$actual" "$target"
+ }
+ 
+-while IFS=$'\t' read -r name revision url; do
++while IFS="$(printf '\t')" read -r name revision url; do
+   [ -z "$name" ] || clone_pinned "$name" "$revision" "$url"
+ done < "$ROOT/scripts/external_env_revisions.tsv"
+ 
+ choose_external_python() {
+-  local candidates=()
+   if [ -n "${CIG_EXTERNAL_PYTHON:-}" ]; then
+-    candidates+=("$CIG_EXTERNAL_PYTHON")
++    candidates="$CIG_EXTERNAL_PYTHON"
+   else
+-    candidates+=(python3.12 python3.11 python3.10)
++    candidates="python3.12 python3.11 python3.10"
+   fi
+-  local candidate resolved version ok
+-  for candidate in "${candidates[@]}"; do
+-    if ! resolved="$(command -v "$candidate" 2>/dev/null)"; then
+-      continue
+-    fi
++  for candidate in $candidates; do
++    resolved="$(command -v "$candidate" 2>/dev/null || true)"
++    [ -n "$resolved" ] || continue
+     version="$($resolved -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+     ok="$($resolved -c 'import sys; print(int(sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12))')"
+     if [ "$ok" = "1" ]; then
+@@ -88,14 +127,15 @@ choose_external_python() {
+ }
+ 
+ if [ "$INSTALL" -eq 1 ]; then
+-  if ! BASE_PYTHON="$(choose_external_python)"; then
++  BASE_PYTHON="$(choose_external_python || true)"
++  if [ -z "$BASE_PYTHON" ]; then
+     CURRENT="$(python -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || true)"
+     cat >&2 <<EOF
+ ERROR: no compatible external-runtime interpreter found.
+ Current project interpreter: ${CURRENT:-unknown}
+-Pinned Flatland requires numpy<2; do not install it into the Python 3.14 CIG env.
++Pinned Flatland requires numpy<2; do not install external repos into the main Python 3.14 environment.
+ 
+-On Homebrew macOS, install Python 3.12 and retry:
++Homebrew macOS:
+   brew install python@3.12
+   CIG_EXTERNAL_PYTHON="\$(brew --prefix python@3.12)/bin/python3.12" \\
+     bash scripts/setup_external_envs.sh --install --recreate-runtime
+@@ -110,19 +150,18 @@ EOF
+     "$BASE_PYTHON" -m venv "$RUNTIME"
+   fi
+   RUNTIME_PY="$RUNTIME/bin/python"
+-  RUNTIME_VERSION="$($RUNTIME_PY -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+   if ! "$RUNTIME_PY" -c 'import sys; raise SystemExit(0 if sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12 else 1)'; then
+-    echo "managed runtime uses incompatible Python $RUNTIME_VERSION; rerun with --recreate-runtime" >&2
++    echo "managed runtime has an unsupported Python; rerun with --recreate-runtime" >&2
+     exit 5
+   fi
+ 
+   rm -f "$RUNTIME/.cig-external-runtime-ready"
+-  "$RUNTIME_PY" -m pip install --upgrade pip setuptools wheel
++  "$RUNTIME_PY" -m pip install --upgrade pip 'setuptools<81' wheel
+   "$RUNTIME_PY" -m pip install -r "$ROOT/requirements-external.txt"
+ 
+-  FAILED_INSTALLS=""
+   INSTALLED=""
+-  while IFS=$'\t' read -r name revision url; do
++  FAILED_INSTALLS=""
++  while IFS="$(printf '\t')" read -r name revision url; do
+     [ -z "$name" ] && continue
+     target="$DEST/$name"
+     echo "[external-runtime] installing $name into $RUNTIME"
+@@ -130,7 +169,7 @@ EOF
+       INSTALLED="$INSTALLED $name"
+     else
+       FAILED_INSTALLS="$FAILED_INSTALLS $name"
+-      echo "[external-runtime] install failed for $name; continuing so other benchmarks remain usable" >&2
++      echo "[external-runtime] install failed for $name; other benchmarks remain usable" >&2
+     fi
+   done < "$ROOT/scripts/external_env_revisions.tsv"
+ 
+@@ -148,8 +187,11 @@ for repo, module in module_by_repo.items():
+         importlib.import_module(module)
+         imports[repo] = {"ok": True, "module": module}
+     except Exception as exc:
+-        imports[repo] = {"ok": False, "module": module, "error": f"{type(exc).__name__}: {exc}"}
+-path = pathlib.Path(os.environ["CIG_RUNTIME_DIR"]) / "runtime.json"
++        imports[repo] = {
++            "ok": False,
++            "module": module,
++            "error": f"{type(exc).__name__}: {exc}",
++        }
+ payload = {
+     "python": sys.executable,
+     "python_version": platform.python_version(),
+@@ -159,10 +201,11 @@ payload = {
+     "failed_install_attempts": os.environ.get("CIG_FAILED_INSTALLS", "").split(),
+     "imports": imports,
+ }
++path = pathlib.Path(os.environ["CIG_RUNTIME_DIR"]) / "runtime.json"
+ path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+ PY
+   touch "$RUNTIME/.cig-external-runtime-ready"
+-  echo "[external-runtime] READY: $RUNTIME_PY ($RUNTIME_VERSION)"
++  echo "[external-runtime] runtime created: $RUNTIME_PY"
+   if [ -n "$FAILED_INSTALLS" ]; then
+     echo "[external-runtime] WARNING: failed installs:$FAILED_INSTALLS" >&2
+   fi
+diff --git a/scripts/setup_external_envs.sh.rej b/scripts/setup_external_envs.sh.rej
+deleted file mode 100644
+index f8fd170..0000000
+--- a/scripts/setup_external_envs.sh.rej
++++ /dev/null
+@@ -1,212 +0,0 @@
+-@@ -1,32 +1,47 @@
+- #!/usr/bin/env bash
+- # Manage all pinned external benchmark repositories under one canonical root.
+-+# Optional installation is isolated from the main CIG environment because the
+-+# pinned Flatland revision requires numpy<2.
+- set -euo pipefail
+- 
+- ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+- EXTERNAL_ROOT="${CIG_EXTERNAL_ENVS_DIR:-$ROOT/external_envs}"
+--# CIG_EXTERNAL_ENVS_DIR may point either at external_envs or directly at its
+--# repos child.  Normalize once so we never create repos/repos.
+- if [ "$(basename "$EXTERNAL_ROOT")" = "repos" ]; then
+-   EXTERNAL_ROOT="$(dirname "$EXTERNAL_ROOT")"
+- fi
+- DEST="$EXTERNAL_ROOT/repos"
+-+RUNTIME="$EXTERNAL_ROOT/runtime"
+- INSTALL=0
+--if [ "${1:-}" = "--install" ]; then
+--  INSTALL=1
+--elif [ "$#" -gt 0 ]; then
+--  echo "usage: $0 [--install]" >&2
+--  exit 2
+--fi
+-+RECREATE=0
+-+
+-+usage() {
+-+  cat >&2 <<EOF
+-+usage: $0 [--install] [--recreate-runtime]
+-+
+-+--install            create/update the isolated external runtime and install all
+-+                     pinned benchmark packages there
+-+--recreate-runtime   delete only the managed external_envs/runtime venv first
+-+
+-+Interpreter selection for --install:
+-+  CIG_EXTERNAL_PYTHON=/path/to/python3.12 $0 --install
+-+Otherwise python3.12, python3.11, then python3.10 are auto-detected.
+-+EOF
+-+}
+-+
+-+while [ "$#" -gt 0 ]; do
+-+  case "$1" in
+-+    --install) INSTALL=1 ;;
+-+    --recreate-runtime) RECREATE=1 ;;
+-+    -h|--help) usage; exit 0 ;;
+-+    *) usage; exit 2 ;;
+-+  esac
+-+  shift
+-+done
+- mkdir -p "$DEST"
+- 
+- clone_pinned() {
+--  local name="$1"
+--  local revision="$2"
+--  local url="$3"
+--  local legacy="$EXTERNAL_ROOT/$name"
+--  local target="$DEST/$name"
+--  # Migrate the old layout in place so existing clones are reused instead of
+--  # downloading a second copy after this repository-management refactor.
+-+  local name="$1" revision="$2" url="$3"
+-+  local legacy="$EXTERNAL_ROOT/$name" target="$DEST/$name"
+-   if [ ! -e "$target" ] && [ -d "$legacy/.git" ]; then
+-     mv "$legacy" "$target"
+-   fi
+-@@ -43,23 +58,135 @@
+-     exit 3
+-   fi
+-   printf '%s\t%s\t%s\n' "$name" "$actual" "$target"
+--  if [ "$INSTALL" -eq 1 ]; then
+--    case "$name" in
+--      CityFlow)
+--        # CityFlow is a native extension; editable install invokes its pinned
+--        # build system and should fail loudly if compiler/Boost prerequisites
+--        # are absent rather than being marked runnable.
+--        python -m pip install -e "$target"
+--        ;;
+--      *)
+--        python -m pip install -e "$target"
+--        ;;
+--    esac
+--  fi
+- }
+- 
+- while IFS=$'\t' read -r name revision url; do
+-   [ -z "$name" ] || clone_pinned "$name" "$revision" "$url"
+- done < "$ROOT/scripts/external_env_revisions.tsv"
+- 
+-+choose_external_python() {
+-+  local candidates=()
+-+  if [ -n "${CIG_EXTERNAL_PYTHON:-}" ]; then
+-+    candidates+=("$CIG_EXTERNAL_PYTHON")
+-+  else
+-+    candidates+=(python3.12 python3.11 python3.10)
+-+  fi
+-+  local candidate resolved version ok
+-+  for candidate in "${candidates[@]}"; do
+-+    if ! resolved="$(command -v "$candidate" 2>/dev/null)"; then
+-+      continue
+-+    fi
+-+    version="$($resolved -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+-+    ok="$($resolved -c 'import sys; print(int(sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12))')"
+-+    if [ "$ok" = "1" ]; then
+-+      printf '%s\n' "$resolved"
+-+      return 0
+-+    fi
+-+    echo "[external-runtime] skipping $resolved (Python $version; need 3.10-3.12)" >&2
+-+  done
+-+  return 1
+-+}
+-+
+-+if [ "$INSTALL" -eq 1 ]; then
+-+  if ! BASE_PYTHON="$(choose_external_python)"; then
+-+    CURRENT="$(python -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || true)"
+-+    cat >&2 <<EOF
+-+ERROR: no compatible external-runtime interpreter found.
+-+Current project interpreter: ${CURRENT:-unknown}
+-+Pinned Flatland requires numpy<2; do not install it into the Python 3.14 CIG env.
+-+
+-+On Homebrew macOS, install Python 3.12 and retry:
+-+  brew install python@3.12
+-+  CIG_EXTERNAL_PYTHON="\$(brew --prefix python@3.12)/bin/python3.12" \\
+-+    bash scripts/setup_external_envs.sh --install --recreate-runtime
+-+EOF
+-+    exit 4
+-+  fi
+-+
+-+  if [ "$RECREATE" -eq 1 ] && [ -d "$RUNTIME" ]; then
+-+    rm -rf "$RUNTIME"
+-+  fi
+-+  if [ ! -x "$RUNTIME/bin/python" ]; then
+-+    "$BASE_PYTHON" -m venv "$RUNTIME"
+-+  fi
+-+  RUNTIME_PY="$RUNTIME/bin/python"
+-+  RUNTIME_VERSION="$($RUNTIME_PY -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+-+  if ! "$RUNTIME_PY" -c 'import sys; raise SystemExit(0 if sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12 else 1)'; then
+-+    echo "managed runtime uses incompatible Python $RUNTIME_VERSION; rerun with --recreate-runtime" >&2
+-+    exit 5
+-+  fi
+-+
+-+  rm -f "$RUNTIME/.cig-external-runtime-ready"
+-+  "$RUNTIME_PY" -m pip install --upgrade pip setuptools wheel
+-+  "$RUNTIME_PY" -m pip install -r "$ROOT/requirements-external.txt"
+-+  if ! "$RUNTIME_PY" - <<'PY'
+-+import importlib
+-+required = ("numpy", "scipy", "pandas", "matplotlib", "torch")
+-+for name in required:
+-+    importlib.import_module(name)
+-+import numpy as np
+-+if not str(np.__version__).startswith("1.26."):
+-+    raise SystemExit(f"managed external runtime expected NumPy 1.26.x, got {np.__version__}")
+-+PY
+-+  then
+-+    echo "external runtime base dependency verification failed; refusing to mark runtime ready" >&2
+-+    exit 7
+-+  fi
+-+
+-+  FAILED_INSTALLS=""
+-+  INSTALLED=""
+-+  while IFS=$'\t' read -r name revision url; do
+-+    [ -z "$name" ] && continue
+-+    target="$DEST/$name"
+-+    echo "[external-runtime] installing $name into $RUNTIME"
+-+    if "$RUNTIME_PY" -m pip install -e "$target"; then
+-+      INSTALLED="$INSTALLED $name"
+-+    else
+-+      FAILED_INSTALLS="$FAILED_INSTALLS $name"
+-+      echo "[external-runtime] install failed for $name; continuing so other benchmarks remain usable" >&2
+-+    fi
+-+  done < "$ROOT/scripts/external_env_revisions.tsv"
+-+
+-+  CIG_RUNTIME_DIR="$RUNTIME" CIG_INSTALLED="$INSTALLED" CIG_FAILED_INSTALLS="$FAILED_INSTALLS" "$RUNTIME_PY" - <<'PY'
+-+import importlib, json, os, pathlib, platform, sys
+-+module_by_repo = {
+-+    "flatland-rl": "flatland",
+-+    "robotic-warehouse": "rware",
+-+    "CybORG": "CybORG",
+-+    "CityFlow": "cityflow",
+-+}
+-+imports = {}
+-+for repo, module in module_by_repo.items():
+-+    try:
+-+        importlib.import_module(module)
+-+        imports[repo] = {"ok": True, "module": module}
+-+    except Exception as exc:
+-+        imports[repo] = {"ok": False, "module": module, "error": f"{type(exc).__name__}: {exc}"}
+-+path = pathlib.Path(os.environ["CIG_RUNTIME_DIR"]) / "runtime.json"
+-+base_versions = {}
+-+for module in ("numpy", "scipy", "pandas", "matplotlib", "torch"):
+-+    imported = importlib.import_module(module)
+-+    base_versions[module] = getattr(imported, "__version__", "unknown")
+-+payload = {
+-+    "python": sys.executable,
+-+    "python_version": platform.python_version(),
+-+    "implementation": platform.python_implementation(),
+-+    "purpose": "isolated pinned external benchmark runtime",
+-+    "installed_attempts": os.environ.get("CIG_INSTALLED", "").split(),
+-+    "failed_install_attempts": os.environ.get("CIG_FAILED_INSTALLS", "").split(),
+-+    "base_versions": base_versions,
+-+    "imports": imports,
+-+}
+-+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+-+PY
+-+  touch "$RUNTIME/.cig-external-runtime-ready"
+-+  echo "[external-runtime] READY: $RUNTIME_PY ($RUNTIME_VERSION)"
+-+  if [ -n "$FAILED_INSTALLS" ]; then
+-+    echo "[external-runtime] WARNING: failed installs:$FAILED_INSTALLS" >&2
+-+  fi
+-+fi
+-+
+- python "$ROOT/scripts/external_env_manager.py" status --json "$EXTERNAL_ROOT/manifest.json"
+-+if [ "$INSTALL" -eq 1 ] && [ -n "${FAILED_INSTALLS:-}" ]; then
+-+  exit 6
+-+fi
+diff --git a/tests/test_external_runtime.py b/tests/test_external_runtime.py
+index 684f539..d574fb3 100644
+--- a/tests/test_external_runtime.py
++++ b/tests/test_external_runtime.py
+@@ -81,6 +81,33 @@ class ExternalRuntimeTests(unittest.TestCase):
+             ):
+                 registry._require_runtime_import("rware")
+ 
++    def test_registry_never_falls_back_to_legacy_root_checkout(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            legacy = root / "robotic-warehouse"
++            legacy.mkdir(parents=True)
++            with mock.patch.dict(os.environ, {"CIG_EXTERNAL_ENVS_DIR": str(root)}, clear=False):
++                self.assertEqual(registry.repo_path("rware"), root / "repos" / "robotic-warehouse")
++                self.assertTrue(registry.legacy_repo_path("rware").exists())
++                with self.assertRaises(FileNotFoundError):
++                    registry.ensure_repo_on_path("rware")
++
++    def test_runtime_active_without_import_manifest_fails_closed(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            runtime = root / "runtime"
++            (runtime / "bin").mkdir(parents=True)
++            (runtime / "bin" / "python").write_text("", encoding="utf-8")
++            (runtime / ".cig-external-runtime-ready").write_text("", encoding="utf-8")
++            with mock.patch.dict(
++                os.environ,
++                {"CIG_EXTERNAL_ENVS_DIR": str(root), "CIG_EXTERNAL_RUNTIME_ACTIVE": "1"},
++                clear=False,
++            ):
++                with self.assertRaises(RuntimeError) as caught:
++                    registry._require_runtime_import("flatland")
++        self.assertIn("no import verification", str(caught.exception))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_external_runtime_hardening.py.rej b/tests/test_external_runtime_hardening.py.rej
+deleted file mode 100644
+index 2f9b790..0000000
+--- a/tests/test_external_runtime_hardening.py.rej
++++ /dev/null
+@@ -1,36 +0,0 @@
+-@@ -0,0 +1,35 @@
+-+from pathlib import Path
+-+import tempfile
+-+import unittest
+-+
+-+from envs.external.runtime import ensure_directory, ensure_output_file_parent, external_python_supported
+-+
+-+
+-+class ExternalRuntimeHardeningTests(unittest.TestCase):
+-+    def test_external_python_guard_rejects_python_314_for_numpy1_stack(self):
+-+        self.assertTrue(external_python_supported((3, 10)))
+-+        self.assertTrue(external_python_supported((3, 12)))
+-+        self.assertFalse(external_python_supported((3, 13)))
+-+        self.assertFalse(external_python_supported((3, 14)))
+-+
+-+    def test_legacy_output_file_is_preserved_before_directory_creation(self):
+-+        with tempfile.TemporaryDirectory() as tmp:
+-+            path = Path(tmp) / "external_flatland"
+-+            path.write_text('{"legacy": true}\n', encoding="utf-8")
+-+            migrated = ensure_directory(path)
+-+            self.assertTrue(path.is_dir())
+-+            self.assertIsNotNone(migrated)
+-+            self.assertEqual(migrated.read_text(encoding="utf-8"), '{"legacy": true}\n')
+-+
+-+    def test_output_file_parent_migrates_legacy_parent_file(self):
+-+        with tempfile.TemporaryDirectory() as tmp:
+-+            parent = Path(tmp) / "external_rware"
+-+            parent.write_text("old\n", encoding="utf-8")
+-+            out = parent / "manifest.json"
+-+            migrated = ensure_output_file_parent(out)
+-+            self.assertTrue(parent.is_dir())
+-+            self.assertTrue(migrated.is_file())
+-+
+-+
+-+if __name__ == "__main__":
+-+    unittest.main()

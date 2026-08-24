@@ -8,7 +8,6 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from envs.external.runtime import ensure_directory, maybe_reexec_in_external_runtime
-maybe_reexec_in_external_runtime()
 
 import numpy as np
 
@@ -37,6 +36,7 @@ def main(argv=None):
     )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
+    maybe_reexec_in_external_runtime(require_ready=True)
     if args.episodes <= 0 or args.max_steps <= 0 or not args.seeds:
         parser.error("episodes, max-steps and seeds must be positive")
     if len(set(args.seeds)) != len(args.seeds):

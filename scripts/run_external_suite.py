@@ -19,7 +19,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from envs.external.runtime import ensure_output_file_parent, maybe_reexec_in_external_runtime
-maybe_reexec_in_external_runtime()
 
 import numpy as np
 
@@ -101,6 +100,8 @@ def main(argv=None):
     parser.add_argument("--config-path")
     parser.add_argument("--manifest-only", action="store_true")
     args = parser.parse_args(argv)
+    if not args.manifest_only:
+        maybe_reexec_in_external_runtime(require_ready=True)
 
     decisions = {panel: _static_panel_support(args.environment, panel) for panel in args.panels}
     runtime = {}

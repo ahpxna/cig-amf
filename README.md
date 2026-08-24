@@ -43,3 +43,12 @@ Pinned external benchmarks are intentionally isolated from the main CIG-AMF
 environment. Run `scripts/setup_external_envs.sh --install` with Python 3.12;
 the managed runtime lives at `external_envs/runtime/` and external runners
 switch to it automatically. See `RUN_GUIDE.md` for macOS commands.
+
+### External benchmark isolation
+
+Pinned Flatland, RWARE, CybORG and CityFlow checkouts live under
+`external_envs/repos/` and execute through the isolated
+`external_envs/runtime/` environment. This keeps benchmark-specific dependency
+constraints out of the main CIG-AMF Python environment and prevents third-party
+test suites from being collected by the project's `pytest` run. See
+`RUN_GUIDE.md` for setup and verification commands.

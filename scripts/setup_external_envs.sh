@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Manage all pinned external benchmark repositories under one canonical root.
-# Optional installation is isolated from the main CIG environment because the
-# pinned Flatland revision requires numpy<2.
+# Clone/migrate pinned external benchmarks into one canonical repository root and
+# optionally install them into an isolated Python 3.10-3.12 runtime.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -10,6 +9,7 @@ if [ "$(basename "$EXTERNAL_ROOT")" = "repos" ]; then
   EXTERNAL_ROOT="$(dirname "$EXTERNAL_ROOT")"
 fi
 DEST="$EXTERNAL_ROOT/repos"
+LEGACY_ARCHIVE="$EXTERNAL_ROOT/legacy_repos"
 RUNTIME="$EXTERNAL_ROOT/runtime"
 INSTALL=0
 RECREATE=0
@@ -18,13 +18,12 @@ usage() {
   cat >&2 <<EOF
 usage: $0 [--install] [--recreate-runtime]
 
---install            create/update the isolated external runtime and install all
-                     pinned benchmark packages there
---recreate-runtime   delete only the managed external_envs/runtime venv first
+--install            install pinned benchmark packages into the isolated
+                     external_envs/runtime environment
+--recreate-runtime   recreate only the managed external runtime
 
-Interpreter selection for --install:
-  CIG_EXTERNAL_PYTHON=/path/to/python3.12 $0 --install
-Otherwise python3.12, python3.11, then python3.10 are auto-detected.
+For installation use Python 3.10-3.12 (3.12 recommended):
+  CIG_EXTERNAL_PYTHON=/path/to/python3.12 $0 --install --recreate-runtime
 EOF
 }
 
@@ -39,19 +38,62 @@ while [ "$#" -gt 0 ]; do
 done
 mkdir -p "$DEST"
 
-clone_pinned() {
-  local name="$1" revision="$2" url="$3"
-  local legacy="$EXTERNAL_ROOT/$name" target="$DEST/$name"
-  if [ ! -e "$target" ] && [ -d "$legacy/.git" ]; then
+archive_dirty_legacy() {
+  name="$1"
+  legacy="$2"
+  mkdir -p "$LEGACY_ARCHIVE"
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  target="$LEGACY_ARCHIVE/${name}-${stamp}"
+  suffix=0
+  while [ -e "$target" ]; do
+    suffix=$((suffix + 1))
+    target="$LEGACY_ARCHIVE/${name}-${stamp}-${suffix}"
+  done
+  mv "$legacy" "$target"
+  echo "[external-repos] preserved dirty/ divergent legacy checkout: $target" >&2
+}
+
+reconcile_legacy() {
+  name="$1"
+  legacy="$EXTERNAL_ROOT/$name"
+  target="$DEST/$name"
+  [ -d "$legacy" ] || return 0
+  [ "$legacy" != "$target" ] || return 0
+
+  if [ ! -e "$target" ]; then
     mv "$legacy" "$target"
+    echo "[external-repos] migrated $name -> $target" >&2
+    return 0
   fi
+
+  # Both paths exist. Remove only an unmodified duplicate at the same commit;
+  # otherwise preserve it under legacy_repos instead of losing user changes.
+  if [ -d "$legacy/.git" ] && [ -d "$target/.git" ]; then
+    legacy_head="$(git -C "$legacy" rev-parse HEAD 2>/dev/null || true)"
+    target_head="$(git -C "$target" rev-parse HEAD 2>/dev/null || true)"
+    legacy_dirty="$(git -C "$legacy" status --porcelain 2>/dev/null || true)"
+    if [ -n "$legacy_head" ] && [ "$legacy_head" = "$target_head" ] && [ -z "$legacy_dirty" ]; then
+      rm -rf "$legacy"
+      echo "[external-repos] removed duplicate clean legacy checkout: $legacy" >&2
+      return 0
+    fi
+  fi
+  archive_dirty_legacy "$name" "$legacy"
+}
+
+clone_pinned() {
+  name="$1"; revision="$2"; url="$3"
+  reconcile_legacy "$name"
+  target="$DEST/$name"
   if [ -d "$target/.git" ]; then
     git -C "$target" fetch --depth 1 origin "$revision"
+  elif [ -e "$target" ]; then
+    echo "ERROR: canonical path exists but is not a git checkout: $target" >&2
+    exit 3
   else
     git clone --no-checkout "$url" "$target"
   fi
   git -C "$target" checkout --detach "$revision"
-  local actual
   actual="$(git -C "$target" rev-parse HEAD)"
   if [ "$actual" != "$revision" ]; then
     echo "revision mismatch for $name: expected $revision got $actual" >&2
@@ -60,22 +102,19 @@ clone_pinned() {
   printf '%s\t%s\t%s\n' "$name" "$actual" "$target"
 }
 
-while IFS=$'\t' read -r name revision url; do
+while IFS="$(printf '\t')" read -r name revision url; do
   [ -z "$name" ] || clone_pinned "$name" "$revision" "$url"
 done < "$ROOT/scripts/external_env_revisions.tsv"
 
 choose_external_python() {
-  local candidates=()
   if [ -n "${CIG_EXTERNAL_PYTHON:-}" ]; then
-    candidates+=("$CIG_EXTERNAL_PYTHON")
+    candidates="$CIG_EXTERNAL_PYTHON"
   else
-    candidates+=(python3.12 python3.11 python3.10)
+    candidates="python3.12 python3.11 python3.10"
   fi
-  local candidate resolved version ok
-  for candidate in "${candidates[@]}"; do
-    if ! resolved="$(command -v "$candidate" 2>/dev/null)"; then
-      continue
-    fi
+  for candidate in $candidates; do
+    resolved="$(command -v "$candidate" 2>/dev/null || true)"
+    [ -n "$resolved" ] || continue
     version="$($resolved -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
     ok="$($resolved -c 'import sys; print(int(sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12))')"
     if [ "$ok" = "1" ]; then
@@ -88,14 +127,15 @@ choose_external_python() {
 }
 
 if [ "$INSTALL" -eq 1 ]; then
-  if ! BASE_PYTHON="$(choose_external_python)"; then
+  BASE_PYTHON="$(choose_external_python || true)"
+  if [ -z "$BASE_PYTHON" ]; then
     CURRENT="$(python -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || true)"
     cat >&2 <<EOF
 ERROR: no compatible external-runtime interpreter found.
 Current project interpreter: ${CURRENT:-unknown}
-Pinned Flatland requires numpy<2; do not install it into the Python 3.14 CIG env.
+Pinned Flatland requires numpy<2; do not install external repos into the main Python 3.14 environment.
 
-On Homebrew macOS, install Python 3.12 and retry:
+Homebrew macOS:
   brew install python@3.12
   CIG_EXTERNAL_PYTHON="\$(brew --prefix python@3.12)/bin/python3.12" \\
     bash scripts/setup_external_envs.sh --install --recreate-runtime
@@ -110,19 +150,18 @@ EOF
     "$BASE_PYTHON" -m venv "$RUNTIME"
   fi
   RUNTIME_PY="$RUNTIME/bin/python"
-  RUNTIME_VERSION="$($RUNTIME_PY -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
   if ! "$RUNTIME_PY" -c 'import sys; raise SystemExit(0 if sys.version_info.major == 3 and 10 <= sys.version_info.minor <= 12 else 1)'; then
-    echo "managed runtime uses incompatible Python $RUNTIME_VERSION; rerun with --recreate-runtime" >&2
+    echo "managed runtime has an unsupported Python; rerun with --recreate-runtime" >&2
     exit 5
   fi
 
   rm -f "$RUNTIME/.cig-external-runtime-ready"
-  "$RUNTIME_PY" -m pip install --upgrade pip setuptools wheel
+  "$RUNTIME_PY" -m pip install --upgrade pip 'setuptools<81' wheel
   "$RUNTIME_PY" -m pip install -r "$ROOT/requirements-external.txt"
 
-  FAILED_INSTALLS=""
   INSTALLED=""
-  while IFS=$'\t' read -r name revision url; do
+  FAILED_INSTALLS=""
+  while IFS="$(printf '\t')" read -r name revision url; do
     [ -z "$name" ] && continue
     target="$DEST/$name"
     echo "[external-runtime] installing $name into $RUNTIME"
@@ -130,7 +169,7 @@ EOF
       INSTALLED="$INSTALLED $name"
     else
       FAILED_INSTALLS="$FAILED_INSTALLS $name"
-      echo "[external-runtime] install failed for $name; continuing so other benchmarks remain usable" >&2
+      echo "[external-runtime] install failed for $name; other benchmarks remain usable" >&2
     fi
   done < "$ROOT/scripts/external_env_revisions.tsv"
 
@@ -148,8 +187,11 @@ for repo, module in module_by_repo.items():
         importlib.import_module(module)
         imports[repo] = {"ok": True, "module": module}
     except Exception as exc:
-        imports[repo] = {"ok": False, "module": module, "error": f"{type(exc).__name__}: {exc}"}
-path = pathlib.Path(os.environ["CIG_RUNTIME_DIR"]) / "runtime.json"
+        imports[repo] = {
+            "ok": False,
+            "module": module,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 payload = {
     "python": sys.executable,
     "python_version": platform.python_version(),
@@ -159,10 +201,11 @@ payload = {
     "failed_install_attempts": os.environ.get("CIG_FAILED_INSTALLS", "").split(),
     "imports": imports,
 }
+path = pathlib.Path(os.environ["CIG_RUNTIME_DIR"]) / "runtime.json"
 path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
   touch "$RUNTIME/.cig-external-runtime-ready"
-  echo "[external-runtime] READY: $RUNTIME_PY ($RUNTIME_VERSION)"
+  echo "[external-runtime] runtime created: $RUNTIME_PY"
   if [ -n "$FAILED_INSTALLS" ]; then
     echo "[external-runtime] WARNING: failed installs:$FAILED_INSTALLS" >&2
   fi

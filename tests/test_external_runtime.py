@@ -81,6 +81,33 @@ class ExternalRuntimeTests(unittest.TestCase):
             ):
                 registry._require_runtime_import("rware")
 
+    def test_registry_never_falls_back_to_legacy_root_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / "robotic-warehouse"
+            legacy.mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"CIG_EXTERNAL_ENVS_DIR": str(root)}, clear=False):
+                self.assertEqual(registry.repo_path("rware"), root / "repos" / "robotic-warehouse")
+                self.assertTrue(registry.legacy_repo_path("rware").exists())
+                with self.assertRaises(FileNotFoundError):
+                    registry.ensure_repo_on_path("rware")
+
+    def test_runtime_active_without_import_manifest_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            (runtime / "bin").mkdir(parents=True)
+            (runtime / "bin" / "python").write_text("", encoding="utf-8")
+            (runtime / ".cig-external-runtime-ready").write_text("", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"CIG_EXTERNAL_ENVS_DIR": str(root), "CIG_EXTERNAL_RUNTIME_ACTIVE": "1"},
+                clear=False,
+            ):
+                with self.assertRaises(RuntimeError) as caught:
+                    registry._require_runtime_import("flatland")
+        self.assertIn("no import verification", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
