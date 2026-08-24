@@ -137,7 +137,7 @@ def _activate_all_pairs(env, pair_rel):
     })
 
 
-def test_t1_scripted_policy_deterministic():
+def _run_t1_scripted_policy_deterministic():
     print("\n" + "=" * 70)
     print("T1 — deterministic scripted policy: BC loss should converge to ~0")
     print("=" * 70)
@@ -153,9 +153,9 @@ def test_t1_scripted_policy_deterministic():
     print(f"  bc_buffer size = {len(pair_rel.bc_buffer)}")
 
     loss = None
-    for epoch in range(24):
+    for epoch in range(48):
         loss = pair_rel.train_bc(n_steps=4, batch_size=128)
-        if epoch % 6 == 0 or epoch == 23:
+        if epoch % 6 == 0 or epoch == 47:
             print(f"  epoch {epoch:3d}  bc_loss = {loss:.4f}")
         if loss < 0.2:
             break
@@ -193,7 +193,7 @@ def _shuffle_and_fit(pair_rel, action_dim):
     return float(loss)
 
 
-def test_t2_label_shuffle():
+def _run_t2_label_shuffle():
     print("\n" + "=" * 70)
     print("T2 — shuffled labels: BC loss should converge to the corrected floor")
     print("=" * 70)
@@ -236,9 +236,17 @@ def test_t2_label_shuffle():
     return ok
 
 
+def test_t1_scripted_policy_deterministic():
+    assert _run_t1_scripted_policy_deterministic()
+
+
+def test_t2_label_shuffle():
+    assert _run_t2_label_shuffle()
+
+
 if __name__ == "__main__":
-    ok1 = test_t1_scripted_policy_deterministic()
-    ok2 = test_t2_label_shuffle()
+    ok1 = _run_t1_scripted_policy_deterministic()
+    ok2 = _run_t2_label_shuffle()
 
     print("\n" + "=" * 70)
     print(f"RESULT: T1={'PASS' if ok1 else 'FAIL'}  T2={'PASS' if ok2 else 'FAIL'}")

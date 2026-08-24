@@ -359,12 +359,19 @@ echo "Profile: $([ "$CIG_CLAIMS_ONLY" -eq 1 ] && printf claims-only || printf co
 echo "Device: $CIG_DEVICE"
 echo "H1 seeds: ${CIG_H1_SEED_ARRAY[*]}"
 echo "H2/H3 seeds: ${CIG_H23_SEED_ARRAY[*]}"
-echo "Planned H1 attempts: $((7 * ${#CIG_H1_SEED_ARRAY[@]}))"
-echo "Planned H2 episodes: $((3 * ${#CIG_H23_SEED_ARRAY[@]} * (4 * CIG_H2_EPISODES + CIG_H2_PRETRAIN_EPISODES)))"
-echo "Planned H3 episodes: $((6 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
-echo "Planned Paper-B allocation episodes: $((6 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
-echo "Planned Paper-B pair-latent episodes: $((5 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
-echo "Planned Paper-B periphery episodes: $((5 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
+CIG_H1_VARIANT_COUNT=$("$CIG_PYTHON" -c 'from scripts.run_h1_calibration import VARIANTS; print(len(VARIANTS))')
+CIG_H2_MODEL_COUNT=$("$CIG_PYTHON" -c 'from scripts.run_h2_selectivity import MODELS; print(len(MODELS))')
+CIG_H3_VARIANT_COUNT=$("$CIG_PYTHON" -c 'from scripts.run_h3_slots import VARIANTS; print(len(VARIANTS))' 2>/dev/null || printf 6)
+CIG_PB_ALLOC_VARIANT_COUNT=$("$CIG_PYTHON" -c 'from scripts.run_paper_b_allocation import VARIANTS; print(len(VARIANTS))')
+CIG_PB_PAIR_VARIANT_COUNT=$("$CIG_PYTHON" -c 'from scripts.run_paper_b_pair_latent import VARIANTS; print(len(VARIANTS))')
+CIG_PB_PERIPH_VARIANT_COUNT=$("$CIG_PYTHON" -c 'from scripts.run_paper_b_periphery import VARIANTS; print(len(VARIANTS))')
+echo "Planned H1 attempts: $((CIG_H1_VARIANT_COUNT * ${#CIG_H1_SEED_ARRAY[@]}))"
+echo "Planned H2 episodes: $((CIG_H2_MODEL_COUNT * ${#CIG_H23_SEED_ARRAY[@]} * (4 * CIG_H2_EPISODES + CIG_H2_PRETRAIN_EPISODES)))"
+echo "Planned H3 episodes: $((CIG_H3_VARIANT_COUNT * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
+echo "Planned Paper-B allocation episodes: $((CIG_PB_ALLOC_VARIANT_COUNT * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES + ${#CIG_H23_SEED_ARRAY[@]} * CIG_H2_PRETRAIN_EPISODES))"
+echo "Planned Paper-B adaptive-budget episodes: $((6 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
+echo "Planned Paper-B pair-latent episodes: $((CIG_PB_PAIR_VARIANT_COUNT * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
+echo "Planned Paper-B periphery episodes: $((CIG_PB_PERIPH_VARIANT_COUNT * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
 echo "Latency oracle: ${CIG_LATENCY_ORACLE_STATES} states x ${CIG_LATENCY_ORACLE_TRIALS} CRN trials"
 echo "Learned latency training after oracle pass: ${CIG_LATENCY_TRAIN_EPISODES} episodes"
 
@@ -569,19 +576,26 @@ run_logged "allocation" "Paper-B selector isolation and end-to-end allocation" "
   --selector-states "$CIG_PAPER_B_SELECTOR_STATES" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/paper_b_allocation"
-run_logged "representation" "Paper-B pair-latent ablations under fixed core" "64_paper_b_pair_latent.log" \
+run_logged "allocation" "Paper-B entropy-adaptive budget at matched fixed cost" "64_paper_b_adaptive_budget.log" \
+  "$CIG_PYTHON" scripts/run_paper_b_adaptive_budget.py \
+  --seeds "${CIG_H23_SEED_ARRAY[@]}" \
+  --episodes "$CIG_H3_EPISODES" \
+  --k-min 2 --k-max 5 \
+  --device "$CIG_DEVICE" \
+  --out-root "$CIG_RUN_DIR/paper_b_adaptive_budget"
+run_logged "representation" "Paper-B pair-latent ablations under fixed core" "65_paper_b_pair_latent.log" \
   "$CIG_PYTHON" scripts/run_paper_b_pair_latent.py \
   --seeds "${CIG_H23_SEED_ARRAY[@]}" \
   --episodes "$CIG_H3_EPISODES" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/paper_b_pair_latent"
-run_logged "representation" "Paper-B peripheral encoders under fixed core" "65_paper_b_periphery.log" \
+run_logged "representation" "Paper-B peripheral encoders under fixed core" "66_paper_b_periphery.log" \
   "$CIG_PYTHON" scripts/run_paper_b_periphery.py \
   --seeds "${CIG_H23_SEED_ARRAY[@]}" \
   --episodes "$CIG_H3_EPISODES" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/paper_b_periphery"
-run_logged "scalability" "Paper-B reward-compute-memory scaling" "66_paper_b_scaling.log" \
+run_logged "scalability" "Paper-B reward-compute-memory scaling" "67_paper_b_scaling.log" \
   "$CIG_PYTHON" scripts/run_paper_b_scaling.py \
   --seeds "${CIG_H23_SEED_ARRAY[@]}" \
   --agent-counts $CIG_PAPER_B_SCALING_AGENTS \

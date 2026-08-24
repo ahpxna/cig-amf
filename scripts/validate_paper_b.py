@@ -16,7 +16,7 @@ except ModuleNotFoundError:
 
 EXPECTED_ALLOCATION = {
     "C-Core", "AbsD-Core", "Random-Core", "Correlation-Core",
-    "Attention-Core", "Oracle-C-Core", "Full-Explicit",
+    "Attention-Core", "WeakPrior-Core", "Oracle-C-Core", "Full-Explicit",
 }
 EXPECTED_PAIR = {
     "Full-Explicit-Reference", "Shared-Neighbor-State", "Pooled-Neighbor", "Explicit-FF-BC", "Recurrent-BC", "Recurrent-BC-CD",
@@ -71,6 +71,34 @@ def _load_scaling(root, expected_seeds):
     )
 
 
+def _load_adaptive_budget(root, expected_seeds):
+    panel_root = os.path.join(root, "paper_b_adaptive_budget")
+    with open(os.path.join(panel_root, "manifest.json"), encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not manifest.get("complete"):
+        raise ValueError("paper_b_adaptive_budget manifest is incomplete")
+    with open(
+        os.path.join(panel_root, "summary_paper_b_adaptive_budget.csv"),
+        newline="", encoding="utf-8",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    seeds = {int(row["seed"]) for row in rows}
+    if seeds != set(expected_seeds):
+        raise ValueError("adaptive-budget seed matrix mismatch")
+    for seed in expected_seeds:
+        subset = [row for row in rows if int(row["seed"]) == int(seed)]
+        names = {row["variant"] for row in subset}
+        if "Adaptive-K" not in names or "Full-Explicit" not in names:
+            raise ValueError("adaptive-budget panel omits required variants")
+        fixed = [row for row in subset if row["variant"].startswith("Fixed-K-")]
+        matched = [row for row in fixed if int(row.get("matched_to_adaptive", 0)) == 1]
+        if not fixed or len(matched) != 1:
+            raise ValueError("adaptive-budget panel must identify one matched fixed-k row")
+        if float(matched[0]["mean_core_cost_gap_to_adaptive"]) > 0.5 + 1e-9:
+            raise ValueError("adaptive-budget fixed comparison is not cost matched")
+    return rows, manifest
+
+
 def _paired(rows, treatment, control, metric, panel=None):
     selected = [
         row for row in rows
@@ -107,6 +135,7 @@ def validate(run_root, expected_seeds, protocol_mode):
         EXPECTED_PERIPHERY, expected_seeds,
     )
     scaling_rows, scaling_manifest = _load_scaling(run_root, expected_seeds)
+    adaptive_rows, adaptive_manifest = _load_adaptive_budget(run_root, expected_seeds)
     if protocol_mode == "quick":
         return {
             "paper": "B", "overall_status": "SMOKE_ONLY",
@@ -124,8 +153,16 @@ def validate(run_root, expected_seeds, protocol_mode):
     for row in allocation:
         if row.get("panel") == "selector_isolation" and row.get(
             "decision_fidelity_protocol"
-        ) != "common_checkpoint_frozen_state_bank":
-            raise ValueError("allocation fidelity must be computed in selector isolation")
+        ) != "neutral_full_explicit_pretrain_selector_then_forward":
+            raise ValueError("allocation fidelity must be computed after selector commit")
+        if row.get("panel") == "selector_isolation" and row.get("checkpoint_role") != (
+            "selector_neutral_full_explicit_pretrain"
+        ):
+            raise ValueError("selector isolation must use neutral full-explicit pretraining")
+        if row.get("panel") == "end_to_end" and row.get("checkpoint_role") != (
+            "common_untrained_initialization"
+        ):
+            raise ValueError("end-to-end selector runs must start from common untrained weights")
 
     c_vs_d = _paired(
         allocation, "C-Core", "AbsD-Core", "selector_oracle_f1",
@@ -149,6 +186,10 @@ def validate(run_root, expected_seeds, protocol_mode):
     )
     c_vs_correlation = _paired(
         allocation, "C-Core", "Correlation-Core", "selector_oracle_f1",
+        panel="selector_isolation",
+    )
+    c_vs_weak_prior = _paired(
+        allocation, "C-Core", "WeakPrior-Core", "selector_oracle_f1",
         panel="selector_isolation",
     )
     oracle_vs_random = _paired(
@@ -303,6 +344,32 @@ def validate(run_root, expected_seeds, protocol_mode):
     pareto_throughput = [row["throughput_vs_full"] for row in scaling_pareto]
     pareto_memory = [row["memory_vs_full"] for row in scaling_pareto]
     pareto_pure_mean = [row["reward_vs_pure_mean_field"] for row in scaling_pareto]
+    adaptive_reward_vs_matched, adaptive_logit_vs_matched = [], []
+    for seed in expected_seeds:
+        subset = [row for row in adaptive_rows if int(row["seed"]) == int(seed)]
+        adaptive = next(row for row in subset if row["variant"] == "Adaptive-K")
+        matched = next(
+            row for row in subset
+            if row["variant"].startswith("Fixed-K-")
+            and int(row.get("matched_to_adaptive", 0)) == 1
+        )
+        adaptive_reward_vs_matched.append(
+            float(adaptive["mean_reward"]) - float(matched["mean_reward"])
+        )
+        adaptive_logit_vs_matched.append(
+            float(matched["policy_logit_l2_to_full_explicit"])
+            - float(adaptive["policy_logit_l2_to_full_explicit"])
+        )
+    # Scaling rows must include the paper-promised fidelity and latency metrics.
+    for row in scaling_rows:
+        for key in (
+            "policy_logit_l2_to_full_explicit", "value_mae_to_full_explicit",
+            "action_agreement_to_full_explicit", "inference_latency_p50_ms",
+            "inference_latency_p95_ms",
+        ):
+            if not math.isfinite(float(row.get(key, float("nan")))):
+                raise ValueError(f"scaling row omits finite {key}")
+
     metrics = {
         "c_core_minus_absd_selector_f1": c_vs_d,
         "c_core_minus_absd_disagreement_f1": c_vs_d_disagreement,
@@ -310,6 +377,7 @@ def validate(run_root, expected_seeds, protocol_mode):
         "c_core_minus_attention_selector_f1": c_vs_attention,
         "c_core_minus_random_selector_f1": c_vs_random,
         "c_core_minus_correlation_selector_f1": c_vs_correlation,
+        "c_core_minus_weak_prior_selector_f1": c_vs_weak_prior,
         "oracle_minus_random_selector_f1": oracle_vs_random,
         "c_core_minus_absd_reward": c_reward_vs_d,
         "c_core_minus_absd_logit_fidelity_error": c_logit_vs_d,
@@ -337,6 +405,8 @@ def validate(run_root, expected_seeds, protocol_mode):
         "scaling_full_minus_semantic_memory_bytes": pareto_memory,
         "scaling_semantic_minus_pure_mean_field_reward": pareto_pure_mean,
         "scaling_semantic_pareto_nondominated": semantic_frontier_flags,
+        "adaptive_minus_matched_fixed_reward": adaptive_reward_vs_matched,
+        "adaptive_minus_matched_fixed_logit_fidelity": adaptive_logit_vs_matched,
     }
     cis = {
         key: VC._bootstrap_mean_ci(value, seed=4100 + index)
@@ -357,6 +427,9 @@ def validate(run_root, expected_seeds, protocol_mode):
         ][0] > 0.0,
         "C_selector_beats_correlation_at_equal_budget": cis[
             "c_core_minus_correlation_selector_f1"
+        ][0] > 0.0,
+        "C_selector_beats_weak_prior_at_equal_budget": cis[
+            "c_core_minus_weak_prior_selector_f1"
         ][0] > 0.0,
         "oracle_selector_beats_random_at_equal_budget": cis[
             "oracle_minus_random_selector_f1"
@@ -417,6 +490,11 @@ def validate(run_root, expected_seeds, protocol_mode):
         ][0] > 0.0,
         "semantic_memory_extends_reward_compute_pareto_frontier": (
             cis["scaling_semantic_pareto_nondominated"][0] > 0.5
+        ),
+        "adaptive_budget_cost_match_is_valid": all(
+            float(row["mean_core_cost_gap_to_adaptive"]) <= 0.5 + 1e-9
+            for row in adaptive_rows
+            if int(row.get("matched_to_adaptive", 0)) == 1
         ),
     }
     secondary_predictions = {

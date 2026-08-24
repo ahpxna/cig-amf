@@ -139,12 +139,61 @@ def _fingerprint(payload):
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_artifact_sources(payload, label):
+    sources = payload.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError(f"{label} omits its source manifest")
+    for source in sources:
+        if not isinstance(source, dict):
+            raise ValueError(f"{label} contains an invalid source entry")
+        source_path = os.path.abspath(str(source.get("path") or ""))
+        expected = str(source.get("sha256") or "").strip().lower()
+        if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+            raise ValueError(f"{label} contains an invalid source SHA-256")
+        if not os.path.isfile(source_path):
+            raise ValueError(f"{label} source is missing: {source_path}")
+        if _sha256_file(source_path) != expected:
+            raise ValueError(f"{label} source SHA-256 mismatch: {source_path}")
+
+
+def _development_seed_set(payload, label):
+    seeds = payload.get("development_seeds")
+    if (
+        not isinstance(seeds, list) or not seeds
+        or len({int(seed) for seed in seeds}) != len(seeds)
+    ):
+        raise ValueError(f"{label} development_seeds must be non-empty and unique")
+    return {int(seed) for seed in seeds}
+
+
 def _load_threshold_calibration(path):
-    """Load the oracle-only threshold decision frozen before an H1 run."""
+    """Load and verify the oracle-only threshold decision frozen before H1."""
     with open(path, encoding="utf-8") as handle:
         payload = json.load(handle)
+    if payload.get("calibration_protocol") != "h1_oracle_only_thresholds_v2_fixed_pi_eval":
+        raise ValueError("H1 threshold calibration protocol is incompatible")
     if payload.get("oracle_only") is not True:
         raise ValueError("H1 threshold calibration must be explicitly oracle-only")
+    _development_seed_set(payload, "H1 threshold calibration")
+    _validate_artifact_sources(payload, "H1 threshold calibration")
+    support = payload.get("support")
+    if not isinstance(support, dict) or not {"capacity", "direction"}.issubset(support):
+        raise ValueError("H1 threshold calibration omits oracle support statistics")
+    for name in ("capacity", "direction"):
+        if not isinstance(support[name], dict):
+            raise ValueError(f"H1 threshold {name} support is invalid")
+        for key in ("active_count", "active_fraction"):
+            if key not in support[name]:
+                raise ValueError(f"H1 threshold {name} support omits {key}")
+
     required = (
         "capacity_active_threshold",
         "capacity_prediction_threshold",
@@ -156,8 +205,7 @@ def _load_threshold_calibration(path):
     missing = [key for key in required if key not in payload]
     if missing:
         raise ValueError(
-            "H1 threshold calibration is incomplete; missing "
-            + ", ".join(missing)
+            "H1 threshold calibration is incomplete; missing " + ", ".join(missing)
         )
     values = {
         key: float(payload[key])
@@ -178,18 +226,31 @@ def _load_threshold_calibration(path):
 def _load_oracle_support(path):
     with open(path, encoding="utf-8") as handle:
         payload = json.load(handle)
+    if payload.get("protocol") != "h1_oracle_support_v2_target_policy_and_capacity_variation":
+        raise ValueError("H1 oracle-support protocol is incompatible")
     if payload.get("oracle_only") is not True or not payload.get("benchmark_identifiable"):
         raise ValueError(
             "H1 oracle-support artifact must be oracle-only and certify "
             "BENCHMARK_NOT_IDENTIFIABLE is false"
         )
+    if payload.get("decision") != "PASS":
+        raise ValueError("H1 oracle-support artifact does not contain decision=PASS")
+    _development_seed_set(payload, "H1 oracle support")
+    _validate_artifact_sources(payload, "H1 oracle support")
+    thresholds = payload.get("thresholds")
+    counts = payload.get("counts")
+    checks = payload.get("checks")
+    if not isinstance(thresholds, dict) or not {"capacity", "direction"}.issubset(thresholds):
+        raise ValueError("H1 oracle support omits capacity/direction thresholds")
+    if not isinstance(counts, dict) or not counts:
+        raise ValueError("H1 oracle support omits support counts")
+    if not isinstance(checks, dict) or not checks or not all(bool(v) for v in checks.values()):
+        raise ValueError("H1 oracle support contains missing or failed checks")
     if payload.get("h1_target_policy_mode") != "scripted_uniform_mixture":
         raise ValueError("H1 oracle support uses an incompatible target policy")
     mass = float(payload.get("h1_eval_uniform_mass", float("nan")))
     if not 0.0 < mass < 1.0:
         raise ValueError("H1 oracle support has invalid target-policy support")
-    if not payload.get("development_seeds"):
-        raise ValueError("H1 oracle support omits its development seed set")
     return payload, _fingerprint(payload)
 
 
@@ -743,9 +804,9 @@ def main(argv=None):
         )
         with open(threshold_path, encoding="utf-8") as handle:
             calibration_payload = json.load(handle)
-        development_seeds = {
-            int(seed) for seed in calibration_payload.get("development_seeds", [])
-        }
+        development_seeds = _development_seed_set(
+            calibration_payload, "H1 threshold calibration"
+        )
         overlap = development_seeds.intersection(int(seed) for seed in args_cli.seeds)
         if overlap and not args_cli.allow_development_thresholds:
             ap.error(

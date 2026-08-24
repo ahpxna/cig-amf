@@ -12,8 +12,21 @@ import hashlib
 import json
 import os
 import tempfile
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from models.drift_probe import DriftDetector
+try:
+    from h2_cusum_contract import (
+        CALIBRATION_PROTOCOL, COLLECTION_PROTOCOL, MIN_NO_CHANGE_TRAJECTORIES,
+    )
+except ModuleNotFoundError:
+    from scripts.h2_cusum_contract import (
+        CALIBRATION_PROTOCOL, COLLECTION_PROTOCOL, MIN_NO_CHANGE_TRAJECTORIES,
+    )
 
 
 def _atomic_json(path, payload):
@@ -36,6 +49,10 @@ def main(argv=None):
     parser.add_argument("--allowance", type=float, required=True)
     parser.add_argument("--false-alarm-target", type=float, default=0.05)
     parser.add_argument(
+        "--min-trajectories", type=int, default=MIN_NO_CHANGE_TRAJECTORIES,
+        help="Minimum independent no-change trajectories required for calibration.",
+    )
+    parser.add_argument(
         "--development-seeds", type=int, nargs="+", required=True,
         help="No-change development seeds; must be disjoint from confirmatory seeds.",
     )
@@ -47,9 +64,19 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not args.development_seeds or len(set(args.development_seeds)) != len(args.development_seeds):
         parser.error("--development-seeds must be non-empty and unique")
+    if args.min_trajectories <= 0:
+        parser.error("--min-trajectories must be positive")
+    if args.allowance < 0.0:
+        parser.error("--allowance must be non-negative")
+    if not 0.0 < args.false_alarm_target < 1.0:
+        parser.error("--false-alarm-target must be in (0, 1)")
     with open(args.no_change_z_json, encoding="utf-8") as handle:
         source = json.load(handle)
-    if not isinstance(source, dict) or source.get("no_change_only") is not True:
+    if (
+        not isinstance(source, dict)
+        or source.get("no_change_only") is not True
+        or source.get("protocol") != COLLECTION_PROTOCOL
+    ):
         raise ValueError(
             "CUSUM calibration input must be a no-change-only JSON artifact "
             "with no_change_only=true"
@@ -71,13 +98,18 @@ def main(argv=None):
             "--development-seeds must exactly match the no-change residual artifact"
         )
     if not isinstance(sequences, list):
-        raise ValueError("no-change JSON must be a list or contain z_sequences")
+        raise ValueError("no-change JSON must contain z_sequences")
+    if len(sequences) < int(args.min_trajectories):
+        raise ValueError(
+            f"CUSUM calibration requires at least {int(args.min_trajectories)} "
+            f"independent no-change trajectories; got {len(sequences)}"
+        )
     calibration = DriftDetector.calibrate_cusum_from_no_change(
         sequences, args.allowance, args.false_alarm_target
     )
     digest = hashlib.sha256(open(args.no_change_z_json, "rb").read()).hexdigest()
     payload = {
-        "calibration_protocol": "page_cusum_no_change_v1",
+        "calibration_protocol": CALIBRATION_PROTOCOL,
         "no_change_only": True,
         "source": {"path": os.path.abspath(args.no_change_z_json), "sha256": digest},
         "source_protocol": source.get("protocol", "unspecified"),

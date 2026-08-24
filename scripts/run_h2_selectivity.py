@@ -49,6 +49,14 @@ except ModuleNotFoundError:  # Support ``import scripts.run_h2_selectivity`` in 
 
 import run_experiment as RE
 from envs.causal_adapter import resolve_env_adapter
+try:
+    from h2_cusum_contract import (
+        build_h2_cusum_contract, contract_hash, validate_calibration_artifact,
+    )
+except ModuleNotFoundError:
+    from scripts.h2_cusum_contract import (
+        build_h2_cusum_contract, contract_hash, validate_calibration_artifact,
+    )
 
 
 # Eq. 33 requires an explicit influence matrix W. CorrelationMeanField is the
@@ -612,20 +620,35 @@ def _restore_frozen_learning_checkpoint(runner, checkpoint):
             torch.cuda.set_rng_state_all(rng["torch_cuda"])
 
 
-def _apply_cusum_calibration(cfg, calibration):
+def _configure_h2_monitoring_cfg(cfg):
+    """Apply the seed-independent H2 arm settings used by null calibration."""
+    cfg["behavioral_adapter_lambda"] = 0.0
+    cfg["behavioral_adapter_only_in_behavioral_drift"] = False
+    cfg["behavioral_adapter_target_roles"] = list(H2_MANIPULATED_NEIGHBOR_ROLES)
+    cfg["freeze_policy_learning"] = True
+    cfg["freeze_representation_state"] = True
+    return cfg
+
+
+def _h2_cusum_reference_hash(cfg, pretrain_episodes, max_steps=30):
+    contract = build_h2_cusum_contract(
+        cfg, n_agents=24, max_steps=int(max_steps),
+        pretrain_episodes=int(pretrain_episodes),
+        evaluation_roles=H2_EVALUATION_EGO_ROLES,
+        manipulated_roles=H2_MANIPULATED_NEIGHBOR_ROLES,
+    )
+    return contract_hash(contract)
+
+
+def _apply_cusum_calibration(
+    cfg, calibration, *, expected_reference_config_hash=None
+):
     if calibration is None:
         return
-    required = (
-        "no_change_only", "cusum_allowance", "cusum_threshold",
-        "target_false_alarm_rate", "observed_false_alarm_rate",
-        "development_seeds", "reference_config_hash",
+    validate_calibration_artifact(
+        calibration,
+        expected_reference_config_hash=expected_reference_config_hash,
     )
-    missing = [key for key in required if key not in calibration]
-    if missing or calibration.get("no_change_only") is not True:
-        raise ValueError(
-            "CUSUM calibration must be a no-change artifact with "
-            + ", ".join(required)
-        )
     cfg["drift_cusum_allowance"] = float(calibration["cusum_allowance"])
     cfg["drift_cusum_threshold"] = float(calibration["cusum_threshold"])
     # Compatibility for components that have not yet consumed the explicit
@@ -856,8 +879,18 @@ def run_one(
     RE.set_global_seed(seed)
     cfg = RE.default_cfg()
     cfg["seed"] = seed
-    _apply_cusum_calibration(cfg, cusum_calibration)
     _apply_tracker_control(model, cfg)
+    _configure_h2_monitoring_cfg(cfg)
+    expected_cusum_hash = _h2_cusum_reference_hash(
+        cfg, int(frozen_checkpoint.get("episodes", 0)) if frozen_checkpoint else 0,
+        max_steps=30,
+    )
+    _apply_cusum_calibration(
+        cfg, cusum_calibration,
+        expected_reference_config_hash=(
+            expected_cusum_hash if model == "Final-CIGAMF" else None
+        ),
+    )
     if mode not in FACTORIAL_CELLS:
         raise ValueError(f"Unknown H2 factorial cell: {mode!r}")
     structural_factor, behavioral_factor = FACTORIAL_CELLS[mode]
@@ -867,11 +900,6 @@ def run_one(
     # disabled in the structural arm so the two perturbations remain separate.
     # The adapter is activated only at the common exogenous intervention;
     # all four branches are identical before that point.
-    cfg["behavioral_adapter_lambda"] = 0.0
-    cfg["behavioral_adapter_only_in_behavioral_drift"] = False
-    cfg["behavioral_adapter_target_roles"] = list(H2_MANIPULATED_NEIGHBOR_ROLES)
-    cfg["freeze_policy_learning"] = True
-    cfg["freeze_representation_state"] = True
     make_args(seed=seed, device=device)  # Validate the shared CLI defaults.
 
     max_steps = 30
@@ -1462,7 +1490,15 @@ def main(argv=None):
     if args.cusum_calibration:
         with open(args.cusum_calibration, encoding="utf-8") as handle:
             cusum_calibration = json.load(handle)
-        _apply_cusum_calibration(RE.default_cfg(), cusum_calibration)
+        contract_cfg = RE.default_cfg()
+        _configure_h2_monitoring_cfg(contract_cfg)
+        expected_hash = _h2_cusum_reference_hash(
+            contract_cfg, args.pretrain_episodes, max_steps=30
+        )
+        _apply_cusum_calibration(
+            contract_cfg, cusum_calibration,
+            expected_reference_config_hash=expected_hash,
+        )
         overlap = set(int(seed) for seed in args.seeds).intersection(
             int(seed) for seed in cusum_calibration["development_seeds"]
         )

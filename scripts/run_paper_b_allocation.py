@@ -41,6 +41,7 @@ VARIANTS = {
     "Random-Core": "random",
     "Correlation-Core": "observational_correlation",
     "Attention-Core": "attention",
+    "WeakPrior-Core": "weak_prior",
     "Oracle-C-Core": "oracle_capacity",
     "Full-Explicit": "full_explicit",
 }
@@ -123,29 +124,46 @@ def _cfg(seed, core_budget, selector="structural_capacity"):
     return cfg
 
 
-def _make_env(seed, phase_length=40):
+def _make_env(seed, phase_length=40, n_agents=24):
     return RE.make_main_env(
         task_mode="behavioral_drift",
-        n_agents=24,
+        n_agents=int(n_agents),
         max_steps=30,
         phase_length=int(phase_length),
         seed=int(seed),
     )
 
 
-def _prepare_variant_runner(variant, seed, core_budget, device, checkpoint):
-    selector = VARIANTS[variant]
-    cfg = _cfg(seed, core_budget, selector=selector)
-    env = _make_env(seed)
-    runner = RE.make_runner("Final-CIGAMF", env, cfg, device)
-    _restore_frozen_learning_checkpoint(runner, checkpoint)
+def _apply_variant_allocation_state(runner, selector, core_budget):
+    """Reapply selector budget after checkpoint runtime restoration."""
     if selector == "full_explicit":
         for belief in runner.belief_modules.values():
-            belief.max_core_size = len(belief.neighbor_ids)
+            size = len(belief.neighbor_ids)
+            belief.adaptive_k = False
+            belief.min_core_size = size
+            belief.max_core_size = size
+            belief.adaptive_k_min = size
             belief.set_fixed_core(belief.neighbor_ids)
         runner.pair_rel_module.reconcile_core_sets(
             {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()}
         )
+        return
+    for belief in runner.belief_modules.values():
+        belief.adaptive_k = False
+        belief.min_core_size = int(core_budget)
+        belief.max_core_size = int(core_budget)
+        belief.adaptive_k_min = int(core_budget)
+
+
+def _prepare_variant_runner(
+    variant, seed, core_budget, device, checkpoint, n_agents=24
+):
+    selector = VARIANTS[variant]
+    cfg = _cfg(seed, core_budget, selector=selector)
+    env = _make_env(seed, n_agents=n_agents)
+    runner = RE.make_runner("Final-CIGAMF", env, cfg, device)
+    _restore_frozen_learning_checkpoint(runner, checkpoint)
+    _apply_variant_allocation_state(runner, selector, core_budget)
     return runner
 
 
@@ -156,15 +174,15 @@ def _top_k(scores, ego, core_budget):
     )[:int(core_budget)])
 
 
-def _oracle_capacity_for_state(
+def _oracle_capacity_direction_for_state(
     env, state, horizon, discount, trials, seed
 ):
-    """Compute clone-state all-action C* for every directed pair."""
+    """Compute clone-state all-action oracle C* and D* for every directed pair."""
     outer = env.clone_state()
-    result = {}
+    capacities, directions = {}, {}
     try:
         for ego in range(int(env.n_agents)):
-            row = {}
+            c_row, d_row = {}, {}
             for source in range(int(env.n_agents)):
                 if source == ego:
                     continue
@@ -172,17 +190,26 @@ def _oracle_capacity_for_state(
                     (int(seed) + 1) * 1000003
                     + int(ego) * 1009 + int(source) * 9176
                 )
-                action_values = []
                 valid_actions = np.flatnonzero(
                     resolve_env_adapter(env).valid_action_mask(source)
                 )
+                if valid_actions.size < 2:
+                    raise RuntimeError("oracle allocation bank requires >=2 valid actions")
+                env.restore_state(copy.deepcopy(state))
+                env.set_behaviour_override("cooperative")
+                pi = np.asarray(
+                    env.scripted_policy_distribution(source), dtype=np.float64
+                )[valid_actions]
+                pi = pi / np.clip(pi.sum(), 1e-12, None)
+                q = np.full(valid_actions.size, 1.0 / valid_actions.size)
+                action_values = []
                 for action in valid_actions:
                     env.restore_state(copy.deepcopy(state))
                     env.set_behaviour_override("cooperative")
                     response = env.compute_oracle_lag_response_from_current_state(
                         ego_id=ego,
                         agent_j=source,
-                        intervention_action=action,
+                        intervention_action=int(action),
                         horizon=int(horizon),
                         n_trials=int(trials),
                         forced_step=0,
@@ -191,11 +218,23 @@ def _oracle_capacity_for_state(
                         discount=float(discount),
                     )
                     action_values.append(float(response["discounted_response"]))
-                row[source] = float(max(action_values) - min(action_values))
-            result[ego] = row
+                values = np.asarray(action_values, dtype=np.float64)
+                c_row[source] = float(np.max(values) - np.min(values))
+                d_row[source] = float(np.dot(pi - q, values))
+            capacities[ego] = c_row
+            directions[ego] = d_row
     finally:
         env.restore_state(outer)
-    return result
+    return capacities, directions
+
+
+def _oracle_capacity_for_state(
+    env, state, horizon, discount, trials, seed
+):
+    capacities, _ = _oracle_capacity_direction_for_state(
+        env, state, horizon, discount, trials, seed
+    )
+    return capacities
 
 
 def _mean_oracle_capacity(oracle_bank):
@@ -232,24 +271,49 @@ def _capacity_ndcg_at_k(predicted_ranking, oracle_scores, core_budget):
     return float(dcg / idcg) if idcg > 1e-12 else 1.0
 
 
-def _pretrain_checkpoint(seed, episodes, core_budget, device):
+def _pretrain_checkpoint(
+    seed, episodes, core_budget, device, n_agents=24
+):
+    """Pretrain a selector-neutral full-explicit representation checkpoint."""
     RE.set_global_seed(seed)
-    cfg = _cfg(seed, core_budget)
-    env = _make_env(seed, phase_length=max(100000, int(episodes) + 1))
+    cfg = _cfg(seed, core_budget, selector="full_explicit")
+    env = _make_env(
+        seed, phase_length=max(100000, int(episodes) + 1), n_agents=n_agents
+    )
     runner = RE.make_runner("Final-CIGAMF", env, cfg, device)
+    for belief in runner.belief_modules.values():
+        belief.max_core_size = len(belief.neighbor_ids)
+        belief.set_fixed_core(belief.neighbor_ids)
+    runner.pair_rel_module.reconcile_core_sets(
+        {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()}
+    )
     runner.run(n_episodes=int(episodes), eval_every=max(1, int(episodes)))
     checkpoint = _capture_frozen_learning_checkpoint(runner)
     checkpoint["episodes"] = int(episodes)
+    checkpoint["checkpoint_role"] = "selector_neutral_full_explicit_pretrain"
+    return checkpoint
+
+
+def _initial_checkpoint(seed, core_budget, device, n_agents=24):
+    """Capture common untrained initialization for end-to-end selector runs."""
+    RE.set_global_seed(seed)
+    cfg = _cfg(seed, core_budget, selector="structural_capacity")
+    env = _make_env(seed, phase_length=100000, n_agents=n_agents)
+    runner = RE.make_runner("Final-CIGAMF", env, cfg, device)
+    checkpoint = _capture_frozen_learning_checkpoint(runner)
+    checkpoint["episodes"] = 0
+    checkpoint["checkpoint_role"] = "common_untrained_initialization"
     return checkpoint
 
 
 def _isolation_rows(
-    variants, seed, core_budget, device, checkpoint, state_bank, oracle_bank
+    variants, seed, core_budget, device, checkpoint, state_bank, oracle_bank,
+    oracle_direction_bank, n_agents=24,
 ):
     records = {variant: [] for variant in variants}
     for variant in variants:
         runner = _prepare_variant_runner(
-            variant, seed, core_budget, device, checkpoint
+            variant, seed, core_budget, device, checkpoint, n_agents=n_agents
         )
         runner.cfg["freeze_policy_learning"] = True
         runner.cfg["freeze_representation_state"] = True
@@ -257,25 +321,30 @@ def _isolation_rows(
             zip(state_bank, oracle_bank)
         ):
             _restore_frozen_learning_checkpoint(runner, checkpoint)
+            _apply_variant_allocation_state(
+                runner, VARIANTS[variant], core_budget
+            )
             runner.env.restore_state(copy.deepcopy(state))
             runner.env.set_behaviour_override("cooperative")
             runner.oracle_capacity_scores_by_ego = copy.deepcopy(oracle_scores)
-            if VARIANTS[variant] == "full_explicit":
-                for belief in runner.belief_modules.values():
-                    belief.max_core_size = len(belief.neighbor_ids)
-                    belief.set_fixed_core(belief.neighbor_ids)
-                runner.pair_rel_module.reconcile_core_sets(
-                    {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()}
-                )
             obs_all = runner.env._get_obs_all()
-            action_dict, cache = runner._select_actions_population(obs_all)
-            actions = [int(action_dict[agent]) for agent in range(runner.n_agents)]
+            # First forward supplies the common factual action/policy context used
+            # to score every selector on this state. Decision fidelity is measured
+            # only after the selector has committed and pair allocation reconciled.
+            teacher_actions, teacher_cache = runner._select_actions_population(obs_all)
+            teacher_action_list = [
+                int(teacher_actions[agent]) for agent in range(runner.n_agents)
+            ]
             runner._score_all_pairs_and_update_beliefs(
                 obs_all=obs_all,
-                actions=actions,
-                behaviour_probs=cache.get("behaviour_probs"),
-                policy_probs=cache.get("policy_probs"),
+                actions=teacher_action_list,
+                behaviour_probs=teacher_cache.get("behaviour_probs"),
+                policy_probs=teacher_cache.get("policy_probs"),
             )
+            decision_actions, decision_cache = runner._select_actions_population(obs_all)
+            actions = [
+                int(decision_actions[agent]) for agent in range(runner.n_agents)
+            ]
             for ego, belief in runner.belief_modules.items():
                 predicted_ranking = sorted(
                     belief.get_core_set(),
@@ -293,21 +362,31 @@ def _isolation_rows(
                         predicted_ranking, oracle_scores[int(ego)], core_budget
                     ),
                     "core_size": len(predicted),
-                    "logits": np.asarray(cache["policy_logits"], dtype=np.float64),
+                    "logits": np.asarray(
+                        decision_cache["policy_logits"], dtype=np.float64
+                    ),
                     "values": np.asarray(
-                        [cache["value_cache"][agent] for agent in range(runner.n_agents)],
+                        [decision_cache["value_cache"][agent] for agent in range(runner.n_agents)],
                         dtype=np.float64,
                     ),
                     "actions": np.asarray(actions, dtype=np.int64),
                 })
 
+    # The challenge subset is defined only from oracle C* and oracle D*, not
+    # from the learned selectors under test. This prevents post-hoc filtering
+    # on estimator success or failure.
     disagreement_keys = set()
-    if "C-Core" in records and "AbsD-Core" in records:
-        c_by_key = {row["key"]: row["predicted"] for row in records["C-Core"]}
-        d_by_key = {row["key"]: row["predicted"] for row in records["AbsD-Core"]}
-        disagreement_keys = {
-            key for key in c_by_key if c_by_key[key] != d_by_key[key]
-        }
+    for state_index, (c_scores, d_scores) in enumerate(
+        zip(oracle_bank, oracle_direction_bank)
+    ):
+        for ego in c_scores:
+            c_top = _top_k(c_scores[int(ego)], ego, core_budget)
+            d_top = _top_k(
+                {j: abs(float(v)) for j, v in d_scores[int(ego)].items()},
+                ego, core_budget,
+            )
+            if c_top != d_top:
+                disagreement_keys.add((int(state_index), int(ego)))
     total_keys = len(records.get("C-Core", next(iter(records.values()), [])))
     rows = []
     reference_fidelity = {
@@ -377,17 +456,20 @@ def _isolation_rows(
                 item["action_agreement_to_full_explicit"] for item in fidelity
             ]),
             "decision_fidelity_reference": "Full-Explicit",
-            "decision_fidelity_protocol": "common_checkpoint_frozen_state_bank",
+            "decision_fidelity_protocol": (
+                "neutral_full_explicit_pretrain_selector_then_forward"
+            ),
+            "checkpoint_role": checkpoint.get("checkpoint_role", "unspecified"),
         })
     return rows
 
 
 def _end_to_end_row(
     variant, seed, episodes, core_budget, device, checkpoint,
-    mean_oracle_capacity,
+    mean_oracle_capacity, n_agents=24,
 ):
     runner = _prepare_variant_runner(
-        variant, seed, core_budget, device, checkpoint
+        variant, seed, core_budget, device, checkpoint, n_agents=n_agents
     )
     if VARIANTS[variant] == "oracle_capacity":
         runner.oracle_capacity_scores_by_ego = copy.deepcopy(mean_oracle_capacity)
@@ -406,6 +488,7 @@ def _end_to_end_row(
         "episodes": int(episodes),
         "pretrain_episodes": int(checkpoint["episodes"]),
         "checkpoint_sha256": checkpoint["sha256"],
+        "checkpoint_role": checkpoint.get("checkpoint_role", "unspecified"),
         "core_budget": int(core_budget),
         "matched_budget": int(selector != "full_explicit"),
         "strict_5d_signature": True,
@@ -432,15 +515,22 @@ def main(argv=None):
     parser.add_argument("--pretrain-episodes", type=int, default=60)
     parser.add_argument("--core-budget", type=int, default=3)
     parser.add_argument("--selector-states", type=int, default=8)
+    parser.add_argument(
+        "--challenge-oversample", type=int, default=3,
+        help="Oracle-only oversampling factor used to construct C* vs |D*| disagreement states.",
+    )
     parser.add_argument("--oracle-trials", type=int, default=1)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--agent-count", type=int, default=24)
     parser.add_argument("--variants", nargs="+", choices=list(VARIANTS), default=None)
     parser.add_argument("--out-root", default=os.path.join(ROOT, "results", "paper_b_allocation"))
     args = parser.parse_args(argv)
     if (
         args.episodes <= 0 or args.pretrain_episodes <= 0
-        or args.selector_states <= 0 or args.oracle_trials <= 0
-        or args.core_budget <= 0 or not args.seeds
+        or args.selector_states <= 0 or args.challenge_oversample <= 0
+        or args.oracle_trials <= 0
+        or args.core_budget <= 0 or args.agent_count <= args.core_budget
+        or not args.seeds
     ):
         parser.error(
             "episodes, pretrain episodes, core budget, and seeds must be positive"
@@ -452,29 +542,49 @@ def main(argv=None):
     rows = []
     selected_variants = args.variants or list(VARIANTS)
     for seed in args.seeds:
-        checkpoint = _pretrain_checkpoint(
-            seed, args.pretrain_episodes, args.core_budget, args.device
+        isolation_checkpoint = _pretrain_checkpoint(
+            seed, args.pretrain_episodes, args.core_budget, args.device,
+            n_agents=args.agent_count
+        )
+        end_to_end_checkpoint = _initial_checkpoint(
+            seed, args.core_budget, args.device, n_agents=args.agent_count
         )
         reference_runner = _prepare_variant_runner(
-            "C-Core", seed, args.core_budget, args.device, checkpoint
+            "C-Core", seed, args.core_budget, args.device, isolation_checkpoint,
+            n_agents=args.agent_count
         )
         reference_runner.env.set_behaviour_override("cooperative")
         bank_seed = int(seed) + 88001
-        state_bank = reference_runner.env.sample_state_bank(
-            n_states=int(args.selector_states), burn_in=3, bank_seed=bank_seed
+        candidate_count = int(args.selector_states) * int(args.challenge_oversample)
+        candidate_states = reference_runner.env.sample_state_bank(
+            n_states=candidate_count, burn_in=3, bank_seed=bank_seed
         )
         horizon = int(reference_runner.cfg["causal_horizon"])
         discount = float(reference_runner.cfg["discount"])
-        oracle_bank = [
-            _oracle_capacity_for_state(
-                reference_runner.env,
-                state,
-                horizon=horizon,
-                discount=discount,
-                trials=args.oracle_trials,
-                seed=bank_seed + state_index * 100003,
+        candidate_oracles = [
+            _oracle_capacity_direction_for_state(
+                reference_runner.env, state, horizon=horizon, discount=discount,
+                trials=args.oracle_trials, seed=bank_seed + state_index * 100003,
             )
-            for state_index, state in enumerate(state_bank)
+            for state_index, state in enumerate(candidate_states)
+        ]
+        challenge_flags = []
+        for c_scores, d_scores in candidate_oracles:
+            has_disagreement = any(
+                _top_k(c_scores[ego], ego, args.core_budget) != _top_k(
+                    {j: abs(float(v)) for j, v in d_scores[ego].items()},
+                    ego, args.core_budget,
+                )
+                for ego in c_scores
+            )
+            challenge_flags.append(bool(has_disagreement))
+        selected_indices = sorted(
+            range(candidate_count), key=lambda index: (not challenge_flags[index], index)
+        )[:int(args.selector_states)]
+        state_bank = [candidate_states[index] for index in selected_indices]
+        oracle_bank = [candidate_oracles[index][0] for index in selected_indices]
+        oracle_direction_bank = [
+            candidate_oracles[index][1] for index in selected_indices
         ]
         mean_oracle_capacity = _mean_oracle_capacity(oracle_bank)
         rows.extend(_isolation_rows(
@@ -482,15 +592,18 @@ def main(argv=None):
             seed,
             args.core_budget,
             args.device,
-            checkpoint,
+            isolation_checkpoint,
             state_bank,
             oracle_bank,
+            oracle_direction_bank,
+            n_agents=args.agent_count,
         ))
         end_to_end = {}
         for variant in selected_variants:
             end_to_end[variant] = _end_to_end_row(
                 variant, seed, args.episodes, args.core_budget, args.device,
-                checkpoint, mean_oracle_capacity,
+                end_to_end_checkpoint, mean_oracle_capacity,
+                n_agents=args.agent_count,
             )
         reference = (
             end_to_end["Full-Explicit"][1]
@@ -522,12 +635,17 @@ def main(argv=None):
         "episodes": args.episodes,
         "pretrain_episodes": args.pretrain_episodes,
         "core_budget": args.core_budget,
+        "agent_count": args.agent_count,
         "selector_states": args.selector_states,
+        "challenge_oversample": args.challenge_oversample,
+        "challenge_selected_state_count_by_seed": "see summary disagreement_pair_state_count",
         "oracle_trials": args.oracle_trials,
         "selector_bank_seed_rule": "training_seed_plus_88001",
         "selector_bank_held_out": True,
         "variants": {name: VARIANTS[name] for name in selected_variants},
         "panels": ["selector_isolation", "end_to_end"],
+        "selector_isolation_checkpoint": "selector_neutral_full_explicit_pretrain",
+        "end_to_end_checkpoint": "common_untrained_initialization",
         "summary": path,
     })
     print(path)

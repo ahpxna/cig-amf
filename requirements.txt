@@ -1,0 +1,8 @@
+# Versions validated by the confirmatory hardening audit (Python 3.13.5).
+numpy==2.3.5
+scipy==1.17.0
+pandas==2.2.3
+matplotlib==3.10.8
+pytest==9.0.2
+# Install the platform-appropriate CPU/CUDA wheel for this version.
+torch==2.10.0

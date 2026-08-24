@@ -161,7 +161,7 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
         false_alarm_reported
         and len(false_alarm_targets) == len(final_false_alarm)
         and all(
-            math.isfinite(target) and target > 0.0
+            math.isfinite(target) and 0.0 < target < 1.0
             for target in false_alarm_targets
         )
         and all(value <= target for value, target in zip(final_false_alarm, false_alarm_targets))

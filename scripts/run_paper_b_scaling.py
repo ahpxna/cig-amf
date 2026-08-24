@@ -9,19 +9,24 @@ panels so scale is an explicit experimental axis.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import os
 import tempfile
+import time
 
 import numpy as np
+import torch
 
 try:
     from exp_common import ROOT, ensure_dir
     from run_paper_b_periphery import _memory_accounting
+    from run_paper_b_allocation import _decision_fidelity
 except ModuleNotFoundError:
     from scripts.exp_common import ROOT, ensure_dir
     from scripts.run_paper_b_periphery import _memory_accounting
+    from scripts.run_paper_b_allocation import _decision_fidelity
 
 import run_experiment as RE
 from runners.h3_ablation_runner import H3NoMultiMemoryRunner
@@ -84,6 +89,79 @@ def _runner(variant, n_agents, seed, device, core_budget):
     return runner
 
 
+def _decision_probe_with_latency(runner, n_states, seed):
+    bank = runner.env.sample_state_bank(
+        n_states=int(n_states), burn_in=3, bank_seed=int(seed)
+    )
+    outer = runner.env.clone_state()
+    logits, values, actions, latencies = [], [], [], []
+    try:
+        for state in bank:
+            runner.env.restore_state(copy.deepcopy(state))
+            obs = runner.env._get_obs_all()
+            started = time.perf_counter()
+            result = runner._select_actions_population(obs)
+            latencies.append(time.perf_counter() - started)
+            if (
+                isinstance(result, tuple) and len(result) == 2
+                and isinstance(result[1], dict)
+            ):
+                selected, cache = result
+                logits_arr = np.asarray(cache["policy_logits"], dtype=np.float64)
+                values_arr = np.asarray(
+                    [cache["value_cache"][ego] for ego in range(runner.n_agents)],
+                    dtype=np.float64,
+                )
+                actions_arr = np.asarray(
+                    [selected[ego] for ego in range(runner.n_agents)], dtype=np.int64
+                )
+            elif isinstance(result, tuple) and len(result) == 3:
+                # PureMeanField keeps its historical action-selection interface.
+                # Reconstruct the same masked policy logits for a comparable
+                # decision-fidelity probe without changing the training API.
+                selected, values_np, mean_field = result
+                obs_batch = np.stack([
+                    runner.env_adapter.observation(obs, ego)
+                    for ego in range(runner.n_agents)
+                ])
+                with torch.no_grad():
+                    obs_t = torch.as_tensor(
+                        obs_batch, dtype=torch.float32, device=runner.device
+                    )
+                    mf_t = torch.as_tensor(
+                        np.stack(mean_field), dtype=torch.float32, device=runner.device
+                    )
+                    raw_logits, _ = runner._forward(obs_t, mf_t)
+                    valid = np.stack([
+                        runner.env_adapter.valid_action_mask(agent)
+                        for agent in range(runner.n_agents)
+                    ])
+                    raw_logits = raw_logits.masked_fill(
+                        ~torch.as_tensor(valid, dtype=torch.bool, device=raw_logits.device),
+                        -torch.inf,
+                    )
+                    logits_arr = raw_logits.detach().cpu().numpy().astype(np.float64)
+                values_arr = np.asarray(values_np, dtype=np.float64)
+                actions_arr = np.asarray(selected, dtype=np.int64)
+            else:
+                raise RuntimeError("unsupported scaling decision-probe interface")
+            logits.append(logits_arr)
+            values.append(values_arr)
+            actions.append(actions_arr)
+    finally:
+        runner.env.restore_state(outer)
+    latency = np.asarray(latencies, dtype=np.float64) * 1000.0
+    return {
+        "logits": np.stack(logits, axis=0),
+        "values": np.stack(values, axis=0),
+        "actions": np.stack(actions, axis=0),
+    }, {
+        "inference_latency_mean_ms": float(np.mean(latency)),
+        "inference_latency_p50_ms": float(np.percentile(latency, 50)),
+        "inference_latency_p95_ms": float(np.percentile(latency, 95)),
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", type=int, nargs="+", required=True)
@@ -98,6 +176,8 @@ def main(argv=None):
     rows = []
     for seed in args.seeds:
         for n_agents in args.agent_counts:
+            group = {}
+            probe_seed = int(seed) + int(n_agents) * 1009 + 92009
             for variant in VARIANTS:
                 runner = _runner(
                     variant, n_agents, seed, args.device,
@@ -105,17 +185,29 @@ def main(argv=None):
                 )
                 history = runner.run(n_episodes=int(args.episodes), eval_every=10)
                 memory = _memory_accounting(runner)
-                rows.append({
+                probe, latency = _decision_probe_with_latency(
+                    runner, n_states=4, seed=probe_seed
+                )
+                group[variant] = ({
                     "variant": variant,
                     "seed": int(seed),
                     "n_agents": int(n_agents),
                     "episodes": int(args.episodes),
                     "mean_reward": _mean(history.get("mean_reward", [])),
+                    "reward_per_agent": _mean(history.get("reward_per_agent", [])),
                     "throughput_total": _mean(
                         history.get("throughput_total_agent_steps_per_sec", [])
                     ),
+                    **latency,
                     **memory,
-                })
+                }, probe)
+            reference = group["Full-Explicit"][1]
+            for variant in VARIANTS:
+                row, probe = group[variant]
+                row.update(_decision_fidelity(probe, reference))
+                row["decision_fidelity_reference"] = "Full-Explicit"
+                row["decision_probe_state_count"] = 4
+                rows.append(row)
     out_root = ensure_dir(os.path.abspath(args.out_root))
     summary = os.path.join(out_root, "summary_paper_b_scaling.csv")
     with open(summary, "w", newline="", encoding="utf-8") as handle:

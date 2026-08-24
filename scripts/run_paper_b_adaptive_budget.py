@@ -1,0 +1,194 @@
+"""Paper-B entropy-adaptive core-budget panel.
+
+Adaptive k is compared with every fixed integer k in [k_min, k_max].  The
+closest fixed-k row is identified per seed after the run, making the matched
+average explicit-model cost comparison auditable rather than hand selected.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import tempfile
+
+import numpy as np
+
+try:
+    from exp_common import ROOT, ensure_dir
+    from run_paper_b_allocation import _decision_fidelity, _decision_probe
+except ModuleNotFoundError:
+    from scripts.exp_common import ROOT, ensure_dir
+    from scripts.run_paper_b_allocation import _decision_fidelity, _decision_probe
+
+import run_experiment as RE
+
+
+def _atomic_json(path, payload):
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".paper-b-budget-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, allow_nan=False)
+            handle.write("\n")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _mean(values):
+    vals = [float(v) for v in values if np.isfinite(v)]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def _make_runner(
+    seed, device, *, adaptive, k_min, k_max, n_agents=24, full_explicit=False
+):
+    RE.set_global_seed(int(seed))
+    cfg = RE.default_cfg()
+    cfg.update({
+        "seed": int(seed),
+        "k0_warmup": 0,
+        "slow_ratio": 1.0,
+        "min_core_size": int(k_min if adaptive else k_max),
+        "belief_adaptive_k_min": int(k_min if adaptive else k_max),
+        "max_core_size": int(k_max),
+        "belief_adaptive_k": bool(adaptive),
+        "periph_require_full_signature": True,
+        "periph_allow_legacy_items": False,
+    })
+    env = RE.make_main_env(
+        task_mode="behavioral_drift", n_agents=int(n_agents), max_steps=30,
+        phase_length=40, seed=int(seed),
+    )
+    runner = RE.make_runner("Final-CIGAMF", env, cfg, device)
+    if full_explicit:
+        runner.cfg["core_selection_mode"] = "full_explicit"
+        for belief in runner.belief_modules.values():
+            belief.adaptive_k = False
+            belief.min_core_size = len(belief.neighbor_ids)
+            belief.max_core_size = len(belief.neighbor_ids)
+            belief.adaptive_k_min = len(belief.neighbor_ids)
+            belief.set_fixed_core(belief.neighbor_ids)
+        runner.pair_rel_module.reconcile_core_sets(
+            {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()}
+        )
+    return runner
+
+
+def _run(seed, episodes, device, variant, k_min, k_max, n_agents=24):
+    if variant == "Adaptive-K":
+        runner = _make_runner(
+            seed, device, adaptive=True, k_min=k_min, k_max=k_max,
+            n_agents=n_agents
+        )
+    elif variant == "Full-Explicit":
+        runner = _make_runner(
+            seed, device, adaptive=False, k_min=k_max, k_max=k_max,
+            n_agents=n_agents, full_explicit=True,
+        )
+    else:
+        fixed_k = int(variant.rsplit("-", 1)[1])
+        runner = _make_runner(
+            seed, device, adaptive=False, k_min=fixed_k, k_max=fixed_k,
+            n_agents=n_agents
+        )
+    history = runner.run(n_episodes=int(episodes), eval_every=10)
+    saturation = [belief.get_saturation_stats() for belief in runner.belief_modules.values()]
+    row = {
+        "variant": variant,
+        "seed": int(seed),
+        "episodes": int(episodes),
+        "k_min": int(k_min),
+        "k_max": int(k_max),
+        "mean_reward": _mean(history.get("mean_reward", [])),
+        "final_reward": float(history.get("mean_reward", [float("nan")])[-1]),
+        "mean_core_size": _mean(history.get("mean_core_size", [])),
+        "core_size_variance": float(np.var(history.get("mean_core_size", [0.0]))),
+        "mean_hit_min_rate": _mean(item["hit_min_rate"] for item in saturation),
+        "mean_hit_max_rate": _mean(item["hit_max_rate"] for item in saturation),
+        "mean_effective_max_k": _mean(item["effective_max_k"] for item in saturation),
+        "throughput_total": _mean(history.get("throughput_total_agent_steps_per_sec", [])),
+        "matched_to_adaptive": 0,
+        "mean_core_cost_gap_to_adaptive": float("nan"),
+    }
+    probe = _decision_probe(runner, n_states=4, seed=int(seed) + 91009)
+    return row, probe
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seeds", type=int, nargs="+", required=True)
+    parser.add_argument("--episodes", type=int, default=200)
+    parser.add_argument("--k-min", type=int, default=2)
+    parser.add_argument("--k-max", type=int, default=5)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--agent-count", type=int, default=24)
+    parser.add_argument(
+        "--out-root", default=os.path.join(ROOT, "results", "paper_b_adaptive_budget")
+    )
+    args = parser.parse_args(argv)
+    if not args.seeds or len(set(args.seeds)) != len(args.seeds):
+        parser.error("--seeds must be non-empty and unique")
+    if (
+        args.episodes <= 0 or args.k_min < 1 or args.k_max < args.k_min
+        or args.agent_count <= args.k_max
+    ):
+        parser.error("invalid episode or adaptive-budget bounds")
+
+    variants = ["Adaptive-K"] + [
+        f"Fixed-K-{k}" for k in range(int(args.k_min), int(args.k_max) + 1)
+    ] + ["Full-Explicit"]
+    rows = []
+    for seed in args.seeds:
+        results = {
+            variant: _run(
+                seed, args.episodes, args.device, variant, args.k_min, args.k_max,
+                n_agents=args.agent_count
+            )
+            for variant in variants
+        }
+        reference = results["Full-Explicit"][1]
+        adaptive_cost = float(results["Adaptive-K"][0]["mean_core_size"])
+        fixed_names = [name for name in variants if name.startswith("Fixed-K-")]
+        matched = min(
+            fixed_names,
+            key=lambda name: abs(
+                float(results[name][0]["mean_core_size"]) - adaptive_cost
+            ),
+        )
+        for variant, (row, probe) in results.items():
+            row.update(_decision_fidelity(probe, reference))
+            row["decision_fidelity_reference"] = "Full-Explicit"
+            if variant == matched:
+                row["matched_to_adaptive"] = 1
+            if variant.startswith("Fixed-K-"):
+                row["mean_core_cost_gap_to_adaptive"] = abs(
+                    float(row["mean_core_size"]) - adaptive_cost
+                )
+            rows.append(row)
+
+    out_root = ensure_dir(os.path.abspath(args.out_root))
+    summary = os.path.join(out_root, "summary_paper_b_adaptive_budget.csv")
+    with open(summary, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=sorted(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    _atomic_json(os.path.join(out_root, "manifest.json"), {
+        "experiment": "paper_b_entropy_adaptive_budget",
+        "complete": True,
+        "seeds": [int(seed) for seed in args.seeds],
+        "episodes": int(args.episodes),
+        "k_min": int(args.k_min),
+        "k_max": int(args.k_max),
+        "agent_count": int(args.agent_count),
+        "variants": variants,
+        "matching_rule": "nearest fixed integer k to observed adaptive mean core size per seed",
+        "summary": summary,
+    })
+    print(summary)
+
+
+if __name__ == "__main__":
+    main()

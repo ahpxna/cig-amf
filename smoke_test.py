@@ -400,10 +400,10 @@ try:
         cd_rows.append(cd_by_pair[pair])
     cd_target = torch.stack(cd_rows)
     lo = hd.compute_loss(z, ego, nbr, cd_target=cd_target)
-    print(f"       L_influence={float(lo['influence']):.4f} "
-          f"L_contrastive={float(lo['contrastive']):.4f}")
-    check("influence loss is finite", np.isfinite(float(lo["influence"])))
-    check("contrastive loss > 0", float(lo["contrastive"]) > 0,
+    print(f"       L_influence={float(lo['influence'].detach()):.4f} "
+          f"L_contrastive={float(lo['contrastive'].detach()):.4f}")
+    check("influence loss is finite", np.isfinite(float(lo["influence"].detach())))
+    check("contrastive loss > 0", float(lo["contrastive"].detach()) > 0,
           "requires same-neighbour, different-ego samples in the batch")
 
     # ---- drift probe ----

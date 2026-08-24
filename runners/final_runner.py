@@ -291,6 +291,10 @@ class FinalCIGAMFRunner:
                 "causal horizon contract violated across proxy, drift, and replay"
             )
 
+        full_explicit_mode = (
+            str(self.cfg.get("core_selection_mode", "structural_capacity"))
+            .strip().lower() == "full_explicit"
+        )
         self.belief_modules = {
             ego: BayesLightBeliefState(
                 ego_id=ego,
@@ -301,17 +305,29 @@ class FinalCIGAMFRunner:
                 tau_in=cfg["belief_tau_in"],
                 tau_out=cfg["belief_tau_out"],
                 weak_prior_top_k=cfg["seed_core_top_k"],
-                min_core_size=cfg.get("min_core_size", 1),
-                max_core_size=cfg.get("max_core_size", 4),
+                min_core_size=(
+                    self.n_agents - 1 if full_explicit_mode
+                    else cfg.get("min_core_size", 1)
+                ),
+                max_core_size=(
+                    self.n_agents - 1 if full_explicit_mode
+                    else cfg.get("max_core_size", 4)
+                ),
                 sigma_floor=cfg.get("sigma_floor", 0.05),
                 # v2 defaults match belief_layer.py recommendations and
                 # preserve behaviour when cfg omits them.
                 core_rule=cfg.get("belief_core_rule", "lcb"),
                 kappa=cfg.get("belief_kappa", 1.0),
                 alpha_decay=cfg.get("belief_alpha_decay", 0.7),
-                adaptive_k=cfg.get("belief_adaptive_k", False),
-                adaptive_k_min=cfg.get(
-                    "belief_adaptive_k_min", cfg.get("min_core_size", 1)
+                adaptive_k=(
+                    False if full_explicit_mode
+                    else cfg.get("belief_adaptive_k", False)
+                ),
+                adaptive_k_min=(
+                    self.n_agents - 1 if full_explicit_mode
+                    else cfg.get(
+                        "belief_adaptive_k_min", cfg.get("min_core_size", 1)
+                    )
                 ),
                 signed_balance=cfg.get("belief_signed_balance", 0.5),
                 sigma_alpha_max=cfg.get("belief_sigma_alpha_max", 1.0),
@@ -320,6 +336,21 @@ class FinalCIGAMFRunner:
         }
 
         self._initialize_seeded_cores()
+        if full_explicit_mode:
+            for belief in self.belief_modules.values():
+                belief.max_core_size = len(belief.neighbor_ids)
+                belief.min_core_size = len(belief.neighbor_ids)
+                belief.adaptive_k = False
+                belief.adaptive_k_min = len(belief.neighbor_ids)
+                belief.set_fixed_core(belief.neighbor_ids)
+        # Seeded belief cores are already part of the policy representation.
+        # Reconcile them immediately so the explicit pair tier is live from
+        # episode zero rather than waiting for the first slow graph update.
+        self.pair_rel_module.reconcile_core_sets(
+            {ego: belief.get_core_set() for ego, belief in self.belief_modules.items()},
+            warm_start=bool(self.cfg.get("pair_warm_start", True)),
+        )
+        self._selector_random_rngs = {}
 
         self.history = {
             "episodes": [],
@@ -1185,7 +1216,10 @@ class FinalCIGAMFRunner:
         """
         obs_all = self.env_adapter.reset()
 
-        if self.scheduler.in_warmup():
+        if (
+            self.scheduler.in_warmup()
+            and str(self.cfg.get("core_selection_mode", "structural_capacity")).strip().lower() != "full_explicit"
+        ):
             for ego in range(self.n_agents):
                 prior_scores = self._compute_weak_prior_scores(ego)
                 self.belief_modules[ego].initialize_from_weak_prior(prior_scores)
@@ -1731,6 +1765,7 @@ class FinalCIGAMFRunner:
             "behavioral_direction",
             "observational_correlation",
             "attention",
+            "weak_prior",
             "random",
             "oracle_capacity",
             "full_explicit",
@@ -2172,9 +2207,20 @@ class FinalCIGAMFRunner:
                 int(j): float(weights[index])
                 for index, j in enumerate(neighbor_ids)
             }
+        if mode == "weak_prior":
+            return {
+                int(j): float(self.env_adapter.weak_prior_score(int(ego), int(j)))
+                for j in neighbor_ids
+            }
         if mode == "random":
-            seed = int(self.cfg.get("seed", 0)) + 104729 * (int(ego) + 1)
-            rng = np.random.RandomState(seed)
+            # Persist one deterministic RNG stream per ego. Re-seeding on every
+            # call made the old "Random-Core" a fixed ranking across all states.
+            ego = int(ego)
+            rng = self._selector_random_rngs.get(ego)
+            if rng is None:
+                seed = int(self.cfg.get("seed", 0)) + 104729 * (ego + 1)
+                rng = np.random.RandomState(seed)
+                self._selector_random_rngs[ego] = rng
             return {int(j): float(rng.uniform()) for j in neighbor_ids}
         if mode == "oracle_capacity":
             table = getattr(self, "oracle_capacity_scores_by_ego", None)

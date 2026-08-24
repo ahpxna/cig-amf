@@ -1,5 +1,6 @@
 """Regression contract for the executable one-step H1 configuration."""
 
+import hashlib
 import json
 import os
 import tempfile
@@ -35,11 +36,21 @@ class H1CliContractTests(unittest.TestCase):
             return {"seed": 101, "protocol_gate_pass": True}
 
         with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "oracle_rows.csv")
+            with open(source, "w", encoding="utf-8") as handle:
+                handle.write("oracle-only fixture\n")
+            source_sha = hashlib.sha256(open(source, "rb").read()).hexdigest()
             calibration = os.path.join(directory, "thresholds.json")
             with open(calibration, "w", encoding="utf-8") as handle:
                 json.dump({
+                    "calibration_protocol": "h1_oracle_only_thresholds_v2_fixed_pi_eval",
                     "oracle_only": True,
                     "development_seeds": [1],
+                    "sources": [{"path": source, "sha256": source_sha}],
+                    "support": {
+                        "capacity": {"active_count": 10, "active_fraction": 0.5},
+                        "direction": {"active_count": 10, "active_fraction": 0.5},
+                    },
                     "capacity_active_threshold": 0.01,
                     "capacity_prediction_threshold": 0.01,
                     "direction_active_threshold": 0.005,

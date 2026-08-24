@@ -353,7 +353,7 @@ class BayesLightBeliefState:
         # frac in [0,1]: zero is concentrated and one fully diffuse.
         frac = entropy / max(max_entropy, 1e-12)
 
-        k = int(round(
+        k = int(np.ceil(
             self.adaptive_k_min
             + frac * (self.max_core_size - self.adaptive_k_min)
         ))
