@@ -16,6 +16,8 @@ class H1CliContractTests(unittest.TestCase):
             "capacity_prediction_threshold": 0.01,
             "direction_active_threshold": 0.005,
             "direction_prediction_threshold": 0.005,
+            "h1_target_policy_mode": "scripted_uniform_mixture",
+            "h1_eval_uniform_mass": 0.10,
         }
         cfg = H1.build_h1_config({"eps": 0.05}, seed=101,
                                   threshold_calibration=thresholds)
@@ -42,6 +44,8 @@ class H1CliContractTests(unittest.TestCase):
                     "capacity_prediction_threshold": 0.01,
                     "direction_active_threshold": 0.005,
                     "direction_prediction_threshold": 0.005,
+                    "h1_target_policy_mode": "scripted_uniform_mixture",
+                    "h1_eval_uniform_mass": 0.10,
                 }, handle)
             with mock.patch.object(H1.RE, "run_tiny_task", fake_tiny_task), \
                  mock.patch.object(
@@ -52,6 +56,7 @@ class H1CliContractTests(unittest.TestCase):
                     "--tiny-proxy-train-episodes", "1", "--tiny-states", "1",
                     "--out-root", directory, "--run-id", "contract",
                     "--threshold-calibration", calibration,
+                    "--allow-development-thresholds",
                 ])
         self.assertEqual(observed["causal_horizon"], 1)
         self.assertEqual(observed["proxy_n_horizons"], 1)

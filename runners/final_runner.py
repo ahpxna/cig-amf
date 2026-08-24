@@ -2000,11 +2000,18 @@ class FinalCIGAMFRunner:
             self.matdet.update(last_influence_matrix)
             matrix_z = float(self.matdet.z_score())
 
+        monitoring_ready = bool(self.drift.is_monitoring_ready())
         if bool(self.cfg.get("disable_drift_detector", False)):
             fire_info = {
                 "fired": False, "reason": "detector_disabled",
                 "n_inflated": 0, "probe_z": probe_z,
                 "probe_cusum": probe_cusum, "matrix_z": matrix_z,
+            }
+        elif not monitoring_ready:
+            fire_info = {
+                "fired": False, "reason": "detector_not_ready",
+                "n_inflated": 0, "probe_z": 0.0,
+                "probe_cusum": 0.0, "matrix_z": matrix_z,
             }
         else:
             fire_info = self.scheduler.evaluate_drift(

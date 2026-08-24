@@ -163,6 +163,7 @@ class DriftDetector:
         self.residual_history: List[float] = []
         self.last_snapshot_episode = None
         self.pending_recalibration_at = None
+        self.recalibration_reference_min_episode = None
         self.n_snapshots = 0
         self.reference_sample_count = 0
 
@@ -175,15 +176,23 @@ class DriftDetector:
 
         return F.one_hot(t, num_classes=self.action_dim).to(dtype=torch.float32)
 
-    def _batch(self, buffer, n: int):
-        """Get batch from proxy replay. Return tensors or None."""
+    def _batch(self, buffer, n: int, min_episode_id: Optional[int] = None):
+        """Get a complete-horizon batch, optionally restricted to a new regime."""
         if buffer is None or len(buffer) == 0:
             return None
 
         # Page-CUSUM targets a complete discounted H-return.  Right-censored
         # episode tails are supervised by the proxy through lag masks, but are
         # not valid witness observations.
-        buf = [sample for sample in buffer if bool(sample.get("horizon_complete", True))]
+        buf = [
+            sample for sample in buffer
+            if bool(sample.get("horizon_complete", True))
+            and (
+                min_episode_id is None
+                or sample.get("episode_id") is not None
+                and int(sample["episode_id"]) >= int(min_episode_id)
+            )
+        ]
         if not buf:
             return None
         n = int(min(n, len(buf)))
@@ -351,7 +360,8 @@ class DriftDetector:
         return val
 
     def calibrate_reference(
-        self, buffer, n_batches: Optional[int] = None, batch_size: Optional[int] = None
+        self, buffer, n_batches: Optional[int] = None, batch_size: Optional[int] = None,
+        min_episode_id: Optional[int] = None,
     ) -> Dict:
         """Calibrate the fixed Page-CUSUM reference on stable replay only."""
         if self.frozen is None:
@@ -366,7 +376,7 @@ class DriftDetector:
             )
         values = []
         for _ in range(count):
-            got = self._batch(buffer, size)
+            got = self._batch(buffer, size, min_episode_id=min_episode_id)
             if got is None:
                 break
             obs, a_i, a_j, target = got
@@ -421,18 +431,11 @@ class DriftDetector:
         )
 
     def residual_z_score(self) -> float:
-        """
-        Standardize against a fixed pre-monitoring reference distribution.
-        """
-        h = self.residual_history
-
-        if self.reference_mean is None:
-            if len(h) < max(5, self.window):
-                return 0.0
-            reference = np.asarray(h[:self.window], dtype=np.float64)
-            self.reference_mean = float(np.mean(reference))
-            self.reference_std = float(max(np.std(reference), 1e-9))
+        """Standardize only after an explicit pre-monitoring calibration."""
+        if not self.is_monitoring_ready() or not self.residual_history:
+            self.latest_standardized_residual = 0.0
             return 0.0
+        h = self.residual_history
         z = float(
             (h[-1] - self.reference_mean) / self.reference_std
         )
@@ -500,6 +503,23 @@ class DriftDetector:
 
             if self.n_batches_trained >= self.warmup_batches:
                 self.snapshot(episode)
+                try:
+                    self.calibrate_reference(
+                        buffer, n_batches=max(20, int(self.window))
+                    )
+                except RuntimeError:
+                    return {
+                        "phase": "reference_calibration",
+                        "batches": int(self.n_batches_trained),
+                        "residual": None,
+                        "z": 0.0,
+                    }
+                return {
+                    "phase": "monitoring_ready",
+                    "batches": int(self.n_batches_trained),
+                    "residual": None,
+                    "z": 0.0,
+                }
 
             return {
                 "phase": "warmup",
@@ -512,22 +532,49 @@ class DriftDetector:
         # The frozen witness is never updated.
         self.train_batches(buffer, n_train_batches)
 
-        res = self.measure(buffer)
-        z = self.residual_z_score()
-
-        # Has it been time for a new photo yet?
+        # Re-freeze only after the adaptation delay, then calibrate the new
+        # witness exclusively on post-trigger samples before monitoring resumes.
         if (
             self.pending_recalibration_at is not None
             and episode >= self.pending_recalibration_at
         ):
+            min_episode_id = self.recalibration_reference_min_episode
+            # Do not replace a valid frozen witness until the replay contains
+            # at least one complete post-trigger sample.  Otherwise snapshot()
+            # would clear the pending recalibration marker and strand the
+            # detector in a permanently-not-ready state.
+            if self._batch(buffer, 1, min_episode_id=min_episode_id) is None:
+                return {
+                    "phase": "reference_recalibration",
+                    "batches": int(self.n_batches_trained),
+                    "residual": None,
+                    "z": 0.0,
+                }
             self.snapshot(episode)
-
+            calibration = self.calibrate_reference(
+                buffer,
+                n_batches=max(20, int(self.window)),
+                min_episode_id=min_episode_id,
+            )
+            self.recalibration_reference_min_episode = None
             return {
                 "phase": "recalibrated",
                 "batches": int(self.n_batches_trained),
-                "residual": res,
+                "residual": None,
+                "z": 0.0,
+                **calibration,
+            }
+
+        if not self.is_monitoring_ready():
+            return {
+                "phase": "reference_calibration",
+                "batches": int(self.n_batches_trained),
+                "residual": None,
                 "z": 0.0,
             }
+
+        res = self.measure(buffer)
+        z = self.residual_z_score()
 
         return {
             "phase": "monitoring",
@@ -545,6 +592,7 @@ class DriftDetector:
         this step, an old witness would alarm forever after a real shift.
         """
         self.pending_recalibration_at = int(episode) + self.recalibrate_after
+        self.recalibration_reference_min_episode = int(episode) + 1
 
     def get_diagnostics(self) -> Dict:
         return {
@@ -552,6 +600,7 @@ class DriftDetector:
             "n_batches_trained": int(self.n_batches_trained),
             "last_snapshot_episode": self.last_snapshot_episode,
             "pending_recalibration_at": self.pending_recalibration_at,
+            "recalibration_reference_min_episode": self.recalibration_reference_min_episode,
             "latest_residual": (
                 float(self.residual_history[-1])
                 if self.residual_history else None

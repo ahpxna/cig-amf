@@ -105,7 +105,7 @@ def collect_bc_buffer(env, pair_rel, n_steps, action_fn, seed=0):
 
 def _make_env_and_module(seed=0):
     env = OmniArena(
-        n_agents=8, grid_size=9, n_zones=2,
+        n_agents=8, grid_size=13, n_zones=1,
         max_steps=64, phase_length=1000,
         enable_conditional_gates=False,
         enable_latency_ladder=False,

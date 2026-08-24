@@ -1650,7 +1650,8 @@ def _train_tiny_runner_for_proxy(tiny_env, tiny_cfg, args, device):
 
         _push_proxy_replay_compat(runner, trajectory)
 
-        runner.update_policy(trajectory)
+        if not bool(tiny_cfg.get("freeze_policy_learning", False)):
+            runner.update_policy(trajectory)
 
         runner.pair_rel_module.train_bc(
             n_steps=tiny_cfg["bc_train_steps"],
