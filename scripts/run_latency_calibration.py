@@ -77,7 +77,8 @@ def run(seed, train_episodes, states, horizon, trials, device):
     runner = RE.make_runner("Final-CIGAMF", env, cfg, device)
     runner.run(n_episodes=int(train_episodes), eval_every=max(1, int(train_episodes)))
     bank = env.sample_state_bank(
-        n_states=int(states), burn_in=3, bank_seed=int(seed) + 9901
+        n_states=int(states), burn_in=3, bank_seed=int(seed) + 9901,
+        min_remaining_steps=int(horizon),
     )
     role_agents = env.zone_role_agents[0]
     ego = int(role_agents[env.ROLE_COLLECTOR])

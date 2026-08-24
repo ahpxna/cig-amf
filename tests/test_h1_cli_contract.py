@@ -39,7 +39,8 @@ class H1CliContractTests(unittest.TestCase):
             source = os.path.join(directory, "oracle_rows.csv")
             with open(source, "w", encoding="utf-8") as handle:
                 handle.write("oracle-only fixture\n")
-            source_sha = hashlib.sha256(open(source, "rb").read()).hexdigest()
+            with open(source, "rb") as source_handle:
+                source_sha = hashlib.sha256(source_handle.read()).hexdigest()
             calibration = os.path.join(directory, "thresholds.json")
             with open(calibration, "w", encoding="utf-8") as handle:
                 json.dump({

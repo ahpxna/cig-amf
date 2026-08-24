@@ -59,6 +59,10 @@ def _mean(values):
 
 
 def _runner(variant, n_agents, seed, device, core_budget):
+    # Every variant in a matched seed/population cell must start from the exact
+    # same parameter RNG state.  Without this reset, sequential construction
+    # confounds architecture differences with different random initialisation.
+    RE.set_global_seed(int(seed))
     cfg = RE.default_cfg()
     cfg.update({
         "seed": int(seed), "k0_warmup": 0, "slow_ratio": 1.0,
@@ -67,6 +71,17 @@ def _runner(variant, n_agents, seed, device, core_budget):
         "max_core_size": int(core_budget), "periph_require_full_signature": True,
         "periph_allow_legacy_items": False,
     })
+    if variant == "Full-Explicit":
+        # Configure the reference before construction so the runner's
+        # episode-zero invariant activates every pair immediately.
+        cfg.update({
+            "core_selection_mode": "full_explicit",
+            "belief_adaptive_k": False,
+            "min_core_size": int(n_agents) - 1,
+            "belief_adaptive_k_min": int(n_agents) - 1,
+            "max_core_size": int(n_agents) - 1,
+            "seed_core_top_k": int(n_agents) - 1,
+        })
     env = RE.make_main_env(
         task_mode="behavioral_drift", n_agents=int(n_agents), max_steps=30,
         phase_length=40, seed=int(seed),
@@ -77,16 +92,7 @@ def _runner(variant, n_agents, seed, device, core_budget):
         if variant == "Attention-Mean":
             cfg["periph_beta_mode"] = "attention"
         return H3NoMultiMemoryRunner(env, cfg, device=device)
-    runner = RE.make_runner("Final-CIGAMF", env, cfg, device)
-    if variant == "Full-Explicit":
-        runner.cfg["core_selection_mode"] = "full_explicit"
-        for belief in runner.belief_modules.values():
-            belief.max_core_size = len(belief.neighbor_ids)
-            belief.set_fixed_core(belief.neighbor_ids)
-        runner.pair_rel_module.reconcile_core_sets(
-            {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()}
-        )
-    return runner
+    return RE.make_runner("Final-CIGAMF", env, cfg, device)
 
 
 def _decision_probe_with_latency(runner, n_states, seed):

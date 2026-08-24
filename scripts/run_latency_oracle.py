@@ -174,6 +174,7 @@ def run_gate(
         n_states=int(n_states),
         burn_in=3,
         bank_seed=int(seed) + 7103,
+        min_remaining_steps=int(horizon),
     )
     rows = []
     zone = 0

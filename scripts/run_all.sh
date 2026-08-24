@@ -304,7 +304,7 @@ run_logged() {
 
   if [ "$command_status" -eq 0 ]; then
     CIG_PASSES=$((CIG_PASSES + 1))
-    echo "PASS: $label"
+    echo "EXECUTION PASS: $label"
   else
     CIG_OPERATIONAL_FAILURES+=("$label (exit $command_status)")
     echo "FAIL: $label (exit $command_status)" >&2
@@ -460,6 +460,13 @@ if "$CIG_PYTHON" -c \
     --trials "$CIG_LATENCY_ORACLE_TRIALS" \
     --device "$CIG_DEVICE" \
     --json-out "$CIG_RUN_DIR/latency_calibration.json"
+  if "$CIG_PYTHON" -c \
+    'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); sys.exit(0 if p.get("gate_pass") else 1)' \
+    "$CIG_RUN_DIR/latency_calibration.json"; then
+    echo "SCIENTIFIC GATE PASS: learned direct-lag latency"
+  else
+    echo "SCIENTIFIC GATE FAIL: learned direct-lag latency (execution succeeded; latency claim remains unsupported)."
+  fi
 else
   echo "GATED OUT: learned latency calibration (oracle gate did not pass)."
 fi

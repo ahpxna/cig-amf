@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from envs.external_contract import BenchmarkCapabilities, flatten_observation
+from envs.external.common import ExternalPopulationMixin
 
 
 class FlatlandCIGAdapter:
@@ -44,9 +45,15 @@ class FlatlandCIGAdapter:
         agent = self.env.rail_env.agents[int(neighbour)]
         active = float(getattr(agent, "position", None) is not None)
         malfunction = float(getattr(getattr(agent, "malfunction_handler", None), "malfunction_down_counter", 0) > 0)
-        speed = float(getattr(getattr(agent, "speed_counter", None), "is_cell_exit", lambda: False)())
+        speed_counter = getattr(agent, "speed_counter", None)
+        if speed_counter is None:
+            at_cell_exit = 0.0
+        else:
+            at_cell_exit = float(
+                speed_counter.is_cell_exit(speed_counter.max_speed)
+            )
         return np.concatenate([self.relation_features(ego, neighbour), onehot,
-                               np.asarray([active, malfunction, speed, 0.0], dtype=np.float32)])
+                               np.asarray([active, malfunction, at_cell_exit, 0.0], dtype=np.float32)])
     def context_key(self, ego, neighbour):
         rel = self.relation_features(ego, neighbour)
         return tuple(np.round(rel, 2).tolist())
@@ -64,9 +71,10 @@ class FlatlandCIGAdapter:
     def fixed_continuation_policy(self, agent): return self.env.fixed_continuation_policy(agent)
 
 
-class FlatlandCIGEnvironment:
-    # Only training support is advertised until rail-specific intervention,
-    # fixed-rho oracle, and structural-disruption methods are implemented.
+class FlatlandCIGEnvironment(ExternalPopulationMixin):
+    # Training and H1 action-response are executable through clone/restore and
+    # fixed-rho forcing. Structural/behavioural H2 and latency-oracle claims
+    # remain disabled until benchmark-specific interventions are justified.
     capabilities = BenchmarkCapabilities(
         "Flatland", True, True, True, True, False, False, False
     )
@@ -126,6 +134,34 @@ class FlatlandCIGEnvironment:
         self._obs = self._normalise_obs(observations)
         self._route_cache.clear()
         return self._obs, [float(rewards.get(i, 0.0)) for i in range(self.n_agents)], done, dict(info)
+    @staticmethod
+    def _effective_configuration(agent):
+        """Mirror Flatland's virtual configuration for off/on/done agents.
+
+        At READY_TO_DEPART ``current_configuration`` is None but the action is
+        applied to ``initial_configuration``.  Using the legacy ``position``
+        property here incorrectly exposed only DO_NOTHING and could keep every
+        train off-map forever.
+        """
+        current = getattr(agent, "current_configuration", None)
+        if current is not None:
+            return current
+        state = getattr(agent, "state", None)
+        is_off_map = getattr(state, "is_off_map_state", None)
+        if callable(is_off_map) and bool(is_off_map()):
+            return getattr(agent, "initial_configuration", None)
+        target = getattr(agent, "target_configuration", None)
+        if target is not None:
+            return target
+        initial = getattr(agent, "initial_configuration", None)
+        if initial is not None:
+            return initial
+        position = getattr(agent, "position", None)
+        direction = getattr(agent, "direction", None)
+        if position is not None and direction is not None:
+            return (position, direction)
+        return None
+
     def valid_action_mask(self, agent):
         mask = np.zeros(5, dtype=bool)
         obj = self.rail_env.agents[int(agent)]
@@ -144,25 +180,39 @@ class FlatlandCIGEnvironment:
         if not required:
             mask[0] = True
             return mask
-        position = getattr(obj, "position", None)
-        direction = getattr(obj, "direction", 0)
-        if position is None:
-            mask[0] = True
-            return mask
+        configuration = self._effective_configuration(obj)
+        if configuration is None:
+            raise RuntimeError(
+                "Flatland requires an action but exposes no effective configuration"
+            )
+        position, direction = configuration
         for action in range(5):
             try:
-                allowed = self.rail_env.rail.apply_action_independent(action, (position, direction)) is not None
-            except Exception:
-                allowed = True
+                allowed = (
+                    self.rail_env.rail.apply_action_independent(
+                        action, (position, direction)
+                    )
+                    is not None
+                )
+            except (AttributeError, TypeError, ValueError, IndexError) as exc:
+                # Action support is a causal-identification contract.  A
+                # compatibility/API failure must block the adapter rather than
+                # silently marking every action valid.
+                raise RuntimeError(
+                    "Flatland action-mask resolution failed; refusing a "
+                    "fail-open support set"
+                ) from exc
             mask[action] = bool(allowed)
+        if not np.any(mask):
+            raise RuntimeError("Flatland reported no valid action for an action-required agent")
         return mask
     def _reachable_rail_cells(self, agent, depth_limit=32):
         """Bounded rail-topology trace keyed by reachable cell and distance."""
-        position = getattr(agent, "position", None)
-        if position is None:
+        configuration = self._effective_configuration(agent)
+        if configuration is None:
             return {}
-        direction = int(getattr(agent, "direction", 0))
-        frontier = [(int(position[0]), int(position[1]), direction, 0)]
+        position, direction = configuration
+        frontier = [(int(position[0]), int(position[1]), int(direction), 0)]
         visited = {}
         moves = ((-1, 0), (0, 1), (1, 0), (0, -1))
         rail = self.rail_env.rail
@@ -175,11 +225,19 @@ class FlatlandCIGEnvironment:
             if depth >= int(depth_limit):
                 continue
             try:
+                # Pinned Flatland 69446a2 uses the v4 transition-map API:
+                # get_transitions(((row, col), orientation)).  The former
+                # three-positional-argument call was swallowed by a broad
+                # exception and made every route trace stop at the current
+                # cell, silently zeroing the rail-topology relation features.
                 transitions = np.asarray(
-                    rail.get_transitions(row, col, heading), dtype=bool
+                    rail.get_transitions(((row, col), heading)), dtype=bool
                 ).reshape(-1)
-            except Exception:
-                transitions = np.zeros(4, dtype=bool)
+            except (AttributeError, TypeError, ValueError, IndexError) as exc:
+                raise RuntimeError(
+                    "Flatland transition-map API mismatch while constructing "
+                    "relation features"
+                ) from exc
             for next_heading, active in enumerate(transitions[:4]):
                 if not active:
                     continue
@@ -229,11 +287,18 @@ class FlatlandCIGEnvironment:
         shared_switch = 0.0
         for row, col in shared:
             try:
-                if int(np.asarray(self.rail_env.rail.get_full_transitions(row, col)).item()).bit_count() > 1:
-                    shared_switch = 1.0
-                    break
-            except Exception:
-                continue
+                transition_bits = int(
+                    np.asarray(
+                        self.rail_env.rail.get_full_transitions(row, col)
+                    ).item()
+                )
+            except (AttributeError, TypeError, ValueError, IndexError) as exc:
+                raise RuntimeError(
+                    "Flatland switch-feature resolution failed"
+                ) from exc
+            if transition_bits.bit_count() > 1:
+                shared_switch = 1.0
+                break
         # The interaction-relevant quantity is arrival time at the first
         # reachable shared conflict, not distance to each train's own target.
         eta_a = float(paths_a[first]) if first is not None else float("inf")

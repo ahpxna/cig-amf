@@ -2440,8 +2440,16 @@ class OmniArena:
         self.restore_state(snapshot)
         return total
 
-    def sample_state_bank(self, n_states=24, burn_in=3, bank_seed=None):
+    def sample_state_bank(
+        self, n_states=24, burn_in=3, bank_seed=None, min_remaining_steps=0
+    ):
         """Sample a state bank with optional common random numbers.
+
+        ``min_remaining_steps`` is a hard oracle-safety contract: every saved
+        state satisfies ``t + min_remaining_steps <= max_steps``.  This is
+        required by H-step clone-state oracles and prevents state banks from
+        containing late-episode states that cannot support the requested
+        intervention horizon.
 
         RC-2: bank_seed temporarily fixes RNG and then restores its old state.
         Paired realized-Phi measurements then differ in exactly one variable,
@@ -2452,14 +2460,33 @@ class OmniArena:
             self.rng.seed(bank_seed)   # Seed in place; preserve the RNG object.
 
         try:
+            n_states = int(n_states)
+            burn_in = int(burn_in)
+            min_remaining_steps = int(min_remaining_steps)
+            if n_states <= 0 or burn_in < 0 or min_remaining_steps < 0:
+                raise ValueError("invalid state-bank sampling arguments")
+            if min_remaining_steps > int(self.max_steps):
+                raise ValueError(
+                    "min_remaining_steps cannot exceed the episode horizon"
+                )
             bank = []
             self.reset()
             for _ in range(n_states):
+                # Reset *before* burn-in if the requested oracle horizon would
+                # cross the episode boundary.  Checking only after burn-in is
+                # insufficient because a done/reset can otherwise leave the
+                # state bank distribution dependent on accidental wraparound.
+                if int(self.t) + burn_in + min_remaining_steps > int(self.max_steps):
+                    self.reset()
                 for _ in range(burn_in):
                     acts = [self.scripted_policy(i) for i in range(self.n_agents)]
                     _, _, done, _ = self.step(acts, return_obs=False, return_info=False)
                     if done:
                         self.reset()
+                if int(self.t) + min_remaining_steps > int(self.max_steps):
+                    self.reset()
+                if int(self.t) + min_remaining_steps > int(self.max_steps):
+                    raise RuntimeError("failed to sample an oracle-safe state")
                 bank.append(self.clone_state())
             return bank
         finally:

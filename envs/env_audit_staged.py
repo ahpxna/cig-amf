@@ -255,7 +255,8 @@ def main(json_out=None):
     print(
         f"\n[Block A] T3 mean CV: BASELINE={fmt(base_m['t3_cv_mean'])} -> "
         f"A={fmt(a_m['t3_cv_mean'])}  "
-        f"({'PASS' if a_m['t3_cv_mean'] > 0.30 else 'FAIL'}, expect BASELINE weak -> A PASS)"
+        f"({'PASS' if a_m['t3_cv_mean'] > 0.30 else 'FAIL'}; under SGTP the legacy P1/P2 "
+        f"flags are no-ops, so equality with BASELINE is expected)"
     )
     print(
         f"[Block A] T4 sign-flip role frac (NEW methodology -- fixed "
@@ -263,7 +264,8 @@ def main(json_out=None):
         f"docstring; key 't4_spread' kept for compat, meaning changed from the "
         f"old sliding-forced_step 'peak spread'): "
         f"BASELINE={fmt(base_m['t4_spread'])} -> A={fmt(a_m['t4_spread'])}  "
-        f"({'PASS' if a_m['t4_spread'] > 0.3 else 'FAIL'}, expect BASELINE weak -> A PASS)"
+        f"({'PASS' if a_m['t4_spread'] > 0.3 else 'FAIL'} diagnostic only; under SGTP the "
+        f"legacy P1/P2 flags are no-ops, so equality with BASELINE is expected)"
     )
     print(
         f"[Block A] T1/T2/T5 should already be fine at baseline (P1/P2 don't "

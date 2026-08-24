@@ -337,7 +337,8 @@ def _oracle_capacity_table(seed, checkpoint, core_budget, device, n_states=2):
     runner.env.set_behaviour_override("cooperative")
     bank_seed = int(seed) + 92001
     bank = runner.env.sample_state_bank(
-        n_states=int(n_states), burn_in=3, bank_seed=bank_seed
+        n_states=int(n_states), burn_in=3, bank_seed=bank_seed,
+        min_remaining_steps=int(runner.cfg["causal_horizon"]),
     )
     oracle_bank = [
         _oracle_capacity_for_state(

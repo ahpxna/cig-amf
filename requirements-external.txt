@@ -1,0 +1,10 @@
+# Shared isolated runtime for the pinned external benchmark repositories.
+# Python 3.10-3.12 only: pinned Flatland requires numpy<2, and NumPy 1.26.x
+# should be installed from a wheel rather than source-built in experiment setup.
+numpy==1.26.4
+scipy==1.17.0
+pandas==2.2.3
+matplotlib==3.10.8
+pytest==9.0.2
+cython>=3.2.9
+torch==2.10.0

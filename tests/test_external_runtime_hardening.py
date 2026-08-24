@@ -1,0 +1,35 @@
+from pathlib import Path
+import tempfile
+import unittest
+
+from envs.external.runtime import ensure_directory, ensure_output_file_parent, external_python_supported
+
+
+class ExternalRuntimeHardeningTests(unittest.TestCase):
+    def test_external_python_guard_rejects_python_314_for_numpy1_stack(self):
+        self.assertTrue(external_python_supported((3, 10)))
+        self.assertTrue(external_python_supported((3, 12)))
+        self.assertFalse(external_python_supported((3, 13)))
+        self.assertFalse(external_python_supported((3, 14)))
+
+    def test_legacy_output_file_is_preserved_before_directory_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "external_flatland"
+            path.write_text('{"legacy": true}\n', encoding="utf-8")
+            migrated = ensure_directory(path)
+            self.assertTrue(path.is_dir())
+            self.assertIsNotNone(migrated)
+            self.assertEqual(migrated.read_text(encoding="utf-8"), '{"legacy": true}\n')
+
+    def test_output_file_parent_migrates_legacy_parent_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "external_rware"
+            parent.write_text("old\n", encoding="utf-8")
+            out = parent / "manifest.json"
+            migrated = ensure_output_file_parent(out)
+            self.assertTrue(parent.is_dir())
+            self.assertTrue(migrated.is_file())
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -89,3 +89,93 @@ after any source change:
 ```bash
 python scripts/build_source_manifest.py --out SOURCE_MANIFEST.json
 ```
+
+## 6. External benchmark repository and adapter workflow
+
+All pinned third-party repositories are managed under one root:
+
+```text
+external_envs/
+  manifest.json
+  repos/
+    flatland-rl/
+    robotic-warehouse/
+    CybORG/
+    CityFlow/
+```
+
+Existing clones from the old `external_envs/<repo>` layout are migrated in
+place the next time setup is run.
+
+Clone/verify the pinned sources:
+
+```bash
+bash scripts/setup_external_envs.sh
+python scripts/external_env_manager.py status
+```
+
+Install each pinned repository into the active Python environment when the
+native/system prerequisites are available:
+
+```bash
+bash scripts/setup_external_envs.sh --install
+```
+
+Before a long external experiment, run the executable adapter contract check:
+
+```bash
+python scripts/run_external_suite.py \
+  --environment flatland \
+  --panels training h1 h2 latency \
+  --out results/external_flatland_contract.json
+```
+
+Repeat with `rware`, `cyborg`, and `cityflow`.  A blocked H2 or latency panel is
+intentional unless that environment has a scientifically defined structural /
+behavioural intervention or a ground-truth latency oracle.  Do not enable a
+capability flag merely to make the manifest green.
+
+Actual Final-CIGAMF architecture-generalization training is separate from the
+capability manifest:
+
+```bash
+python scripts/run_external_training.py \
+  --environment rware --seeds 0 1 2 3 4 \
+  --episodes 100 --agent-count 6 --max-steps 60 \
+  --out results/external_rware_training
+```
+
+For CityFlow, pass `--config-path /abs/path/to/config.json` when automatic
+example-config discovery is not appropriate.  External training evidence is
+an architecture/generalization result; it is not automatically an H1/H2 or
+latency claim.
+
+## External benchmark runtime isolation
+
+Do **not** install the pinned external repositories directly into the main CIG
+virtual environment.  The pinned Flatland revision requires `numpy<2`, while
+the confirmatory CIG environment is validated separately.  External packages
+are installed into `external_envs/runtime/` and external commands automatically
+re-exec there once the runtime is marked ready.
+
+On macOS, use Python 3.12 for the external runtime:
+
+```bash
+brew install python@3.12
+CIG_EXTERNAL_PYTHON="$(brew --prefix python@3.12)/bin/python3.12" \
+  bash scripts/setup_external_envs.sh --install --recreate-runtime
+python scripts/external_env_manager.py status
+```
+
+If the main CIG environment already runs the project but only lacks pytest,
+install the test-only dependency set without perturbing NumPy/Torch:
+
+```bash
+python -m pip install -r requirements-test.txt
+python -m pytest -q
+```
+
+Legacy external-suite outputs such as `results/external_flatland` may be JSON
+files from older code.  If a new command needs the same path as a directory,
+the runner preserves the old file as `*.legacy-file` and creates the directory
+rather than raising `FileExistsError`.

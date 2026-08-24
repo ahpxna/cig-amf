@@ -211,7 +211,8 @@ def _fixed_estimand_panel(
     try:
         env.set_behaviour_override("cooperative")
         bank = env.sample_state_bank(
-            n_states=int(n_states), burn_in=2, bank_seed=int(seed) + 3401
+            n_states=int(n_states), burn_in=2, bank_seed=int(seed) + 3401,
+            min_remaining_steps=int(horizon),
         )
         for raw_state in bank:
             state = copy.deepcopy(raw_state)

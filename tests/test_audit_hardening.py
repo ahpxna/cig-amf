@@ -155,5 +155,144 @@ class AuditHardeningTests(unittest.TestCase):
                 H1._load_oracle_support(support)
 
 
+class ExternalAndStateBankHardeningTests(unittest.TestCase):
+    def test_state_bank_reserves_oracle_horizon(self):
+        env = RE.make_main_env(
+            task_mode="behavioral_drift", n_agents=6, max_steps=12,
+            phase_length=1000, seed=919,
+        )
+        horizon = 8
+        bank = env.sample_state_bank(
+            n_states=12, burn_in=3, bank_seed=991,
+            min_remaining_steps=horizon,
+        )
+        outer = env.clone_state()
+        try:
+            for state in bank:
+                env.restore_state(state)
+                self.assertLessEqual(int(env.t) + horizon, int(env.max_steps))
+        finally:
+            env.restore_state(outer)
+
+
+    def test_scaling_variants_share_exact_policy_initialization_per_seed(self):
+        import torch
+        from scripts import run_paper_b_scaling as scaling
+
+        sparse = scaling._runner("Semantic-Free", 6, 12345, "cpu", 2)
+        full = scaling._runner("Full-Explicit", 6, 12345, "cpu", 2)
+        sparse_state = sparse.policy_value.state_dict()
+        full_state = full.policy_value.state_dict()
+        self.assertEqual(set(sparse_state), set(full_state))
+        self.assertTrue(
+            all(torch.equal(sparse_state[key], full_state[key]) for key in sparse_state),
+            "matched scaling variants must not differ because of construction order",
+        )
+        self.assertTrue(
+            all(len(b.get_core_set()) == 5 for b in full.belief_modules.values())
+        )
+
+    def test_flatland_action_mask_fails_closed_on_api_error(self):
+        from types import SimpleNamespace
+        from envs.flatland_adapter import FlatlandCIGEnvironment
+
+        class BrokenRail:
+            def apply_action_independent(self, action, configuration):
+                raise TypeError("simulated pinned-API mismatch")
+
+        class BrokenRailEnv:
+            number_of_agents = 1
+            agents = [SimpleNamespace(
+                position=(1, 1), direction=0, state=object(),
+                speed_counter=SimpleNamespace(
+                    max_speed=1, is_cell_exit=lambda *args: True
+                ),
+            )]
+            rail = BrokenRail()
+            @staticmethod
+            def action_required(*args):
+                return True
+
+        env = FlatlandCIGEnvironment(BrokenRailEnv(), observation_width=8)
+        with self.assertRaisesRegex(RuntimeError, "fail-open"):
+            env.valid_action_mask(0)
+
+
+    def test_flatland_route_profile_uses_pinned_tuple_configuration_api(self):
+        from types import SimpleNamespace
+        from envs.flatland_adapter import FlatlandCIGEnvironment
+
+        class Rail:
+            def __init__(self):
+                self.calls = []
+            def get_transitions(self, configuration):
+                self.calls.append(configuration)
+                (row, col), heading = configuration
+                # one step east from the first cell, then stop
+                return (False, col == 1, False, False)
+            def get_full_transitions(self, row, col):
+                return 1
+
+        rail = Rail()
+        env = FlatlandCIGEnvironment.__new__(FlatlandCIGEnvironment)
+        env.rail_env = SimpleNamespace(rail=rail)
+        agent = SimpleNamespace(position=(1, 1), direction=1)
+        cells = env._reachable_rail_cells(agent, depth_limit=2)
+        self.assertIn(((1, 1), 1), rail.calls)
+        self.assertIn((1, 2), cells)
+
+
+    def test_flatland_ready_to_depart_uses_initial_configuration(self):
+        from types import SimpleNamespace
+        from envs.flatland_adapter import FlatlandCIGEnvironment
+
+        class OffMapState:
+            def is_off_map_state(self):
+                return True
+
+        class Speed:
+            max_speed = 1
+            def is_cell_exit(self, speed):
+                return True
+
+        class Rail:
+            def __init__(self):
+                self.configurations = []
+            def apply_action_independent(self, action, configuration):
+                self.configurations.append(configuration)
+                return (configuration, True) if action in (1, 2, 3) else None
+
+        agent = SimpleNamespace(
+            current_configuration=None,
+            initial_configuration=((3, 4), 1),
+            target_configuration=None,
+            state=OffMapState(),
+            speed_counter=Speed(),
+            position=None, direction=None,
+        )
+        rail = Rail()
+        class RailEnv:
+            number_of_agents = 1
+            agents = [agent]
+            @staticmethod
+            def action_required(*args):
+                return True
+        raw = RailEnv()
+        raw.rail = rail
+        env = FlatlandCIGEnvironment(raw, observation_width=8)
+        mask = env.valid_action_mask(0)
+        self.assertTrue(mask[1] and mask[2] and mask[3])
+        self.assertFalse(mask[0] or mask[4])
+        self.assertTrue(rail.configurations)
+        self.assertTrue(all(cfg == ((3, 4), 1) for cfg in rail.configurations))
+
+    def test_external_training_capability_requires_clone_restore(self):
+        from envs.external_contract import BenchmarkCapabilities
+        cap = BenchmarkCapabilities(
+            "bad-training", True, True, False, True, False, False, False
+        )
+        self.assertFalse(cap.supports("training"))
+
+
 if __name__ == "__main__":
     unittest.main()

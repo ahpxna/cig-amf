@@ -556,10 +556,11 @@ def main(argv=None):
         reference_runner.env.set_behaviour_override("cooperative")
         bank_seed = int(seed) + 88001
         candidate_count = int(args.selector_states) * int(args.challenge_oversample)
-        candidate_states = reference_runner.env.sample_state_bank(
-            n_states=candidate_count, burn_in=3, bank_seed=bank_seed
-        )
         horizon = int(reference_runner.cfg["causal_horizon"])
+        candidate_states = reference_runner.env.sample_state_bank(
+            n_states=candidate_count, burn_in=3, bank_seed=bank_seed,
+            min_remaining_steps=horizon,
+        )
         discount = float(reference_runner.cfg["discount"])
         candidate_oracles = [
             _oracle_capacity_direction_for_state(

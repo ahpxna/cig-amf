@@ -29,7 +29,7 @@ class BenchmarkCapabilities:
 
     def supports(self, panel: str) -> bool:
         needs = {
-            "training": ("fixed_discrete_actions", "state_dependent_action_mask"),
+            "training": ("fixed_discrete_actions", "state_dependent_action_mask", "clone_restore"),
             "h1": ("clone_restore", "fixed_continuation", "fixed_discrete_actions"),
             "h2": ("clone_restore", "structural_intervention", "behavioural_intervention"),
             "latency": ("clone_restore", "fixed_continuation", "latency_oracle"),
@@ -55,8 +55,10 @@ class ExternalCIGEnvironment(Protocol):
 
 
 def flatten_observation(value: Any, width: int | None = None) -> np.ndarray:
-    """Stable float representation for dict, tuple, or tensor observations."""
-    if isinstance(value, Mapping):
+    """Stable finite float representation for optional nested observations."""
+    if value is None:
+        arr = np.zeros((0,), dtype=np.float32)
+    elif isinstance(value, Mapping):
         parts = [flatten_observation(value[key]) for key in sorted(value)]
         arr = np.concatenate(parts) if parts else np.zeros((0,), dtype=np.float32)
     elif isinstance(value, (tuple, list)):
@@ -64,8 +66,15 @@ def flatten_observation(value: Any, width: int | None = None) -> np.ndarray:
         arr = np.concatenate(parts) if parts else np.zeros((0,), dtype=np.float32)
     else:
         arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    # External libraries may encode unavailable sensor fields as NaN/Inf.
+    # Those values must never leak into policy/proxy inputs or silently poison
+    # pair-representation losses.  Preserve shape while making the normalized
+    # contract explicitly finite.
+    arr = np.nan_to_num(
+        arr.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0
+    )
     if width is None:
-        return arr.astype(np.float32)
+        return arr
     out = np.zeros((int(width),), dtype=np.float32)
     out[: min(out.size, arr.size)] = arr[: out.size]
     return out
@@ -78,6 +87,7 @@ def require_panel(env: ExternalCIGEnvironment, panel: str) -> None:
             "CIG-AMF causal contract; do not emit that claim."
         )
     required_methods = {
+        "training": ("clone_state", "restore_state"),
         "h1": ("clone_state", "restore_state", "fixed_continuation_policy", "oracle_lag_response"),
         "h2": ("clone_state", "restore_state", "apply_structural_intervention", "apply_behavioural_intervention"),
         "latency": ("clone_state", "restore_state", "fixed_continuation_policy", "oracle_lag_response"),

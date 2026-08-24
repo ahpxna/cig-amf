@@ -58,23 +58,21 @@ def _make_runner(
         "periph_require_full_signature": True,
         "periph_allow_legacy_items": False,
     })
+    if full_explicit:
+        full_k = int(n_agents) - 1
+        cfg.update({
+            "core_selection_mode": "full_explicit",
+            "belief_adaptive_k": False,
+            "min_core_size": full_k,
+            "belief_adaptive_k_min": full_k,
+            "max_core_size": full_k,
+            "seed_core_top_k": full_k,
+        })
     env = RE.make_main_env(
         task_mode="behavioral_drift", n_agents=int(n_agents), max_steps=30,
         phase_length=40, seed=int(seed),
     )
-    runner = RE.make_runner("Final-CIGAMF", env, cfg, device)
-    if full_explicit:
-        runner.cfg["core_selection_mode"] = "full_explicit"
-        for belief in runner.belief_modules.values():
-            belief.adaptive_k = False
-            belief.min_core_size = len(belief.neighbor_ids)
-            belief.max_core_size = len(belief.neighbor_ids)
-            belief.adaptive_k_min = len(belief.neighbor_ids)
-            belief.set_fixed_core(belief.neighbor_ids)
-        runner.pair_rel_module.reconcile_core_sets(
-            {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()}
-        )
-    return runner
+    return RE.make_runner("Final-CIGAMF", env, cfg, device)
 
 
 def _run(seed, episodes, device, variant, k_min, k_max, n_agents=24):

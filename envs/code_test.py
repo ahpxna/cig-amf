@@ -38,11 +38,11 @@ logic:
       blocking contributes -0.18 immediately and pushes +1.0 outside the
       horizon.
 
-Requested item (4), struct_value = reward(oracle-core) - reward(pure-MF), was
-NOT implemented anywhere in the repository at the time this diagnostic was
-written; a search for "structure_value" under envs/ returned no result. To
-avoid fabricating a number, this script ONLY prints a warning at the end and
-does not compute a synthetic value.
+Structure value is intentionally not recomputed inside this H/Phi unit
+diagnostic.  The repository now implements the separate zero-cost oracle-core
+prerequisite in ``envs/structure_value_tier0.py`` and executes it through
+``run_oracle.py``.  Keeping the experiments separate prevents this diagnostic
+from fabricating or duplicating the Section-7 quantity.
 """
 import sys
 import numpy as np
@@ -257,7 +257,8 @@ def main():
                   f"zones) = {mean_w:+.4f}")
 
     # ------------------------------------------------------------
-    # (2)/(4) Interpret Pearson versus sign agreement and warn about structure_value.
+    # (2)/(4) Interpret Pearson versus sign agreement and point to the
+    # dedicated structure-value experiment.
     # ------------------------------------------------------------
     print("\n" + "=" * 78)
     print("INTERPRETATION")
@@ -277,14 +278,9 @@ def main():
               "The 'good signs, weak Pearson' condition is not met; inspect "
               "the raw values above before drawing a conclusion.")
 
-    print("\n[WARNING] structure_value = reward(oracle-core) - reward(pure-MF) "
-          "was NOT implemented in this repository when this diagnostic was "
-          "written; no 'structure_value' definition was found under envs/. "
-          "This script DOES NOT fabricate that value. Computing the Section 7 "
-          "quantity requires separate implementations of (a) a policy that "
-          "acts using only top-k |W*| oracle-core pairs and (b) a pure "
-          "mean-field/random control policy, followed by comparison of total "
-          "reward over identical episodes and seeds.")
+    print("\n[INFO] structure-value is evaluated separately by run_oracle.py "
+          "using envs/structure_value_tier0.py. This H/Phi diagnostic does "
+          "not duplicate that experiment or mix its gate into the unit check.")
 
 
 if __name__ == "__main__":
