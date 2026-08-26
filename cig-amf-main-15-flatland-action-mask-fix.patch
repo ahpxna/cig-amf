@@ -1,0 +1,155 @@
+diff -ruN a/envs/flatland_adapter.py b/envs/flatland_adapter.py
+--- a/envs/flatland_adapter.py	2026-08-25 05:29:51.491290071 +0000
++++ b/envs/flatland_adapter.py	2026-08-25 05:42:55.131770131 +0000
+@@ -186,7 +186,25 @@
+                 "Flatland requires an action but exposes no effective configuration"
+             )
+         position, direction = configuration
+-        for action in range(5):
++        # RailEnv.step() normalizes the discrete integer through
++        # RailEnvActions.from_value() before asking the transition map to
++        # resolve it.  The pinned fastenum action type is not guaranteed to
++        # compare equal to a raw int inside _check_action_new(), so the mask
++        # must mirror that preprocessing exactly when Flatland is installed.
++        try:
++            from flatland.envs.rail_env_action import RailEnvActions
++        except ImportError:
++            # Keep the adapter module/unit-testable without the optional
++            # benchmark dependency.  Real external execution is already gated
++            # by the managed-runtime import verifier.
++            RailEnvActions = None
++
++        for action_value in range(5):
++            action = (
++                RailEnvActions.from_value(action_value)
++                if RailEnvActions is not None
++                else action_value
++            )
+             try:
+                 allowed = (
+                     self.rail_env.rail.apply_action_independent(
+@@ -202,9 +220,34 @@
+                     "Flatland action-mask resolution failed; refusing a "
+                     "fail-open support set"
+                 ) from exc
+-            mask[action] = bool(allowed)
++            mask[action_value] = bool(allowed)
++
+         if not np.any(mask):
+-            raise RuntimeError("Flatland reported no valid action for an action-required agent")
++            # A current rail configuration with no outgoing transition is a
++            # real topology/API invariant violation and must still fail closed.
++            try:
++                outgoing = np.asarray(
++                    self.rail_env.rail.get_transitions(((position[0], position[1]), direction)),
++                    dtype=bool,
++                ).reshape(-1)
++            except (AttributeError, TypeError, ValueError, IndexError) as exc:
++                raise RuntimeError(
++                    "Flatland action-mask fallback could not verify the current "
++                    "rail configuration"
++                ) from exc
++            if not np.any(outgoing[:4]):
++                raise RuntimeError(
++                    "Flatland action-required agent is on a configuration with "
++                    "no outgoing rail transition"
++                )
++
++            # RailEnv.step() still accepts STOP_MOVING when an independent
++            # movement successor cannot be formed: the action is converted to
++            # RailEnvActions, stop_action_given is recorded, and invalid
++            # movement drives new_speed to zero.  Expose only that safe
++            # non-moving fallback rather than failing the entire episode or
++            # marking movement actions valid.
++            mask[4] = True
+         return mask
+     def _reachable_rail_cells(self, agent, depth_limit=32):
+         """Bounded rail-topology trace keyed by reachable cell and distance."""
+diff -ruN a/tests/test_audit_hardening.py b/tests/test_audit_hardening.py
+--- a/tests/test_audit_hardening.py	2026-08-24 19:57:39.000000000 +0000
++++ b/tests/test_audit_hardening.py	2026-08-25 05:42:55.681139561 +0000
+@@ -286,6 +286,84 @@
+         self.assertTrue(rail.configurations)
+         self.assertTrue(all(cfg == ((3, 4), 1) for cfg in rail.configurations))
+ 
++    def test_flatland_action_mask_uses_safe_stop_when_successors_are_temporarily_unavailable(self):
++        from types import SimpleNamespace
++        from envs.flatland_adapter import FlatlandCIGEnvironment
++
++        class State:
++            def is_off_map_state(self):
++                return False
++
++        class Speed:
++            max_speed = 1
++            def is_cell_exit(self, speed):
++                return True
++
++        class Rail:
++            def apply_action_independent(self, action, configuration):
++                return None
++            def get_transitions(self, configuration):
++                return (False, True, False, False)
++
++        agent = SimpleNamespace(
++            current_configuration=((4, 4), 1),
++            initial_configuration=((4, 4), 1),
++            target_configuration=None,
++            state=State(),
++            speed_counter=Speed(),
++            position=(4, 4), direction=1,
++        )
++        class RailEnv:
++            number_of_agents = 1
++            agents = [agent]
++            rail = Rail()
++            @staticmethod
++            def action_required(*args):
++                return True
++
++        env = FlatlandCIGEnvironment(RailEnv(), observation_width=8)
++        mask = env.valid_action_mask(0)
++        self.assertEqual(mask.tolist(), [False, False, False, False, True])
++
++    def test_flatland_action_mask_still_fails_closed_on_invalid_configuration(self):
++        from types import SimpleNamespace
++        from envs.flatland_adapter import FlatlandCIGEnvironment
++
++        class State:
++            def is_off_map_state(self):
++                return False
++
++        class Speed:
++            max_speed = 1
++            def is_cell_exit(self, speed):
++                return True
++
++        class Rail:
++            def apply_action_independent(self, action, configuration):
++                return None
++            def get_transitions(self, configuration):
++                return (False, False, False, False)
++
++        agent = SimpleNamespace(
++            current_configuration=((4, 4), 1),
++            initial_configuration=((4, 4), 1),
++            target_configuration=None,
++            state=State(),
++            speed_counter=Speed(),
++            position=(4, 4), direction=1,
++        )
++        class RailEnv:
++            number_of_agents = 1
++            agents = [agent]
++            rail = Rail()
++            @staticmethod
++            def action_required(*args):
++                return True
++
++        env = FlatlandCIGEnvironment(RailEnv(), observation_width=8)
++        with self.assertRaisesRegex(RuntimeError, "no outgoing rail transition"):
++            env.valid_action_mask(0)
++
+     def test_external_training_capability_requires_clone_restore(self):
+         from envs.external_contract import BenchmarkCapabilities
+         cap = BenchmarkCapabilities(

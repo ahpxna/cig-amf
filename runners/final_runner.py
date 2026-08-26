@@ -301,9 +301,13 @@ class FinalCIGAMFRunner:
                 neighbor_ids=[j for j in range(self.n_agents) if j != ego],
                 lambda_0=cfg["belief_lambda_0"],
                 uncertainty_scale=cfg["belief_uncertainty_scale"],
-                tau=cfg["belief_tau"],
-                tau_in=cfg["belief_tau_in"],
-                tau_out=cfg["belief_tau_out"],
+                tau=cfg.get("belief_tau_enter", cfg.get("belief_tau", 0.005)),
+                tau_in=1.0,
+                tau_out=cfg.get(
+                    "belief_hysteresis_ratio",
+                    cfg.get("belief_tau_out", 0.35)
+                    / max(cfg.get("belief_tau_in", 0.55), 1e-8),
+                ),
                 weak_prior_top_k=cfg["seed_core_top_k"],
                 min_core_size=(
                     self.n_agents - 1 if full_explicit_mode
@@ -423,9 +427,15 @@ class FinalCIGAMFRunner:
             neighbor_ids=[j for j in range(self.n_agents) if j != ego],
             lambda_0=self.cfg["belief_lambda_0"],
             uncertainty_scale=self.cfg["belief_uncertainty_scale"],
-            tau=self.cfg["belief_tau"],
-            tau_in=self.cfg["belief_tau_in"],
-            tau_out=self.cfg["belief_tau_out"],
+            tau=self.cfg.get(
+                "belief_tau_enter", self.cfg.get("belief_tau", 0.005)
+            ),
+            tau_in=1.0,
+            tau_out=self.cfg.get(
+                "belief_hysteresis_ratio",
+                self.cfg.get("belief_tau_out", 0.35)
+                / max(self.cfg.get("belief_tau_in", 0.55), 1e-8),
+            ),
             weak_prior_top_k=self.cfg["seed_core_top_k"],
         )
 

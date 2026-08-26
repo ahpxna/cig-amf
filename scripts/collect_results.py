@@ -1,8 +1,9 @@
-"""Validate and aggregate fresh H1/H2/H3 summaries.
+"""Validate and aggregate fresh H1/H2 summaries plus optional legacy H3 diagnostics.
 
-Default paths remain ``results/h1``, ``results/h2``, and ``results/h3``.
-Passing ``--run-root`` instead reads the three experiment directories below
-that isolated root and writes ``summary_tables.md`` beside them.
+Default paths are ``results/h1`` and ``results/h2``. Legacy ``results/h3``
+is included only when the caller explicitly supplies ``--expected-h3-seeds``.
+Passing ``--run-root`` reads the selected experiment directories below that
+isolated root and writes ``summary_tables.md`` beside them.
 
 The collector rejects partial seed matrices, duplicate rows, and non-finite
 claim metrics. H2 additionally requires the complete-attempt manifest written
@@ -23,16 +24,22 @@ try:
 except ModuleNotFoundError:  # Support ``import scripts.collect_results`` in tests.
     from scripts.exp_common import ROOT
 
+try:
+    import run_h1_calibration as H1
+except ModuleNotFoundError:
+    from scripts import run_h1_calibration as H1
 
-H1_VARIANTS = {
-    "row_aipw_diag_eps005",
-    "plugin_eps005",
-    "plugin_eps000",
-    "plugin_eps001",
-    "plugin_eps003",
-    "plugin_eps008",
-    "plugin_eps012",
-}
+
+try:
+    import run_h2_selectivity as H2
+except ModuleNotFoundError:
+    from scripts import run_h2_selectivity as H2
+
+
+# Derive the H1 artifact contract from the producing runner so collector and
+# experiment code cannot silently drift to different protocol versions or
+# preregistered variant sets.
+H1_VARIANTS = {str(name) for name, _ in H1.VARIANTS}
 H3_VARIANTS = {
     "Full-CIGAMF",
     "Scalar-Only",
@@ -41,8 +48,8 @@ H3_VARIANTS = {
     "Fixed-Cardinality",
     "NoMultiMemory-SingleMean",
 }
-H2_PROTOCOL_VERSION = "h2_factorial_frozen_policy_v6"
-H1_PROTOCOL_VERSION = "h1_qcd_crossfit_v4"
+H2_PROTOCOL_VERSION = H2.PROTOCOL_VERSION
+H1_PROTOCOL_VERSION = H1.PROTOCOL_VERSION
 
 SPECS = {
     "h1": {
@@ -66,7 +73,7 @@ SPECS = {
         ],
     },
     "h2": {
-        "title": "H2 — RQ2: tier separation and selectivity (Eq. 33)",
+        "title": "H2 — Paper A: paired 2×2 structural/behavioural selectivity",
         "filename": "summary_h2.csv",
         "group_key": "model",
         "expected_groups": None,  # Read from the complete H2 manifest.
@@ -94,7 +101,7 @@ SPECS = {
         ],
     },
     "h3": {
-        "title": "H3 — RQ3: slot collapse and capacity allocation",
+        "title": "Legacy H3 diagnostic — slot-system ablations (not a Paper A/B gate)",
         "filename": "summary_h3.csv",
         "group_key": "variant",
         "expected_groups": H3_VARIANTS,
@@ -504,7 +511,13 @@ def collect(
     }
     loaded = {}
     h2_marker = None
-    for name, spec in SPECS.items():
+    # Legacy H3 is no longer a Paper-A/Paper-B gate. Do not let a stale or
+    # partial h3/ directory from a prior diagnostic invalidate current paper
+    # aggregation. The caller must opt in explicitly with expected_h3_seeds.
+    include_legacy_h3 = expected_h3_seeds is not None
+    selected_names = ["h1", "h2"] + (["h3"] if include_legacy_h3 else [])
+    for name in selected_names:
+        spec = SPECS[name]
         experiment_dir = os.path.join(run_root, name)
         expected_for_name = expected_by_name[name]
         if name == "h1":
@@ -531,7 +544,7 @@ def collect(
             rows, h2_marker = _load_h2_complete_rows(experiment_dir)
             expected_groups = set(h2_marker.get("models", []))
             marker_seeds = [int(seed) for seed in h2_marker.get("seeds", [])]
-            if expected_for_name is not None and marker_seeds != list(expected_for_name):
+            if expected_for_name is not None and sorted(marker_seeds) != sorted(expected_for_name):
                 raise ResultValidationError(
                     f"h2: manifest seeds {marker_seeds} do not match "
                     f"expected seeds {list(expected_for_name)}"
@@ -548,7 +561,7 @@ def collect(
                     f"found {sorted(expected_groups)}"
                 )
             marker_seeds = [int(seed) for seed in h3_attempt.get("seeds", [])]
-            if expected_for_name is not None and marker_seeds != list(expected_for_name):
+            if expected_for_name is not None and sorted(marker_seeds) != sorted(expected_for_name):
                 raise ResultValidationError(
                     f"h3: attempt seeds {marker_seeds} do not match "
                     f"expected seeds {list(expected_for_name)}"
@@ -564,7 +577,8 @@ def collect(
         loaded[name] = rows
 
     markdown = ["# CIG-AMF validated experiment summary (mean ± population SD)\n"]
-    for name, spec in SPECS.items():
+    for name in selected_names:
+        spec = SPECS[name]
         markdown.append(f"\n## {spec['title']}\n\n")
         markdown.append(
             _render_table(loaded[name], spec["group_key"], spec["metrics"])
@@ -572,23 +586,22 @@ def collect(
 
     markdown.append("\n## Claim gates\n\n")
     markdown.append(
-        "- H1 passes only if the DR condition improves ranking over plug-in and "
-        "the observational control, with sign agreement at least 0.75.\n"
+        "- H1 is adjudicated by one-step Q/C/D recovery plus intervention "
+        "support integrity. Row-AIPW/cross-fitted AIPW and epsilon sweeps are "
+        "estimator/manipulation diagnostics, not superiority gates.\n"
     )
     markdown.append(
-        "- H2 passes only if Final-CIGAMF has SR clearly above 1, the "
-        "CorrelationMeanField observational comparator is near 1, and recovery "
-        "is observed with matched triggers. NoTwoTimescale isolates the scheduler; "
-        "PureMeanField cannot define Eq. 33 because it has no W matrix.\n"
+        "- H2 is adjudicated by matched-seed 2×2 structural/behavioural "
+        "factorial contrasts and the frozen tracking/false-alarm protocol. "
+        "The implementation reports paired seed-level contrasts rather than "
+        "claiming that a library MixedLM fit was executed.\n"
     )
-    markdown.append(
-        "- H3 passes only if slot entropy remains high while off-diagonal slot "
-        "cosine is low, semantic/auxiliary ablations degrade, and the "
-        "Fixed-Cardinality control is "
-        "verified as constant rather than adaptive. The decision endpoint is "
-        "matched-seed post-warm-up F1 against the faithful single-mean "
-        "ablation; reward and common-probe throughput are reported separately.\n"
-    )
+    if include_legacy_h3:
+        markdown.append(
+            "- Legacy H3 slot-system ablations are diagnostic only. They do "
+            "not adjudicate Paper A or Paper B and cannot invalidate an "
+            "otherwise complete paper-specific run.\n"
+        )
     text = "".join(markdown)
     output_path = os.path.join(run_root, "summary_tables.md")
     _atomic_write_text(output_path, text)
@@ -601,7 +614,7 @@ def main(argv=None):
         "--run-root",
         default=os.path.join(ROOT, "results"),
         help=(
-            "Root containing h1/, h2/, and h3/ (absolute or relative to the "
+            "Root containing h1/ and h2/ plus optional h3/ (absolute or relative to the "
             "repository root). Default: results/"
         ),
     )

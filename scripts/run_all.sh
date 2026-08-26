@@ -4,6 +4,7 @@
 #   bash scripts/run_all.sh
 #   bash scripts/run_all.sh --quick
 #   bash scripts/run_all.sh --claims-only
+#   bash scripts/run_all.sh --with-legacy-h3   # optional diagnostic only
 #   bash scripts/run_all.sh --run-id 20260821_confirmatory
 #
 # Confirmatory mode uses eight paired seeds for every hypothesis panel.
@@ -29,6 +30,7 @@ fi
 
 CIG_QUICK=0
 CIG_CLAIMS_ONLY=0
+CIG_RUN_LEGACY_H3="${CIG_RUN_LEGACY_H3:-0}"
 CIG_RUN_ID=""
 CIG_DEVICE="${CIG_DEVICE:-cpu}"
 # A frozen oracle-only threshold artifact is mandatory for confirmatory H1.
@@ -55,6 +57,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --claims-only)
       CIG_CLAIMS_ONLY=1
+      shift
+      ;;
+    --with-legacy-h3)
+      CIG_RUN_LEGACY_H3=1
       shift
       ;;
     --run-id)
@@ -127,6 +133,14 @@ if [ "${#CIG_H1_SEED_ARRAY[@]}" -eq 0 ] || [ "${#CIG_H23_SEED_ARRAY[@]}" -eq 0 ]
   echo "CIG_RUN_SEEDS resolved to an empty seed list." >&2
   exit 2
 fi
+
+case "$CIG_RUN_LEGACY_H3" in
+  0|1) ;;
+  *)
+    echo "CIG_RUN_LEGACY_H3 must be 0 or 1." >&2
+    exit 2
+    ;;
+esac
 
 if [ "$CIG_MODE" = "confirmatory" ] && [ "${CIG_ALLOW_DIRTY_CONFIRMATORY:-0}" != "1" ]; then
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
@@ -252,6 +266,7 @@ printf 'category\tlabel\texit_code\telapsed_seconds\tlog\n' > "$CIG_STATUS_TSV"
   printf 'python=%s\n' "$CIG_PYTHON"
   printf 'device=%s\n' "$CIG_DEVICE"
   printf 'profile=%s\n' "$([ "$CIG_CLAIMS_ONLY" -eq 1 ] && printf claims-only || printf complete)"
+  printf 'legacy_h3=%s\n' "$CIG_RUN_LEGACY_H3"
   printf 'h1_seeds=%s\n' "${CIG_H1_SEED_ARRAY[*]}"
   printf 'h2_h3_seeds=%s\n' "${CIG_H23_SEED_ARRAY[*]}"
   printf 'h2_episodes=%s\n' "$CIG_H2_EPISODES"
@@ -367,7 +382,11 @@ CIG_PB_PAIR_VARIANT_COUNT=$("$CIG_PYTHON" -c 'from scripts.run_paper_b_pair_late
 CIG_PB_PERIPH_VARIANT_COUNT=$("$CIG_PYTHON" -c 'from scripts.run_paper_b_periphery import VARIANTS; print(len(VARIANTS))')
 echo "Planned H1 attempts: $((CIG_H1_VARIANT_COUNT * ${#CIG_H1_SEED_ARRAY[@]}))"
 echo "Planned H2 episodes: $((CIG_H2_MODEL_COUNT * ${#CIG_H23_SEED_ARRAY[@]} * (4 * CIG_H2_EPISODES + CIG_H2_PRETRAIN_EPISODES)))"
-echo "Planned H3 episodes: $((CIG_H3_VARIANT_COUNT * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
+if [ "$CIG_RUN_LEGACY_H3" -eq 1 ]; then
+  echo "Planned legacy H3 episodes: $((CIG_H3_VARIANT_COUNT * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
+else
+  echo "Planned legacy H3 episodes: 0 (diagnostic disabled)"
+fi
 echo "Planned Paper-B allocation episodes: $((CIG_PB_ALLOC_VARIANT_COUNT * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES + ${#CIG_H23_SEED_ARRAY[@]} * CIG_H2_PRETRAIN_EPISODES))"
 echo "Planned Paper-B adaptive-budget episodes: $((6 * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
 echo "Planned Paper-B pair-latent episodes: $((CIG_PB_PAIR_VARIANT_COUNT * ${#CIG_H23_SEED_ARRAY[@]} * CIG_H3_EPISODES))"
@@ -569,12 +588,16 @@ run_logged "hypothesis" "Paper-A H2 factorial structural/behavioural selectivity
     --cusum-calibration "$CIG_CUSUM_CALIBRATION" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/h2"
-run_logged "ablation" "Legacy end-to-end slot-system ablations" "62_h3.log" \
-  "$CIG_PYTHON" scripts/run_h3_slots.py \
-  --seeds "${CIG_H23_SEED_ARRAY[@]}" \
-  --episodes "$CIG_H3_EPISODES" \
-  --device "$CIG_DEVICE" \
-  --out-root "$CIG_RUN_DIR/h3"
+if [ "$CIG_RUN_LEGACY_H3" -eq 1 ]; then
+  run_logged "ablation" "Legacy end-to-end slot-system ablations" "62_h3.log" \
+    "$CIG_PYTHON" scripts/run_h3_slots.py \
+    --seeds "${CIG_H23_SEED_ARRAY[@]}" \
+    --episodes "$CIG_H3_EPISODES" \
+    --device "$CIG_DEVICE" \
+    --out-root "$CIG_RUN_DIR/h3"
+else
+  echo "SKIP: legacy H3 diagnostic is not a Paper-A/Paper-B claim gate."
+fi
 run_logged "allocation" "Paper-B selector isolation and end-to-end allocation" "63_paper_b_allocation.log" \
   "$CIG_PYTHON" scripts/run_paper_b_allocation.py \
   --seeds "${CIG_H23_SEED_ARRAY[@]}" \
@@ -630,12 +653,16 @@ fi
 # 8. Run-scoped aggregation and scientific gates.
 # ---------------------------------------------------------------------------
 echo "=== [8/9] Aggregation and claim validation ==="
+CIG_COLLECT_ARGS=(
+  --run-root "$CIG_RUN_DIR"
+  --expected-h1-seeds "${CIG_H1_SEED_ARRAY[@]}"
+  --expected-h2-seeds "${CIG_H23_SEED_ARRAY[@]}"
+)
+if [ "$CIG_RUN_LEGACY_H3" -eq 1 ]; then
+  CIG_COLLECT_ARGS+=(--expected-h3-seeds "${CIG_H23_SEED_ARRAY[@]}")
+fi
 run_logged "report" "Aggregate experiment results" "71_collect_results.log" \
-  "$CIG_PYTHON" scripts/collect_results.py \
-  --run-root "$CIG_RUN_DIR" \
-  --expected-h1-seeds "${CIG_H1_SEED_ARRAY[@]}" \
-  --expected-h2-seeds "${CIG_H23_SEED_ARRAY[@]}" \
-  --expected-h3-seeds "${CIG_H23_SEED_ARRAY[@]}"
+  "$CIG_PYTHON" scripts/collect_results.py "${CIG_COLLECT_ARGS[@]}"
 run_paper_validation "Validate Paper A" "72_validate_paper_a.log" \
   "$CIG_PYTHON" scripts/validate_paper_a.py \
   --run-root "$CIG_RUN_DIR" \

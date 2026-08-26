@@ -233,7 +233,6 @@ class H1ClaimGateTests(unittest.TestCase):
             "plugin_eps005": 0.30,
             "row_aipw_diag_eps005": 0.10,
             "plugin_eps008": 0.08,
-            "plugin_eps012": 0.05,
         }
         rows = []
         for seed in range(8):

@@ -956,12 +956,13 @@ class FullExplicitLocalRunner:
 
     def __init__(self, env, cfg, device="cpu"):
         self.env = env
+        self.env_adapter = resolve_env_adapter(env)
         self.cfg = dict(cfg)
         self.device = device
 
-        self.n_agents = int(env.n_agents)
-        self.obs_dim = int(env.get_obs_dim())
-        self.action_dim = int(env.get_action_dim())
+        self.n_agents = int(self.env_adapter.n_agents)
+        self.obs_dim = int(self.env_adapter.obs_dim)
+        self.action_dim = int(self.env_adapter.max_action_dim)
 
         self.explicit_dim = self.action_dim + 4
         self.hidden = int(cfg.get("policy_hidden", 160))
@@ -1058,7 +1059,7 @@ class FullExplicitLocalRunner:
         explicit_batch = []
 
         for ego in range(self.n_agents):
-            obs_batch.append(self.env.get_obs_of_ego(obs_all, ego))
+            obs_batch.append(self.env_adapter.observation(obs_all, ego))
             explicit_batch.append(self._explicit_summary_for_ego(ego, last_actions))
 
         obs_t = torch.tensor(np.stack(obs_batch), dtype=torch.float32, device=self.device)
@@ -1066,17 +1067,26 @@ class FullExplicitLocalRunner:
 
         with torch.no_grad():
             logits, values = self._forward(obs_t, explicit_t)
+            valid_action_masks = np.stack([
+                self.env_adapter.valid_action_mask(agent)
+                for agent in range(self.n_agents)
+            ], axis=0)
+            valid_t = torch.tensor(
+                valid_action_masks, dtype=torch.bool, device=logits.device
+            )
+            logits = logits.masked_fill(~valid_t, -torch.inf)
             probs = torch.softmax(logits, dim=-1)
             dist = torch.distributions.Categorical(probs=probs)
             sampled = dist.sample().detach().cpu().numpy()
 
+        self._last_valid_action_masks = valid_action_masks
         actions = [int(a) for a in sampled]
         values_np = values.detach().cpu().numpy().astype(np.float32)
 
         return actions, values_np, explicit_batch
 
     def collect_episode(self):
-        obs_all = self.env.reset()
+        obs_all = self.env_adapter.reset()
 
         done = False
         trajectory = []
@@ -1087,9 +1097,9 @@ class FullExplicitLocalRunner:
         while not done:
             actions, values_np, explicit_batch = self._select_actions_population(obs_all)
 
-            env_snapshot_before_step = self.env.clone_state()
-            next_obs_all, rewards, done, info = self.env.step(actions)
-            env_snapshot_after_step = self.env.clone_state()
+            env_snapshot_before_step = self.env_adapter.clone_state()
+            next_obs_all, rewards, done, info = self.env_adapter.step(actions)
+            env_snapshot_after_step = self.env_adapter.clone_state()
 
             rewards = np.array(rewards, dtype=np.float32)
             ep_reward += rewards
@@ -1099,6 +1109,9 @@ class FullExplicitLocalRunner:
                     "obs_all": [x.copy() for x in obs_all],
                     "explicit_context": [x.copy() for x in explicit_batch],
                     "actions": list(actions),
+                    "valid_action_masks": np.asarray(
+                        self._last_valid_action_masks, dtype=bool
+                    ),
                     "rewards": list(rewards),
                     "values": list(values_np),
                     "env_snapshot_before_step": env_snapshot_before_step,
@@ -1136,7 +1149,7 @@ class FullExplicitLocalRunner:
             returns_batch = []
 
             for ego in range(self.n_agents):
-                obs_batch.append(self.env.get_obs_of_ego(step["obs_all"], ego))
+                obs_batch.append(self.env_adapter.observation(step["obs_all"], ego))
                 explicit_batch.append(step["explicit_context"][ego])
                 actions_batch.append(int(step["actions"][ego]))
                 returns_batch.append(float(returns[t][ego]))
@@ -1147,6 +1160,12 @@ class FullExplicitLocalRunner:
             ret_t = torch.tensor(returns_batch, dtype=torch.float32, device=self.device)
 
             logits, value = self._forward(obs_t, explicit_t)
+            valid_t = torch.tensor(
+                np.asarray(step["valid_action_masks"], dtype=bool),
+                dtype=torch.bool,
+                device=logits.device,
+            )
+            logits = logits.masked_fill(~valid_t, -torch.inf)
             probs = torch.softmax(logits, dim=-1)
             dist = torch.distributions.Categorical(probs=probs)
 
@@ -1471,9 +1490,15 @@ class SharedAblationBase:
             neighbor_ids=[j for j in range(self.n_agents) if j != ego],
             lambda_0=self.cfg["belief_lambda_0"],
             uncertainty_scale=self.cfg["belief_uncertainty_scale"],
-            tau=self.cfg["belief_tau"],
-            tau_in=self.cfg["belief_tau_in"],
-            tau_out=self.cfg["belief_tau_out"],
+            tau=self.cfg.get(
+                "belief_tau_enter", self.cfg.get("belief_tau", 0.005)
+            ),
+            tau_in=1.0,
+            tau_out=self.cfg.get(
+                "belief_hysteresis_ratio",
+                self.cfg.get("belief_tau_out", 0.35)
+                / max(self.cfg.get("belief_tau_in", 0.55), 1e-8),
+            ),
             weak_prior_top_k=self.cfg["seed_core_top_k"],
         )
 

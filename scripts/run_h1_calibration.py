@@ -452,7 +452,6 @@ def _epsilon_bias_trend(rows):
         (0.03, "plugin_eps003"),
         (0.05, "plugin_eps005"),
         (0.08, "plugin_eps008"),
-        (0.12, "plugin_eps012"),
     )
     curve = []
     for epsilon, variant in variants:

@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Sequence
 import numpy as np
 
 from envs.external_contract import BenchmarkCapabilities, flatten_observation
+from utils.latency_protocol import LATENCY_ONSET_ABS_FLOOR, LATENCY_ONSET_FRACTION
 
 
 class ExternalCIGAdapter:
@@ -171,7 +172,11 @@ class ExternalPopulationMixin:
         if total_mass <= 1e-12:
             onset = peak = centre = None
         else:
-            onset = int(np.flatnonzero(mass >= 0.10 * float(mass.max()))[0])
+            onset_threshold = max(
+                LATENCY_ONSET_ABS_FLOOR,
+                LATENCY_ONSET_FRACTION * float(mass.max()),
+            )
+            onset = int(np.flatnonzero(mass >= onset_threshold)[0])
             peak = int(np.argmax(mass))
             centre = float(np.dot(np.arange(horizon, dtype=np.float64), mass) / total_mass)
         weights = float(discount) ** np.arange(horizon, dtype=np.float64)

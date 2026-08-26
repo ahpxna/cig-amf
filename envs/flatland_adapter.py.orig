@@ -80,12 +80,10 @@ class FlatlandCIGEnvironment(ExternalPopulationMixin):
         "Flatland", True, True, True, True, False, False, False
     )
 
-    def __init__(self, rail_env, observation_width: int = 256, max_steps: int = 60):
+    def __init__(self, rail_env, observation_width: int = 256):
         self.rail_env = rail_env
         self.n_agents = int(getattr(rail_env, "number_of_agents", len(rail_env.agents)))
         self.obs_dim = int(observation_width)
-        self.max_steps = max(1, int(max_steps))
-        self._step_count = 0
         self.causal_adapter = FlatlandCIGAdapter(self)
         self._obs = [np.zeros(self.obs_dim, dtype=np.float32) for _ in range(self.n_agents)]
         self.last_actions = [0 for _ in range(self.n_agents)]
@@ -123,8 +121,6 @@ class FlatlandCIGEnvironment(ExternalPopulationMixin):
                 raise RuntimeError("unsupported Flatland reset API: no random_seed/seed parameter")
         observations = result[0] if isinstance(result, tuple) else result
         self._obs = self._normalise_obs(observations)
-        self._step_count = 0
-        self.last_actions = [0 for _ in range(self.n_agents)]
         self._route_cache.clear()
         return self._obs
     def step(self, actions):
@@ -146,8 +142,6 @@ class FlatlandCIGEnvironment(ExternalPopulationMixin):
             observations, rewards, terminated, truncated, info = result
             done = bool(terminated.get("__all__", False) or truncated.get("__all__", False))
         self.last_actions = [int(a) for a in actions]
-        self._step_count += 1
-        done = bool(done or self._step_count >= self.max_steps)
         self._obs = self._normalise_obs(observations)
         self._route_cache.clear()
         return self._obs, [float(rewards.get(i, 0.0)) for i in range(self.n_agents)], done, dict(info)
@@ -409,7 +403,6 @@ class FlatlandCIGEnvironment(ExternalPopulationMixin):
             self.last_actions,
             self._behaviour_override,
             self._route_cache,
-            self._step_count,
         ) = state
     def fixed_continuation_policy(self, agent):
         mask = self.valid_action_mask(agent)

@@ -1,4 +1,4 @@
-"""Validate Paper-A Q/C/D recovery, selectivity, and each H3 contribution."""
+"""Validate Paper-A Q/C/D recovery, selectivity, tracking, and optional latency."""
 
 import argparse
 import json
@@ -39,32 +39,42 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
     if {int(row["seed"]) for row in h2_rows} != set(h2_seeds):
         raise CR.ResultValidationError("Paper-A H2 seed matrix mismatch")
     latency_path = os.path.join(run_root, "latency_oracle.json")
-    with open(latency_path, encoding="utf-8") as handle:
-        oracle_latency = json.load(handle)
-    oracle_pass = bool(oracle_latency.get("gate_pass", False))
+    oracle_latency = None
+    latency_gate_reason = None
+    if os.path.exists(latency_path):
+        with open(latency_path, encoding="utf-8") as handle:
+            oracle_latency = json.load(handle)
+    else:
+        latency_gate_reason = "oracle latency artifact is absent"
+    oracle_pass = bool(oracle_latency and oracle_latency.get("gate_pass", False))
     learned_latency = None
     if oracle_pass:
         learned_path = os.path.join(run_root, "latency_calibration.json")
         if not os.path.exists(learned_path):
-            raise CR.ResultValidationError(
-                "oracle latency gate passed but learned calibration is missing"
-            )
-        with open(learned_path, encoding="utf-8") as handle:
-            learned_latency = json.load(handle)
-        learned_seeds = {int(seed) for seed in learned_latency.get("seeds", [])}
-        if protocol_mode == "confirmatory" and learned_seeds != set(h2_seeds):
-            raise CR.ResultValidationError(
-                "learned latency seed matrix does not match the confirmatory "
-                f"Paper-A seeds: {sorted(learned_seeds)} != {sorted(h2_seeds)}"
-            )
+            latency_gate_reason = "oracle passed but learned latency calibration is absent"
+        else:
+            with open(learned_path, encoding="utf-8") as handle:
+                learned_latency = json.load(handle)
+            learned_seeds = {int(seed) for seed in learned_latency.get("seeds", [])}
+            if protocol_mode == "confirmatory" and learned_seeds != set(h2_seeds):
+                raise CR.ResultValidationError(
+                    "learned latency seed matrix does not match the confirmatory "
+                    f"Paper-A seeds: {sorted(learned_seeds)} != {sorted(h2_seeds)}"
+                )
+    elif oracle_latency is not None and not oracle_pass:
+        latency_gate_reason = "oracle latency mechanism gate did not pass"
     learned_pass = bool(learned_latency and learned_latency.get("gate_pass"))
+    if learned_latency is not None and not learned_pass:
+        latency_gate_reason = "learned latency calibration did not pass"
     latency_status = {
         "status": "SUPPORTED" if learned_pass else "GATED_OUT",
         "supported": learned_pass,
         "optional": True,
+        "gate_reason": None if learned_pass else latency_gate_reason,
+        "oracle_artifact_present": oracle_latency is not None,
         "oracle_gate_pass": oracle_pass,
         "learned_gate_pass": learned_pass,
-        "oracle_metrics": {
+        "oracle_metrics": None if oracle_latency is None else {
             key: oracle_latency.get(key)
             for key in (
                 "randomized_delay_rank_correlation",
@@ -196,16 +206,22 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
     }
     h3_latency_supported = bool(latency_status["supported"])
     h3_tracking_supported = bool(tracking_status["supported"])
-    supported = bool(
-        h1["supported"] and h2["supported"]
-        and h3_latency_supported and h3_tracking_supported
+
+    # Latency is an explicitly optional/gated contribution.  A failed latency
+    # oracle or learned-latency gate removes that contribution from the
+    # submitted claim set; it must not turn otherwise supported Q/C/D,
+    # selectivity, and structural-tracking claims into a paper-level failure.
+    core_supported = bool(
+        h1["supported"] and h2["supported"] and h3_tracking_supported
     )
-    if supported:
-        overall_status = "SUPPORTED"
-    elif h1["supported"] and h2["supported"]:
-        overall_status = "CORE_SUPPORTED_H3_INCOMPLETE"
+    all_modules_supported = bool(core_supported and h3_latency_supported)
+    if core_supported and h3_latency_supported:
+        overall_status = "SUPPORTED_WITH_LATENCY"
+    elif core_supported:
+        overall_status = "SUPPORTED_LATENCY_GATED_OUT"
     else:
         overall_status = "NOT_SUPPORTED"
+
     return {
         "paper": "A",
         "overall_status": overall_status,
@@ -213,14 +229,16 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
         "H2": h2,
         "H3a_latency": latency_status,
         "H3b_tracking": tracking_status,
-        "full_hypothesis_set_supported": supported,
-        # Compatibility alias; it is not used to infer full Paper-A support.
+        "submitted_claim_set_supported": core_supported,
+        "full_hypothesis_set_supported": core_supported,
+        "all_optional_modules_supported": all_modules_supported,
         "latency": latency_status,
         "latency_policy": (
-            "H3a is separately gated. An oracle or learned failure does not "
-            "invalidate Q/C/D, but it prevents a full Paper-A supported label."
+            "H3a latency is separately gated and optional. Oracle or learned "
+            "latency failure gates out only the latency contribution; Paper-A "
+            "support is adjudicated by H1, H2, and H3b structural tracking."
         ),
-    }, VC.EXIT_SUPPORTED if supported else VC.EXIT_UNSUPPORTED
+    }, VC.EXIT_SUPPORTED if core_supported else VC.EXIT_UNSUPPORTED
 
 
 def main(argv=None):

@@ -1,6 +1,6 @@
 """Run actual Final-CIGAMF training on one normalized external benchmark."""
 from __future__ import annotations
-import argparse, csv, json, math, os, time
+import argparse, csv, hashlib, json, math, os, subprocess, time
 from pathlib import Path
 import sys
 
@@ -15,6 +15,46 @@ ENVIRONMENTS = ("cityflow", "cyborg", "flatland", "rware")
 def _finite_mean(values):
     vals = [float(v) for v in values if math.isfinite(float(v))]
     return float(sum(vals) / len(vals)) if vals else None
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fingerprint(payload):
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _git_head(path):
+    result = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _expected_external_revision(repo_path):
+    revisions = ROOT / "scripts" / "external_env_revisions.tsv"
+    if not revisions.is_file():
+        return None
+    repo_name = Path(repo_path).name
+    for raw in revisions.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0] == repo_name:
+            return parts[1]
+    return None
 
 
 def main(argv=None):
@@ -39,7 +79,8 @@ def main(argv=None):
     # failing on torch/numpy before it has a chance to re-exec.
     import numpy as np
     import run_experiment as RE
-    from envs.external.registry import build_environment
+    from envs.external.registry import build_environment, repo_path
+    from envs.external.runtime import runtime_metadata
     from envs.external_contract import require_panel
 
     if args.episodes <= 0 or args.max_steps <= 0 or not args.seeds:
@@ -50,6 +91,7 @@ def main(argv=None):
     if migrated is not None:
         print(f"[EXTERNAL-OUT] preserved legacy output file as {migrated}", file=sys.stderr)
     rows = []
+    seed_config_fingerprints = {}
     for seed in args.seeds:
         RE.set_global_seed(int(seed))
         env = build_environment(
@@ -69,6 +111,7 @@ def main(argv=None):
             "periph_require_full_signature": True,
             "periph_allow_legacy_items": False,
         })
+        seed_config_fingerprints[str(int(seed))] = _fingerprint(cfg)
         runner = RE.make_runner("Final-CIGAMF", env, cfg, args.device)
         started = time.perf_counter()
         history = runner.run(n_episodes=args.episodes, eval_every=1)
@@ -81,6 +124,8 @@ def main(argv=None):
             "n_agents": int(env.n_agents),
             "action_dim": int(env.get_action_dim()),
             "obs_dim": int(env.get_obs_dim()),
+            "max_steps_requested": int(args.max_steps),
+            "max_steps_effective": int(getattr(env, "max_steps", args.max_steps)),
             "mean_reward": _finite_mean(history.get("mean_reward", [])),
             "final_reward": float(history.get("mean_reward", [float("nan")])[-1]),
             "mean_core_size": _finite_mean(history.get("mean_core_size", [])),
@@ -91,15 +136,48 @@ def main(argv=None):
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader(); writer.writerows(rows)
+    source_head = _git_head(ROOT)
+    external_repo = repo_path(args.environment)
+    external_head = _git_head(external_repo)
+    external_expected = _expected_external_revision(external_repo)
+    external_pin_match = bool(
+        external_head and external_expected and external_head == external_expected
+    )
+    config_path = Path(args.config_path).resolve() if args.config_path else None
     manifest = {
-        "experiment": "external_final_cigamf_training_v1",
+        "experiment": "external_final_cigamf_training_v2_provenance",
         "environment": args.environment,
-        "seeds": args.seeds,
-        "episodes": args.episodes,
+        "seeds": [int(seed) for seed in args.seeds],
+        "episodes": int(args.episodes),
+        "agent_count_requested": int(args.agent_count),
+        "max_steps_requested": int(args.max_steps),
         "profile": args.profile,
+        "device": args.device,
         "summary": str(csv_path),
+        "source_git_head": source_head,
+        "external_repo": str(external_repo),
+        "external_repo_head": external_head,
+        "external_repo_expected_revision": external_expected,
+        "external_pin_match": external_pin_match,
+        "external_runtime": runtime_metadata(),
+        "config_path": str(config_path) if config_path else None,
+        "config_sha256": (
+            _sha256_file(config_path)
+            if config_path is not None and config_path.is_file()
+            else None
+        ),
+        "seed_config_fingerprints_sha256": seed_config_fingerprints,
         "paper_evidence_scope": "architecture_generalization_only",
         "not_an_h1_h2_or_latency_claim": True,
+        "provenance_complete": bool(
+            source_head
+            and external_pin_match
+            and all(seed_config_fingerprints.values())
+            and (
+                config_path is None
+                or (config_path.is_file() and _sha256_file(config_path))
+            )
+        ),
     }
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(csv_path)

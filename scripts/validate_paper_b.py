@@ -10,25 +10,24 @@ import tempfile
 
 try:
     import validate_claims as VC
+    import run_paper_b_allocation as PB_ALLOCATION
+    import run_paper_b_pair_latent as PB_PAIR
+    import run_paper_b_periphery as PB_PERIPHERY
+    import run_paper_b_scaling as PB_SCALING
 except ModuleNotFoundError:
     from scripts import validate_claims as VC
+    from scripts import run_paper_b_allocation as PB_ALLOCATION
+    from scripts import run_paper_b_pair_latent as PB_PAIR
+    from scripts import run_paper_b_periphery as PB_PERIPHERY
+    from scripts import run_paper_b_scaling as PB_SCALING
 
 
-EXPECTED_ALLOCATION = {
-    "C-Core", "AbsD-Core", "Random-Core", "Correlation-Core",
-    "Attention-Core", "WeakPrior-Core", "Oracle-C-Core", "Full-Explicit",
-}
-EXPECTED_PAIR = {
-    "Full-Explicit-Reference", "Shared-Neighbor-State", "Pooled-Neighbor", "Explicit-FF-BC", "Recurrent-BC", "Recurrent-BC-CD",
-    "Recurrent-BC-CD-NoWarmStart", "Recurrent-BC-CD-Contrastive",
-}
-EXPECTED_PERIPHERY = {
-    "Full-Explicit", "Semantic-Free", "Semantic-Only", "Unconstrained", "No-Aux", "Single-Mean",
-    "Single-Mean-Matched", "Attention-Mean", "AbsD-Pooling",
-}
-EXPECTED_SCALING = {
-    "PureMeanField", "Attention-Mean", "Full-Explicit", "Semantic-Free", "Single-Mean",
-}
+# Derive matrix contracts from the producing runners so a producer update
+# cannot leave the final validator silently pinned to a stale variant set.
+EXPECTED_ALLOCATION = set(PB_ALLOCATION.VARIANTS)
+EXPECTED_PAIR = set(PB_PAIR.VARIANTS)
+EXPECTED_PERIPHERY = set(PB_PERIPHERY.VARIANTS)
+EXPECTED_SCALING = set(PB_SCALING.VARIANTS)
 
 
 def _atomic_json(path, payload):

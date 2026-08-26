@@ -1,7 +1,11 @@
-"""Validate scientific support separately from experiment completion.
+"""Legacy combined H1/H2/H3 claim validator.
 
-Exit status:
-    0   complete confirmatory protocol; H1, H2, and H3 are supported
+Final paper decisions are made by ``validate_paper_a.py`` and
+``validate_paper_b.py``. This module is retained for historical/diagnostic
+compatibility and for shared helper functions used by those validators.
+
+Exit status for this legacy combined validator:
+    0   complete confirmatory protocol; H1, H2, and legacy H3 are supported
     10  complete confirmatory protocol; at least one claim is not supported
     11  smoke protocol completed; scientific claims were not evaluated
     20  incomplete, stale, malformed, or otherwise invalid protocol
@@ -521,7 +525,7 @@ def _render_markdown(report):
         "\n## Interpretation constraints\n\n",
         "- H1 is confirmatory only for the aligned one-step stochastic-policy contrast.\n",
         "- H2 is conditional on H1 because its scheduler consumes the learned influence matrix.\n",
-        "- H3 uses matched-seed post-warm-up F1 as the decision endpoint; reward and throughput remain separate trade-offs.\n",
+        "- Legacy H3 uses matched-seed post-warm-up F1 as a diagnostic endpoint; it is not a Paper-A/Paper-B gate.\n",
         "- A completed command is never treated as a supported claim without the gates above.\n",
     ])
     return "".join(lines)

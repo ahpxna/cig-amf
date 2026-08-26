@@ -20,7 +20,10 @@ READY_MARKER = ".cig-external-runtime-ready"
 
 
 def external_root() -> Path:
-    root = Path(os.environ.get("CIG_EXTERNAL_ENVS_DIR", DEFAULT_EXTERNAL_ROOT)).resolve()
+    # Keep the same lexical-root contract as external.registry.  Runtime and
+    # checkout discovery must never disagree merely because `/var` is a
+    # symlink to `/private/var` on macOS.
+    root = Path(os.environ.get("CIG_EXTERNAL_ENVS_DIR", DEFAULT_EXTERNAL_ROOT)).expanduser()
     return root.parent if root.name == "repos" else root
 
 

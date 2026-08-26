@@ -10,8 +10,9 @@ from envs.external.common import ExternalPopulationMixin, pad_observations
 class RWARECIGEnvironment(ExternalPopulationMixin):
     capabilities = BenchmarkCapabilities("RWARE", True, True, True, True, False, False, False)
 
-    def __init__(self, warehouse, observation_width=192):
+    def __init__(self, warehouse, observation_width=192, max_steps=60):
         self.raw_env = warehouse
+        self.max_steps = max(1, int(max_steps))
         self.n_agents = int(warehouse.n_agents)
         self.max_action_dim = 5
         self.obs_dim = int(observation_width)
@@ -76,6 +77,6 @@ def make_rware_environment(seed=0, n_agents=6, max_steps=60, observation_width=1
         observation_type=ObservationType.FLATTENED,
         render_mode="rgb_array",
     )
-    env = RWARECIGEnvironment(warehouse, observation_width=observation_width)
+    env = RWARECIGEnvironment(warehouse, observation_width=observation_width, max_steps=max_steps)
     env.reset(seed=int(seed))
     return env

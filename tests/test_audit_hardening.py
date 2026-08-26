@@ -286,6 +286,84 @@ class ExternalAndStateBankHardeningTests(unittest.TestCase):
         self.assertTrue(rail.configurations)
         self.assertTrue(all(cfg == ((3, 4), 1) for cfg in rail.configurations))
 
+    def test_flatland_action_mask_uses_safe_stop_when_successors_are_temporarily_unavailable(self):
+        from types import SimpleNamespace
+        from envs.flatland_adapter import FlatlandCIGEnvironment
+
+        class State:
+            def is_off_map_state(self):
+                return False
+
+        class Speed:
+            max_speed = 1
+            def is_cell_exit(self, speed):
+                return True
+
+        class Rail:
+            def apply_action_independent(self, action, configuration):
+                return None
+            def get_transitions(self, configuration):
+                return (False, True, False, False)
+
+        agent = SimpleNamespace(
+            current_configuration=((4, 4), 1),
+            initial_configuration=((4, 4), 1),
+            target_configuration=None,
+            state=State(),
+            speed_counter=Speed(),
+            position=(4, 4), direction=1,
+        )
+        class RailEnv:
+            number_of_agents = 1
+            agents = [agent]
+            rail = Rail()
+            @staticmethod
+            def action_required(*args):
+                return True
+
+        env = FlatlandCIGEnvironment(RailEnv(), observation_width=8)
+        mask = env.valid_action_mask(0)
+        self.assertEqual(mask.tolist(), [False, False, False, False, True])
+
+    def test_flatland_action_mask_still_fails_closed_on_invalid_configuration(self):
+        from types import SimpleNamespace
+        from envs.flatland_adapter import FlatlandCIGEnvironment
+
+        class State:
+            def is_off_map_state(self):
+                return False
+
+        class Speed:
+            max_speed = 1
+            def is_cell_exit(self, speed):
+                return True
+
+        class Rail:
+            def apply_action_independent(self, action, configuration):
+                return None
+            def get_transitions(self, configuration):
+                return (False, False, False, False)
+
+        agent = SimpleNamespace(
+            current_configuration=((4, 4), 1),
+            initial_configuration=((4, 4), 1),
+            target_configuration=None,
+            state=State(),
+            speed_counter=Speed(),
+            position=(4, 4), direction=1,
+        )
+        class RailEnv:
+            number_of_agents = 1
+            agents = [agent]
+            rail = Rail()
+            @staticmethod
+            def action_required(*args):
+                return True
+
+        env = FlatlandCIGEnvironment(RailEnv(), observation_width=8)
+        with self.assertRaisesRegex(RuntimeError, "no outgoing rail transition"):
+            env.valid_action_mask(0)
+
     def test_external_training_capability_requires_clone_restore(self):
         from envs.external_contract import BenchmarkCapabilities
         cap = BenchmarkCapabilities(

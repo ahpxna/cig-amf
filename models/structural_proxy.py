@@ -71,6 +71,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from envs.causal_adapter import OmniArenaAdapter, PUBLIC_ROLES
+from utils.latency_protocol import LATENCY_ONSET_ABS_FLOOR, LATENCY_ONSET_FRACTION
 
 try:
     from torch.func import functional_call, stack_module_state, vmap
@@ -2291,7 +2292,11 @@ class LocalCounterfactualProxyEnsemble:
         latency_peak = torch.where(
             latency_valid, latency_peak, torch.full_like(latency_peak, -1)
         )
-        onset_mask = lag_mass >= (0.05 * peak_value).unsqueeze(1)
+        onset_threshold = torch.clamp(
+            LATENCY_ONSET_FRACTION * peak_value,
+            min=LATENCY_ONSET_ABS_FLOOR,
+        )
+        onset_mask = lag_mass >= onset_threshold.unsqueeze(1)
         latency_onset = torch.argmax(onset_mask.to(torch.int64), dim=1)
         latency_onset = torch.where(
             latency_valid, latency_onset, torch.full_like(latency_onset, -1)

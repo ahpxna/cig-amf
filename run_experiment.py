@@ -167,9 +167,12 @@ def default_cfg():
 
         "belief_lambda_0": 0.08,
         "belief_uncertainty_scale": 2.0,
-        "belief_tau": 0.005,
-        "belief_tau_in": 0.55,
-        "belief_tau_out": 0.35,
+        # LCB hysteresis is parameterized on the actual G=C-kappa*sigma
+        # scale.  The former belief_tau_in/out names were only used as a ratio
+        # and looked like literal thresholds, which made the paper/config
+        # contract misleading.
+        "belief_tau_enter": 0.005,
+        "belief_hysteresis_ratio": 0.35 / 0.55,
         "seed_core_top_k": 3,
         # Fixed oracle truth cardinality.  Evaluation never adapts the target
         # core size to a model's predicted core, which would inflate F1.
@@ -182,11 +185,6 @@ def default_cfg():
         "h1_direction_active_threshold": 0.005,
         "h1_direction_prediction_threshold": 0.005,
         "h1_min_active_pairs": 30,
-        # Normalized magnitude gates.  They are prespecified calibration
-        # checks, complementary to rank/selectivity endpoints.
-        "h1_max_q_normalized_rmse": 1.0,
-        "h1_max_capacity_normalized_mae": 1.0,
-        "h1_max_direction_normalized_mae": 1.0,
         # Support quality is distributional, not the probability of one
         # factual action. Uniform 13-action policies have low per-action mass
         # but maximal support. Values below this normalized entropy indicate
@@ -293,11 +291,9 @@ def default_cfg():
         "freeze_representation_state": False,
         "seed": 0,
 
-        # final_runner.py sig_tracker/forcer/heads/drift/matdet/recip defaults
-        # match the runner's original hard-coded values. See
-        # models/{influence_signature,intervention,ego_conditioned_latent,
-        # drift_probe,reciprocity}.py.
-        "sig_tracker_window": 30,
+        # final_runner.py forcer/heads/drift/matdet/recip defaults match the
+        # runner's original hard-coded values. sig_tracker_window is defined
+        # once above with the peripheral-signature settings.
         "semantic_calibration_every": 25,
 
         # [EPS-ANNEAL] 0.03 -> 0.05. A1 showed that ONLY eps=0.05 separated

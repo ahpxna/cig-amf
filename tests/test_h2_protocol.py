@@ -18,6 +18,7 @@ from runners.baseline_runner import (
 from runners.final_runner import FinalCIGAMFRunner, NoTwoTimescaleRunner
 from models.core_behavior import PairRelationalModule
 from scripts.collect_results import (
+    H1_PROTOCOL_VERSION,
     H1_VARIANTS,
     H2_PROTOCOL_VERSION,
     H3_VARIANTS,
@@ -453,7 +454,7 @@ class H2ProtocolTests(unittest.TestCase):
                 {
                     **attempt,
                     "run_id": "h1-run",
-                    "protocol_version": "h1_qcd_crossfit_v4",
+                    "protocol_version": H1_PROTOCOL_VERSION,
                     "config_fingerprint": "abc123",
                     "attempt_complete": True,
                     "q_spearman_mean": 0.1,
@@ -468,7 +469,7 @@ class H2ProtocolTests(unittest.TestCase):
             self._write_csv(h1_summary, h1_rows)
             h1_manifest = {
                 "run_id": "h1-run",
-                "protocol_version": "h1_qcd_crossfit_v4",
+                "protocol_version": H1_PROTOCOL_VERSION,
                 "status": "complete",
                 "expected_attempts": h1_attempts,
                 "completed_attempts": h1_attempts,
@@ -482,7 +483,7 @@ class H2ProtocolTests(unittest.TestCase):
             with open(os.path.join(h1_dir, "latest_complete_run.json"), "w", encoding="utf-8") as f:
                 json.dump({
                     "run_id": "h1-run",
-                    "protocol_version": "h1_qcd_crossfit_v4",
+                    "protocol_version": H1_PROTOCOL_VERSION,
                     "summary_path": h1_summary,
                     "manifest_path": h1_manifest_path,
                 }, f)
@@ -593,7 +594,18 @@ class H2ProtocolTests(unittest.TestCase):
 
             output, text = collect(root, expected_seeds=[0])
             self.assertTrue(os.path.exists(output))
-            self.assertIn("matched-seed post-warm-up F1", text)
+            self.assertIn("paired 2×2 structural/behavioural selectivity", text)
+            self.assertIn("paired seed-level contrasts", text)
+
+            # Legacy H3 is optional for the paper-specific pipeline. Removing
+            # it must not make H1/H2 aggregation invalid.
+            import shutil
+            shutil.rmtree(h3_dir)
+            output, text = collect(
+                root, expected_h1_seeds=[0], expected_h2_seeds=[0]
+            )
+            self.assertTrue(os.path.exists(output))
+            self.assertNotIn("Legacy H3 diagnostic", text)
 
 
 # The collector resolves relative manifest paths against the repository root.

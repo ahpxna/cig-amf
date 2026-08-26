@@ -97,18 +97,6 @@ class CityFlowCIGEnvironment(ExternalPopulationMixin):
                 adj[a].add(b); adj[b].add(a)
         return adj
 
-    @staticmethod
-    def _lane_belongs_to_road(lane_id, road_id):
-        """Match CityFlow lane ids without prefix collisions.
-
-        CityFlow's conventional lane ids are ``<road_id>_<lane_index>``.
-        ``startswith(road_id)`` confuses roads such as ``road_1`` and
-        ``road_10`` and contaminates local observations/rewards.
-        """
-        lane_id = str(lane_id)
-        road_id = str(road_id)
-        return lane_id == road_id or lane_id.startswith(road_id + "_")
-
     def _refresh_obs(self):
         lane_count = self.raw_env.get_lane_vehicle_count()
         waiting = self.raw_env.get_lane_waiting_vehicle_count()
@@ -116,7 +104,7 @@ class CityFlowCIGEnvironment(ExternalPopulationMixin):
         for iid in self.agent_ids:
             item = self._intersection[iid]
             road_ids = set(str(x) for x in item.get("roads", []))
-            selected_lanes = [lane for lane in lane_count if any(self._lane_belongs_to_road(lane, r) for r in road_ids)]
+            selected_lanes = [lane for lane in lane_count if any(lane.startswith(r) for r in road_ids)]
             counts = [float(lane_count.get(lane, 0.0)) for lane in selected_lanes]
             waits = [float(waiting.get(lane, 0.0)) for lane in selected_lanes]
             features = np.asarray([
@@ -153,7 +141,7 @@ class CityFlowCIGEnvironment(ExternalPopulationMixin):
         rewards = []
         for iid in self.agent_ids:
             roads = set(str(x) for x in self._intersection[iid].get("roads", []))
-            local = [float(v) for lane, v in waiting.items() if any(self._lane_belongs_to_road(lane, r) for r in roads)]
+            local = [float(v) for lane, v in waiting.items() if any(lane.startswith(r) for r in roads)]
             rewards.append(-float(sum(local)))
         self.last_actions = applied_actions
         self._refresh_obs()

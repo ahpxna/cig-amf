@@ -20,6 +20,11 @@ if str(ROOT) not in sys.path:
 
 from envs.omni_arena import OmniArena
 from envs.causal_adapter import resolve_env_adapter
+from utils.latency_protocol import (
+    LATENCY_ONSET_ABS_FLOOR,
+    LATENCY_ONSET_FRACTION,
+    LATENCY_ONSET_RULE,
+)
 
 
 ROLE_ORDER = ("blocker", "gatekeeper", "relay", "controller")
@@ -209,8 +214,11 @@ def run_gate(
             )
             response_mass = float(np.sum(np.abs(capacity_spectrum)))
             peak = float(np.max(capacity_spectrum)) if capacity_spectrum.size else 0.0
-            active_threshold = max(1e-8, 0.05 * peak)
-            active_lags = np.flatnonzero(capacity_spectrum > active_threshold)
+            active_threshold = max(
+                LATENCY_ONSET_ABS_FLOOR,
+                LATENCY_ONSET_FRACTION * peak,
+            )
+            active_lags = np.flatnonzero(capacity_spectrum >= active_threshold)
             onset_lag = int(active_lags[0]) if active_lags.size else None
             peak_lag = int(np.argmax(capacity_spectrum)) if peak > 0.0 else None
             centre_of_mass_lag = (
@@ -250,6 +258,9 @@ def run_gate(
         "n_trials": int(n_trials),
         "action_count": int(env.get_action_dim()),
         "min_response_mass": float(min_response_mass),
+        "latency_onset_fraction": float(LATENCY_ONSET_FRACTION),
+        "latency_onset_absolute_floor": float(LATENCY_ONSET_ABS_FLOOR),
+        "latency_onset_rule": LATENCY_ONSET_RULE,
         "rows": rows,
         **summary,
     }

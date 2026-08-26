@@ -102,6 +102,17 @@ clone_pinned() {
   printf '%s\t%s\t%s\n' "$name" "$actual" "$target"
 }
 
+prepare_cityflow_build_compat() {
+  target="$DEST/CityFlow"
+  pybind="$target/extern/pybind11"
+  # CityFlow's pinned simulator source remains unchanged.  Its 2019 pybind11
+  # submodule cannot compile against Python 3.11+ because it accesses removed
+  # CPython frame internals, so use this exact build-only compatibility layer.
+  git -C "$target" submodule update --init --recursive
+  git -C "$pybind" fetch --depth 1 https://github.com/pybind/pybind11.git refs/tags/v2.12.0
+  git -C "$pybind" checkout --detach FETCH_HEAD
+}
+
 while IFS="$(printf '\t')" read -r name revision url; do
   [ -z "$name" ] || clone_pinned "$name" "$revision" "$url"
 done < "$ROOT/scripts/external_env_revisions.tsv"
@@ -165,7 +176,26 @@ EOF
     [ -z "$name" ] && continue
     target="$DEST/$name"
     echo "[external-runtime] installing $name into $RUNTIME"
-    if "$RUNTIME_PY" -m pip install -e "$target"; then
+    if [ "$name" = "CityFlow" ]; then
+      prepare_cityflow_build_compat
+      if [ -x /opt/homebrew/opt/llvm/bin/clang++ ]; then
+        CITYFLOW_CC=/opt/homebrew/opt/llvm/bin/clang
+        CITYFLOW_CXX=/opt/homebrew/opt/llvm/bin/clang++
+        CITYFLOW_CXXFLAGS="-stdlib=libc++ -isystem /opt/homebrew/opt/llvm/include/c++/v1"
+        CITYFLOW_LDFLAGS="-L/opt/homebrew/opt/llvm/lib/c++ -L/opt/homebrew/opt/llvm/lib/unwind -lunwind"
+      else
+        CITYFLOW_CC="${CC:-cc}"
+        CITYFLOW_CXX="${CXX:-c++}"
+        CITYFLOW_CXXFLAGS="${CXXFLAGS:-}"
+        CITYFLOW_LDFLAGS="${LDFLAGS:-}"
+      fi
+      if CMAKE_POLICY_VERSION_MINIMUM=3.5 CC="$CITYFLOW_CC" CXX="$CITYFLOW_CXX" CXXFLAGS="$CITYFLOW_CXXFLAGS" LDFLAGS="$CITYFLOW_LDFLAGS" "$RUNTIME_PY" -m pip install -e "$target"; then
+        INSTALLED="$INSTALLED $name"
+      else
+        FAILED_INSTALLS="$FAILED_INSTALLS $name"
+        echo "[external-runtime] install failed for $name; other benchmarks remain usable" >&2
+      fi
+    elif "$RUNTIME_PY" -m pip install -e "$target"; then
       INSTALLED="$INSTALLED $name"
     else
       FAILED_INSTALLS="$FAILED_INSTALLS $name"
@@ -211,7 +241,12 @@ PY
   fi
 fi
 
-python "$ROOT/scripts/external_env_manager.py" status --json "$EXTERNAL_ROOT/manifest.json"
+if [ -x "$RUNTIME/bin/python" ]; then
+  STATUS_PY="$RUNTIME/bin/python"
+else
+  STATUS_PY="$(command -v python3)"
+fi
+"$STATUS_PY" "$ROOT/scripts/external_env_manager.py" status --json "$EXTERNAL_ROOT/manifest.json"
 if [ "$INSTALL" -eq 1 ] && [ -n "${FAILED_INSTALLS:-}" ]; then
   exit 6
 fi

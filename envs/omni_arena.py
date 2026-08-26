@@ -33,6 +33,8 @@ shown in info for each episode.
 import copy
 import numpy as np
 
+from utils.latency_protocol import LATENCY_ONSET_ABS_FLOOR, LATENCY_ONSET_FRACTION
+
 try:
     from tiny_oracle_dig import OracleInfluenceProfile
 except ModuleNotFoundError:
@@ -2377,9 +2379,14 @@ class OmniArena:
             peak_lag = None
             centre_of_mass_lag = None
         else:
-            # A relative onset threshold is stable across role-specific scales
-            # and distinguishes a delayed response from numerical noise.
-            onset_lag = int(np.flatnonzero(mass >= 0.10 * float(mass.max()))[0])
+            # Use the same relative onset estimand as the learned proxy and
+            # the standalone oracle validator. Keeping the constants shared
+            # prevents a silent 5%-vs-10% paper/code drift.
+            onset_threshold = max(
+                LATENCY_ONSET_ABS_FLOOR,
+                LATENCY_ONSET_FRACTION * float(mass.max()),
+            )
+            onset_lag = int(np.flatnonzero(mass >= onset_threshold)[0])
             peak_lag = int(np.argmax(mass))
             centre_of_mass_lag = float(
                 np.dot(np.arange(horizon, dtype=np.float64), mass) / total_mass

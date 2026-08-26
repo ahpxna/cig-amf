@@ -503,7 +503,7 @@ class BayesLightBeliefState:
             self._n_updates_arr[idx] += 1
             t = self._n_updates_arr[idx].astype(np.float64)
 
-            # [B3] Robbins-Monro schedule; formula unchanged.
+            # [B3] Robbins-Monro schedule with prespecified uncertainty clipping.
             decay_factor = (
                 t ** self.alpha_decay if self.alpha_decay > 0.0 else np.ones_like(t)
             )
@@ -593,11 +593,13 @@ class BayesLightBeliefState:
         """
         Default v2 rule.
 
-        Enter core when lcb_score>tau; remain when lcb_score>tau_hold, where
-        tau_hold<tau provides hysteresis.
+        Enter core when lcb_score > tau_enter; remain when
+        lcb_score > tau_stay, where tau_stay = hysteresis_ratio*tau_enter.
 
-        Hysteresis preserves v1's anti-chatter intent on the LCB scale instead
-        of the saturated p_core scale.
+        ``self.tau`` is tau_enter.  ``tau_in/tau_out`` are retained only for
+        backward compatibility with the legacy p_core rule; for the LCB rule
+        their ratio defines hysteresis and is not interpreted as two literal
+        G-scale thresholds.
         """
         # [GPU contract section 1.4] The dual-threshold rule is elementwise
         # Boolean logic, vectorized across neighbours in one NumPy operation.

@@ -11,10 +11,8 @@ from envs.external.common import ExternalPopulationMixin, pad_observations
 class CybORGCIGEnvironment(ExternalPopulationMixin):
     capabilities = BenchmarkCapabilities("CybORG", True, True, True, True, False, False, False)
 
-    def __init__(self, wrapped_env, observation_width=256, max_steps=60):
+    def __init__(self, wrapped_env, observation_width=256):
         self.raw_env = wrapped_env
-        self.max_steps = max(1, int(max_steps))
-        self._step_count = 0
         self.agent_names = list(getattr(wrapped_env, "possible_agents", []))
         if not self.agent_names:
             self.agent_names = list(getattr(wrapped_env, "agents", []))
@@ -48,7 +46,6 @@ class CybORGCIGEnvironment(ExternalPopulationMixin):
             observations = observations[0]
         self._obs = self._ordered_obs(observations)
         self.last_actions = [0] * self.n_agents
-        self._step_count = 0
         return self._obs
 
     def step(self, actions):
@@ -68,8 +65,6 @@ class CybORGCIGEnvironment(ExternalPopulationMixin):
             done = bool(all(bool(terminated.get(name, False) or truncated.get(name, False)) for name in self.agent_names))
         self._obs = self._ordered_obs(observations)
         self.last_actions = [int(action_dict[name]) for name in self.agent_names]
-        self._step_count += 1
-        done = bool(done or self._step_count >= self.max_steps)
         reward_list = [float(rewards.get(name, 0.0)) for name in self.agent_names]
         return self._obs, reward_list, done, dict(info)
 
@@ -178,6 +173,6 @@ def make_cyborg_environment(
         maximum_steps=max(1, int(max_steps)),
     )
     raw = PettingZooParallelWrapper(CybORG(scenario_generator=scenario, environment="sim"))
-    env = CybORGCIGEnvironment(raw, observation_width=observation_width, max_steps=max_steps)
+    env = CybORGCIGEnvironment(raw, observation_width=observation_width)
     env.reset(seed=int(seed))
     return env

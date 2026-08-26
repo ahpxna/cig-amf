@@ -103,6 +103,7 @@ def build_environment(key: str, **kwargs):
 
 
 def make_flatland(seed=0, n_agents=6, observation_width=256, max_steps=60, **_):
+    del max_steps
     from flatland.envs.rail_env import RailEnv
     from flatland.envs.rail_generators import sparse_rail_generator
     from flatland.envs.line_generators import sparse_line_generator
@@ -120,7 +121,7 @@ def make_flatland(seed=0, n_agents=6, observation_width=256, max_steps=60, **_):
         # selected stop action, while preserving the five-action interface.
         braking_delta=0.0,
     )
-    env = FlatlandCIGEnvironment(rail, observation_width=observation_width, max_steps=max_steps)
+    env = FlatlandCIGEnvironment(rail, observation_width=observation_width)
     env.reset(seed=int(seed))
     return env
 
