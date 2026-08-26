@@ -17,3 +17,7 @@ PAPER_B_SELECTOR_ORACLE_HORIZON = 1
 PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION = (
     "paper_b_candidate_recall_topk_crn_v1"
 )
+
+# Paper B H2b evaluates a promotion transient over one frozen decision window.
+# This is intentionally independent of a run's end-to-end episode budget.
+PAPER_B_PROMOTION_WINDOW_STEPS = 10

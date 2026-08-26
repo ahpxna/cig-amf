@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import hashlib
 import json
 import os
 import tempfile
@@ -169,7 +170,7 @@ def _decision_probe_with_latency(runner, n_states, seed):
         n_states=int(n_states), burn_in=3, bank_seed=int(seed)
     )
     outer = runner.env.clone_state()
-    logits, values, actions, latencies = [], [], [], []
+    logits, values, actions, masks, latencies = [], [], [], [], []
     previous_diag = _set_periphery_diagnostics(runner, False)
     try:
         for state in bank:
@@ -200,6 +201,7 @@ def _decision_probe_with_latency(runner, n_states, seed):
             ):
                 selected, cache = result
                 logits_arr = np.asarray(cache["policy_logits"], dtype=np.float64)
+                valid_arr = np.asarray(cache["valid_action_masks"], dtype=bool)
                 values_arr = np.asarray(
                     [cache["value_cache"][ego] for ego in range(runner.n_agents)],
                     dtype=np.float64,
@@ -228,11 +230,13 @@ def _decision_probe_with_latency(runner, n_states, seed):
                         -torch.inf,
                     )
                     logits_arr = raw_logits.detach().cpu().numpy().astype(np.float64)
+                    valid_arr = np.asarray(valid, dtype=bool)
                 values_arr = np.asarray(values_np, dtype=np.float64)
                 actions_arr = np.argmax(logits_arr, axis=-1).astype(np.int64)
             else:
                 raise RuntimeError("unsupported scaling decision-probe interface")
             logits.append(logits_arr)
+            masks.append(valid_arr)
             values.append(values_arr)
             actions.append(actions_arr)
     finally:
@@ -244,6 +248,7 @@ def _decision_probe_with_latency(runner, n_states, seed):
         "logits": np.stack(logits, axis=0),
         "values": np.stack(values, axis=0),
         "actions": np.stack(actions, axis=0),
+        "valid_action_masks": np.stack(masks, axis=0),
     }, {
         "inference_latency_mean_ms": float(np.mean(latency)),
         "inference_latency_p50_ms": float(np.percentile(latency, 50)),
@@ -637,6 +642,9 @@ def main(argv=None):
                         "candidate_added_pairs": _mean(history.get("candidate_added_pairs", [])),
                         "candidate_removed_pairs": _mean(history.get("candidate_removed_pairs", [])),
                         "candidate_last_hash": str(history.get("candidate_map_hash", [""])[-1]) if history.get("candidate_map_hash") else "",
+                        "candidate_history_sha256": str(
+                            history.get("candidate_trajectory_sha256", [""])[-1]
+                        ) if history.get("candidate_trajectory_sha256") else "",
                         "candidate_provider": str(history.get("candidate_provider", ["unknown"])[-1]) if history.get("candidate_provider") else "unknown",
                         "mean_reward": _mean(history.get("mean_reward", [])),
                         "reward_per_agent": _mean(history.get("reward_per_agent", [])),
@@ -656,6 +664,8 @@ def main(argv=None):
         writer = csv.DictWriter(handle, fieldnames=sorted(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    with open(summary, "rb") as handle:
+        summary_sha256 = hashlib.sha256(handle.read()).hexdigest()
     _atomic_json(os.path.join(out_root, "manifest.json"), {
         "experiment": "paper_b_runtime_memory_scaling",
         "complete": True, "seeds": args.seeds, "agent_counts": args.agent_counts,
@@ -699,6 +709,8 @@ def main(argv=None):
         "analytic_memory_protocol": (
             "analytic_trainable_parameters_plus_persistent_representation_state"
         ),
+        "summary_row_count": int(len(rows)),
+        "summary_sha256": summary_sha256,
         "variants": list(VARIANTS), "summary": summary,
     })
     print(summary)

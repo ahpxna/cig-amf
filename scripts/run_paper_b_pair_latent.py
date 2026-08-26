@@ -3,8 +3,10 @@
 import argparse
 import copy
 import csv
+import hashlib
 import json
 import os
+import pickle
 import tempfile
 
 import numpy as np
@@ -31,13 +33,16 @@ except ModuleNotFoundError:
 
 import run_experiment as RE
 from models.ego_conditioned_latent import pair_specificity_score
+from utils.paper_contracts import PAPER_B_PROMOTION_WINDOW_STEPS
 try:
     from representation_isolation import (
         collect_teacher_trajectory, replay_pair_history, terminal_states,
+        teacher_history_hashes,
     )
 except ModuleNotFoundError:
     from scripts.representation_isolation import (
         collect_teacher_trajectory, replay_pair_history, terminal_states,
+        teacher_history_hashes,
     )
 
 
@@ -66,6 +71,12 @@ VARIANTS = {
         "heads_w_contrastive": 1.0,
     },
 }
+
+
+def _sha256_object(value):
+    return hashlib.sha256(
+        pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+    ).hexdigest()
 
 
 def _atomic_json(path, payload):
@@ -216,6 +227,30 @@ def _latent_profile_geometry(runner):
 
 
 def _decision_fidelity(probe, reference):
+    student_logits = np.asarray(probe["logits"], dtype=np.float64)
+    teacher_logits = np.asarray(reference["logits"], dtype=np.float64)
+    valid = np.asarray(probe["valid_action_masks"], dtype=bool)
+    reference_valid = np.asarray(reference["valid_action_masks"], dtype=bool)
+    if (
+        student_logits.shape != teacher_logits.shape
+        or valid.shape != student_logits.shape
+        or not np.array_equal(valid, reference_valid)
+        or not np.all(np.any(valid, axis=-1))
+    ):
+        raise ValueError("decision-fidelity logits/action masks are not matched")
+    teacher_masked = np.where(valid, teacher_logits, -np.inf)
+    student_masked = np.where(valid, student_logits, -np.inf)
+    teacher_shift = teacher_masked - np.max(teacher_masked, axis=-1, keepdims=True)
+    student_shift = student_masked - np.max(student_masked, axis=-1, keepdims=True)
+    teacher_exp = np.where(valid, np.exp(teacher_shift), 0.0)
+    student_exp = np.where(valid, np.exp(student_shift), 0.0)
+    teacher_prob = teacher_exp / np.sum(teacher_exp, axis=-1, keepdims=True)
+    student_prob = student_exp / np.sum(student_exp, axis=-1, keepdims=True)
+    teacher_logp = np.where(valid, np.log(np.clip(teacher_prob, 1e-12, None)), 0.0)
+    student_logp = np.where(valid, np.log(np.clip(student_prob, 1e-12, None)), 0.0)
+    policy_kl = float(np.mean(np.sum(
+        np.where(valid, teacher_prob * (teacher_logp - student_logp), 0.0), axis=-1
+    )))
     return {
         "policy_logit_l2_to_full_explicit": float(np.mean(
             (probe["logits"] - reference["logits"]) ** 2
@@ -226,19 +261,21 @@ def _decision_fidelity(probe, reference):
         "action_agreement_to_full_explicit": float(np.mean(
             probe["actions"] == reference["actions"]
         )),
+        "policy_kl_to_full_explicit": policy_kl,
     }
 
 
 def _probe_state_bank(runner, bank):
     """Evaluate a runner on an already sampled, shared clone-state bank."""
     outer = runner.env.clone_state()
-    logits, values, actions = [], [], []
+    logits, values, actions, masks = [], [], [], []
     try:
         for state in bank:
             runner.env.restore_state(copy.deepcopy(state))
             obs = runner.env._get_obs_all()
             selected, cache = runner._select_actions_population(obs)
             logits.append(np.asarray(cache["policy_logits"], dtype=np.float64))
+            masks.append(np.asarray(cache["valid_action_masks"], dtype=bool))
             values.append(np.asarray(
                 [cache["value_cache"][ego] for ego in range(runner.n_agents)],
                 dtype=np.float64,
@@ -255,6 +292,7 @@ def _probe_state_bank(runner, bank):
         "logits": np.stack(logits, axis=0),
         "values": np.stack(values, axis=0),
         "actions": np.stack(actions, axis=0),
+        "valid_action_masks": np.stack(masks, axis=0),
     }
 
 
@@ -404,7 +442,7 @@ def _matched_history_probe(
         raise ValueError("matched-history probe requires non-empty teacher traces")
     probe = {
         key: np.concatenate([item[key] for item in probes], axis=0)
-        for key in ("logits", "values", "actions")
+        for key in ("logits", "values", "actions", "valid_action_masks")
     }
     return probe, runner
 
@@ -419,7 +457,10 @@ def _promotion_panel(
     evolve, and every post-promotion measurement is compared with a
     Full-Explicit reference on the same clone-state bank.
     """
-    transient_steps = max(1, min(10, int(episodes) // 4))
+    transient_steps = int(PAPER_B_PROMOTION_WINDOW_STEPS)
+    # ``episodes`` controls the optional pre-promotion teacher history only;
+    # the adjudicated post-promotion window is the frozen W even in a quick
+    # smoke run with a smaller nominal budget.
     pre_steps = max(0, int(episodes) - transient_steps)
     runner.cfg["freeze_policy_learning"] = True
     runner.cfg["freeze_pair_bc_learning"] = False
@@ -477,6 +518,9 @@ def _promotion_panel(
         "promotion_event_count": int(len(events)),
         "promotion_episode": int(pre_steps),
         "promotion_transient_horizon": int(transient_steps),
+        "promotion_total_teacher_steps": int(pre_steps + transient_steps),
+        "promotion_window_contract": int(PAPER_B_PROMOTION_WINDOW_STEPS),
+        "promotion_policy_kl_auc": auc("policy_kl_to_full_explicit"),
         "promotion_logit_error_auc": auc("policy_logit_l2_to_full_explicit"),
         "promotion_value_error_auc": auc("value_mae_to_full_explicit"),
         "promotion_action_agreement_auc": auc("action_agreement_to_full_explicit"),
@@ -590,6 +634,7 @@ def main(argv=None):
         teacher_traces = collect_teacher_trajectory(
             teacher, max(1, int(args.episodes))
         )
+        provenance = teacher_history_hashes(teacher_traces)
         fidelity_bank = [
             copy.deepcopy(trace[-1]["env_snapshot_after_step"])
             for trace in teacher_traces if trace
@@ -609,6 +654,10 @@ def main(argv=None):
             for name in selected_variants
         }
         reference = matched.get(reference_name, (None, None))[0]
+        fidelity_bank_hash = _sha256_object(fidelity_bank)
+        reference_target_hash = (
+            _sha256_object(reference) if reference is not None else None
+        )
         for name, (row, probe) in variants.items():
             if reference is None:
                 row.update({
@@ -627,6 +676,12 @@ def main(argv=None):
                     len(trace) for trace in teacher_traces
                 ))
                 row["decision_fidelity_terminal_state_count"] = int(len(fidelity_bank))
+            row.update(provenance)
+            row["decision_fidelity_state_bank_sha256"] = fidelity_bank_hash
+            row["full_explicit_target_sha256"] = reference_target_hash or ""
+            row["decision_fidelity_downstream_checkpoint_sha256"] = str(
+                checkpoint["sha256"]
+            )
             rows.append(row)
     summary_path = os.path.join(out_root, "summary_paper_b_pair_latent.csv")
     with open(summary_path, "w", newline="", encoding="utf-8") as handle:
@@ -635,6 +690,8 @@ def main(argv=None):
         )
         writer.writeheader()
         writer.writerows(rows)
+    with open(summary_path, "rb") as handle:
+        summary_sha256 = hashlib.sha256(handle.read()).hexdigest()
     _atomic_json(os.path.join(out_root, "manifest.json"), {
         "experiment": "paper_b_pair_latent",
         "complete": True,
@@ -642,6 +699,9 @@ def main(argv=None):
         "episodes": args.episodes,
         "pretrain_episodes": args.pretrain_episodes,
         "core_budget": args.core_budget,
+        "promotion_window_steps": int(PAPER_B_PROMOTION_WINDOW_STEPS),
+        "summary_row_count": int(len(rows)),
+        "summary_sha256": summary_sha256,
         "variants": list(selected_variants),
         "summary": summary_path,
     })

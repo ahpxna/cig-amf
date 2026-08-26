@@ -79,10 +79,25 @@ class ScientificGateLadderTests(unittest.TestCase):
             prechecks = os.path.join(root, "prechecks.json")
             with open(prechecks, "w", encoding="utf-8") as handle:
                 json.dump({
-                    "protocol_version": "scientific_prechecks_g0_g4_v3_disagreement_capture",
+                    "protocol_version": "scientific_prechecks_g0_g4_v4_allocation_fidelity",
                     "gates": {
-                        name: {"gate": name, "passed": True, "required": True}
-                        for name in ("G0", "G1", "G2", "G3", "G4")
+                        **{
+                            name: {"gate": name, "passed": True, "required": True}
+                            for name in ("G1", "G2", "G3", "G4")
+                        },
+                        "G0": {
+                            "gate": "G0", "passed": True, "required": True,
+                            "metrics": {
+                                "allocation_value_reference": "Full-Explicit",
+                                "allocation_value_protocol": (
+                                    "common_frozen_checkpoint_state_bank_policy_context_oracle_allocation"
+                                ),
+                                "allocation_value_oracle_horizon": 1,
+                                "oracle_C_minus_random_logit_fidelity_error_ci95": [0.1, 0.2],
+                                "oracle_C_minus_random_value_fidelity_error_ci95": [0.1, 0.2],
+                                "oracle_C_minus_random_action_agreement_ci95": [0.1, 0.2],
+                            },
+                        },
                     },
                 }, handle)
             # Stub G5/G7/G9 so this test focuses on the gate-ladder scope rule.

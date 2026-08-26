@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -22,6 +23,7 @@ except ModuleNotFoundError:
     from scripts import run_paper_b_scaling as PB_SCALING
 from utils.paper_contracts import (
     PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION,
+    PAPER_B_PROMOTION_WINDOW_STEPS,
     PAPER_B_SELECTOR_ORACLE_HORIZON,
 )
 
@@ -66,16 +68,22 @@ def _validate_candidate_recall_protocol_horizon(protocol):
     return observed_horizon
 
 
-def _validate_candidate_recall_protocol_version(protocol):
-    """Validate an explicit oracle-protocol version when an artifact has one.
+def _validate_candidate_recall_protocol_version(protocol, *, required=False):
+    """Validate the candidate-recall protocol-version trust boundary.
 
-    The producer now always emits this field. Older H=1 artifacts predate the
-    field, so absence stays backward-compatible; a present version is never
-    silently ignored.
+    Inspection/quick mode may read historical H=1 artifacts which predate the
+    version field.  Confirmatory adjudication must be fail-closed: matching a
+    numeric horizon alone does not establish the same candidate-oracle
+    sampling, CRN, or action-mask semantics.
     """
     if not isinstance(protocol, dict):
         raise ValueError("Paper-B candidate-recall protocol must be a JSON object")
     if "protocol_version" not in protocol:
+        if required:
+            raise ValueError(
+                "Paper-B confirmatory candidate-recall protocol omits "
+                "protocol_version"
+            )
         return None
     observed = protocol["protocol_version"]
     if observed != PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION:
@@ -103,27 +111,93 @@ def _atomic_json(path, payload):
             os.unlink(temporary)
 
 
-def _load_panel(root, directory, filename, expected_variants, expected_seeds):
+def _require_exact_matrix(rows, expected_cells, key_fn, label):
+    """Fail closed unless every logical confirmatory cell occurs exactly once."""
+    keys = [key_fn(row) for row in rows]
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"{label} contains duplicate logical cells")
+    expected = set(expected_cells)
+    observed = set(keys)
+    if observed != expected:
+        missing = len(expected - observed)
+        unexpected = len(observed - expected)
+        raise ValueError(
+            f"{label} matrix mismatch: missing={missing}, unexpected={unexpected}"
+        )
+    if len(rows) != len(expected):
+        raise ValueError(f"{label} row-count mismatch")
+
+
+def _require_unique_cells(rows, key_fn, label):
+    """Reject duplicates even when the full expected matrix is data-dependent."""
+    keys = [key_fn(row) for row in rows]
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"{label} contains duplicate logical cells")
+
+
+def _validate_summary_binding(manifest, summary_path, rows, label, *, required):
+    """Bind a confirmatory manifest to the exact CSV bytes it adjudicates."""
+    if not required:
+        return
+    expected_count = manifest.get("summary_row_count")
+    expected_hash = str(manifest.get("summary_sha256", "")).strip()
+    try:
+        count_matches = int(expected_count) == len(rows)
+    except (TypeError, ValueError):
+        count_matches = False
+    if not count_matches or len(expected_hash) != 64:
+        raise ValueError(f"{label} manifest omits a valid summary binding")
+    with open(summary_path, "rb") as handle:
+        observed_hash = hashlib.sha256(handle.read()).hexdigest()
+    if observed_hash != expected_hash:
+        raise ValueError(f"{label} summary SHA-256 does not match its manifest")
+
+
+def _load_panel(
+    root, directory, filename, expected_variants, expected_seeds,
+    expected_panels=None, protocol_mode="quick",
+):
     panel_root = os.path.join(root, directory)
     with open(os.path.join(panel_root, "manifest.json"), encoding="utf-8") as handle:
         manifest = json.load(handle)
     if not manifest.get("complete"):
         raise ValueError(f"{directory} manifest is incomplete")
-    with open(os.path.join(panel_root, filename), newline="", encoding="utf-8") as handle:
+    summary_path = os.path.join(panel_root, filename)
+    with open(summary_path, newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    variants = {row["variant"] for row in rows}
-    seeds = {int(row["seed"]) for row in rows}
-    if variants != set(expected_variants) or seeds != set(expected_seeds):
-        raise ValueError(
-            f"{directory} matrix mismatch: variants={sorted(variants)}, seeds={sorted(seeds)}"
+    _validate_summary_binding(
+        manifest, summary_path, rows, directory,
+        required=(protocol_mode == "confirmatory"),
+    )
+    if expected_panels is None:
+        expected = {
+            (variant, int(seed))
+            for variant in expected_variants for seed in expected_seeds
+        }
+        _require_exact_matrix(
+            rows, expected,
+            lambda row: (row["variant"], int(row["seed"])),
+            directory,
+        )
+    else:
+        expected = {
+            (panel, variant, int(seed))
+            for panel in expected_panels
+            for variant in expected_variants
+            for seed in expected_seeds
+        }
+        _require_exact_matrix(
+            rows, expected,
+            lambda row: (row.get("panel", ""), row["variant"], int(row["seed"])),
+            directory,
         )
     return rows, manifest
 
 
-def _load_scaling(root, expected_seeds):
+def _load_scaling(root, expected_seeds, protocol_mode="quick"):
     rows, manifest = _load_panel(
         root, "paper_b_scaling", "summary_paper_b_scaling.csv",
-        EXPECTED_SCALING, expected_seeds,
+        EXPECTED_SCALING, expected_seeds, protocol_mode=protocol_mode,
     )
     degree = int(manifest.get("candidate_max_degree", 0))
     if degree <= 0:
@@ -140,7 +214,9 @@ def _load_scaling(root, expected_seeds):
     if not isinstance(recall, dict):
         raise ValueError("scaling manifest omits the oracle candidate-recall protocol")
     _validate_candidate_recall_protocol_horizon(recall)
-    _validate_candidate_recall_protocol_version(recall)
+    _validate_candidate_recall_protocol_version(
+        recall, required=(protocol_mode == "confirmatory")
+    )
     minimum = float(recall.get("minimum", float("nan")))
     if not math.isfinite(minimum) or not 0.0 <= minimum <= 1.0:
         raise ValueError("scaling manifest has an invalid candidate-recall minimum")
@@ -161,17 +237,19 @@ def _load_scaling(root, expected_seeds):
     if not budgets or len(set(budgets)) != len(budgets) or any(k <= 0 for k in budgets):
         raise ValueError("scaling manifest omits a unique positive core-budget sweep")
     agent_counts = sorted({int(row["n_agents"]) for row in rows})
-    observed = {
-        (int(row["seed"]), int(row["n_agents"]), int(row["core_budget"]), row["variant"])
-        for row in rows
-    }
     expected = {
         (int(seed), int(n), min(int(k), int(n) - 1), variant)
         for seed in expected_seeds for n in agent_counts for k in budgets
         for variant in EXPECTED_SCALING
     }
-    if observed != expected:
-        raise ValueError("scaling seed x population x core-budget x variant matrix is incomplete")
+    _require_exact_matrix(
+        rows, expected,
+        lambda row: (
+            int(row["seed"]), int(row["n_agents"]),
+            int(row["core_budget"]), row["variant"],
+        ),
+        "scaling seed x population x core-budget x variant",
+    )
     degradation = manifest.get("candidate_degradation_gate")
     if not isinstance(degradation, dict) or degradation.get("reference_variant") != "Semantic-Free-Unrestricted":
         raise ValueError("scaling manifest omits the frozen dynamic-vs-unrestricted gate")
@@ -193,17 +271,26 @@ def _mean_finite(values):
     return sum(values) / float(len(values))
 
 
-def _load_adaptive_budget(root, expected_seeds):
+def _load_adaptive_budget(root, expected_seeds, protocol_mode="quick"):
     panel_root = os.path.join(root, "paper_b_adaptive_budget")
     with open(os.path.join(panel_root, "manifest.json"), encoding="utf-8") as handle:
         manifest = json.load(handle)
     if not manifest.get("complete"):
         raise ValueError("paper_b_adaptive_budget manifest is incomplete")
+    summary_path = os.path.join(panel_root, "summary_paper_b_adaptive_budget.csv")
     with open(
-        os.path.join(panel_root, "summary_paper_b_adaptive_budget.csv"),
+        summary_path,
         newline="", encoding="utf-8",
     ) as handle:
         rows = list(csv.DictReader(handle))
+    _validate_summary_binding(
+        manifest, summary_path, rows, "adaptive-budget",
+        required=(protocol_mode == "confirmatory"),
+    )
+    _require_unique_cells(
+        rows, lambda row: (row["variant"], int(row["seed"])),
+        "adaptive-budget",
+    )
     seeds = {int(row["seed"]) for row in rows}
     if seeds != set(expected_seeds):
         raise ValueError("adaptive-budget seed matrix mismatch")
@@ -278,6 +365,11 @@ def _paired(rows, treatment, control, metric, panel=None):
         row for row in rows
         if panel is None or row.get("panel") == panel
     ]
+    _require_unique_cells(
+        selected,
+        lambda row: (row.get("panel", ""), row["variant"], int(row["seed"])),
+        "paired comparison",
+    )
     by_variant = {}
     for row in selected:
         by_variant.setdefault(row["variant"], {})[int(row["seed"])] = row
@@ -299,17 +391,23 @@ def validate(run_root, expected_seeds, protocol_mode):
     allocation, allocation_manifest = _load_panel(
         run_root, "paper_b_allocation", "summary_paper_b_allocation.csv",
         EXPECTED_ALLOCATION, expected_seeds,
+        expected_panels={"selector_isolation", "end_to_end"},
+        protocol_mode=protocol_mode,
     )
     pair_rows, _ = _load_panel(
         run_root, "paper_b_pair_latent", "summary_paper_b_pair_latent.csv",
-        EXPECTED_PAIR, expected_seeds,
+        EXPECTED_PAIR, expected_seeds, protocol_mode=protocol_mode,
     )
     periphery_rows, _ = _load_panel(
         run_root, "paper_b_periphery", "summary_paper_b_periphery.csv",
-        EXPECTED_PERIPHERY, expected_seeds,
+        EXPECTED_PERIPHERY, expected_seeds, protocol_mode=protocol_mode,
     )
-    scaling_rows, scaling_manifest = _load_scaling(run_root, expected_seeds)
-    adaptive_rows, adaptive_manifest = _load_adaptive_budget(run_root, expected_seeds)
+    scaling_rows, scaling_manifest = _load_scaling(
+        run_root, expected_seeds, protocol_mode=protocol_mode
+    )
+    adaptive_rows, adaptive_manifest = _load_adaptive_budget(
+        run_root, expected_seeds, protocol_mode=protocol_mode
+    )
     if protocol_mode == "quick":
         return {
             "paper": "B", "overall_status": "SMOKE_ONLY",
@@ -334,6 +432,62 @@ def validate(run_root, expected_seeds, protocol_mode):
             raise ValueError(
                 "Paper-B periphery fidelity must use frozen Full-Explicit "
                 "distillation targets on one immutable pre-action history"
+            )
+    # Pair representation and allocation are isolation experiments too. Bind
+    # every arm to the same immutable teacher/state/target/downstream content,
+    # rather than trusting a shared seed or checkpoint label alone.
+    pair_provenance = {}
+    for row in pair_rows:
+        if int(float(row.get("decision_fidelity_history_steps", 0))) <= 0:
+            raise ValueError("pair fidelity history is empty")
+        for key in (
+            "teacher_trace_sha256",
+            "teacher_action_history_sha256",
+            "decision_fidelity_state_bank_sha256",
+            "full_explicit_target_sha256",
+            "decision_fidelity_downstream_checkpoint_sha256",
+        ):
+            if len(str(row.get(key, "")).strip()) != 64:
+                raise ValueError(f"pair row omits valid {key}")
+        seed = int(float(row["seed"]))
+        fingerprint = tuple(str(row[key]) for key in (
+            "teacher_trace_sha256",
+            "teacher_action_history_sha256",
+            "decision_fidelity_state_bank_sha256",
+            "full_explicit_target_sha256",
+            "decision_fidelity_downstream_checkpoint_sha256",
+        ))
+        previous = pair_provenance.setdefault(seed, fingerprint)
+        if previous != fingerprint:
+            raise ValueError(
+                "pair variants within a seed did not share identical teacher/state provenance"
+            )
+    allocation_provenance = {}
+    for row in allocation:
+        if row.get("panel") != "selector_isolation":
+            continue
+        for key in (
+            "selector_state_bank_sha256",
+            "selector_teacher_context_sha256",
+            "selector_oracle_target_sha256",
+            "full_explicit_decision_target_sha256",
+            "decision_fidelity_downstream_checkpoint_sha256",
+        ):
+            if len(str(row.get(key, "")).strip()) != 64:
+                raise ValueError(f"allocation selector row omits valid {key}")
+        seed = int(float(row["seed"]))
+        fingerprint = tuple(str(row[key]) for key in (
+            "selector_state_bank_sha256",
+            "selector_teacher_context_sha256",
+            "selector_oracle_target_sha256",
+            "full_explicit_decision_target_sha256",
+            "decision_fidelity_downstream_checkpoint_sha256",
+        ))
+        previous = allocation_provenance.setdefault(seed, fingerprint)
+        if previous != fingerprint:
+            raise ValueError(
+                "allocation variants within a seed did not share identical "
+                "state/context/oracle provenance"
             )
     # Periphery isolation must be backed by one immutable, non-empty
     # peripheral teacher history and one common fidelity state bank.  A protocol
@@ -426,6 +580,15 @@ def validate(run_root, expected_seeds, protocol_mode):
         allocation, "C-Core", "WeakPrior-Core", "selector_oracle_f1",
         panel="selector_isolation",
     )
+    c_disagreement_selector_by_comparator = {}
+    for comparator in (
+        "AbsD-Core", "Attention-Core", "Random-Core", "Correlation-Core",
+        "WeakPrior-Core",
+    ):
+        c_disagreement_selector_by_comparator[comparator] = _paired(
+            allocation, "C-Core", comparator,
+            "disagreement_selector_oracle_f1", panel="selector_isolation",
+        )
     oracle_vs_random = _paired(
         allocation, "Oracle-C-Core", "Random-Core", "selector_oracle_f1",
         panel="selector_isolation",
@@ -450,6 +613,7 @@ def validate(run_root, expected_seeds, protocol_mode):
         "WeakPrior-Core",
     )
     c_fidelity_by_comparator = {}
+    c_disagreement_fidelity_by_comparator = {}
     for comparator in allocation_fidelity_comparators:
         c_fidelity_by_comparator[comparator] = {
             "logit": [-value for value in _paired(
@@ -463,6 +627,23 @@ def validate(run_root, expected_seeds, protocol_mode):
             "action": _paired(
                 allocation, "C-Core", comparator,
                 "action_agreement_to_full_explicit", panel="selector_isolation",
+            ),
+        }
+        c_disagreement_fidelity_by_comparator[comparator] = {
+            "logit": [-value for value in _paired(
+                allocation, "C-Core", comparator,
+                "disagreement_policy_logit_l2_to_full_explicit",
+                panel="selector_isolation",
+            )],
+            "value": [-value for value in _paired(
+                allocation, "C-Core", comparator,
+                "disagreement_value_mae_to_full_explicit",
+                panel="selector_isolation",
+            )],
+            "action": _paired(
+                allocation, "C-Core", comparator,
+                "disagreement_action_agreement_to_full_explicit",
+                panel="selector_isolation",
             ),
         }
     pair_retrieval = [
@@ -513,6 +694,10 @@ def validate(run_root, expected_seeds, protocol_mode):
     warm_start_logit = [-value for value in _paired(
         pair_rows, "Recurrent-BC-CD", "Recurrent-BC-CD-NoWarmStart",
         "promotion_logit_error_auc",
+    )]
+    warm_start_policy_kl = [-value for value in _paired(
+        pair_rows, "Recurrent-BC-CD", "Recurrent-BC-CD-NoWarmStart",
+        "promotion_policy_kl_auc",
     )]
     warm_start_value = [-value for value in _paired(
         pair_rows, "Recurrent-BC-CD", "Recurrent-BC-CD-NoWarmStart",
@@ -876,6 +1061,8 @@ def validate(run_root, expected_seeds, protocol_mode):
                 candidate_provider_work_bound_valid = False
         if not str(row.get("candidate_last_hash", "")).strip():
             candidate_provider_contract_valid = False
+        if len(str(row.get("candidate_history_sha256", "")).strip()) != 64:
+            candidate_provider_contract_valid = False
         for key in (
             "candidate_refresh_ms", "candidate_churn", "candidate_added_pairs",
             "candidate_removed_pairs", "candidate_cell_occupancy_mean",
@@ -891,6 +1078,12 @@ def validate(run_root, expected_seeds, protocol_mode):
         "c_core_minus_random_selector_f1": c_vs_random,
         "c_core_minus_correlation_selector_f1": c_vs_correlation,
         "c_core_minus_weak_prior_selector_f1": c_vs_weak_prior,
+        **{
+            "c_core_minus_"
+            f"{comparator.lower().replace('-core', '').replace('-', '_')}"
+            "_disagreement_selector_f1": values
+            for comparator, values in c_disagreement_selector_by_comparator.items()
+        },
         "oracle_minus_random_selector_f1": oracle_vs_random,
         "c_core_minus_absd_reward": c_reward_vs_d,
         "c_core_minus_absd_logit_fidelity_error": c_logit_vs_d,
@@ -903,6 +1096,7 @@ def validate(run_root, expected_seeds, protocol_mode):
         "full_cd_minus_bc_action_agreement": pair_action,
         "warm_start_minus_no_warm_post_promotion_bc_loss": warm_start_transient,
         "warm_start_minus_no_warm_promotion_logit_error": warm_start_logit,
+        "warm_start_minus_no_warm_promotion_policy_kl": warm_start_policy_kl,
         "warm_start_minus_no_warm_promotion_value_error": warm_start_value,
         "warm_start_minus_no_warm_promotion_action_agreement": warm_start_action,
         "semantic_free_minus_single_mean_reward": periphery_reward,
@@ -928,6 +1122,11 @@ def validate(run_root, expected_seeds, protocol_mode):
         metrics[f"c_core_minus_{tag}_logit_fidelity_error"] = values["logit"]
         metrics[f"c_core_minus_{tag}_value_fidelity_error"] = values["value"]
         metrics[f"c_core_minus_{tag}_action_agreement"] = values["action"]
+    for comparator, values in c_disagreement_fidelity_by_comparator.items():
+        tag = comparator.lower().replace("-core", "").replace("-", "_")
+        metrics[f"c_core_minus_{tag}_disagreement_logit_fidelity_error"] = values["logit"]
+        metrics[f"c_core_minus_{tag}_disagreement_value_fidelity_error"] = values["value"]
+        metrics[f"c_core_minus_{tag}_disagreement_action_agreement"] = values["action"]
     for baseline, values in pair_fidelity_by_baseline.items():
         tag = baseline.lower().replace("-", "_")
         metrics[f"full_pair_minus_{tag}_logit_fidelity_error"] = values["logit"]
@@ -951,12 +1150,29 @@ def validate(run_root, expected_seeds, protocol_mode):
         key: VC._bootstrap_mean_ci(value, seed=4100 + index)
         for index, (key, value) in enumerate(metrics.items())
     }
-    c_fidelity_all = all(
-        cis[f"c_core_minus_{comp.lower().replace('-core','').replace('-','_')}_logit_fidelity_error"][0] > 0.0
-        and cis[f"c_core_minus_{comp.lower().replace('-core','').replace('-','_')}_value_fidelity_error"][0] > 0.0
-        and cis[f"c_core_minus_{comp.lower().replace('-core','').replace('-','_')}_action_agreement"][0] > 0.0
+    c_disagreement_fidelity_all = all(
+        cis[f"c_core_minus_{comp.lower().replace('-core','').replace('-','_')}_disagreement_logit_fidelity_error"][0] > 0.0
+        and cis[f"c_core_minus_{comp.lower().replace('-core','').replace('-','_')}_disagreement_value_fidelity_error"][0] > 0.0
+        and cis[f"c_core_minus_{comp.lower().replace('-core','').replace('-','_')}_disagreement_action_agreement"][0] > 0.0
         for comp in allocation_fidelity_comparators
     )
+    for row in pair_rows:
+        if row["variant"] not in {
+            "Recurrent-BC-CD", "Recurrent-BC-CD-NoWarmStart",
+        }:
+            continue
+        if int(float(row.get("promotion_transient_horizon", -1))) != int(
+            PAPER_B_PROMOTION_WINDOW_STEPS
+        ):
+            raise ValueError("pair promotion artifact violates frozen Paper-B W")
+        if int(float(row.get("promotion_window_contract", -1))) != int(
+            PAPER_B_PROMOTION_WINDOW_STEPS
+        ):
+            raise ValueError("pair promotion artifact omits frozen W contract")
+        if int(float(row.get("promotion_total_teacher_steps", 0))) < int(
+            PAPER_B_PROMOTION_WINDOW_STEPS
+        ):
+            raise ValueError("pair promotion artifact has fewer than W post-promotion steps")
     pair_fidelity_all = all(
         cis[f"full_pair_minus_{base.lower().replace('-','_')}_logit_fidelity_error"][0] > 0.0
         and cis[f"full_pair_minus_{base.lower().replace('-','_')}_value_fidelity_error"][0] > 0.0
@@ -975,38 +1191,24 @@ def validate(run_root, expected_seeds, protocol_mode):
         and all(value > 0.5 for value in candidate_degradation_pass_flags)
     )
     primary_conditions = {
-        "C_selector_beats_absD_at_equal_budget": cis[
-            "c_core_minus_absd_selector_f1"
-        ][0] > 0.0,
         "C_selector_beats_absD_when_profiles_disagree": cis[
             "c_core_minus_absd_disagreement_f1"
         ][0] > 0.0,
-        "C_selector_beats_attention_at_equal_budget": cis[
-            "c_core_minus_attention_selector_f1"
-        ][0] > 0.0,
-        "C_selector_beats_random_at_equal_budget": cis[
-            "c_core_minus_random_selector_f1"
-        ][0] > 0.0,
-        "C_selector_beats_correlation_at_equal_budget": cis[
-            "c_core_minus_correlation_selector_f1"
-        ][0] > 0.0,
-        "C_selector_beats_weak_prior_at_equal_budget": cis[
-            "c_core_minus_weak_prior_selector_f1"
-        ][0] > 0.0,
-        "oracle_selector_beats_random_at_equal_budget": cis[
-            "oracle_minus_random_selector_f1"
-        ][0] > 0.0,
-        "C_allocation_improves_end_to_end_reward_over_absD": cis[
-            "c_core_minus_absd_reward"
-        ][0] > 0.0,
-        "C_allocation_improves_policy_fidelity_over_absD": cis[
-            "c_core_minus_absd_logit_fidelity_error"
-        ][0] > 0.0 and cis["c_core_minus_absd_action_agreement"][0] > 0.0,
-        "C_allocation_improves_value_fidelity_over_absD": cis[
-            "c_core_minus_absd_value_fidelity_error"
-        ][0] > 0.0,
+        **{
+            "C_selector_beats_"
+            f"{comparator.lower().replace('-core', '').replace('-', '_')}"
+            "_when_profiles_disagree": cis[
+                "c_core_minus_"
+                f"{comparator.lower().replace('-core', '').replace('-', '_')}"
+                "_disagreement_selector_f1"
+            ][0] > 0.0
+            for comparator in (
+                "Attention-Core", "Random-Core", "Correlation-Core",
+                "WeakPrior-Core",
+            )
+        },
         "H1a_C_improves_full_explicit_decision_fidelity_over_all_stated_comparators": bool(
-            c_fidelity_all
+            c_disagreement_fidelity_all
         ),
         "CD_contrastive_latent_improves_profile_retrieval": cis[
             "bc_minus_full_cd_retrieval_mae"
@@ -1024,13 +1226,9 @@ def validate(run_root, expected_seeds, protocol_mode):
             pair_fidelity_all
         ),
         "shadow_warm_start_reduces_post_promotion_transient": cis[
-            "warm_start_minus_no_warm_post_promotion_bc_loss"
-        ][0] > 0.0 and cis[
-            "warm_start_minus_no_warm_promotion_logit_error"
+            "warm_start_minus_no_warm_promotion_policy_kl"
         ][0] > 0.0 and cis[
             "warm_start_minus_no_warm_promotion_value_error"
-        ][0] > 0.0 and cis[
-            "warm_start_minus_no_warm_promotion_action_agreement"
         ][0] > 0.0 and all(count > 0 for count in warm_start_events),
         "semantic_free_memory_improves_reward_over_single_mean": cis[
             "semantic_free_minus_single_mean_reward"
@@ -1113,6 +1311,33 @@ def validate(run_root, expected_seeds, protocol_mode):
         ),
     }
     secondary_predictions = {
+        "C_selector_beats_absD_at_equal_budget": cis[
+            "c_core_minus_absd_selector_f1"
+        ][0] > 0.0,
+        "C_selector_beats_attention_at_equal_budget": cis[
+            "c_core_minus_attention_selector_f1"
+        ][0] > 0.0,
+        "C_selector_beats_random_at_equal_budget": cis[
+            "c_core_minus_random_selector_f1"
+        ][0] > 0.0,
+        "C_selector_beats_correlation_at_equal_budget": cis[
+            "c_core_minus_correlation_selector_f1"
+        ][0] > 0.0,
+        "C_selector_beats_weak_prior_at_equal_budget": cis[
+            "c_core_minus_weak_prior_selector_f1"
+        ][0] > 0.0,
+        "oracle_selector_beats_random_at_equal_budget": cis[
+            "oracle_minus_random_selector_f1"
+        ][0] > 0.0,
+        "C_allocation_improves_end_to_end_reward_over_absD": cis[
+            "c_core_minus_absd_reward"
+        ][0] > 0.0,
+        "C_allocation_improves_policy_fidelity_over_absD": cis[
+            "c_core_minus_absd_logit_fidelity_error"
+        ][0] > 0.0 and cis["c_core_minus_absd_action_agreement"][0] > 0.0,
+        "C_allocation_improves_value_fidelity_over_absD": cis[
+            "c_core_minus_absd_value_fidelity_error"
+        ][0] > 0.0,
         "capacity_pooling_beats_absD_weighted_pooling": cis[
             "capacity_pooling_minus_absD_pooling_reward"
         ][0] > 0.0,

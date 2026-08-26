@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import tempfile
@@ -230,6 +231,8 @@ def main(argv=None):
         writer = csv.DictWriter(handle, fieldnames=sorted(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    with open(summary, "rb") as handle:
+        summary_sha256 = hashlib.sha256(handle.read()).hexdigest()
     _atomic_json(os.path.join(out_root, "manifest.json"), {
         "experiment": "paper_b_entropy_adaptive_budget",
         "complete": True,
@@ -249,6 +252,8 @@ def main(argv=None):
         "pilot_adaptive_core_cost_per_ego": float(pilot_adaptive_cost),
         "matched_fixed_variant": matched,
         "pooled_adaptive_core_cost_per_ego": float(adaptive_cost),
+        "summary_row_count": int(len(rows)),
+        "summary_sha256": summary_sha256,
         "summary": summary,
     })
     print(summary)

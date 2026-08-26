@@ -593,6 +593,8 @@ def main(argv=None):
         )
         writer.writeheader()
         writer.writerows(rows)
+    with open(summary_path, "rb") as handle:
+        summary_sha256 = hashlib.sha256(handle.read()).hexdigest()
     _atomic_json(os.path.join(out_root, "manifest.json"), {
         "experiment": "paper_b_fixed_core_periphery",
         "complete": True,
@@ -611,6 +613,8 @@ def main(argv=None):
             "tolerance": 0.05,
             "selection": "deterministic architecture-only width search",
         },
+        "summary_row_count": int(len(rows)),
+        "summary_sha256": summary_sha256,
         "summary": summary_path,
     })
     print(summary_path)

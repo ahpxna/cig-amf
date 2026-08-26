@@ -10,8 +10,10 @@ identification test—that remains Paper A/H1.
 import argparse
 import copy
 import csv
+import hashlib
 import json
 import os
+import pickle
 import tempfile
 
 import numpy as np
@@ -48,13 +50,20 @@ VARIANTS = {
 }
 
 
+def _sha256_object(value):
+    """Content-bind a frozen isolation input or target, not its file path."""
+    return hashlib.sha256(
+        pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+    ).hexdigest()
+
+
 def _decision_probe(runner, n_states, seed):
     """Evaluate policy/value outputs on a held-out common state bank."""
     bank = runner.env.sample_state_bank(
         n_states=int(n_states), burn_in=3, bank_seed=int(seed)
     )
     outer = runner.env.clone_state()
-    logits, values, actions = [], [], []
+    logits, values, actions, masks = [], [], [], []
     try:
         for state in bank:
             runner.env.restore_state(copy.deepcopy(state))
@@ -63,6 +72,7 @@ def _decision_probe(runner, n_states, seed):
                 obs, apply_forcing=False
             )
             logits.append(np.asarray(cache["policy_logits"], dtype=np.float64))
+            masks.append(np.asarray(cache["valid_action_masks"], dtype=bool))
             values.append(np.asarray(
                 [cache["value_cache"][ego] for ego in range(runner.n_agents)],
                 dtype=np.float64,
@@ -79,13 +89,23 @@ def _decision_probe(runner, n_states, seed):
         "logits": np.stack(logits, axis=0),
         "values": np.stack(values, axis=0),
         "actions": np.stack(actions, axis=0),
+        "valid_action_masks": np.stack(masks, axis=0),
     }
 
 
 def _decision_fidelity(probe, reference):
+    valid = np.asarray(probe["valid_action_masks"], dtype=bool)
+    reference_valid = np.asarray(reference["valid_action_masks"], dtype=bool)
+    if (
+        valid.shape != np.asarray(probe["logits"]).shape
+        or not np.array_equal(valid, reference_valid)
+        or not np.all(np.any(valid, axis=-1))
+    ):
+        raise ValueError("allocation fidelity requires one matched non-empty action mask")
     return {
         "policy_logit_l2_to_full_explicit": float(np.mean(
-            (probe["logits"] - reference["logits"]) ** 2
+            (np.asarray(probe["logits"])[valid]
+             - np.asarray(reference["logits"])[valid]) ** 2
         ) ** 0.5),
         "value_mae_to_full_explicit": float(np.mean(np.abs(
             probe["values"] - reference["values"]
@@ -477,6 +497,7 @@ def _initial_checkpoint(seed, core_budget, device, n_agents=24):
 def _isolation_rows(
     variants, seed, core_budget, device, checkpoint, state_bank, oracle_bank,
     oracle_direction_bank, teacher_contexts, n_agents=24,
+    require_disagreement=True,
 ):
     records = {variant: [] for variant in variants}
     for variant in variants:
@@ -540,6 +561,9 @@ def _isolation_rows(
                         dtype=np.float64,
                     ),
                     "actions": np.asarray(actions, dtype=np.int64),
+                    "valid_action_masks": np.asarray(
+                        decision_cache["valid_action_masks"], dtype=bool
+                    ),
                 })
 
     # The challenge subset is defined only from oracle C* and oracle D*, not
@@ -562,6 +586,15 @@ def _isolation_rows(
     reference_fidelity = {
         row["key"]: row for row in records.get("Full-Explicit", [])
     }
+    if len(reference_fidelity) != len(state_bank) * int(n_agents):
+        raise RuntimeError("Full-Explicit selector reference does not cover the state bank")
+    state_bank_hash = _sha256_object(state_bank)
+    teacher_context_hash = _sha256_object(teacher_contexts)
+    oracle_target_hash = _sha256_object({
+        "capacity": oracle_bank,
+        "direction": oracle_direction_bank,
+    })
+    reference_target_hash = _sha256_object(reference_fidelity)
     for variant in variants:
         values = records[variant]
         selector = VARIANTS[variant]
@@ -575,21 +608,51 @@ def _isolation_rows(
         disagreement = [
             row["f1"] for row in values if row["key"] in disagreement_keys
         ]
+        if require_disagreement and (not disagreement_keys or not disagreement):
+            raise RuntimeError(
+                "selector-isolation bank contains no oracle C*/|D* "
+                "disagreement states; H1a is not identifiable"
+            )
         fidelity = [
             _decision_fidelity(
                 {
                     "logits": row["logits"][None, ...],
                     "values": row["values"][None, ...],
                     "actions": row["actions"][None, ...],
+                    "valid_action_masks": row["valid_action_masks"][None, ...],
                 },
                 {
                     "logits": reference_fidelity[row["key"]]["logits"][None, ...],
                     "values": reference_fidelity[row["key"]]["values"][None, ...],
                     "actions": reference_fidelity[row["key"]]["actions"][None, ...],
+                    "valid_action_masks": reference_fidelity[row["key"]]["valid_action_masks"][None, ...],
                 },
             )
             for row in values if row["key"] in reference_fidelity
         ]
+        disagreement_fidelity = [
+            _decision_fidelity(
+                {
+                    "logits": row["logits"][None, ...],
+                    "values": row["values"][None, ...],
+                    "actions": row["actions"][None, ...],
+                    "valid_action_masks": row["valid_action_masks"][None, ...],
+                },
+                {
+                    "logits": reference_fidelity[row["key"]]["logits"][None, ...],
+                    "values": reference_fidelity[row["key"]]["values"][None, ...],
+                    "actions": reference_fidelity[row["key"]]["actions"][None, ...],
+                    "valid_action_masks": reference_fidelity[row["key"]]["valid_action_masks"][None, ...],
+                },
+            )
+            for row in values
+            if row["key"] in disagreement_keys and row["key"] in reference_fidelity
+        ]
+        if require_disagreement and len(disagreement_fidelity) != len(disagreement_keys):
+            raise RuntimeError(
+                "selector-isolation disagreement states are missing a "
+                "Full-Explicit decision-fidelity reference"
+            )
         rows.append({
             "panel": "selector_isolation",
             "variant": variant,
@@ -598,9 +661,14 @@ def _isolation_rows(
             "episodes": 0,
             "pretrain_episodes": int(checkpoint["episodes"]),
             "checkpoint_sha256": checkpoint["sha256"],
+            "selector_state_bank_sha256": state_bank_hash,
+            "selector_teacher_context_sha256": teacher_context_hash,
+            "selector_oracle_target_sha256": oracle_target_hash,
+            "full_explicit_decision_target_sha256": reference_target_hash,
+            "decision_fidelity_downstream_checkpoint_sha256": checkpoint["sha256"],
             "core_budget": int(core_budget),
             "matched_budget": int(selector != "full_explicit"),
-            "strict_5d_signature": True,
+            "allocator_5d_signature_and_retained_latency_profile": True,
             "selector_state_count": int(len(state_bank)),
             "selector_pair_state_count": int(len(values)),
             "oracle_reference": "clone_state_all_action_fixed_rho_C",
@@ -624,6 +692,21 @@ def _isolation_rows(
             ]),
             "action_agreement_to_full_explicit": _mean([
                 item["action_agreement_to_full_explicit"] for item in fidelity
+            ]),
+            # H1a's primary endpoint is fidelity on the oracle-defined C*/|D*
+            # challenge subset. Broad-state fidelity above is retained only as
+            # a secondary descriptive result.
+            "disagreement_policy_logit_l2_to_full_explicit": _mean([
+                item["policy_logit_l2_to_full_explicit"]
+                for item in disagreement_fidelity
+            ]),
+            "disagreement_value_mae_to_full_explicit": _mean([
+                item["value_mae_to_full_explicit"]
+                for item in disagreement_fidelity
+            ]),
+            "disagreement_action_agreement_to_full_explicit": _mean([
+                item["action_agreement_to_full_explicit"]
+                for item in disagreement_fidelity
             ]),
             "decision_fidelity_reference": "Full-Explicit",
             "decision_fidelity_protocol": (
@@ -661,7 +744,7 @@ def _end_to_end_row(
         "checkpoint_role": checkpoint.get("checkpoint_role", "unspecified"),
         "core_budget": int(core_budget),
         "matched_budget": int(selector != "full_explicit"),
-        "strict_5d_signature": True,
+        "allocator_5d_signature_and_retained_latency_profile": True,
         "mean_core_size": _mean(history.get("mean_core_size", [])),
         "selector_oracle_f1": float("nan"),
         "oracle_reference": (
@@ -872,6 +955,8 @@ def main(argv=None):
         )
         writer.writeheader()
         writer.writerows(rows)
+    with open(path, "rb") as handle:
+        summary_sha256 = hashlib.sha256(handle.read()).hexdigest()
     _atomic_json(os.path.join(out_root, "manifest.json"), {
         "experiment": "paper_b_c_vs_absd_allocation",
         "complete": True,
@@ -892,6 +977,8 @@ def main(argv=None):
         "selector_bank_held_out": True,
         "variants": {name: VARIANTS[name] for name in selected_variants},
         "panels": ["selector_isolation", "end_to_end"],
+        "summary_row_count": int(len(rows)),
+        "summary_sha256": summary_sha256,
         "selector_isolation_checkpoint": "selector_neutral_full_explicit_pretrain",
         "end_to_end_checkpoint": "common_untrained_initialization",
         "summary": path,

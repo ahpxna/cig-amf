@@ -31,8 +31,9 @@ from scripts.scientific_gate_common import (
     GATE_SCHEMA_VERSION, atomic_json, bootstrap_mean_ci, gate_record, load_json,
     wilson_interval,
 )
+from utils.paper_contracts import PAPER_B_SELECTOR_ORACLE_HORIZON
 
-PROTOCOL_VERSION = "scientific_prechecks_g0_g4_v3_disagreement_capture"
+PROTOCOL_VERSION = "scientific_prechecks_g0_g4_v4_allocation_fidelity"
 TRUE_NULL_C_TOLERANCE = 1e-10
 
 
@@ -94,6 +95,86 @@ def _oracle_allocation_value_seed(
         "oracle_C_minus_random": float(rewards["OracleCore"] - rewards["RandomCore"]),
         "oracle_C_minus_mean_field": float(rewards["OracleCore"] - rewards["PureMeanField"]),
         "oracle_C_minus_absD": float(rewards["OracleCore"] - rewards["OracleAbsDCore"]),
+    }
+
+
+def _oracle_allocation_decision_fidelity_seed(
+    *, seed, device, n_agents, pretrain_episodes, state_count, k, horizon,
+    trials,
+):
+    """Run Paper-B's pre-training Allocation-Value Gate on a frozen bank.
+
+    The sole moving factor is the matched-k core allocation.  Full Explicit is
+    the decision reference and Oracle-C/Random consume one common frozen
+    downstream checkpoint, clone-state bank, factual co-action context, and
+    all-action H=1 oracle.  Reward is intentionally not used as the endpoint
+    here; it remains a separate practical outcome gate.
+    """
+    if int(horizon) != int(PAPER_B_SELECTOR_ORACLE_HORIZON):
+        raise ValueError(
+            "Paper-B Allocation-Value Gate is frozen to "
+            f"H={PAPER_B_SELECTOR_ORACLE_HORIZON}"
+        )
+    RE.set_global_seed(int(seed))
+    checkpoint = PB._pretrain_checkpoint(
+        int(seed), int(pretrain_episodes), int(k), device,
+        n_agents=int(n_agents),
+    )
+    neutral = PB._prepare_variant_runner(
+        "Full-Explicit", int(seed), int(k), device, checkpoint,
+        n_agents=int(n_agents),
+    )
+    neutral.cfg["freeze_policy_learning"] = True
+    neutral.cfg["freeze_representation_state"] = True
+    state_bank = neutral.env.sample_state_bank(
+        n_states=int(state_count), burn_in=3, bank_seed=int(seed) + 17011,
+    )
+    if not state_bank:
+        raise RuntimeError("Allocation-Value Gate sampled an empty frozen state bank")
+    teacher_contexts = [
+        PB._policy_context_for_state(neutral, state) for state in state_bank
+    ]
+    oracle_capacity, oracle_direction = [], []
+    for index, state in enumerate(state_bank):
+        capacity, direction = PB._oracle_capacity_direction_for_state(
+            neutral.env, state, horizon=int(horizon), discount=0.97,
+            trials=int(trials), seed=(int(seed) + 1) * 1900813 + int(index),
+            target_policy_probs=teacher_contexts[index]["policy_probs"],
+        )
+        oracle_capacity.append(capacity)
+        oracle_direction.append(direction)
+    rows = PB._isolation_rows(
+        ("Full-Explicit", "Oracle-C-Core", "Random-Core"), int(seed), int(k),
+        device, checkpoint, state_bank, oracle_capacity, oracle_direction,
+        teacher_contexts, n_agents=int(n_agents), require_disagreement=False,
+    )
+    by_variant = {row["variant"]: row for row in rows}
+    required = {"Full-Explicit", "Oracle-C-Core", "Random-Core"}
+    if set(by_variant) != required:
+        raise RuntimeError("Allocation-Value Gate did not produce its exact matrix")
+    oracle = by_variant["Oracle-C-Core"]
+    random = by_variant["Random-Core"]
+    return {
+        "seed": int(seed),
+        "core_budget": int(k),
+        "pretrain_episodes": int(pretrain_episodes),
+        "state_count": int(len(state_bank)),
+        "oracle_horizon": int(horizon),
+        "oracle_trials": int(trials),
+        "reference_variant": "Full-Explicit",
+        "protocol": "common_frozen_checkpoint_state_bank_policy_context_oracle_allocation",
+        "oracle_C_minus_random_logit_fidelity_error": float(
+            random["policy_logit_l2_to_full_explicit"]
+            - oracle["policy_logit_l2_to_full_explicit"]
+        ),
+        "oracle_C_minus_random_value_fidelity_error": float(
+            random["value_mae_to_full_explicit"]
+            - oracle["value_mae_to_full_explicit"]
+        ),
+        "oracle_C_minus_random_action_agreement": float(
+            oracle["action_agreement_to_full_explicit"]
+            - random["action_agreement_to_full_explicit"]
+        ),
     }
 
 
@@ -282,6 +363,12 @@ def main(argv=None):
     ap.add_argument("--oracle-trials", type=int, default=1)
     ap.add_argument("--core-k", type=int, default=3)
     ap.add_argument("--allocation-episodes", type=int, default=40)
+    ap.add_argument("--allocation-pretrain-episodes", type=int, default=40)
+    ap.add_argument("--allocation-state-count", type=int, default=4)
+    ap.add_argument(
+        "--allocation-oracle-horizon", type=int,
+        default=PAPER_B_SELECTOR_ORACLE_HORIZON,
+    )
     ap.add_argument("--allocation-max-steps", type=int, default=30)
     ap.add_argument("--allocation-core-refresh-every", type=int, default=5)
     ap.add_argument("--allocation-final-window", type=int, default=10)
@@ -308,8 +395,14 @@ def main(argv=None):
     if (
         args.allocation_episodes <= 0 or args.allocation_max_steps <= 0
         or args.allocation_core_refresh_every <= 0 or args.allocation_final_window <= 0
+        or args.allocation_pretrain_episodes <= 0 or args.allocation_state_count <= 0
     ):
         ap.error("allocation-gate budgets must be positive integers")
+    if int(args.allocation_oracle_horizon) != int(PAPER_B_SELECTOR_ORACLE_HORIZON):
+        ap.error(
+            "--allocation-oracle-horizon is frozen to "
+            f"{PAPER_B_SELECTOR_ORACLE_HORIZON} for Paper B"
+        )
 
     exp0 = load_json(args.experiment0, "Experiment 0")
     exp0_pass = bool(exp0.get("required_gate_pass", False))
@@ -344,9 +437,17 @@ def main(argv=None):
         _oracle_allocation_value_seed(
             seed=seed, device=args.device, n_agents=args.n_agents,
             episodes=args.allocation_episodes, max_steps=args.allocation_max_steps,
-            k=args.core_k, horizon=args.oracle_horizon, trials=args.oracle_trials,
+            k=args.core_k, horizon=args.allocation_oracle_horizon,
             core_refresh_every=args.allocation_core_refresh_every,
             final_window=args.allocation_final_window,
+        ) for seed in args.seeds
+    ]
+    allocation_fidelity_rows = [
+        _oracle_allocation_decision_fidelity_seed(
+            seed=seed, device=args.device, n_agents=args.n_agents,
+            pretrain_episodes=args.allocation_pretrain_episodes,
+            state_count=args.allocation_state_count, k=args.core_k,
+            horizon=args.allocation_oracle_horizon, trials=args.oracle_trials,
         ) for seed in args.seeds
     ]
     h1_rows = [
@@ -369,10 +470,28 @@ def main(argv=None):
     c_vs_mean_field = [row["oracle_C_minus_mean_field"] for row in allocation_rows]
     c_random_ci = bootstrap_mean_ci(c_vs_random, seed=4100)
     c_mean_field_ci = bootstrap_mean_ci(c_vs_mean_field, seed=4101)
+    c_vs_random_logit = [
+        row["oracle_C_minus_random_logit_fidelity_error"]
+        for row in allocation_fidelity_rows
+    ]
+    c_vs_random_value = [
+        row["oracle_C_minus_random_value_fidelity_error"]
+        for row in allocation_fidelity_rows
+    ]
+    c_vs_random_action = [
+        row["oracle_C_minus_random_action_agreement"]
+        for row in allocation_fidelity_rows
+    ]
+    c_random_logit_ci = bootstrap_mean_ci(c_vs_random_logit, seed=4102)
+    c_random_value_ci = bootstrap_mean_ci(c_vs_random_value, seed=4103)
+    c_random_action_ci = bootstrap_mean_ci(c_vs_random_action, seed=4104)
     g0_pass = bool(
         exp0_pass and scientific
         and math.isfinite(c_random_ci[0]) and c_random_ci[0] > 0.0
         and math.isfinite(c_mean_field_ci[0]) and c_mean_field_ci[0] > 0.0
+        and math.isfinite(c_random_logit_ci[0]) and c_random_logit_ci[0] > 0.0
+        and math.isfinite(c_random_value_ci[0]) and c_random_value_ci[0] > 0.0
+        and math.isfinite(c_random_action_ci[0]) and c_random_action_ci[0] > 0.0
     )
     g0 = gate_record(
         "G0", g0_pass, required=True,
@@ -382,17 +501,31 @@ def main(argv=None):
             "oracle_C_minus_random_reward_ci95": c_random_ci,
             "oracle_C_minus_PureMeanField_reward_by_seed": c_vs_mean_field,
             "oracle_C_minus_PureMeanField_reward_ci95": c_mean_field_ci,
+            "allocation_value_reference": "Full-Explicit",
+            "allocation_value_protocol": (
+                "common_frozen_checkpoint_state_bank_policy_context_oracle_allocation"
+            ),
+            "oracle_C_minus_random_logit_fidelity_error_by_seed": c_vs_random_logit,
+            "oracle_C_minus_random_logit_fidelity_error_ci95": c_random_logit_ci,
+            "oracle_C_minus_random_value_fidelity_error_by_seed": c_vs_random_value,
+            "oracle_C_minus_random_value_fidelity_error_ci95": c_random_value_ci,
+            "oracle_C_minus_random_action_agreement_by_seed": c_vs_random_action,
+            "oracle_C_minus_random_action_agreement_ci95": c_random_action_ci,
             "matched_core_k": int(args.core_k),
             "allocation_episodes": int(args.allocation_episodes),
             "allocation_final_window": int(args.allocation_final_window),
             "oracle_core_refresh_every": int(args.allocation_core_refresh_every),
             "oracle_scope": "periodically_refreshed_operational_oracle",
+            "allocation_value_oracle_horizon": int(args.allocation_oracle_horizon),
+            "allocation_value_state_count": int(args.allocation_state_count),
+            "allocation_value_pretrain_episodes": int(args.allocation_pretrain_episodes),
         },
         rule=(
-            "the periodically refreshed operational oracle C*-core must beat a matched-k RandomCore and the structural-blind "
-            "PureMeanField control on paired final-window reward, with positive seed-level "
-            "bootstrap lower bounds; Experiment0 must independently establish non-zero "
-            "structure value"
+            "on one frozen state bank, matched-k Oracle-C must reduce masked "
+            "policy-logit and value error and increase action agreement versus "
+            "RandomCore relative to Full Explicit; it must also beat RandomCore "
+            "and structural-blind PureMeanField on paired final-window reward. "
+            "Experiment0 must independently establish non-zero structure value"
         ),
         failure_action="redesign environment or stop Paper-B allocation claim",
     )

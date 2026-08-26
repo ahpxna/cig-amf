@@ -1,3 +1,4 @@
+import hashlib
 import time
 import numpy as np
 import torch
@@ -561,6 +562,7 @@ class FinalCIGAMFRunner:
             "feature_snapshot_linear_candidate": [],
             "candidate_epoch": [],
             "candidate_map_hash": [],
+            "candidate_trajectory_sha256": [],
             "candidate_provider": [],
             "candidate_refresh_ms": [],
             "candidate_provider_work_units": [],
@@ -2864,6 +2866,11 @@ class FinalCIGAMFRunner:
         candidate_degree_mean = float(edge_count) / float(max(1, self.n_agents))
         core_degree_mean = float(core_pair_count) / float(max(1, self.n_agents))
         n_steps = int(len(trajectory))
+        candidate_trajectory_sha256 = hashlib.sha256(
+            "\n".join(
+                str(step.get("candidate_map_hash", "")) for step in trajectory
+            ).encode("utf-8")
+        ).hexdigest()
 
         def _state_bytes(states):
             total = 0
@@ -2917,6 +2924,7 @@ class FinalCIGAMFRunner:
             "feature_snapshot_linear_candidate": bool(self.feature_snapshot_linear_candidate),
             "candidate_epoch": int(self.candidate_epoch),
             "candidate_map_hash": str(self.candidate_map_hash),
+            "candidate_trajectory_sha256": candidate_trajectory_sha256,
             "candidate_provider": str(self._candidate_telemetry.get("provider", "unknown")),
             "candidate_refresh_ms": float(
                 self._candidate_telemetry.get("candidate_refresh_ms", 0.0)
@@ -3315,6 +3323,9 @@ class FinalCIGAMFRunner:
                 )
                 self.history.setdefault("candidate_map_hash", []).append(
                     str(snapshot.get("candidate_map_hash", ""))
+                )
+                self.history.setdefault("candidate_trajectory_sha256", []).append(
+                    str(snapshot.get("candidate_trajectory_sha256", ""))
                 )
                 self.history.setdefault("candidate_provider", []).append(
                     str(snapshot.get("candidate_provider", "unknown"))

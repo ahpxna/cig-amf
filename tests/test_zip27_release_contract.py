@@ -5,6 +5,7 @@ import pytest
 
 from models.structural_proxy import LocalCounterfactualProxyEnsemble
 from scripts.validate_paper_b import (
+    _require_exact_matrix,
     _validate_candidate_recall_protocol_horizon,
     _validate_candidate_recall_protocol_version,
 )
@@ -72,6 +73,22 @@ def test_paper_b_validator_rejects_stale_candidate_oracle_protocol():
     for invalid in ({"protocol_version": "old-candidate-oracle-v0"},):
         with pytest.raises(ValueError, match="protocol version"):
             _validate_candidate_recall_protocol_version(invalid)
+    with pytest.raises(ValueError, match="omits protocol_version"):
+        _validate_candidate_recall_protocol_version({}, required=True)
+
+
+def test_paper_b_exact_matrix_rejects_duplicate_logical_cells():
+    rows = [
+        {"panel": "selector_isolation", "variant": "C-Core", "seed": "101"},
+        {"panel": "selector_isolation", "variant": "C-Core", "seed": "101"},
+    ]
+    with pytest.raises(ValueError, match="duplicate logical cells"):
+        _require_exact_matrix(
+            rows,
+            {("selector_isolation", "C-Core", 101)},
+            lambda row: (row["panel"], row["variant"], int(row["seed"])),
+            "allocation",
+        )
 
 
 def test_scaling_default_uses_shared_selector_oracle_horizon():

@@ -18,6 +18,7 @@ from scripts.scientific_gate_common import (
     wilson_interval,
 )
 from scripts.run_latency_oracle import PROTOCOL_VERSION as LATENCY_ORACLE_PROTOCOL
+from utils.paper_contracts import PAPER_B_SELECTOR_ORACLE_HORIZON
 
 PROTOCOL_VERSION = "scientific_gate_ladder_g0_g9_v3_provenance_and_total_memory"
 EXIT_SUPPORTED = 0
@@ -37,6 +38,35 @@ def _boolish(value):
 def _sha256(value):
     value = str(value or "").strip().lower()
     return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def _validate_g0_allocation_value_contract(gate):
+    """Reject a G0 artifact that lacks Paper-B's decision-fidelity endpoint."""
+    metrics = gate.get("metrics") if isinstance(gate, dict) else None
+    if not isinstance(metrics, dict):
+        raise ValueError("G0 omits allocation-value metrics")
+    if metrics.get("allocation_value_reference") != "Full-Explicit":
+        raise ValueError("G0 allocation-value reference must be Full-Explicit")
+    if metrics.get("allocation_value_protocol") != (
+        "common_frozen_checkpoint_state_bank_policy_context_oracle_allocation"
+    ):
+        raise ValueError("G0 omits the frozen allocation-value isolation protocol")
+    if int(metrics.get("allocation_value_oracle_horizon", 0)) != int(
+        PAPER_B_SELECTOR_ORACLE_HORIZON
+    ):
+        raise ValueError("G0 allocation-value oracle horizon violates Paper-B H=1")
+    for name in (
+        "oracle_C_minus_random_logit_fidelity_error_ci95",
+        "oracle_C_minus_random_value_fidelity_error_ci95",
+        "oracle_C_minus_random_action_agreement_ci95",
+    ):
+        interval = metrics.get(name)
+        if (
+            not isinstance(interval, list) or len(interval) != 2
+            or not all(isinstance(value, (int, float)) and math.isfinite(value)
+                       for value in interval)
+        ):
+            raise ValueError(f"G0 omits finite allocation-value interval: {name}")
 
 
 def _within(path, root):
@@ -332,7 +362,7 @@ def validate(
     min_cusum_windows=72, min_external_episodes=50,
 ):
     early = load_json(prechecks, "G0-G4 precheck")
-    if early.get("protocol_version") != "scientific_prechecks_g0_g4_v3_disagreement_capture":
+    if early.get("protocol_version") != "scientific_prechecks_g0_g4_v4_allocation_fidelity":
         raise ValueError("G0-G4 artifact uses an incompatible protocol")
     if protocol_mode == "quick":
         return {
@@ -345,6 +375,7 @@ def validate(
     early_gates = early.get("gates")
     if not isinstance(early_gates, dict) or set(early_gates) != {"G0", "G1", "G2", "G3", "G4"}:
         raise ValueError("G0-G4 artifact is incomplete")
+    _validate_g0_allocation_value_contract(early_gates["G0"])
 
     gates = dict(early_gates)
     gates["G5"] = _h1_capacity_gate(
