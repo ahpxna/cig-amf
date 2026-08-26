@@ -4,7 +4,14 @@ import numpy as np
 import pytest
 
 from models.structural_proxy import LocalCounterfactualProxyEnsemble
-from utils.paper_contracts import PAPER_B_SELECTOR_ORACLE_HORIZON
+from scripts.validate_paper_b import (
+    _validate_candidate_recall_protocol_horizon,
+    _validate_candidate_recall_protocol_version,
+)
+from utils.paper_contracts import (
+    PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION,
+    PAPER_B_SELECTOR_ORACLE_HORIZON,
+)
 
 
 def _strict_proxy():
@@ -45,6 +52,26 @@ def _base_row():
 
 def test_paper_b_selector_oracle_horizon_is_frozen_to_one():
     assert PAPER_B_SELECTOR_ORACLE_HORIZON == 1
+
+
+def test_paper_b_validator_rejects_noncanonical_candidate_horizon():
+    assert _validate_candidate_recall_protocol_horizon({"horizon": "1"}) == 1
+    for invalid in (
+        {}, {"horizon": 0}, {"horizon": -1}, {"horizon": 1.5},
+        {"horizon": True}, {"horizon": 8},
+    ):
+        with pytest.raises(ValueError, match="horizon"):
+            _validate_candidate_recall_protocol_horizon(invalid)
+
+
+def test_paper_b_validator_rejects_stale_candidate_oracle_protocol():
+    assert _validate_candidate_recall_protocol_version({
+        "protocol_version": PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION,
+    }) == PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION
+    assert _validate_candidate_recall_protocol_version({}) is None
+    for invalid in ({"protocol_version": "old-candidate-oracle-v0"},):
+        with pytest.raises(ValueError, match="protocol version"):
+            _validate_candidate_recall_protocol_version(invalid)
 
 
 def test_scaling_default_uses_shared_selector_oracle_horizon():

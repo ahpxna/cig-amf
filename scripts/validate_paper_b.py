@@ -20,6 +20,10 @@ except ModuleNotFoundError:
     from scripts import run_paper_b_pair_latent as PB_PAIR
     from scripts import run_paper_b_periphery as PB_PERIPHERY
     from scripts import run_paper_b_scaling as PB_SCALING
+from utils.paper_contracts import (
+    PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION,
+    PAPER_B_SELECTOR_ORACLE_HORIZON,
+)
 
 
 # Derive matrix contracts from the producing runners so a producer update
@@ -28,6 +32,59 @@ EXPECTED_ALLOCATION = set(PB_ALLOCATION.VARIANTS)
 EXPECTED_PAIR = set(PB_PAIR.VARIANTS)
 EXPECTED_PERIPHERY = set(PB_PERIPHERY.VARIANTS)
 EXPECTED_SCALING = set(PB_SCALING.VARIANTS)
+
+
+def _validate_candidate_recall_protocol_horizon(protocol):
+    """Reject artifacts whose oracle estimand differs from Paper B's H=1.
+
+    This check is deliberately performed while loading the scaling artifact,
+    before any aggregate gate can consume its rows.  Launchers already freeze
+    the horizon, but artifacts are an independent trust boundary: a stale or
+    modified manifest must not be adjudicated under the one-step Paper-B
+    allocation claim.
+    """
+    if not isinstance(protocol, dict):
+        raise ValueError("Paper-B candidate-recall protocol must be a JSON object")
+    raw_horizon = protocol.get("horizon")
+    if isinstance(raw_horizon, bool):
+        raise ValueError("Paper-B candidate-recall horizon must be an integer")
+    try:
+        numeric_horizon = float(raw_horizon)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Paper-B candidate-recall protocol omits an integer horizon"
+        ) from exc
+    if not math.isfinite(numeric_horizon) or not numeric_horizon.is_integer():
+        raise ValueError("Paper-B candidate-recall horizon must be an integer")
+    observed_horizon = int(numeric_horizon)
+    expected_horizon = int(PAPER_B_SELECTOR_ORACLE_HORIZON)
+    if observed_horizon != expected_horizon:
+        raise ValueError(
+            "Paper-B candidate-recall horizon contract mismatch: "
+            f"expected {expected_horizon}, received {observed_horizon}"
+        )
+    return observed_horizon
+
+
+def _validate_candidate_recall_protocol_version(protocol):
+    """Validate an explicit oracle-protocol version when an artifact has one.
+
+    The producer now always emits this field. Older H=1 artifacts predate the
+    field, so absence stays backward-compatible; a present version is never
+    silently ignored.
+    """
+    if not isinstance(protocol, dict):
+        raise ValueError("Paper-B candidate-recall protocol must be a JSON object")
+    if "protocol_version" not in protocol:
+        return None
+    observed = protocol["protocol_version"]
+    if observed != PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION:
+        raise ValueError(
+            "Paper-B candidate-recall protocol version mismatch: "
+            f"expected {PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION!r}, "
+            f"received {observed!r}"
+        )
+    return observed
 
 
 def _atomic_json(path, payload):
@@ -82,10 +139,12 @@ def _load_scaling(root, expected_seeds):
     recall = manifest.get("candidate_oracle_recall")
     if not isinstance(recall, dict):
         raise ValueError("scaling manifest omits the oracle candidate-recall protocol")
+    _validate_candidate_recall_protocol_horizon(recall)
+    _validate_candidate_recall_protocol_version(recall)
     minimum = float(recall.get("minimum", float("nan")))
     if not math.isfinite(minimum) or not 0.0 <= minimum <= 1.0:
         raise ValueError("scaling manifest has an invalid candidate-recall minimum")
-    for key in ("states", "horizon", "trials", "independent_replicates"):
+    for key in ("states", "trials", "independent_replicates"):
         if int(recall.get(key, 0)) <= 0:
             raise ValueError(f"scaling candidate-recall protocol omits positive {key}")
     if str(recall.get("target_k_rule", "")).strip() != (
@@ -672,8 +731,8 @@ def validate(run_root, expected_seeds, protocol_mode):
     candidate_oracle_stability_valid = True
     candidate_recall_protocol = scaling_manifest["candidate_oracle_recall"]
     candidate_recall_minimum = float(candidate_recall_protocol["minimum"])
-    if int(candidate_recall_protocol.get("horizon", 0)) <= 0:
-        raise ValueError("Paper-B candidate recall requires a positive structural horizon")
+    _validate_candidate_recall_protocol_horizon(candidate_recall_protocol)
+    _validate_candidate_recall_protocol_version(candidate_recall_protocol)
     if int(candidate_recall_protocol.get("trials", 0)) < 2:
         raise ValueError("Paper-B candidate recall requires repeated CRN trials")
     if int(candidate_recall_protocol.get("independent_replicates", 0)) < 2:

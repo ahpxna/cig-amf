@@ -43,7 +43,10 @@ except ModuleNotFoundError:
 import run_experiment as RE
 from envs.causal_adapter import build_dynamic_candidate_map, resolve_env_adapter
 from runners.h3_ablation_runner import H3NoMultiMemoryRunner
-from utils.paper_contracts import PAPER_B_SELECTOR_ORACLE_HORIZON
+from utils.paper_contracts import (
+    PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION,
+    PAPER_B_SELECTOR_ORACLE_HORIZON,
+)
 
 
 VARIANTS = (
@@ -525,6 +528,12 @@ def main(argv=None):
         ) < 0.0
     ):
         parser.error("invalid scaling/candidate gate configuration")
+    if int(args.candidate_recall_horizon) != int(PAPER_B_SELECTOR_ORACLE_HORIZON):
+        parser.error(
+            "Paper-B candidate-recall horizon is frozen to "
+            f"{PAPER_B_SELECTOR_ORACLE_HORIZON}; received "
+            f"{args.candidate_recall_horizon}"
+        )
     rows = []
     for seed in args.seeds:
         for n_agents in args.agent_counts:
@@ -660,6 +669,7 @@ def main(argv=None):
         "candidate_radius": args.candidate_radius,
         "candidate_max_cell_occupancy": int(args.candidate_max_cell_occupancy),
         "candidate_oracle_recall": {
+            "protocol_version": PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION,
             "minimum": float(args.candidate_recall_min),
             "states": int(args.candidate_recall_states),
             "horizon": int(args.candidate_recall_horizon),
