@@ -11,9 +11,9 @@ from models.influence_signature import (
 )
 from models.structural_proxy import (
     LocalCounterfactualProxyEnsemble,
-    PAIR_FEAT_DIM,
     build_pair_feat,
 )
+from envs.causal_adapter import OmniArenaAdapter
 from runners.baseline_runner import SharedAblationBase, _adapt_executed_policy
 from runners.final_runner import FinalCIGAMFRunner
 
@@ -141,18 +141,16 @@ class CDDecompositionTests(unittest.TestCase):
         self.assertEqual(demoted, {1})
 
     def test_pair_feature_uses_public_target_role_without_oracle_label(self):
-        role = ["collector", "blocker"]
-        feat = build_pair_feat(
-            positions=[[0, 0], [2, 1]],
-            agent_zone=[0, 0],
-            grid_size=10,
-            n_zones=1,
-            ego=0,
-            j=1,
-            agent_role=role,
-        )
-        self.assertEqual(PAIR_FEAT_DIM, 11)
-        self.assertEqual(feat.shape, (11,))
+        class Env:
+            positions = [[0, 0], [2, 1]]
+            agent_zone = [0, 0]
+            grid_size = 10
+            n_zones = 1
+            agent_role = ["collector", "blocker"]
+
+        adapter = OmniArenaAdapter(Env())
+        feat = build_pair_feat(adapter, 0, 1)
+        self.assertEqual(feat.shape, (adapter.pair_feature_dim,))
         self.assertEqual(float(np.sum(feat[5:])), 1.0)
         self.assertEqual(float(feat[8]), 1.0)  # blocker
 

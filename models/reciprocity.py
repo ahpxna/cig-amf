@@ -211,7 +211,13 @@ class ReciprocityTracker:
         z = np.asarray(logits, dtype=np.float64).reshape(-1)
         z = z - np.max(z)
         logZ = float(np.log(np.sum(np.exp(z)) + 1e-300))
-        t = int(np.clip(target, 0, z.shape[0] - 1))
+        raw_target = int(target)
+        if raw_target != target or raw_target < 0 or raw_target >= z.shape[0]:
+            raise ValueError(
+                "reciprocity target action must be an integer in "
+                f"[0, {z.shape[0]}), got {target!r}"
+            )
+        t = raw_target
 
         return float(logZ - z[t])
 

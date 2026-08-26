@@ -263,6 +263,10 @@ def build_h1_config(cfg_override, seed, threshold_calibration=None):
     # proxy/replay horizons, so both fields are protocol-critical.
     cfg["causal_horizon"] = 1
     cfg["proxy_n_horizons"] = 1
+    # H1 is an all-pair oracle-identification panel.  Candidate restriction
+    # belongs to Paper-B scaling experiments and would silently remove oracle
+    # pairs from the response-surface estimand here.
+    cfg["candidate_max_degree"] = None
     cfg["proxy_iw_clip"] = 2000.0
     cfg["h1_target_policy_mode"] = "scripted_uniform_mixture"
     cfg["h1_eval_uniform_mass"] = 0.10
@@ -270,6 +274,12 @@ def build_h1_config(cfg_override, seed, threshold_calibration=None):
     # policy learning is a separate MARL question and must not move that
     # estimand during proxy data collection.
     cfg["freeze_policy_learning"] = True
+    # H1 does not adjudicate the tracking detector, so it is not a
+    # ``confirmatory`` CUSUM run.  It is nevertheless a Paper-A causal
+    # identification panel and must reject every legacy C=|D|/uniform-memory
+    # compatibility path at the representation boundary.
+    cfg["strict_causal_profile"] = True
+    cfg["semantic_router_frozen"] = True
     cfg["seed"] = int(seed)
     if threshold_calibration is not None:
         cfg["h1_capacity_active_threshold"] = float(

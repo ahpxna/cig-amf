@@ -47,8 +47,8 @@ THREE CORRECTION LAYERS, USED TOGETHER
         slot 0, "Beneficial": mu > 0, strong, and certain
         slot 1, "Harmful"   : mu < 0, strong, and certain
         slot 2, "Neutral"   : |mu| approximately 0
-        slot 3, "Anomalous" : high sigma — not yet understood, representing
-                               agents whose effects remain uncertain
+        slot 3, "Uncertain" : high sigma — not yet understood, representing
+                              agents whose effects remain uncertain
      Assignment is soft through sigmoid gates, so gradients still flow.
 
      Compared with k-means, semantic slot meanings remain FIXED over time.
@@ -57,10 +57,9 @@ THREE CORRECTION LAYERS, USED TOGETHER
      their interpretation, introducing another source of non-stationarity —
      exactly the phenomenon the paper is intended to address.
 
-     The "Anomalous" slot is particularly important: it turns sigma from a
-     control parameter into a SEMANTIC DIMENSION. Most methods treat
-     uncertainty only as something to reduce; here it is an attribute used
-     for classification.
+     The "Uncertain" slot is particularly important: it turns sigma from a
+     control parameter into a semantic dimension. It is a routing category
+     for epistemic uncertainty, not an anomaly detector or anomaly claim.
 
 [T2] PREVENT MONOPOLY COLLAPSE — load-balancing loss (Switch Transformer).
         L_lb = alpha * K * sum_q f_q * P_q
@@ -92,8 +91,9 @@ import torch.nn.functional as F
 from envs.causal_adapter import compact_relation_features, resolve_env_adapter
 
 from models.influence_signature import (
+    CausalPairSignal,
     N_SEMANTIC_ROLES,
-    ROLE_ANOMALOUS,
+    ROLE_UNCERTAIN,
     ROLE_BENEFICIAL,
     ROLE_HARMFUL,
     ROLE_NEUTRAL,
@@ -101,13 +101,16 @@ from models.influence_signature import (
 )
 
 
-# Full H3 items contain the five-dimensional influence signature followed by
-# belief and geometry fields.  The nine-dimensional layout used before H3 was
+# Full H3 items contain Paper B's retained eight-dimensional profile
+# ``[C,D,sigma_C,sigma_D,v_ctx,m_ctx,L_tilde,m_L]``, followed by opaque
+# adapter-owned relation fields. Allocation still reads only the first five
+# coordinates; latency is representation information with an explicit mask.
+# The nine-dimensional layout used before H3 was
 # wired to the tracker is still accepted, but is upgraded explicitly and is
 # reported as ``legacy_derived`` in diagnostics.  A run that claims to test the
 # full signature must set ``require_full_signature=True``.
 LEGACY_ITEM_DIM = 9
-FULL_ITEM_DIM = 11
+FULL_ITEM_DIM = 13
 
 ITEM_ACTION = 0
 ITEM_CAPACITY = 1
@@ -115,16 +118,18 @@ ITEM_DIRECTION = 2
 ITEM_SIGMA_CAPACITY = 3
 ITEM_SIGMA_DIRECTION = 4
 ITEM_CONTEXT_STD = 5
+ITEM_CONTEXT_VALID = 6
+ITEM_LATENCY_NORM = 7
+ITEM_LATENCY_VALID = 8
 # Compatibility aliases for callers that still import the former names.
 ITEM_SIGNED_MU = ITEM_DIRECTION
 ITEM_ABS_MU = ITEM_CAPACITY
 ITEM_SIGMA = ITEM_SIGMA_DIRECTION
 ITEM_TEMPORAL_STD = ITEM_SIGMA_CAPACITY
-ITEM_CONTEXT_VALID = 6
-ITEM_REL_ROW = 7
-ITEM_REL_COL = 8
-ITEM_ZONE_DIFF = 9
-ITEM_DISTANCE = 10
+ITEM_REL_ROW = 9
+ITEM_REL_COL = 10
+ITEM_ZONE_DIFF = 11
+ITEM_DISTANCE = 12
 
 ROUTING_MODES = ("semantic", "unconstrained")
 SIGNATURE_MODES = ("full", "scalar")
@@ -134,11 +139,11 @@ class PeripheralMultiMemory(nn.Module):
     """
     Peripheral encoder with semantic and free slots.
 
-    Hybrid architecture: four fixed beneficial/harmful/neutral/anomalous
+    Hybrid architecture: four fixed beneficial/harmful/neutral/uncertain
     semantic slots plus n_free_slots learned by the router to capture residual
     structure. Total slots equal 4+n_free_slots.
 
-    Full item format has eleven dimensions:
+    Full item format has thirteen dimensions:
         0: action_j
         1: structural capacity C
         2: behavioural direction D
@@ -146,17 +151,16 @@ class PeripheralMultiMemory(nn.Module):
         4: sigma_D
         5: context_std(v_C)
         6: context_valid
-        7: rel_row
-        8: rel_col
-        9: zone_diff
-       10: distance_norm
+        7: normalized latency centre of mass L_cm/(H-1), zero iff invalid
+        8: latency-valid mask m_L
+        9--12: compact adapter-owned relation features (opaque to this model)
 
     Nine-dimensional legacy items are upgraded only for compatibility.  They
     do not provide separate C/D uncertainty and cannot support the redesigned
     representation claim.
 
     Input:
-        periph_items: np/tensor [N_p, 9]
+        periph_items: np/tensor [N_p, 13]
     Output:
         forward()      -> [out_dim]
         forward_full() returns memory and auxiliary losses.
@@ -168,8 +172,11 @@ class PeripheralMultiMemory(nn.Module):
             Load-balancing coefficient; Fedus et al. recommend 1e-2.
         orth_coeff:
             Orthogonality-loss coefficient.
-        role_sharpness:
-            Sigmoid slope for soft assignment; larger approaches hard assignment.
+        temperature_D, temperature_0, temperature_sigma:
+            Frozen router temperatures for the Paper-B valence softmax and
+            uncertainty sigmoid.  The retired ``role_sharpness`` parameter is
+            intentionally not accepted because it described a different,
+            non-contract routing rule.
         use_uniform_mix:
             v1 uniform-memory mixing pulled every slot toward a
             common mean and induced uniform collapse. v2 disables it by
@@ -180,7 +187,8 @@ class PeripheralMultiMemory(nn.Module):
             and is the faithful no-semantic ablation.
         signature_mode:
             ``full`` uses all five signature dimensions. ``scalar`` masks all
-            influence-signature channels except signed_mu while retaining
+            influence-signature channels except the behavioural-direction
+            coordinate while retaining
             action, belief membership, and geometry as controls.
     """
 
@@ -195,22 +203,25 @@ class PeripheralMultiMemory(nn.Module):
         # Role thresholds should come from tracker.auto_calibrate().
         tau_role: float = 0.05,
         sigma_hi: float = 0.5,
-        role_sharpness: float = 3.0,
+        temperature_D: float = 0.05,
+        temperature_0: float = 0.05,
+        temperature_sigma: float = 0.05,
         # Regularization coefficients.
         lb_coeff: float = 1e-2,
         orth_coeff: float = 1e-2,
         # Backward compatibility.
         num_slots: Optional[int] = None,
         use_uniform_mix: bool = False,
-        uniform_mix: float = 0.25,
+        uniform_mix: float = 0.0,
         routing_mode: str = "semantic",
         signature_mode: str = "full",
         require_full_signature: bool = True,
         allow_legacy_items: bool = False,
-        mu_floor: float = 0.02,
-        beta_floor: float = 0.05,
+        mu_floor: float = 0.0,
+        beta_floor: float = 0.0,
         beta_mode: str = "capacity",
         semantic_mass: float = 0.5,
+        lambda_sigma: float = 1.0,
         eps: float = 1e-6,
     ):
         super().__init__()
@@ -246,6 +257,10 @@ class PeripheralMultiMemory(nn.Module):
         self.signature_full_items_seen = 0
         self.signature_legacy_items_seen = 0
         self.last_signature_source = "none"
+        # Typed Paper-A signals are retained alongside the 5D allocator view.
+        # The full Paper-B profile, including latency/masks, is concatenated
+        # into the representation item; allocation remains 5D C/D-based.
+        self._last_causal_pair_signals = {}
 
         self.n_semantic_slots = int(N_SEMANTIC_ROLES)
         self.n_free_slots = int(max(0, n_free_slots))
@@ -264,11 +279,17 @@ class PeripheralMultiMemory(nn.Module):
 
         self.tau_role = float(tau_role)
         self.sigma_hi = float(sigma_hi)
-        self.role_sharpness = float(role_sharpness)
+        self.temperature_D = float(temperature_D)
+        self.temperature_0 = float(temperature_0)
+        self.temperature_sigma = float(temperature_sigma)
+        if self.temperature_D <= 0.0 or self.temperature_0 <= 0.0 or self.temperature_sigma <= 0.0:
+            raise ValueError("semantic routing temperatures must be positive")
+        # Retained as a compatibility diagnostic; canonical routing uses the
+        # explicit temperature_sigma parameter above.
         self.sigma_iqr_floor = float(sigma_hi)
 
-        self.register_buffer("g_anom_usage_ema", torch.zeros(1))
-        self.g_anom_ema_alpha = 0.05
+        self.register_buffer("g_uncertain_usage_ema", torch.zeros(1))
+        self.uncertain_ema_alpha = 0.05
 
         self.lb_coeff = float(lb_coeff)
         self.orth_coeff = float(orth_coeff)
@@ -277,6 +298,14 @@ class PeripheralMultiMemory(nn.Module):
         self.uniform_mix = float(uniform_mix)
         self.mu_floor = float(mu_floor)
         self.beta_floor = float(beta_floor)
+        if abs(self.mu_floor) > 1e-12 or abs(self.beta_floor) > 1e-12:
+            raise ValueError(
+                "canonical CIG-AMF uses strict structural capacity weighting; "
+                "mu_floor and beta_floor must both be zero"
+            )
+        self.lambda_sigma = float(lambda_sigma)
+        if self.lambda_sigma < 0.0:
+            raise ValueError("lambda_sigma must be non-negative")
         self.beta_mode = str(beta_mode).strip().lower()
         if self.beta_mode not in {"capacity", "abs_direction", "attention"}:
             raise ValueError("beta_mode must be capacity, abs_direction, or attention")
@@ -382,7 +411,16 @@ class PeripheralMultiMemory(nn.Module):
 
     def _one_hot_actions(self, actions: torch.Tensor) -> torch.Tensor:
         """actions: [N] long -> [N, action_dim]"""
-        a = actions.long().clamp(min=0, max=self.action_dim - 1)
+        raw = actions
+        if not bool(torch.all(torch.isfinite(raw))):
+            raise ValueError("peripheral action identities must be finite")
+        if not bool(torch.all(raw == torch.floor(raw))):
+            raise ValueError("peripheral action identities must be integers")
+        a = raw.long()
+        if bool(torch.any((a < 0) | (a >= self.action_dim))):
+            raise ValueError(
+                f"peripheral action identities must lie in [0, {self.action_dim})"
+            )
         return F.one_hot(a, num_classes=self.action_dim).to(dtype=torch.float32)
 
     def _normalise_inputs(self, periph_items) -> torch.Tensor:
@@ -412,7 +450,7 @@ class PeripheralMultiMemory(nn.Module):
             if self.require_full_signature or not self.allow_legacy_items:
                 raise ValueError(
                     "Received legacy 9D peripheral items, but this module "
-                    "requires the tracker-derived 5D influence signature"
+            "requires the tracker-derived retained C/D/validity profile"
                 )
             legacy = x
             upgraded = torch.zeros(
@@ -424,6 +462,8 @@ class PeripheralMultiMemory(nn.Module):
             upgraded[:, ITEM_ABS_MU] = torch.abs(legacy[:, 1])
             upgraded[:, ITEM_SIGMA] = legacy[:, 2]
             # temporal_std and context_std are unavailable in v1.
+            # No legacy source can supply context validity. It remains zero.
+            # deliberately left at zero, distinct from valid zero values.
             upgraded[:, ITEM_CONTEXT_VALID] = 0.0
             upgraded[:, ITEM_REL_ROW:] = legacy[:, 5:]
             x = upgraded
@@ -441,20 +481,23 @@ class PeripheralMultiMemory(nn.Module):
 
     def _prepare_encoder_input(self, items: torch.Tensor) -> torch.Tensor:
         """Convert full items to the action-one-hot encoder representation."""
-        action_col = items[:, ITEM_ACTION].long().clamp(
-            min=0, max=self.action_dim - 1
-        )
+        action_col = items[:, ITEM_ACTION].long()
+        if bool(torch.any((action_col < 0) | (action_col >= self.action_dim))):
+            raise ValueError("peripheral item contains an out-of-range action")
         action_oh = self._one_hot_actions(action_col)  # [N, action_dim]
         rest = items[:, 1:].to(dtype=torch.float32).clone()
 
         if self.signature_mode == "scalar":
-            # Keep D only; remove C, both uncertainty channels, and v_ctx.
+            # Keep D only; remove the other retained-profile coordinates.
             # Indices are relative to ``rest`` (item columns 1..).
             rest[:, [
                 ITEM_CAPACITY - 1,
                 ITEM_SIGMA_CAPACITY - 1,
                 ITEM_SIGMA_DIRECTION - 1,
                 ITEM_CONTEXT_STD - 1,
+                ITEM_CONTEXT_VALID - 1,
+                ITEM_LATENCY_NORM - 1,
+                ITEM_LATENCY_VALID - 1,
             ]] = 0.0
 
         return torch.cat([action_oh, rest], dim=-1)
@@ -492,56 +535,39 @@ class PeripheralMultiMemory(nn.Module):
         """
         Soft-assign each peripheral item to four influence-signature roles.
 
-        items: [N,12], with the five signature fields in columns 1:6.
+        items: [N,13], with Paper B's retained validity-masked profile.
+        The semantic router reads C/D/uncertainty; context and latency remain
+        available to the learned item encoder without changing slot meaning.
 
         Returns:
             [N,4], with each row summing to approximately one.
 
-        The three directional roles use a normalized softmax whose neutral
-        logit dominates at D=0. An independent uncertainty gate then moves
-        mass to the anomalous slot.
+        The three directional roles use the paper's explicit temperature-
+        parameterized logits, whose neutral logit dominates at D=0. An
+        independent uncertainty gate then moves mass to the uncertain slot.
         """
         direction = items[:, ITEM_DIRECTION]
         if self.signature_mode == "scalar":
             # A genuine scalar-signature ablation has no uncertainty channel,
-            # so it cannot use the anomalous role as a hidden second feature.
+            # so it cannot use the uncertain route as a hidden second feature.
             sigma = torch.zeros_like(direction)
         else:
             sigma = torch.clamp(items[:, ITEM_SIGMA_DIRECTION], min=0.0)
 
-        direction_temperature = max(
-            self.tau_role / max(self.role_sharpness, 1e-6), 1e-4
-        )
-        # [B2.3] Scale g_anom by sigma-distribution dispersion rather than its
-        # threshold. Threshold normalization is valid for mu because tau_role
-        # is a |mu| percentile, but sigma_hi shrinks as beliefs converge while
-        # the ensemble fix raised input sigma 16x. rho/sigma_hi then exploded,
-        # saturated g_anom at one, routed every neighbour as anomalous, and
-        # collapsed entropy. A floored IQR denominator stabilizes slope.
-        k_sg_denom = max(
-            float(getattr(self, "sigma_iqr_floor", self.sigma_hi)),
-            float(self.sigma_hi) * 0.25,
-            1e-3,
-        )
-        # [B2.3b] Cap the slope. Changing only the denominator reversed the
-        # degeneracy: g_anom_mean was 0.0000 at ep15 and 0.0213 at ep50,
-        # anomalous was almost unused, Hit Max Rate doubled 0.1429->0.2857,
-        # and entropy fell 0.7949->0.7143. Both all-anomalous and none-anomalous
-        # are degenerate. With sigma_hi at percentile 80, expected mean is
-        # about 0.2. A finite cap of 12 keeps typical +/-0.05 differences at
-        # sigmoid(+/-0.6)=0.35/0.65 and therefore retains a soft gate.
-        k_sg = float(np.clip(self.role_sharpness / k_sg_denom, 1.0, 12.0))
-
         uncertainty = (
             torch.zeros_like(sigma)
             if self.signature_mode == "scalar"
-            else torch.sigmoid(k_sg * (sigma - self.sigma_hi))
+            else torch.sigmoid((sigma - self.sigma_hi) / self.temperature_sigma)
         )
+        # Paper B semantic routing: positive/negative/neutral logits are
+        # defined directly from D and tau_D.  Neutral is therefore dominant
+        # at D=0, while the uncertainty gate independently transfers mass to
+        # the uncertain slot.
         directional_logits = torch.stack(
             [
-                (direction - self.tau_role) / direction_temperature,
-                (-direction - self.tau_role) / direction_temperature,
-                (self.tau_role - torch.abs(direction)) / direction_temperature,
+                (direction - self.tau_role) / self.temperature_D,
+                (-direction - self.tau_role) / self.temperature_D,
+                (self.tau_role - torch.abs(direction)) / self.temperature_0,
             ],
             dim=1,
         )
@@ -556,13 +582,13 @@ class PeripheralMultiMemory(nn.Module):
         probs[:, ROLE_BENEFICIAL] = certain * directional[:, 0]
         probs[:, ROLE_HARMFUL] = certain * directional[:, 1]
         probs[:, ROLE_NEUTRAL] = certain * directional[:, 2]
-        probs[:, ROLE_ANOMALOUS] = uncertainty
+        probs[:, ROLE_UNCERTAIN] = uncertainty
 
         row_sum = torch.clamp(probs.sum(dim=1, keepdim=True), min=self.eps)  # [N,1]
 
         with torch.no_grad():
-            self.g_anom_usage_ema.mul_(1.0 - self.g_anom_ema_alpha).add_(
-                self.g_anom_ema_alpha * uncertainty.mean()
+            self.g_uncertain_usage_ema.mul_(1.0 - self.uncertain_ema_alpha).add_(
+                self.uncertain_ema_alpha * uncertainty.mean()
             )
 
         return probs / row_sum  # [N, 4]
@@ -571,11 +597,10 @@ class PeripheralMultiMemory(nn.Module):
         """
         Confidence weight for within-slot pooling.
 
-        Preserve v1's prioritization of strong effects via |mu|, but apply the
-        absolute value here after sign has already selected the slot, not in
-        the estimator.
-
-        beta = (C + c0) / (1 + sigma_C)
+        The canonical structural path is exactly
+        ``beta=C/(1+lambda_sigma*sigma_C)``.  Direction controls semantic
+        routing, not structural mass; alternative beta modes are labelled
+        ablations only.
 
         Returns: [N]
         """
@@ -585,13 +610,16 @@ class PeripheralMultiMemory(nn.Module):
             if self.signature_mode == "scalar"
             else torch.clamp(items[:, ITEM_SIGMA_CAPACITY], min=0.0)
         )
-        confidence = 1.0 / (1.0 + sigma + self.eps)  # [N]
+        confidence = 1.0 / (1.0 + self.lambda_sigma * sigma)  # [N]
 
         if self.beta_mode == "capacity":
-            beta = (capacity + self.mu_floor) * confidence
+            # Paper B Eq. (22): causally null pairs carry no structural mass.
+            # Empty slots are handled by the support mask below, never by a
+            # capacity floor that would make C=0 structurally important.
+            beta = capacity * confidence
         elif self.beta_mode == "abs_direction":
             direction = torch.abs(items[:, ITEM_DIRECTION])
-            beta = (direction + self.mu_floor) * confidence
+            beta = direction * confidence
         else:
             # This is an observational aggregate comparator, never a core
             # selection signal.
@@ -599,7 +627,7 @@ class PeripheralMultiMemory(nn.Module):
                 self.importance_attention(items).squeeze(-1), dim=0
             )
 
-        return torch.clamp(beta, min=self.eps)
+        return torch.clamp(beta, min=0.0)
 
     def _route_items(
         self,
@@ -807,7 +835,7 @@ class PeripheralMultiMemory(nn.Module):
             slot_usage:  [K]                 — usage fraction per slot
             memories:    [K, memory_dim]     — vector for each slot
         """
-        items = self._normalise_inputs(periph_items)  # [N, 9]
+        items = self._normalise_inputs(periph_items)  # [N, 13]
         device = self._device()
 
         zero = torch.zeros((), dtype=torch.float32, device=device)
@@ -1015,14 +1043,16 @@ class PeripheralMultiMemory(nn.Module):
             Mapping[int, Sequence[float]]
         ] = None,
         context_validity: Optional[Mapping[int, float]] = None,
+        causal_pair_signals: Optional[Mapping[int, CausalPairSignal]] = None,
         require_full_signature: Optional[bool] = None,
     ) -> np.ndarray:
         """
         Build the item matrix for one ego agent.
 
-        ``influence_signatures`` must map neighbour ID to the tracker output
-        ``[C, D, sigma_C, sigma_D, v_ctx]``.  When omitted, an explicitly
-        labelled compatibility vector is derived from the legacy belief.
+        ``influence_signatures`` maps neighbour IDs to the five-coordinate
+        allocator view. The authoritative ``CausalPairSignal`` additionally
+        carries ``m_ctx``, normalized latency, and ``m_L`` into the full
+        representation item exactly as specified in Paper B Eq. (3).
         Compatibility
         data are rejected when ``require_full_signature`` is true.
 
@@ -1030,7 +1060,7 @@ class PeripheralMultiMemory(nn.Module):
         vectors cannot support a five-dimensional-versus-scalar H3 claim.
 
         Returns:
-            np.ndarray float32 [len(peripheral_ids), 11]
+            np.ndarray float32 [len(peripheral_ids), 13]
         """
         ego_id = int(ego_id)
         prev_core_set = set() if prev_core_set is None else set(prev_core_set)
@@ -1041,6 +1071,7 @@ class PeripheralMultiMemory(nn.Module):
         )
 
         ids = [int(j) for j in list(peripheral_ids) if int(j) != ego_id]
+        self._last_causal_pair_signals = {}
 
         if len(ids) == 0:
             return np.zeros((0, self.item_dim), dtype=np.float32)
@@ -1056,10 +1087,26 @@ class PeripheralMultiMemory(nn.Module):
         legacy_count = 0
 
         for j in ids:
+            signal = None
+            if causal_pair_signals is not None:
+                signal = causal_pair_signals.get(int(j))
+                if signal is None or not isinstance(signal, CausalPairSignal):
+                    raise ValueError(
+                        "causal_pair_signals must contain a typed CausalPairSignal "
+                        f"for neighbour={j}"
+                    )
+                if signal.ego_id != ego_id or signal.target_id != int(j):
+                    raise ValueError("typed pair signal IDs do not match build_inputs")
+                self._last_causal_pair_signals[int(j)] = signal
             relation = compact_relation_features(adapter, ego_id, j, width=4)
             b = belief_state[j]
 
-            action_j = int(np.clip(int(last_actions[j]), 0, self.action_dim - 1))
+            action_j = int(last_actions[j])
+            if action_j < 0 or action_j >= self.action_dim:
+                raise ValueError(
+                    f"peripheral action for neighbour={j} must lie in "
+                    f"[0, {self.action_dim}), got {action_j}"
+                )
 
             signature = None
             if influence_signatures is not None:
@@ -1070,22 +1117,34 @@ class PeripheralMultiMemory(nn.Module):
                 except (KeyError, TypeError, ValueError):
                     signature = None
 
+            # The typed Paper-A object is the authoritative cross-paper
+            # boundary.  The five-vector is merely its fixed-width allocator
+            # projection.  A separately supplied vector/mask may be used as
+            # a consistency check, never as an alternative source of truth.
+            if signal is not None:
+                typed_signature = signal.allocator_profile
+                if signature is not None and not np.allclose(
+                    signature, typed_signature, rtol=1e-5, atol=1e-6
+                ):
+                    raise ValueError(
+                        "influence signature disagrees with typed CausalPairSignal"
+                    )
+                signature = typed_signature
+
             if signature is None:
                 if require_full:
                     raise ValueError(
-                        "Full 5D peripheral signature required but missing "
+                        "Full retained pair profile required but missing "
                         f"for ego={ego_id}, neighbour={j}"
                     )
                 mu_legacy = float(b["mu_bar"])
                 sigma_legacy = float(b["sigma_bar"])
+                if not self.allow_legacy_items:
+                    raise ValueError(
+                        "Missing C/D profile cannot be upgraded in final CIG-AMF mode"
+                    )
                 signature = np.asarray(
-                    [
-                        abs(mu_legacy),
-                        mu_legacy,
-                        sigma_legacy,
-                        sigma_legacy,
-                        0.0,
-                    ],
+                    [abs(mu_legacy), mu_legacy, sigma_legacy, sigma_legacy, 0.0],
                     dtype=np.float32,
                 )
                 legacy_count += 1
@@ -1103,14 +1162,37 @@ class PeripheralMultiMemory(nn.Module):
                     )
                 full_count += 1
 
+            if signal is not None:
+                typed_context_valid = float(bool(signal.context_valid))
+                if context_validity is not None:
+                    supplied_context_valid = float(
+                        context_validity.get(int(j), typed_context_valid)
+                    )
+                    if not np.isclose(
+                        supplied_context_valid, typed_context_valid, rtol=0.0, atol=1e-6
+                    ):
+                        raise ValueError(
+                            "context validity disagrees with typed CausalPairSignal"
+                        )
+                context_valid = typed_context_valid
+                latency_normalized = float(signal.normalized_latency)
+                latency_valid = float(bool(signal.latency_representation_valid))
+            else:
+                context_valid = 0.0 if context_validity is None else float(
+                    context_validity.get(int(j), 0.0)
+                )
+                latency_normalized = 0.0
+                latency_valid = 0.0
+            if not np.isfinite(context_valid):
+                raise ValueError("context_validity must be finite")
+            if not np.isfinite(latency_normalized):
+                raise ValueError("normalized latency must be finite")
             rows.append([
                 float(action_j),
                 *[float(v) for v in signature],
-                float(
-                    0.0
-                    if context_validity is None
-                    else context_validity.get(int(j), 0.0)
-                ),
+                context_valid,
+                latency_normalized,
+                latency_valid,
                 *[float(value) for value in relation],
             ])
 
@@ -1119,11 +1201,15 @@ class PeripheralMultiMemory(nn.Module):
         if full_count and legacy_count:
             self.last_signature_source = "mixed"
         elif full_count:
-            self.last_signature_source = "full_5d"
+            self.last_signature_source = "full_profile"
         else:
             self.last_signature_source = "legacy_derived"
 
         return np.asarray(rows, dtype=np.float32)
+
+    def get_last_causal_pair_signals(self) -> Dict[int, CausalPairSignal]:
+        """Return the typed Paper-A signals attached to the last input batch."""
+        return dict(self._last_causal_pair_signals)
 
     # =====================================================================
     # Diagnostics.
@@ -1151,7 +1237,7 @@ class PeripheralMultiMemory(nn.Module):
             self.assignment_entropy_ema.zero_()
             self.assignment_max_prob_ema.zero_()
             self.slot_diag_updates.zero_()
-            self.g_anom_usage_ema.zero_()
+            self.g_uncertain_usage_ema.zero_()
         self.signature_full_items_seen = 0
         self.signature_legacy_items_seen = 0
         self.last_signature_source = "none"
@@ -1238,7 +1324,7 @@ class PeripheralMultiMemory(nn.Module):
         }
 
         for q in range(min(K, self.n_semantic_slots)):
-            name = ("beneficial", "harmful", "neutral", "anomalous")[q]
+            name = ("beneficial", "harmful", "neutral", "uncertain")[q]
             out[f"usage_{name}"] = float(usage[q])
 
         support = self.slot_signature_support_ema.detach().cpu().numpy()
@@ -1314,7 +1400,7 @@ class PeripheralMultiMemory(nn.Module):
         out["collapse_detected"] = bool(
             monopoly or diffuse or uniform_content
         )
-        out["g_anom_mean"] = float(self.g_anom_usage_ema.item())
+        out["g_uncertain_mean"] = float(self.g_uncertain_usage_ema.item())
         return out
 
     def set_role_thresholds(self, tau_role: float, sigma_hi: float, sigma_iqr: float = None):
@@ -1328,6 +1414,7 @@ class PeripheralMultiMemory(nn.Module):
         """
         self.tau_role = float(tau_role)
         self.sigma_hi = float(sigma_hi)
+        # tau_role is the public compatibility name for the paper's tau_D.
         self.sigma_iqr_floor = float(sigma_iqr) if sigma_iqr is not None else float(sigma_hi)
 
 

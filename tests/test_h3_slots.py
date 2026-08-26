@@ -7,13 +7,16 @@ import torch
 
 import run_experiment as RE
 from models.influence_signature import (
-    ROLE_ANOMALOUS,
+    CausalPairSignal,
+    ROLE_UNCERTAIN,
     ROLE_BENEFICIAL,
     ROLE_HARMFUL,
     ROLE_NEUTRAL,
 )
 from models.peripheral_memory import (
     FULL_ITEM_DIM,
+    ITEM_LATENCY_NORM,
+    ITEM_LATENCY_VALID,
     PeripheralMultiMemory,
 )
 from models.single_mean_memory import SingleMeanPeripheral
@@ -23,7 +26,7 @@ from scripts import run_h3_slots as H3
 
 
 def role_items():
-    """Two examples for each semantic role in the full 12D layout."""
+    """Two examples for each semantic role in the full 13D layout."""
     items = np.zeros((8, FULL_ITEM_DIM), dtype=np.float32)
     items[:, 0] = np.arange(8) % 4
     items[:, 1:6] = np.asarray(
@@ -40,7 +43,9 @@ def role_items():
         dtype=np.float32,
     )
     items[:, 6] = 0.25
-    items[:, 8:] = np.linspace(-0.5, 0.5, 8)[:, None]
+    items[:, 7] = np.linspace(0.0, 1.0, 8)
+    items[:, 8] = 1.0
+    items[:, 9:] = np.linspace(-0.5, 0.5, 8)[:, None]
     return items
 
 
@@ -54,7 +59,7 @@ class FakeEnv:
 
 
 class TestSignatureInputProtocol(unittest.TestCase):
-    def test_full_signature_mapping_builds_12d_rows(self):
+    def test_full_signature_mapping_builds_13d_rows(self):
         module = PeripheralMultiMemory(
             action_dim=4,
             num_slots=6,
@@ -78,9 +83,44 @@ class TestSignatureInputProtocol(unittest.TestCase):
         )
         self.assertEqual(rows.shape, (2, FULL_ITEM_DIM))
         np.testing.assert_allclose(rows[0, 1:6], signatures[1])
-        self.assertEqual(module.last_signature_source, "full_5d")
+        self.assertEqual(module.last_signature_source, "full_profile")
         self.assertEqual(module.signature_full_items_seen, 2)
         self.assertEqual(module.signature_legacy_items_seen, 0)
+
+    def test_typed_latency_is_retained_with_a_distinct_validity_mask(self):
+        module = PeripheralMultiMemory(
+            action_dim=4, num_slots=6, require_full_signature=True,
+            allow_legacy_items=False,
+        )
+        belief = {1: {"mu_bar": 0.0, "sigma_bar": 0.0, "p_core": 0.2}}
+
+        def signal(*, latency_cm, latency_valid, peak, onset):
+            return CausalPairSignal(
+                ego_id=0, target_id=1, timestamp=4, structure_regime_id=0,
+                capacity=0.2, direction=-0.1, sigma_capacity=0.03,
+                sigma_direction=0.04, context_variation=0.05,
+                context_valid=True, latency_onset=onset, latency_peak=peak,
+                latency_cm=latency_cm, latency_valid=latency_valid,
+                latency_onset_valid=latency_valid, support_valid=True,
+                valid_action_count=3, latency_horizon=5,
+            )
+
+        zero_lag = module.build_inputs(
+            ego_id=0, peripheral_ids=[1], env=FakeEnv(), belief_state=belief,
+            causal_pair_signals={1: signal(
+                latency_cm=0.0, latency_valid=True, peak=0, onset=0,
+            )},
+        )
+        unsupported = module.build_inputs(
+            ego_id=0, peripheral_ids=[1], env=FakeEnv(), belief_state=belief,
+            causal_pair_signals={1: signal(
+                latency_cm=0.0, latency_valid=False, peak=-1, onset=-1,
+            )},
+        )
+        self.assertEqual(float(zero_lag[0, ITEM_LATENCY_NORM]), 0.0)
+        self.assertEqual(float(zero_lag[0, ITEM_LATENCY_VALID]), 1.0)
+        self.assertEqual(float(unsupported[0, ITEM_LATENCY_NORM]), 0.0)
+        self.assertEqual(float(unsupported[0, ITEM_LATENCY_VALID]), 0.0)
 
     def test_strict_mode_rejects_missing_tracker_signature(self):
         module = PeripheralMultiMemory(
@@ -164,8 +204,8 @@ class TestRoutingAndCollapseDiagnostics(unittest.TestCase):
                 ROLE_HARMFUL,
                 ROLE_NEUTRAL,
                 ROLE_NEUTRAL,
-                ROLE_ANOMALOUS,
-                ROLE_ANOMALOUS,
+                ROLE_UNCERTAIN,
+                ROLE_UNCERTAIN,
             ],
         )
 
@@ -177,7 +217,7 @@ class TestRoutingAndCollapseDiagnostics(unittest.TestCase):
             signature_mode="scalar",
         )
         scalar_probs = scalar.forward_full(items)["semantic_probs"]
-        self.assertTrue(torch.allclose(scalar_probs[:, ROLE_ANOMALOUS], torch.zeros(8)))
+        self.assertTrue(torch.allclose(scalar_probs[:, ROLE_UNCERTAIN], torch.zeros(8)))
         self.assertNotEqual(
             scalar_probs.argmax(1).tolist(),
             full_roles,

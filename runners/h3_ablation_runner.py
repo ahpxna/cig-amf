@@ -27,14 +27,18 @@ class H3NoMultiMemoryRunner(FinalCIGAMFRunner):
             memory_dim=cfg.get("single_mean_memory_dim", cfg["periph_memory_dim"]),
             out_dim=self.periph_dim,
             item_hidden=cfg.get("single_mean_item_hidden", 48),
-            mu_floor=cfg.get("periph_mu_floor", 0.02),
-            beta_floor=cfg.get("periph_beta_floor", 0.05),
+            mu_floor=cfg.get("periph_mu_floor", 0.0),
+            beta_floor=cfg.get("periph_beta_floor", 0.0),
             beta_mode=cfg.get("periph_beta_mode", "capacity"),
+            lambda_sigma=cfg.get("periph_lambda_sigma", 1.0),
             signature_mode=cfg.get("periph_signature_mode", "full"),
             require_full_signature=cfg.get(
-                "periph_require_full_signature", False
+                "periph_require_full_signature", True
             ),
-            allow_legacy_items=cfg.get("periph_allow_legacy_items", True),
+            # H3 compares representations under the retained C/D contract;
+            # silently fabricating legacy C=|D| items would invalidate the
+            # comparison. Compatibility must be requested explicitly.
+            allow_legacy_items=cfg.get("periph_allow_legacy_items", False),
         ).to(device)
 
         # The optimizer created by the parent references the discarded slot

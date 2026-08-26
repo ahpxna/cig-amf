@@ -349,7 +349,10 @@ def _h2_status(rows, h1_supported):
     correlation_selectivity_ci = _bootstrap_mean_ci(
         correlation_selectivity_delta, seed=2206
     )
-    behavioral_false_trigger_rate = values(final, "behavioral_false_trigger_rate")
+    behavioral_false_alarm_window_rate = values(
+        final, "behavioral_false_alarm_window_rate"
+    )
+    behavioral_false_alarm_targets = values(final, "cusum_false_alarm_target")
 
     mechanism_conditions = {
         "factorial_protocol_evaluable_and_frozen": evaluable,
@@ -370,8 +373,17 @@ def _h2_status(rows, h1_supported):
             _boolean(row.get("direction_manipulation_pass", False))
             for row in final
         ),
-        "behavioral_only_false_trigger_rate_reported": all(
-            rate >= 0.0 for rate in behavioral_false_trigger_rate
+        "behavioral_only_false_alarm_at_or_below_target": bool(
+            behavioral_false_alarm_window_rate
+            and behavioral_false_alarm_targets
+            and len(behavioral_false_alarm_window_rate) == len(behavioral_false_alarm_targets)
+            and all(
+                0.0 <= rate <= target
+                for rate, target in zip(
+                    behavioral_false_alarm_window_rate,
+                    behavioral_false_alarm_targets,
+                )
+            )
         ),
         "causal_capacity_is_more_structurally_selective_than_correlation": (
             correlation_selectivity_ci[0] > 0.0
@@ -403,7 +415,7 @@ def _h2_status(rows, h1_supported):
                 estimand_capacity_selectivity_ci
             ),
             "fixed_estimand_direction_behavioral_ci95": estimand_direction_behav_ci,
-            "behavioral_only_false_trigger_rate": behavioral_false_trigger_rate,
+            "behavioral_only_false_alarm_window_rate": behavioral_false_alarm_window_rate,
             "final_recovery_latency_mean": _mean(final, "recovery_latency"),
             "correlation_capacity_structural_minus_abs_behavioral": (
                 correlation_selectivity

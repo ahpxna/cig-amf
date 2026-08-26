@@ -116,28 +116,29 @@ def oracle_structure_regret(
     N = env.n_agents
     saved = env.clone_state()
 
-    # ---- 1. True core: top-k by |W*|. ----
+    # ---- 1. True structural core: top-k by all-action capacity C*. ----
     # intervention_action MUST be a real action such as env.STAY, not None.
     # With candidate_actions=None, the oracle starts from range(N_ACTIONS) and
     # appends an intervention absent from that range. None would become a fake
     # forced action and silently contaminate per_action/signed/range/best/worst.
     # env.STAY is already valid and adds no spurious candidate.
     if precomputed_core_ids is None:
-        infl = {}
+        capacity_scores = {}
         for j in range(N):
             if j == ego_id:
                 continue
             try:
-                profile = env.compute_oracle_influence_from_current_state(
-                    ego_id=ego_id, agent_j=j, intervention_action=env.STAY,
-                    horizon=horizon, n_trials=n_trials,
+                capacity = env.compute_oracle_capacity_all_egos_from_current_state(
+                    agent_j=j, horizon=horizon, n_trials=n_trials,
                 )
-                infl[j] = abs(float(profile["signed"]))
+                capacity_scores[j] = max(0.0, float(capacity[int(ego_id)]))
             except Exception:
-                infl[j] = 0.0
+                capacity_scores[j] = 0.0
             env.restore_state(saved)
 
-        core_ids = sorted(infl, key=infl.get, reverse=True)[:int(k_core)]
+        core_ids = sorted(
+            capacity_scores, key=capacity_scores.get, reverse=True
+        )[:int(k_core)]
     else:
         core_ids = list(precomputed_core_ids)
 
@@ -211,7 +212,7 @@ def _precompute_core_ids_all_egos(env, k_core, horizon, n_trials=3):
 
     The legacy API repeated each (ego,j) call even though every rollout already
     returned all ego rewards. The all-egos API retains that vector, scans
-    j-by-action, and averages actions to produce identical signed scores without
+    j-by-action, and takes the action-response range to produce C* without
     repeating each trajectory 24 times.
     """
     A, N = env.get_action_dim(), env.n_agents
@@ -233,10 +234,11 @@ def _precompute_core_ids_all_egos(env, k_core, horizon, n_trials=3):
             per_action.append(np.asarray(delta, dtype=np.float64))
             env.restore_state(snapshot)
 
-        signed = np.mean(np.stack(per_action, axis=0), axis=0)
+        response_surface = np.stack(per_action, axis=0)
+        capacity = np.max(response_surface, axis=0) - np.min(response_surface, axis=0)
         for ego in range(N):
             if ego != j:
-                influence[ego][j] = abs(float(signed[ego]))
+                influence[ego][j] = max(0.0, float(capacity[ego]))
 
     env.restore_state(snapshot)
     return {

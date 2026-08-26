@@ -120,6 +120,8 @@ def _cfg(seed, core_budget, selector="structural_capacity"):
         "max_core_size": int(core_budget),
         "periph_require_full_signature": True,
         "periph_allow_legacy_items": False,
+        "strict_causal_profile": True,
+        "semantic_router_frozen": True,
     })
     return cfg
 
@@ -193,8 +195,18 @@ def _oracle_capacity_direction_for_state(
                 valid_actions = np.flatnonzero(
                     resolve_env_adapter(env).valid_action_mask(source)
                 )
-                if valid_actions.size < 2:
-                    raise RuntimeError("oracle allocation bank requires >=2 valid actions")
+                if valid_actions.size == 0:
+                    raise RuntimeError(
+                        "oracle allocation bank encountered an empty valid-action set"
+                    )
+                # With exactly one available action the max--min capacity and
+                # policy-versus-reference directional contrast are both
+                # mathematically zero.  This is a valid null causal pair, not
+                # an oracle failure, and matters for masked external actions.
+                if valid_actions.size == 1:
+                    c_row[source] = 0.0
+                    d_row[source] = 0.0
+                    continue
                 env.restore_state(copy.deepcopy(state))
                 env.set_behaviour_override("cooperative")
                 pi = np.asarray(

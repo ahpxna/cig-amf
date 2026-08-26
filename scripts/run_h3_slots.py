@@ -47,6 +47,11 @@ BASE_H3_CONFIG = {
     "periph_signature_mode": "full",
     "periph_require_full_signature": True,
     "periph_allow_legacy_items": False,
+    # Paper-B arms use the retained typed profile boundary.  Individual
+    # ablations may change the declared representation mechanism, but may not
+    # reactivate signed/legacy/uniform compatibility paths.
+    "strict_causal_profile": True,
+    "semantic_router_frozen": True,
 }
 
 
@@ -252,8 +257,7 @@ def _tracker_support(runner, min_observations=2):
     counts = [
         runner.sig_tracker.get_n_observations(ego, neighbor)
         for ego in range(runner.n_agents)
-        for neighbor in range(runner.n_agents)
-        if neighbor != ego
+        for neighbor in runner._candidate_ids(ego)
     ]
     observed = [count >= int(min_observations) for count in counts]
     return {
@@ -280,7 +284,7 @@ def _validate_variant_config(spec, cfg):
     routing = cfg.get("periph_routing_mode")
     signature = cfg.get("periph_signature_mode")
     if name == "Scalar-Only" and signature != "scalar":
-        errors.append("Scalar-Only must mask all signature channels except signed_mu")
+        errors.append("Scalar-Only must use the explicitly declared scalar signature")
     if name != "Scalar-Only" and signature != "full":
         errors.append(f"{name} must use the full 5D signature")
     if name == "Unconstrained-NoSemantic" and routing != "unconstrained":
@@ -369,7 +373,7 @@ def _slot_summary(runner):
         diag = runner.periph_module.get_input_diagnostics()
         full_fraction = float(diag.get("signature_full_fraction", float("nan")))
         input_valid = bool(
-            diag.get("signature_source") == "full_5d"
+            diag.get("signature_source") == "full_profile"
             and np.isfinite(full_fraction)
             and abs(full_fraction - 1.0) <= 1e-12
             and bool(diag.get("require_full_signature", False))
@@ -386,7 +390,7 @@ def _slot_summary(runner):
     diag = runner.periph_module.get_slot_diagnostics()
     full_fraction = float(diag.get("signature_full_fraction", float("nan")))
     input_protocol_valid = bool(
-        diag.get("signature_source") == "full_5d"
+        diag.get("signature_source") == "full_profile"
         and np.isfinite(full_fraction)
         and abs(full_fraction - 1.0) <= 1e-12
         and bool(diag.get("require_full_signature", False))

@@ -57,7 +57,14 @@ class PolicyValueNet(nn.Module):
         self.actor = nn.Linear(self.hidden, self.action_dim)
         self.critic = nn.Linear(self.hidden, 1)
 
-    def forward(self, obs, core_summary, peripheral_summary, belief_summary):
+    def forward(
+        self,
+        obs,
+        core_summary,
+        peripheral_summary,
+        belief_summary,
+        valid_action_mask=None,
+    ):
         # 1. Gather all inputs into one list
         inputs = [
             obs,
@@ -93,6 +100,16 @@ class PolicyValueNet(nn.Module):
         h = self.backbone(x)
 
         logits = self.actor(h)
+        if valid_action_mask is not None:
+            mask = torch.as_tensor(
+                valid_action_mask, dtype=torch.bool, device=logits.device
+            )
+            if mask.shape != logits.shape or not bool(mask.any(dim=1).all()):
+                raise ValueError(
+                    "valid_action_mask must match policy logits and retain "
+                    "at least one action per row"
+                )
+            logits = logits.masked_fill(~mask, -torch.inf)
         value = self.critic(h).squeeze(-1)
 
         return logits, value

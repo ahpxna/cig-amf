@@ -1,6 +1,6 @@
 """Single-aggregate peripheral encoder for the H3 one-module ablation.
 
-The class deliberately implements the same 11-dimensional item protocol as
+The class deliberately implements the same retained-profile item protocol as
 ``PeripheralMultiMemory`` and differs only at aggregation: all peripheral
 items are compressed into one confidence-weighted mean.  Keeping the input
 features, signature source, optimizer path, output width, and leave-one-out
@@ -17,13 +17,17 @@ import torch.nn.functional as F
 
 from envs.causal_adapter import compact_relation_features, resolve_env_adapter
 
-from models.influence_signature import SIGNATURE_DIM
+from models.influence_signature import CausalPairSignal, SIGNATURE_DIM
 from models.peripheral_memory import (
     FULL_ITEM_DIM,
-    ITEM_ABS_MU,
     ITEM_ACTION,
+    ITEM_CAPACITY,
+    ITEM_CONTEXT_VALID,
     ITEM_CONTEXT_STD,
     ITEM_DIRECTION,
+    ITEM_LATENCY_NORM,
+    ITEM_LATENCY_VALID,
+    ITEM_REL_ROW,
     ITEM_SIGMA_CAPACITY,
     LEGACY_ITEM_DIM,
 )
@@ -42,11 +46,12 @@ class SingleMeanPeripheral(nn.Module):
         item_hidden: int = 48,
         *,
         signature_mode: str = "full",
-        require_full_signature: bool = False,
-        allow_legacy_items: bool = True,
-        mu_floor: float = 0.02,
-        beta_floor: float = 0.05,
+        require_full_signature: bool = True,
+        allow_legacy_items: bool = False,
+        mu_floor: float = 0.0,
+        beta_floor: float = 0.0,
         beta_mode: str = "capacity",
+        lambda_sigma: float = 1.0,
         eps: float = 1e-6,
     ):
         super().__init__()
@@ -63,6 +68,14 @@ class SingleMeanPeripheral(nn.Module):
         self.allow_legacy_items = bool(allow_legacy_items)
         self.mu_floor = float(mu_floor)
         self.beta_floor = float(beta_floor)
+        if abs(self.mu_floor) > 1e-12 or abs(self.beta_floor) > 1e-12:
+            raise ValueError(
+                "canonical CIG-AMF uses strict structural capacity weighting; "
+                "mu_floor and beta_floor must both be zero"
+            )
+        self.lambda_sigma = float(lambda_sigma)
+        if self.lambda_sigma < 0.0:
+            raise ValueError("lambda_sigma must be non-negative")
         self.beta_mode = str(beta_mode).strip().lower()
         if self.beta_mode not in {"capacity", "abs_direction", "attention"}:
             raise ValueError("beta_mode must be capacity, abs_direction, or attention")
@@ -71,6 +84,7 @@ class SingleMeanPeripheral(nn.Module):
         self.signature_full_items_seen = 0
         self.signature_legacy_items_seen = 0
         self.last_signature_source = "none"
+        self._last_causal_pair_signals: Dict[int, CausalPairSignal] = {}
 
         self.encoder_in_dim = self.action_dim + self.item_dim - 1
         self.item_encoder = nn.Sequential(
@@ -92,7 +106,12 @@ class SingleMeanPeripheral(nn.Module):
         # FinalCIGAMFRunner's threshold calibration reads this field and calls
         # set_role_thresholds when available.  It is intentionally inert here:
         # a single mean has no semantic gates.
-        self.register_buffer("g_anom_usage_ema", torch.zeros(1))
+        self.register_buffer("g_uncertain_usage_ema", torch.zeros(1))
+
+    @property
+    def g_anom_usage_ema(self):
+        """Deprecated compatibility alias; this value is uncertainty only."""
+        return self.g_uncertain_usage_ema
 
     def _device(self):
         return next(self.parameters()).device
@@ -127,7 +146,7 @@ class SingleMeanPeripheral(nn.Module):
             if self.require_full_signature or not self.allow_legacy_items:
                 raise ValueError(
                     "Received legacy 9D peripheral items, but this module "
-                    "requires the tracker-derived 5D influence signature"
+                    "requires the tracker-derived retained pair profile"
                 )
             legacy = items
             upgraded = torch.zeros(
@@ -135,11 +154,16 @@ class SingleMeanPeripheral(nn.Module):
                 dtype=torch.float32, device=device,
             )
             upgraded[:, 0] = legacy[:, 0]
-            upgraded[:, 1] = legacy[:, 1]
-            upgraded[:, 2] = torch.abs(legacy[:, 1])
+            upgraded[:, 1] = torch.abs(legacy[:, 1])
+            upgraded[:, 2] = legacy[:, 1]
             upgraded[:, 3] = legacy[:, 2]
+            upgraded[:, 4] = legacy[:, 2]
+            upgraded[:, 5] = 0.0
             upgraded[:, 6] = 0.0
-            upgraded[:, 7:] = legacy[:, 5:]
+            # Legacy items have no context/latency masks. Preserve only their
+            # opaque relation tail at the new relation offset; leave both
+            # validity-masked latency coordinates explicitly unsupported.
+            upgraded[:, ITEM_REL_ROW:] = legacy[:, 5:]
             items = upgraded
         if items.shape[-1] != self.item_dim:
             raise ValueError(
@@ -149,30 +173,43 @@ class SingleMeanPeripheral(nn.Module):
         return items
 
     def _prepare_encoder_input(self, items: torch.Tensor) -> torch.Tensor:
-        actions = items[:, ITEM_ACTION].long().clamp(0, self.action_dim - 1)
+        actions = items[:, ITEM_ACTION].long()
+        if bool(torch.any((actions < 0) | (actions >= self.action_dim))):
+            raise ValueError("single-mean item contains an out-of-range action")
         action_oh = F.one_hot(actions, num_classes=self.action_dim).float()
         rest = items[:, 1:].clone()
         if self.signature_mode == "scalar":
-            rest[:, ITEM_ABS_MU - 1:ITEM_CONTEXT_STD] = 0.0
+            # Scalar-signature ablation retains only D, action, and relation;
+            # profile validity/latency coordinates cannot leak the removed
+            # retained profile back into this comparator.
+            rest[:, [
+                ITEM_CAPACITY - 1,
+                ITEM_SIGMA_CAPACITY - 1,
+                ITEM_SIGMA_DIRECTION - 1,
+                ITEM_CONTEXT_STD - 1,
+                ITEM_CONTEXT_VALID - 1,
+                ITEM_LATENCY_NORM - 1,
+                ITEM_LATENCY_VALID - 1,
+            ]] = 0.0
         return torch.cat([action_oh, rest], dim=-1)
 
     def _importance_beta(self, items: torch.Tensor) -> torch.Tensor:
-        mu = items[:, 1]
+        capacity = torch.clamp(items[:, ITEM_CAPACITY], min=0.0)
         sigma = (
-            torch.zeros_like(mu)
+            torch.zeros_like(capacity)
             if self.signature_mode == "scalar"
             else torch.clamp(items[:, ITEM_SIGMA_CAPACITY], min=0.0)
         )
-        confidence = 1.0 / (1.0 + sigma + self.eps)
+        confidence = 1.0 / (1.0 + self.lambda_sigma * sigma)
         if self.beta_mode == "capacity":
-            beta = (torch.abs(mu) + self.mu_floor) * confidence
+            beta = capacity * confidence
         elif self.beta_mode == "abs_direction":
-            beta = (torch.abs(items[:, ITEM_DIRECTION]) + self.mu_floor) * confidence
+            beta = torch.abs(items[:, ITEM_DIRECTION]) * confidence
         else:
             beta = torch.softmax(
                 self.importance_attention(items).squeeze(-1), dim=0
             )
-        return torch.clamp(beta, min=self.eps)
+        return torch.clamp(beta, min=0.0)
 
     def _encode_and_weight(self, items: torch.Tensor):
         encoded = self.item_encoder(self._prepare_encoder_input(items))
@@ -243,9 +280,10 @@ class SingleMeanPeripheral(nn.Module):
             Mapping[int, Sequence[float]]
         ] = None,
         context_validity: Optional[Mapping[int, float]] = None,
+        causal_pair_signals: Optional[Mapping[int, CausalPairSignal]] = None,
         require_full_signature: Optional[bool] = None,
     ) -> np.ndarray:
-        """Build the same full 11D rows used by the multi-slot encoder."""
+        """Build the same retained-profile rows used by the multi-slot encoder."""
         ego_id = int(ego_id)
         prev_core_set = set() if prev_core_set is None else set(prev_core_set)
         require_full = (
@@ -254,6 +292,7 @@ class SingleMeanPeripheral(nn.Module):
             else bool(require_full_signature)
         )
         ids = [int(j) for j in peripheral_ids if int(j) != ego_id]
+        self._last_causal_pair_signals = {}
         if not ids:
             return np.zeros((0, self.item_dim), dtype=np.float32)
 
@@ -263,6 +302,17 @@ class SingleMeanPeripheral(nn.Module):
         full_count = 0
         legacy_count = 0
         for neighbor_id in ids:
+            signal = None
+            if causal_pair_signals is not None:
+                signal = causal_pair_signals.get(int(neighbor_id))
+                if signal is None or not isinstance(signal, CausalPairSignal):
+                    raise ValueError(
+                        "causal_pair_signals must contain a typed CausalPairSignal "
+                        f"for neighbour={neighbor_id}"
+                    )
+                if signal.ego_id != ego_id or signal.target_id != int(neighbor_id):
+                    raise ValueError("typed pair signal IDs do not match build_inputs")
+                self._last_causal_pair_signals[int(neighbor_id)] = signal
             relation = compact_relation_features(
                 adapter, ego_id, neighbor_id, width=4
             )
@@ -275,15 +325,29 @@ class SingleMeanPeripheral(nn.Module):
                     ).reshape(-1)
                 except (KeyError, TypeError, ValueError):
                     signature = None
+            if signal is not None:
+                typed_signature = signal.allocator_profile
+                if signature is not None and not np.allclose(
+                    signature, typed_signature, rtol=1e-5, atol=1e-6
+                ):
+                    raise ValueError(
+                        "influence signature disagrees with typed CausalPairSignal"
+                    )
+                signature = typed_signature
             if signature is None:
                 if require_full:
                     raise ValueError(
-                        "Full 5D peripheral signature required but missing "
+                        "Full retained pair profile required but missing "
                         f"for ego={ego_id}, neighbour={neighbor_id}"
                     )
                 mu = float(belief["mu_bar"])
+                if not self.allow_legacy_items:
+                    raise ValueError(
+                        "Missing C/D profile cannot be upgraded in final CIG-AMF mode"
+                    )
                 signature = np.asarray(
-                    [abs(mu), mu, float(belief["sigma_bar"]), float(belief["sigma_bar"]), 0.0],
+                    [abs(mu), mu, float(belief["sigma_bar"]),
+                     float(belief["sigma_bar"]), 0.0],
                     dtype=np.float32,
                 )
                 legacy_count += 1
@@ -298,14 +362,29 @@ class SingleMeanPeripheral(nn.Module):
                     raise ValueError("Influence signature contains non-finite values")
                 full_count += 1
 
+            if signal is not None:
+                typed_context_valid = float(bool(signal.context_valid))
+                if context_validity is not None:
+                    supplied_context_valid = float(
+                        context_validity.get(int(neighbor_id), typed_context_valid)
+                    )
+                    if not np.isclose(
+                        supplied_context_valid, typed_context_valid, rtol=0.0, atol=1e-6
+                    ):
+                        raise ValueError(
+                            "context validity disagrees with typed CausalPairSignal"
+                        )
+                context_valid = typed_context_valid
+            else:
+                context_valid = 0.0 if context_validity is None else float(
+                    context_validity.get(int(neighbor_id), 0.0)
+                )
+            if not np.isfinite(context_valid):
+                raise ValueError("context_validity must be finite")
             rows.append([
-                float(np.clip(last_actions[neighbor_id], 0, self.action_dim - 1)),
+                float(int(last_actions[neighbor_id])),
                 *[float(value) for value in signature],
-                float(
-                    0.0
-                    if context_validity is None
-                    else context_validity.get(neighbor_id, 0.0)
-                ),
+                context_valid,
                 *[float(value) for value in relation],
             ])
 
@@ -314,10 +393,14 @@ class SingleMeanPeripheral(nn.Module):
         if full_count and legacy_count:
             self.last_signature_source = "mixed"
         elif full_count:
-            self.last_signature_source = "full_5d"
+            self.last_signature_source = "full_profile"
         else:
             self.last_signature_source = "legacy_derived"
         return np.asarray(rows, dtype=np.float32)
+
+    def get_last_causal_pair_signals(self) -> Dict[int, CausalPairSignal]:
+        """Return the typed Paper-A signals attached to the last item matrix."""
+        return dict(self._last_causal_pair_signals)
 
     def get_input_diagnostics(self):
         total = self.signature_full_items_seen + self.signature_legacy_items_seen

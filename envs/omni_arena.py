@@ -903,6 +903,16 @@ class OmniArena:
     # P4: structural shift by bottleneck relocation, without role swapping
     # ============================================================
 
+    def get_structure_regime_id(self):
+        """Return the ground-truth structural phase for typed replay rows.
+
+        Behaviour-only runs deliberately remain in regime zero even though
+        they may advance an episode phase for controller scheduling.
+        """
+        if self.mode == "structural_shift" and self.enable_structural_shift:
+            return int(self.current_phase)
+        return 0
+
     def _maybe_structural_shift(self):
         # P4 flag OFF: bottleneck relocation NEVER triggers -- only
         # behavioural_drift semantics remain reachable. Real branch, not a
@@ -1938,8 +1948,10 @@ class OmniArena:
         role = self.agent_role[agent_id]
         if role != self.ROLE_DRIFTER:
             action = int(self.scripted_policy(agent_id))
+            if action < 0 or action >= self.N_ACTIONS:
+                raise ValueError("scripted policy returned an invalid action")
             out = np.zeros(self.N_ACTIONS, dtype=np.float32)
-            out[np.clip(action, 0, self.N_ACTIONS - 1)] = 1.0
+            out[action] = 1.0
             return out
 
         if agent_id % 3 == 0:
@@ -2557,6 +2569,48 @@ class OmniArena:
             self.restore_state(snapshot)
 
         return acc / float(max(1, int(n_trials)))
+
+    def compute_oracle_capacity_all_egos_from_current_state(
+        self,
+        agent_j,
+        horizon=None,
+        n_trials=1,
+        forced_step=0,
+        crn_seed=None,
+        candidate_actions=None,
+    ):
+        """Return all-egos structural capacity C* for one source agent.
+
+        Capacity is the all-action response range under the same fixed scripted
+        continuation used by the intervention oracle.  Computing every ego at
+        once preserves the optimized all-egos rollout path while aligning the
+        zero-cost OracleCore baseline with the paper's C=max_a Q-min_a Q
+        estimand rather than the legacy absolute signed single-action score.
+        """
+        if horizon is None:
+            horizon = self.causal_horizon
+        if candidate_actions is None:
+            candidate_actions = range(self.get_action_dim())
+        actions = [int(action) for action in candidate_actions]
+        if len(actions) < 2:
+            raise ValueError("oracle capacity requires at least two candidate actions")
+        values = []
+        for action in actions:
+            values.append(
+                np.asarray(
+                    self.compute_oracle_influence_all_egos_from_current_state(
+                        agent_j=int(agent_j),
+                        intervention_action=int(action),
+                        horizon=int(horizon),
+                        n_trials=int(n_trials),
+                        forced_step=int(forced_step),
+                        crn_seed=crn_seed,
+                    ),
+                    dtype=np.float64,
+                )
+            )
+        surface = np.stack(values, axis=0)
+        return np.max(surface, axis=0) - np.min(surface, axis=0)
 
     def compute_oracle_influence_from_current_state(
         self,

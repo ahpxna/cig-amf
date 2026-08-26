@@ -170,9 +170,18 @@ class DriftDetector:
     # ------------------------------------------------------------------
 
     def _one_hot(self, a: np.ndarray) -> torch.Tensor:
-        t = torch.tensor(
-            np.asarray(a, dtype=np.int64), dtype=torch.long, device=self.device
-        ).clamp(0, self.action_dim - 1)
+        raw = np.asarray(a)
+        if raw.ndim != 1 or not np.all(np.isfinite(raw)):
+            raise ValueError("drift probe action identities must be finite scalars")
+        if not np.all(raw == np.floor(raw)):
+            raise ValueError("drift probe action identities must be integers")
+        raw = raw.astype(np.int64, copy=False)
+        if np.any(raw < 0) or np.any(raw >= self.action_dim):
+            raise ValueError(
+                "drift probe action identity is outside the action space: "
+                f"expected [0, {self.action_dim})"
+            )
+        t = torch.tensor(raw, dtype=torch.long, device=self.device)
 
         return F.one_hot(t, num_classes=self.action_dim).to(dtype=torch.float32)
 

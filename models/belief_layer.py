@@ -7,7 +7,7 @@ V1 DEFECTS, DIAGNOSED USING THE PAPER'S OWN RESULTS
 
 [B1] p_core SATURATED BECAUSE sigma WAS IN THE DENOMINATOR.
      v1 used:
-         score  = (|mu_bar| - tau) / (sigma_bar + eps)
+         score  = (capacity_bar - tau) / (sigma_capacity_bar + eps)
          p_core = sigmoid(score)
 
      A small sigma made the denominator small, amplified the sigmoid argument,
@@ -28,7 +28,7 @@ V1 DEFECTS, DIAGNOSED USING THE PAPER'S OWN RESULTS
 
      v2 SEPARATES THE TWO ROLES. sigma regulates only learning speed. Core
      selection uses an uncertainty-penalized capacity score:
-         score_lcb = |mu_bar| - kappa * sigma_bar
+     score_lcb = capacity_bar - kappa * sigma_capacity_bar
      High uncertainty is SUBTRACTED, making core entry conservatively harder,
      but cannot saturate the score because sigma is additive rather than a
      divisor.
@@ -58,10 +58,8 @@ V1 DEFECTS, DIAGNOSED USING THE PAPER'S OWN RESULTS
      This satisfies Robbins-Monro and allows the paper to reuse Pieroth's proof
      framework for an almost-free convergence proposition.
 
-[B4] BELIEF HAD NO SIGN.
-     v1 stored mu_bar but applied |mu_bar| everywhere, making harmful agents
-     indistinguishable from helpful ones. v2 preserves sign throughout and
-     supplies it to the beneficial/harmful semantic slots.
+The structural belief stores non-negative capacity only. Signed behavioural
+direction is carried by the fast CausalPairSignal and semantic router.
 =============================================================================
 """
 
@@ -82,7 +80,8 @@ class BayesLightBeliefState:
         core_rule:
             "lcb": recommended default, |mu|-kappa*sigma
             "p_core": legacy p_core threshold for ablation
-            "signed": separately balance top helpful and harmful agents
+            "signed": deprecated legacy mode. It is invalid for a structural
+                capacity belief because C is nonnegative.
         kappa:
             LCB uncertainty penalty; larger values produce smaller conservative cores.
         alpha_decay:
@@ -114,6 +113,7 @@ class BayesLightBeliefState:
         adaptive_k_min: Optional[int] = None,
         signed_balance: float = 0.5,
         sigma_alpha_max: float = 1.0,
+        allow_legacy_signed_core: bool = False,
     ):
         self.ego_id = int(ego_id)
         self.neighbor_ids = [int(j) for j in neighbor_ids]
@@ -137,10 +137,16 @@ class BayesLightBeliefState:
         self.max_core_size = min(self.max_core_size, len(self.neighbor_ids))
         self.min_core_size = min(self.min_core_size, self.max_core_size)
 
+        core_rule = str(core_rule).strip().lower()
         if core_rule not in ("lcb", "p_core", "signed"):
             raise ValueError(f"invalid core_rule: {core_rule}")
+        if core_rule == "signed" and not bool(allow_legacy_signed_core):
+            raise ValueError(
+                "core_rule='signed' is incompatible with nonnegative structural "
+                "capacity C; use an explicit D-based selector ablation instead"
+            )
 
-        self.core_rule = str(core_rule)
+        self.core_rule = core_rule
         self.kappa = float(kappa)
         self.alpha_decay = float(alpha_decay)
         self.adaptive_k = bool(adaptive_k)
@@ -285,7 +291,7 @@ class BayesLightBeliefState:
         """
         [B1] Lower confidence bound replacing v1's saturating formula.
 
-            score = |mu_bar| - kappa * sigma_bar
+            score = capacity_bar - kappa * sigma_capacity_bar
 
         High uncertainty is subtracted rather than used as a divisor, so it
         cannot cause saturation. This follows bandit LCB/UCB practice and
@@ -518,7 +524,9 @@ class BayesLightBeliefState:
             )
             alpha = np.clip(alpha, 0.0, 1.0)
 
-            # [B4] Preserve mu sign.
+            # Structural capacity is non-negative by contract. Behavioural
+            # direction D is tracked separately by the signature tracker.
+            mus_arr = np.maximum(mus_arr, 0.0)
             self._mu_arr[idx] = (1.0 - alpha) * self._mu_arr[idx] + alpha * mus_arr
             self._sigma_arr[idx] = (
                 (1.0 - alpha) * self._sigma_arr[idx] + alpha * sigmas_arr
@@ -593,22 +601,13 @@ class BayesLightBeliefState:
         """
         Default v2 rule.
 
-        Enter core when lcb_score > tau_enter; remain when
-        lcb_score > tau_stay, where tau_stay = hysteresis_ratio*tau_enter.
-
-        ``self.tau`` is tau_enter.  ``tau_in/tau_out`` are retained only for
-        backward compatibility with the legacy p_core rule; for the LCB rule
-        their ratio defines hysteresis and is not interpreted as two literal
-        G-scale thresholds.
+        Enter core when ``G > tau_in`` and remain while ``G > tau_out``.
+        Both thresholds are literal values on the same structural score
+        ``G=C-kappa*sigma``; no hidden ratio or probability scale is used.
         """
         # [GPU contract section 1.4] The dual-threshold rule is elementwise
         # Boolean logic, vectorized across neighbours in one NumPy operation.
         # The formula is unchanged.
-        ratio = (
-            self.tau_out / self.tau_in if self.tau_in > 1e-8 else 0.75
-        )
-        tau_hold = self.tau * float(np.clip(ratio, 0.0, 1.0))
-
         idx_all = np.arange(len(self.neighbor_ids), dtype=np.int64)
         mu_deb, sig_deb = self._debiased_arr(idx_all)
         g = np.maximum(mu_deb, 0.0) - self.kappa * np.maximum(sig_deb, self.sigma_floor)  # [n]
@@ -617,8 +616,8 @@ class BayesLightBeliefState:
             [j in self.prev_core_set for j in self.neighbor_ids], dtype=bool
         )
 
-        enter = g > self.tau
-        stay = was_in_prev & (g > tau_hold)
+        enter = g > self.tau_in
+        stay = was_in_prev & (g > self.tau_out)
         keep = enter | stay
 
         new_core = set(int(j) for j, k in zip(self.neighbor_ids, keep.tolist()) if k)
@@ -627,7 +626,8 @@ class BayesLightBeliefState:
 
     def _select_core_signed(self) -> Set[int]:
         """
-        Signed rule balancing helpful and harmful agents.
+        Deprecated compatibility rule. Final structural-C mode rejects it;
+        signed behavioural allocation belongs to an explicit D-based ablation.
 
         MAGIC (2026) shows strong influence need not be beneficial. Ranking
         only by |mu| can fill the core with one sign. Allocate signed_balance
@@ -748,11 +748,13 @@ class BayesLightBeliefState:
         return {
             # Publish debiased values because peripheral semantic assignment
             # requires a correctly scaled estimate.
-            "mu_bar": float(self.debiased_mu(j)),      # Signed.
+            "mu_bar": float(self.debiased_mu(j)),      # Deprecated capacity alias.
             "sigma_bar": float(self.debiased_sigma(j)),
             "capacity_bar": float(max(self.debiased_mu(j), 0.0)),
             "sigma_capacity_bar": float(self.debiased_sigma(j)),
-            "mu_bar_raw": float(self.mu_bar[j]),
+            "g_score": float(self._lcb_score(j)),
+            "capacity_bar_raw": float(max(self.mu_bar[j], 0.0)),
+            "mu_bar_raw": float(self.mu_bar[j]),  # deprecated alias
             "p_core": float(self.p_core[j]),
             "in_core": float(j in self.core_set),
             "in_seed_core": float(j in self.seeded_core_set),
@@ -970,32 +972,32 @@ class BayesLightBeliefState:
             "hard_max_core_size": int(self.max_core_size),
         }
 
-    def get_signed_stats(self) -> Dict[str, float]:
-        """[B4] Signed statistics used by semantic slots."""
-        mus = np.array(
-            [float(self.mu_bar[j]) for j in self.neighbor_ids], dtype=np.float64
+    def get_capacity_stats(self) -> Dict[str, float]:
+        """Return diagnostics for the non-negative structural belief."""
+        capacities = np.asarray(
+            [max(0.0, float(self.debiased_mu(j))) for j in self.neighbor_ids],
+            dtype=np.float64,
         )
-
-        if mus.size == 0:
-            return {
-                "n_helpful": 0, "n_harmful": 0, "n_neutral": 0,
-                "mean_signed_mu": 0.0, "helpful_harmful_ratio": 0.0,
-            }
-
-        helpful = int(np.sum(mus > self.tau))
-        harmful = int(np.sum(mus < -self.tau))
-        neutral = int(mus.size - helpful - harmful)
-
+        if capacities.size == 0:
+            return {"n_capacity_positive": 0, "mean_capacity": 0.0,
+                    "max_capacity": 0.0, "min_capacity": 0.0}
         return {
-            "n_helpful": helpful,
-            "n_harmful": harmful,
-            "n_neutral": neutral,
-            "mean_signed_mu": float(np.mean(mus)),
-            "helpful_harmful_ratio": float(helpful) / float(max(1, harmful)),
+            "n_capacity_positive": int(np.sum(capacities > self.tau)),
+            "mean_capacity": float(np.mean(capacities)),
+            "max_capacity": float(np.max(capacities)),
+            "min_capacity": float(np.min(capacities)),
         }
 
+    def get_signed_stats(self) -> Dict[str, float]:
+        """Deprecated alias for :meth:`get_capacity_stats`.
+
+        Structural belief no longer carries a signed signal; signed
+        behavioural direction belongs to the CausalPairSignal tracker.
+        """
+        return self.get_capacity_stats()
+
     def get_population_debug_stats(self) -> Dict:
-        mu_abs = [abs(float(self.mu_bar[j])) for j in self.neighbor_ids]
+        capacities = [max(0.0, float(self.mu_bar[j])) for j in self.neighbor_ids]
         sig = [float(self.sigma_bar[j]) for j in self.neighbor_ids]
         lcb = [self._lcb_score(j) for j in self.neighbor_ids]
 
@@ -1007,8 +1009,8 @@ class BayesLightBeliefState:
             "core_rule": self.core_rule,
             "kappa": float(self.kappa),
             "tau": float(self.tau),
-            "mean_abs_mu": float(np.mean(mu_abs)) if mu_abs else 0.0,
-            "max_abs_mu": float(np.max(mu_abs)) if mu_abs else 0.0,
+            "mean_capacity_raw": float(np.mean(capacities)) if capacities else 0.0,
+            "max_capacity_raw": float(np.max(capacities)) if capacities else 0.0,
             "mean_sigma": float(np.mean(sig)) if sig else 0.0,
             "min_sigma": float(np.min(sig)) if sig else 0.0,
             "max_sigma": float(np.max(sig)) if sig else 0.0,
@@ -1020,7 +1022,7 @@ class BayesLightBeliefState:
         }
 
         out.update(self.get_saturation_stats())
-        out.update(self.get_signed_stats())
+        out.update(self.get_capacity_stats())
 
         return out
 

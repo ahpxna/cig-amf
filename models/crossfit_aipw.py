@@ -13,8 +13,16 @@ import numpy as np
 
 def proxy_context_features(sample, action_dim):
     """Return the pre-treatment X representation shared by both stages."""
+    raw_action = sample["action_i"]
+    if not np.isfinite(raw_action) or int(raw_action) != raw_action:
+        raise ValueError("action_i must be a finite integer action identity")
+    raw_action = int(raw_action)
+    if raw_action < 0 or raw_action >= int(action_dim):
+        raise ValueError(
+            f"action_i must lie in [0, {int(action_dim)}), got {raw_action}"
+        )
     action_i = np.zeros(int(action_dim), dtype=np.float64)
-    action_i[int(np.clip(sample["action_i"], 0, action_dim - 1))] = 1.0
+    action_i[raw_action] = 1.0
     fields = (
         np.asarray(sample["obs_i"], dtype=np.float64).reshape(-1),
         action_i,
@@ -120,15 +128,86 @@ class CrossFittedConditionalAIPW:
             for local, row_index in enumerate(indices):
                 sample = rows[row_index]
                 action = int(sample["observed_action_j"])
+                if action < 0 or action >= self.action_dim:
+                    raise ValueError(
+                        f"observed_action_j must lie in [0, {self.action_dim}), got {action}"
+                    )
                 pi = np.asarray(sample["policy_probs_j"], dtype=np.float64)
+                # The typed action-time record is authoritative whenever it
+                # is present.  Compatibility keys remain for diagnostic
+                # baselines, but Paper-A calibration must never reconstruct
+                # q or b from a differently timed policy array.
+                typed_pi = sample.get("target_pi")
+                typed_q = sample.get("target_q")
+                typed_b = sample.get("target_b")
+                if typed_pi is not None:
+                    pi_typed = np.asarray(typed_pi, dtype=np.float64)
+                    if pi_typed.shape != (self.action_dim,) or not np.allclose(
+                        pi, pi_typed, rtol=1e-6, atol=1e-7
+                    ):
+                        raise ValueError(
+                            "policy_probs_j disagrees with typed target_pi"
+                        )
+                    pi = pi_typed
+                if pi.shape != (self.action_dim,) or not np.all(np.isfinite(pi)) or np.any(pi < 0.0):
+                    raise ValueError("policy_probs_j must be a finite non-negative action vector")
                 valid = np.asarray(
                     sample.get("valid_action_mask", np.ones(self.action_dim)),
                     dtype=bool,
                 )
+                if valid.shape != (self.action_dim,) or not np.any(valid):
+                    raise ValueError("valid_action_mask is malformed")
+                if not bool(valid[action]):
+                    raise ValueError("observed_action_j is invalid under its recorded mask")
+                if np.any(pi[~valid] > 1e-8):
+                    raise ValueError(
+                        "policy_probs_j must assign zero mass to invalid actions"
+                    )
                 pi = np.where(valid, pi, 0.0)
                 pi = pi / np.clip(pi.sum(), 1e-12, None)
-                q_uniform = valid.astype(np.float64) / float(max(1, valid.sum()))
-                behaviour = max(float(sample["behaviour_prob_j"]), 1e-12)
+                q_uniform = valid.astype(np.float64) / float(valid.sum())
+                if typed_q is not None:
+                    q_typed = np.asarray(typed_q, dtype=np.float64)
+                    if (
+                        q_typed.shape != (self.action_dim,)
+                        or not np.all(np.isfinite(q_typed))
+                        or np.any(q_typed < 0.0)
+                        or np.any(q_typed[~valid] > 1e-8)
+                        or not np.allclose(q_typed, q_uniform, rtol=1e-6, atol=1e-7)
+                    ):
+                        raise ValueError(
+                            "target_q must be the recorded fixed rule: uniform over valid actions"
+                        )
+                    q_uniform = q_typed
+                behaviour_raw = float(sample["behaviour_prob_j"])
+                if not np.isfinite(behaviour_raw) or behaviour_raw <= 0.0:
+                    raise ValueError("behaviour_prob_j must be finite and strictly positive")
+                if typed_b is not None:
+                    b_typed = np.asarray(typed_b, dtype=np.float64)
+                    if (
+                        b_typed.shape != (self.action_dim,)
+                        or not np.all(np.isfinite(b_typed))
+                        or np.any(b_typed < 0.0)
+                        or np.any(b_typed[~valid] > 1e-8)
+                        or not np.isclose(float(b_typed.sum()), 1.0, rtol=1e-6, atol=1e-7)
+                        or not np.isclose(
+                            behaviour_raw, float(b_typed[action]), rtol=1e-6, atol=1e-7
+                        )
+                    ):
+                        raise ValueError(
+                            "behaviour_prob_j disagrees with typed target_b"
+                        )
+                    epsilon = sample.get("target_epsilon")
+                    if epsilon is not None:
+                        epsilon = float(epsilon)
+                        if not 0.0 <= epsilon <= 1.0:
+                            raise ValueError("target_epsilon must lie in [0, 1]")
+                        expected_b = (1.0 - epsilon) * pi + epsilon * q_uniform
+                        if not np.allclose(b_typed, expected_b, rtol=1e-5, atol=1e-6):
+                            raise ValueError(
+                                "typed target_b violates b=(1-epsilon)pi+epsilon q"
+                            )
+                behaviour = behaviour_raw
                 weight = (pi[action] - q_uniform[action]) / behaviour
                 if self.iw_clip is not None:
                     weight = float(np.clip(weight, -self.iw_clip, self.iw_clip))

@@ -57,6 +57,8 @@ def _make_runner(
         "belief_adaptive_k": bool(adaptive),
         "periph_require_full_signature": True,
         "periph_allow_legacy_items": False,
+        "strict_causal_profile": True,
+        "semantic_router_frozen": True,
     })
     if full_explicit:
         full_k = int(n_agents) - 1

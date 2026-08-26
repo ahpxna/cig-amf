@@ -28,8 +28,9 @@ try:
         FullExplicitLocalRunner,
         NoBeliefRunner,
         NoMultiMemoryRunner,
-        OracleCoreRunner,      # [FIX-O3]
-        RandomCoreRunner,      # [FIX-O3]
+        OracleCoreRunner,
+        OracleAbsDCoreRunner,
+        RandomCoreRunner,
     )
 except ModuleNotFoundError:
     from runners.baseline_runner import (
@@ -38,8 +39,9 @@ except ModuleNotFoundError:
         FullExplicitLocalRunner,
         NoBeliefRunner,
         NoMultiMemoryRunner,
-        OracleCoreRunner,      # [FIX-O3]
-        RandomCoreRunner,      # [FIX-O3]
+        OracleCoreRunner,
+        OracleAbsDCoreRunner,
+        RandomCoreRunner,
     )
 
 from models.crossfit_aipw import CrossFittedConditionalAIPW
@@ -115,6 +117,10 @@ def cleanup_runtime_memory():
 
 def default_cfg():
     return {
+        # Optional policy-independent candidate bound (Paper B Eq. 28).
+        # None preserves the dense reference protocol; only a positive bound
+        # may be reported as candidate-restricted scaling.
+        "candidate_max_degree": None,
         "discount": 0.97,
         "causal_horizon": 8,
 
@@ -140,6 +146,9 @@ def default_cfg():
         "proxy_train_steps": 16,
         "proxy_batch_size": 256,
         "proxy_holdout_size": 128,
+        # Scientific gate G1 can train a diagnostic nuisance model using only
+        # randomized forcing rows.  The production estimator remains False.
+        "proxy_forced_only_training": False,
 
         "core_lr": 5e-4,
         "bc_buffer_size": 200000,
@@ -148,7 +157,20 @@ def default_cfg():
         "bc_batch_size": 256,
 
         "policy_lr": 7e-4,
+        "critic_loss_coeff": 0.5,
+        "entropy_coeff": 0.01,
+        "policy_grad_clip": 0.5,
         "debug_verbose": False,
+        "confirmatory": False,
+        # H1 is a causal-identification panel rather than a CUSUM tracking
+        # panel, but its Paper-B representation boundary is still locked.
+        # ``strict_causal_profile`` rejects legacy C=|D| and uniform-memory
+        # compatibility paths without pretending that H1 has a CUSUM artifact.
+        "strict_causal_profile": False,
+        # Semantic thresholds/temperatures are development parameters.  A
+        # confirmatory or otherwise paper-locked panel must use the values in
+        # this configuration and never retune them from its own stream.
+        "semantic_router_frozen": False,
 
         "k0_warmup": 30,
         "slow_ratio": 0.15,
@@ -161,7 +183,10 @@ def default_cfg():
         # detector compares the Page-CUSUM statistic with this calibrated
         # threshold, not a single residual z-score.
         "z_threshold": 8.0,
-        "drift_cusum_threshold": 8.0,
+        # Confirmatory runs must load this from the frozen no-change
+        # calibration artifact.  ``None`` prevents an undocumented numeric
+        # default from being mistaken for a calibrated threshold.
+        "drift_cusum_threshold": None,
         "drift_cusum_allowance": 0.5,
         "inflation_t_reset": 1,
 
@@ -172,6 +197,10 @@ def default_cfg():
         # and looked like literal thresholds, which made the paper/config
         # contract misleading.
         "belief_tau_enter": 0.005,
+        "belief_tau_in": 0.005,
+        "belief_tau_out": 0.00175,
+        # Deprecated ratio alias retained for old configs; canonical runtime
+        # uses literal G-scale tau_in/tau_out values above.
         "belief_hysteresis_ratio": 0.35 / 0.55,
         "seed_core_top_k": 3,
         # Fixed oracle truth cardinality.  Evaluation never adapts the target
@@ -218,9 +247,19 @@ def default_cfg():
         # budget but ranks candidates by |D|.  It must never update belief C.
         "core_selection_mode": "structural_capacity",
 
-        "periph_mu_floor": 0.015,
-        "periph_beta_floor": 0.05,
+        # Paper B Eq. (22): beta is exactly capacity-weighted. Empty slots
+        # are represented by support masks, not a positive null-capacity floor.
+        "periph_mu_floor": 0.0,
+        # Retained only for explicit legacy/attention ablations; canonical
+        # capacity pooling has no positive null-capacity floor.
+        "periph_beta_floor": 0.0,
+        "periph_lambda_sigma": 1.0,
         "periph_semantic_mass": 0.5,
+        "periph_tau_D": 0.05,
+        "periph_sigma_D_hi": 0.5,
+        "periph_temperature_D": 0.05,
+        "periph_temperature_0": 0.05,
+        "periph_temperature_sigma": 0.05,
         "sig_tracker_window": 30,
         "sig_tracker_direction_window": 5,
         # Uniform mixing recreates the global mean inside every slot and is
@@ -229,7 +268,8 @@ def default_cfg():
         "periph_use_uniform_mix": False,
         "periph_routing_mode": "semantic",
         "periph_signature_mode": "full",
-        # The redesigned runtime consumes only tracker-derived 5D signatures.
+        # The redesigned runtime consumes only tracker-derived retained
+        # C/D/context/latency profiles.
         # Legacy vectors remain available only through explicit compatibility
         # unit tests and cannot silently enter a confirmatory run.
         "periph_require_full_signature": True,
@@ -243,10 +283,11 @@ def default_cfg():
         # [FIX-2] Expose orth_coeff through configuration so the No-AuxLoss
         # ablation disables BOTH Equation 27 components, not only load balancing.
         "periph_orth_coeff": 1e-2,
-        "belief_priority_mu_floor": 0.01,
+        "belief_priority_mu_floor": 0.0,
         "shadow_loss_weight": 0.25,
         "pair_state_mode": "recurrent",
         "cd_normalization_min_samples": 32,
+        "cd_target_max_age_steps": 16,
         "graph_score_steps": 8,
 
         # structural_proxy v2 defaults match structural_proxy.py.
@@ -262,10 +303,9 @@ def default_cfg():
         "proxy_iw_clip": 10.0,
         "proxy_bootstrap_ratio": 0.8,
         "proxy_use_belief_input": False,
-        # x_ij includes five geometric channels and a six-way public-role
-        # one-hot vector. Set this to zero
-        # to reproduce the old configuration, where f_theta is blind to
-        # neighbour identity, for the H1 ablation.
+        # x_ij is supplied by the environment adapter and contains only
+        # observable pre-treatment target features. Set this to zero only for
+        # the explicitly named neighbour-blind ablation.
         # None delegates feature dimensionality to the environment adapter.
         # Set 0 only for the explicit neighbour-blind H1 ablation.
         "proxy_pair_feat_dim": None,
@@ -277,10 +317,10 @@ def default_cfg():
         "behavioral_adapter_lambda": 0.0,
         "behavioral_adapter_only_in_behavioral_drift": True,
         "behavioral_adapter_target_roles": None,
-        # H1 identification uses a frozen, non-uniform target policy so the
-        # directional contrast D^pi is identifiable independently of whether
-        # the MARL actor has moved away from its near-uniform initialization.
-        # The H1 launcher alone enables this protocol policy.
+        # Ordinary runtime uses the learned execution policy.  The H1
+        # identification launcher explicitly replaces this with its frozen,
+        # non-uniform full-support pi_eval, so causal calibration does not
+        # accidentally depend on early actor convergence.
         "h1_target_policy_mode": "learned",
         "h1_eval_uniform_mass": 0.10,
         "freeze_policy_learning": False,
@@ -288,6 +328,10 @@ def default_cfg():
         # a common checkpoint while still allowing peripheral modules to learn
         # from the fixed downstream objective.
         "freeze_downstream_policy_value": False,
+        # The structural summary must also remain common in a periphery-only
+        # isolation panel; otherwise fidelity mixes M_i changes with an
+        # independently adapted B_i encoder.
+        "freeze_belief_summary_learning": False,
         "freeze_representation_state": False,
         "seed": 0,
 
@@ -885,6 +929,8 @@ def make_runner(model_name, env, cfg, device):
         # correctly. Register the actual runners here.
         "OracleCore": "OracleCore",
         "oracle_core": "OracleCore",
+        "OracleAbsDCore": "OracleAbsDCore",
+        "oracle_absd_core": "OracleAbsDCore",
         "RandomCore": "RandomCore",
         "random_core": "RandomCore",
     }
@@ -914,6 +960,9 @@ def make_runner(model_name, env, cfg, device):
 
     if canonical == "OracleCore":
         return OracleCoreRunner(env, cfg, device=device)
+
+    if canonical == "OracleAbsDCore":
+        return OracleAbsDCoreRunner(env, cfg, device=device)
 
     if canonical == "RandomCore":
         return RandomCoreRunner(env, cfg, device=device)
@@ -1319,13 +1368,13 @@ def _compute_tiny_oracle_scores(tiny_env, state, ego, neighbor_ids, cfg, tiny_ho
     signed_scores = {}
     magnitude_scores = {}
     range_scores = {}
-    candidate_actions = _tiny_candidate_intervention_actions(tiny_env)
 
     for j in neighbor_ids:
         signed_vals = []
         magnitude_vals = []
         range_vals = []
 
+        tiny_env.restore_state(state)
         valid_actions = np.flatnonzero(
             resolve_env_adapter(tiny_env).valid_action_mask(int(j))
         )
@@ -1352,8 +1401,13 @@ def _compute_tiny_oracle_scores(tiny_env, state, ego, neighbor_ids, cfg, tiny_ho
         magnitude_scores[int(j)] = (
             float(np.mean(magnitude_vals)) if len(magnitude_vals) > 0 else 0.0
         )
+        # Structural capacity is the action-response range, not the mean
+        # absolute response.  Keep this historical path mathematically
+        # consistent with C=max_a Q(a)-min_a Q(a); confirmatory H1 uses the
+        # exact one-step oracle below.
         range_scores[int(j)] = (
-            float(np.mean(range_vals)) if len(range_vals) > 0 else 0.0
+            float(np.max(signed_vals) - np.min(signed_vals))
+            if len(signed_vals) > 0 else 0.0
         )
 
     tiny_env.restore_state(state)
@@ -2005,6 +2059,9 @@ def _h1_one_step_oracle_scores(
     response_surfaces = {}
 
     for j in neighbor_ids:
+        # Validity belongs to the intervention state s_t, not the state after
+        # the factual transition used for the replay-integrity check.
+        tiny_env.restore_state(state)
         candidate_returns = []
         valid_actions = np.flatnonzero(
             resolve_env_adapter(tiny_env).valid_action_mask(int(j))
@@ -2103,8 +2160,13 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
             "clone protocol is implemented."
         )
 
-    candidate_actions = _tiny_candidate_intervention_actions(tiny_env)
-    runner.proxy.candidate_actions = list(candidate_actions)
+    # q in the H1 estimand is uniform over every action that is valid for the
+    # target in the current state.  Keep the semantic intervention subset only
+    # as an oracle diagnostic/metadata field; never feed it into proxy q.
+    diagnostic_actions = _tiny_candidate_intervention_actions(tiny_env)
+    # Canonical H1 q is uniform over the complete action alphabet after
+    # state-valid masking; do not report a semantic subset as the estimand.
+    candidate_actions = list(range(int(tiny_env.get_action_dim())))
     eval_steps, policy_return_metadata = _collect_h1_eval_steps(
         runner, int(args.tiny_states)
     )
@@ -2409,16 +2471,20 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
         "oracle_baseline": "uniform_action_policy",
         "oracle_intervention": "V_pi_eval_minus_V_uniform_current_action",
         "h1_target_policy_mode": str(
-            tiny_cfg.get("h1_target_policy_mode", "learned")
+            tiny_cfg.get("h1_target_policy_mode", "scripted_uniform_mixture")
         ),
         "h1_eval_uniform_mass": float(
-            tiny_cfg.get("h1_eval_uniform_mass", 0.0)
+            tiny_cfg.get("h1_eval_uniform_mass", 0.10)
         ),
         "factual_replay_role": "integrity_check_and_AIPW_observed_outcome",
         "nuisance_training_score_mode": "plugin_fixed_across_ablation",
         "candidate_actions": list(candidate_actions),
         "candidate_action_count": int(len(candidate_actions)),
+        "diagnostic_intervention_actions": list(diagnostic_actions),
         "proxy_action_count": int(runner.proxy.action_dim),
+        "proxy_forced_only_training": bool(
+            getattr(runner.proxy, "forced_only_training", False)
+        ),
         "dr_requested": dr_requested,
         "dr_applied_calls_eval": int(dr_calls),
         "dr_applied_rows_eval": int(dr_rows),
@@ -2766,9 +2832,13 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
         "direction_mae",
         "direction_bias",
         "direction_sign_agreement",
+        "capacity_active_count",
+        "capacity_null_count",
         "capacity_active_mae",
         "capacity_active_spearman",
         "capacity_null_fpr",
+        "direction_active_count",
+        "direction_null_count",
         "direction_active_mae",
         "direction_active_spearman",
         "direction_active_sign_agreement",
@@ -2866,8 +2936,10 @@ def run_tiny_task(args, cfg, device, out_dir=None, run_label="standalone"):
     print(f"dr_applied_rows_eval={summary.get('dr_applied_rows_eval', 0)}")
     print(f"Saved tiny oracle results to: {out_dir}")
 
-    if bool(getattr(args, "h1_exact_protocol", False)) and not bool(
-        summary.get("protocol_gate_pass", False)
+    if (
+        bool(getattr(args, "h1_exact_protocol", False))
+        and not bool(getattr(args, "h1_diagnostic_only", False))
+        and not bool(summary.get("protocol_gate_pass", False))
     ):
         raise RuntimeError(
             "H1 protocol gate failed; the saved metrics are diagnostic only and "

@@ -36,7 +36,7 @@ section("1. SEMANTIC SLOTS — four-role assignment")
 # =====================================================================
 try:
     from models.influence_signature import (
-        ROLE_ANOMALOUS, ROLE_BENEFICIAL, ROLE_HARMFUL, ROLE_NAMES,
+        ROLE_UNCERTAIN, ROLE_BENEFICIAL, ROLE_HARMFUL, ROLE_NAMES,
         ROLE_NEUTRAL, soft_role_assignment,
     )
 
@@ -45,7 +45,7 @@ try:
     P = soft_role_assignment(mu, sg, tau_role=0.05, sigma_hi=0.5)
 
     expect = [ROLE_BENEFICIAL, ROLE_HARMFUL, ROLE_NEUTRAL,
-              ROLE_NEUTRAL, ROLE_NEUTRAL, ROLE_ANOMALOUS]
+              ROLE_NEUTRAL, ROLE_NEUTRAL, ROLE_UNCERTAIN]
     got = P.argmax(1)
 
     for i, (m, s_, e, g) in enumerate(zip(mu, sg, expect, got)):
@@ -363,7 +363,9 @@ try:
     items[:, 4] = np.concatenate([np.full(11, 0.1), np.full(3, 0.9)])  # sigma_D
     items[:, 5] = rr.uniform(0, 1, 14)  # v_ctx
     items[:, 6] = 1.0                   # context-validity mask
-    items[:, 7:] = rr.randn(14, 4)      # geometry features
+    items[:, 7] = rr.uniform(0, 1, 14)  # normalized latency
+    items[:, 8] = 1.0                   # latency-valid mask
+    items[:, 9:] = rr.randn(14, 4)      # opaque relation features
 
     res = pm.forward_full(items)
     print(f"       memory shape={tuple(res['memory'].shape)} "

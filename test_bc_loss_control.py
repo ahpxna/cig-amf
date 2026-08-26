@@ -164,7 +164,7 @@ def _run_t1_scripted_policy_deterministic():
     print(f"\n  final BC loss = {loss:.4f}  (uniform floor ln6 = {ln6:.4f})")
 
     ok = loss < 0.3
-    print(f"  [{'PASS' if ok else 'FAIL'}] T1: bc_loss < 0.3  (gate G2)")
+    print(f"  [{'PASS' if ok else 'FAIL'}] T1: bc_loss < 0.3  (BC mechanism control)")
 
     if not ok and loss > ln6:
         print(

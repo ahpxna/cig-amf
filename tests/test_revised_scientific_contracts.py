@@ -19,7 +19,7 @@ from models.peripheral_memory import (
     ITEM_DIRECTION,
     ITEM_SIGMA_DIRECTION,
     PeripheralMultiMemory,
-    ROLE_ANOMALOUS,
+    ROLE_UNCERTAIN,
     ROLE_BENEFICIAL,
     ROLE_HARMFUL,
     ROLE_NEUTRAL,
@@ -318,11 +318,57 @@ class RevisedScientificContractTests(unittest.TestCase):
         self.assertEqual(out["c_lag_mu"].shape, (1, 1))
         np.testing.assert_allclose(out["c_lag_mu"], [[1.0]])
         np.testing.assert_allclose(out["latency_center"], [0.0])
-        np.testing.assert_array_equal(out["latency_onset"], [0])
-        np.testing.assert_array_equal(out["latency_peak"], [0])
+        np.testing.assert_array_equal(out["latency_onset"], [-1])
+        np.testing.assert_array_equal(out["latency_peak"], [-1])
+        np.testing.assert_array_equal(out["latency_valid"], [0.0])
         self.assertNotAlmostEqual(
             float(out["d_plugin_mu"][0]), float(out["d_row_aipw_mu"][0])
         )
+
+    def test_subthreshold_lag_mass_is_not_misreported_as_zero_lag(self):
+        proxy = LocalCounterfactualProxyEnsemble(
+            obs_dim=1, action_dim=2, core_dim=1, periph_dim=1,
+            belief_dim=1, pair_feat_dim=0, n_ensemble=1, n_horizons=3,
+            use_vmap_ensemble=False,
+        )
+        proxy._predict_all_actions = lambda **_: torch.tensor(
+            [[[[0.0, 0.0, 0.0], [1e-8, 1e-8, 1e-8]]]],
+            dtype=torch.float32,
+        )
+        out = proxy.score_batch_full(
+            obs_i_batch=[[0.0]], action_i_batch=[0],
+            observed_action_j_batch=[1], z_core_excl_j_batch=[[0.0]],
+            m_periph_excl_j_batch=[[0.0]], belief_summary_batch=[[0.0]],
+            policy_probs_j_batch=[[0.5, 0.5]],
+        )
+        np.testing.assert_array_equal(out["latency_valid"], [0.0])
+        np.testing.assert_array_equal(out["latency_onset_valid"], [0.0])
+        np.testing.assert_array_equal(out["latency_onset"], [-1])
+        np.testing.assert_array_equal(out["latency_peak"], [-1])
+
+    def test_capacity_is_range_of_the_ensemble_mean_response_surface(self):
+        proxy = LocalCounterfactualProxyEnsemble(
+            obs_dim=1, action_dim=2, core_dim=1, periph_dim=1,
+            belief_dim=1, pair_feat_dim=0, n_ensemble=2, n_horizons=2,
+            use_vmap_ensemble=False,
+        )
+        # Each member has range 1, but they disagree on which action is high.
+        # Paper A defines C on Q-bar, whose action range is therefore zero.
+        proxy._predict_all_actions = lambda **_: torch.tensor(
+            [
+                [[[0.0, 0.0], [1.0, 1.0]]],
+                [[[1.0, 1.0], [0.0, 0.0]]],
+            ], dtype=torch.float32,
+        )
+        out = proxy.score_batch_full(
+            obs_i_batch=[[0.0]], action_i_batch=[0],
+            observed_action_j_batch=[0], z_core_excl_j_batch=[[0.0]],
+            m_periph_excl_j_batch=[[0.0]], belief_summary_batch=[[0.0]],
+            policy_probs_j_batch=[[0.5, 0.5]],
+        )
+        np.testing.assert_allclose(out["c_mu"], [0.0])
+        np.testing.assert_allclose(out["c_lag_mu"], [[0.0, 0.0]])
+        self.assertGreater(float(out["c_sigma"][0]), 0.0)
 
     def test_semantic_router_contract(self):
         module = PeripheralMultiMemory(action_dim=3, n_free_slots=2)
@@ -333,7 +379,7 @@ class RevisedScientificContractTests(unittest.TestCase):
         roles = module._semantic_slot_probs(items).argmax(dim=1).tolist()
         self.assertEqual(
             roles,
-            [ROLE_NEUTRAL, ROLE_BENEFICIAL, ROLE_HARMFUL, ROLE_ANOMALOUS],
+            [ROLE_NEUTRAL, ROLE_BENEFICIAL, ROLE_HARMFUL, ROLE_UNCERTAIN],
         )
 
     def test_context_validity_requires_multiple_supported_contexts(self):

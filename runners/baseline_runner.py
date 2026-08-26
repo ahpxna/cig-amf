@@ -9,7 +9,11 @@ import torch.nn.functional as F
 from models.structural_proxy import (
     LocalCounterfactualProxyEnsemble,
 )
-from envs.causal_adapter import compact_relation_features, resolve_env_adapter
+from envs.causal_adapter import (
+    bounded_candidate_neighbors,
+    compact_relation_features,
+    resolve_env_adapter,
+)
 from models.belief_layer import BayesLightBeliefState
 from models.core_behavior import PairRelationalModule
 from models.peripheral_memory import PeripheralMultiMemory
@@ -145,6 +149,16 @@ class PureMeanFieldRunner:
         self.n_agents = int(self.env_adapter.n_agents)
         self.obs_dim = int(self.env_adapter.obs_dim)
         self.action_dim = int(self.env_adapter.max_action_dim)
+        self.candidate_max_degree = self.cfg.get("candidate_max_degree", None)
+        self.candidate_neighbors_by_ego = {
+            ego: bounded_candidate_neighbors(
+                self.env_adapter, ego, self.candidate_max_degree
+            )
+            for ego in range(self.n_agents)
+        }
+        self.measured_edge_count = int(sum(
+            len(ids) for ids in self.candidate_neighbors_by_ego.values()
+        ))
 
         self.hidden = int(cfg.get("policy_hidden", 160))
         self.discount = float(cfg.get("discount", 0.95))
@@ -640,9 +654,9 @@ class OracleCoreRunner:
     """
     Oracle-core baseline for Experiment 0, the Structure Value gate.
 
-    The oracle PROVIDES the core as the top-k neighbours by true |W*| through
-    env.compute_oracle_influence_from_current_state, the same function used by
-    structure_value_tier0.py and tier1.py. The core is NOT learned from data.
+    The oracle PROVIDES the core as the top-k neighbours by true structural
+    capacity C*=max_a Q-min_a Q through the all-action intervention oracle, the
+    same estimand used by Paper-B allocation. The core is NOT learned from data.
     This is "zero cost" in the paper's precise sense: zero structure-
     identification cost, not zero policy-training cost. The policy still learns
     through RL, but receives one-hot actions from the true core instead of a
@@ -702,67 +716,117 @@ class OracleCoreRunner:
             "mean_mu": [], "max_p": [],
         }
 
+    oracle_selector = "capacity"
+
+    def _oracle_source_scores(self, source, saved, adapter):
+        """Return one all-egos oracle score vector for ``source``.
+
+        ``capacity`` implements C*=max_a Q-min_a Q. ``abs_direction`` uses the
+        matched policy contrast |D*|=|sum_a(pi-q)Q_a| under the environment's
+        frozen scripted reference policy.  The latter exists only as the
+        oracle G4 comparator; Paper-B allocation itself remains C-based.
+        """
+        valid = np.flatnonzero(np.asarray(adapter.valid_action_mask(source), dtype=bool))
+        if valid.size < 2:
+            raise RuntimeError(
+                f"oracle {self.oracle_selector} source {source} has fewer than two valid actions"
+            )
+        if self.oracle_selector == "capacity":
+            values = self.env.compute_oracle_capacity_all_egos_from_current_state(
+                agent_j=int(source),
+                horizon=self.oracle_horizon,
+                n_trials=self.oracle_n_trials,
+                candidate_actions=[int(action) for action in valid],
+            )
+            return np.maximum(0.0, np.asarray(values, dtype=np.float64))
+        if self.oracle_selector != "abs_direction":
+            raise ValueError(f"unknown oracle selector {self.oracle_selector!r}")
+
+        pi_fn = getattr(self.env, "scripted_policy_distribution", None)
+        if not callable(pi_fn):
+            raise RuntimeError("oracle |D*| selector requires scripted_policy_distribution")
+        pi_full = np.asarray(pi_fn(int(source)), dtype=np.float64).reshape(-1)
+        if pi_full.size != int(self.action_dim) or not np.all(np.isfinite(pi_full)):
+            raise RuntimeError("oracle |D*| selector received an invalid target policy")
+        pi = np.clip(pi_full[valid], 0.0, None)
+        if float(pi.sum()) <= 0.0:
+            raise RuntimeError("oracle |D*| target policy has no feasible support")
+        pi /= pi.sum()
+        q = np.full(valid.size, 1.0 / float(valid.size), dtype=np.float64)
+        response_vectors = []
+        # The identical CRN seed is reused across all candidate actions so the
+        # policy contrast is not polluted by action-specific environment noise.
+        refresh_id = int(getattr(self, "_oracle_refresh_index", 0))
+        crn_seed = (
+            (int(self.cfg.get("seed", 0)) + 1) * 1000003
+            + refresh_id * 1009 + int(source) * 9176
+        )
+        for action in valid:
+            self.env.restore_state(saved)
+            response_vectors.append(np.asarray(
+                self.env.compute_oracle_influence_all_egos_from_current_state(
+                    agent_j=int(source), intervention_action=int(action),
+                    horizon=self.oracle_horizon, n_trials=self.oracle_n_trials,
+                    crn_seed=int(crn_seed),
+                ), dtype=np.float64,
+            ))
+        surface = np.stack(response_vectors, axis=0)
+        return np.abs(np.sum((pi - q)[:, None] * surface, axis=0))
+
     def _refresh_core_if_needed(self):
-        """Use true oracle |W*|; RandomCoreRunner overrides this for its control."""
+        """Refresh an exact oracle top-k selector and fail closed on oracle loss.
+
+        A partial failed refresh must never be interpreted as a zero score: that
+        silently lets broken sources enter a top-k tie and contaminates the
+        supposed oracle control.  Scientific oracle baselines therefore abort
+        the refresh if *any* source cannot be evaluated.
+        """
         if self._steps_since_refresh < self.core_refresh_every:
             self._steps_since_refresh += 1
             return
 
-        # [FIX-O1] The old implementation looped over (ego, j), performing
-        # 24 x 23 = 552 oracle rollouts PER refresh and approximately 6–7
-        # refreshes per episode, making a run take all night. Looping only over
-        # j is sufficient: one intervention on j produces W* for EVERY ego at
-        # once because env.step() returns a reward VECTOR. This is an exact
-        # 24x reduction with NO approximation or loss of accuracy; it only
-        # reuses information already produced by the rollout.
-        #
-        # [FIX-O2] The old implementation swallowed errors with
-        # `except Exception: infl[j] = 0.0`. Near the end of an episode, guard B
-        # (self.t + horizon <= max_steps) raised for EVERY pair, making all
-        # influences zero. sorted() then returned the first three agents in
-        # dictionary order, silently turning the "oracle" into an inert baseline
-        # without a warning. Failed refreshes now retain the previous core and
-        # are counted for reporting.
         saved = self.env.clone_state()
-        infl_matrix = np.zeros((self.n_agents, self.n_agents), dtype=np.float64)
-        n_failed = 0
+        score_matrix = np.full(
+            (self.n_agents, self.n_agents), np.nan, dtype=np.float64
+        )
+        adapter = resolve_env_adapter(self.env)
+        failures = []
+        try:
+            for source in range(self.n_agents):
+                try:
+                    scores = self._oracle_source_scores(source, saved, adapter)
+                    if scores.shape != (self.n_agents,) or not np.all(np.isfinite(scores)):
+                        raise RuntimeError("oracle score vector is non-finite or malformed")
+                    for ego in range(self.n_agents):
+                        if ego != source:
+                            score_matrix[ego, source] = max(0.0, float(scores[ego]))
+                except Exception as exc:
+                    failures.append((int(source), type(exc).__name__, str(exc)))
+                finally:
+                    self.env.restore_state(saved)
+        finally:
+            self.env.restore_state(saved)
 
-        for j in range(self.n_agents):
-            try:
-                profile = self.env.compute_oracle_influence_all_egos_from_current_state(
-                    agent_j=j, intervention_action=self.env.STAY,
-                    horizon=self.oracle_horizon, n_trials=self.oracle_n_trials,
-                )
-                for ego in range(self.n_agents):
-                    if ego != j:
-                        infl_matrix[ego, j] = abs(float(profile[ego]))
-            except AssertionError:
-                # P2/P4 guard: the rollout crossed an episode or shift boundary.
-                n_failed += 1
-            except Exception as e:
-                n_failed += 1
-                if not getattr(self, "_oracle_warned", False):
-                    print(f"[OracleCore][WARN] oracle rollout failed ({type(e).__name__}: {e}) "
-                          f"-- retaining the old core instead of treating influence as zero.")
-                    self._oracle_warned = True
-            finally:
-                self.env.restore_state(saved)
-
-        self.env.restore_state(saved)
-        self._oracle_failed_refreshes = getattr(self, "_oracle_failed_refreshes", 0)
-
-        if n_failed >= self.n_agents:
-            # No measurement was possible; RETAIN the old core instead of noise.
-            self._oracle_failed_refreshes += 1
-            self._steps_since_refresh = 0
-            return
+        if failures:
+            self._oracle_failed_refreshes = getattr(self, "_oracle_failed_refreshes", 0) + 1
+            first = failures[0]
+            raise RuntimeError(
+                f"{self._log_tag} oracle refresh failed for {len(failures)}/"
+                f"{self.n_agents} sources; first=source{first[0]} {first[1]}: {first[2]}"
+            )
 
         for ego in range(self.n_agents):
-            infl = {j: infl_matrix[ego, j] for j in range(self.n_agents) if j != ego}
+            scores = {
+                source: float(score_matrix[ego, source])
+                for source in range(self.n_agents) if source != ego
+            }
+            if len(scores) < self.k_core:
+                raise RuntimeError("oracle selector has fewer candidates than matched k")
             self._cached_core[ego] = sorted(
-                infl, key=infl.get, reverse=True
+                scores, key=lambda source: (-scores[source], int(source))
             )[: self.k_core]
 
+        self._oracle_refresh_index = int(getattr(self, "_oracle_refresh_index", 0)) + 1
         self._steps_since_refresh = 0
 
     def _core_context(self, actions_list, ego):
@@ -896,11 +960,25 @@ class OracleCoreRunner:
         return self.history
 
 
+class OracleAbsDCoreRunner(OracleCoreRunner):
+    """Matched-k oracle control that ranks neighbours by |D*| instead of C*.
+
+    It shares the exact policy/value architecture, optimizer, refresh cadence,
+    state, and core budget of :class:`OracleCoreRunner`.  The only scientific
+    difference is the oracle selector.  This makes G4 an outcome comparison,
+    not the tautology that C-top-k captures more C than |D|-top-k.
+    """
+
+    _log_tag = "OracleAbsDCore"
+    oracle_selector = "abs_direction"
+
+
 class RandomCoreRunner(OracleCoreRunner):
     """
     Experiment 0 control with architecture and input size IDENTICAL to
     OracleCoreRunner, including k_core*action_dim. The ONLY difference is that
-    the core is selected RANDOMLY rather than by true |W*|. This is precisely
+    the core is selected RANDOMLY rather than by oracle structural capacity C*.
+    This is precisely
     the control required for
     learning_range = R[oracle] - R[random] in structure_value_tier2.py.
     """
@@ -932,13 +1010,10 @@ class FullExplicitLocalRunner:
       local-feature pooling.
     - This baseline is richer than mean field but is not structurally filtered.
 
-    Because the environment may not expose a separate observation for each
-    neighbour, this implementation uses commonly available fields:
-        positions
-        agent_zone
-        agent_role
-        last_actions
-        get_obs_of_ego()
+    The baseline consumes the same adapter-owned information contract as the
+    final method: ego observations, executed neighbour actions, and opaque
+    compact relation features.  It never interprets relation-vector
+    coordinates as grid positions, zones, or roles.
 
     The policy receives:
         obs_i
@@ -946,12 +1021,9 @@ class FullExplicitLocalRunner:
 
     explicit_local_summary_i has dimension:
         action_dim + 4
-    comprising:
-        mean one-hot action over neighbours
-        mean normalized relative row
-        mean normalized relative col
-        mean same-zone indicator
-        normalized neighbor count
+    comprising a mean one-hot action summary, a learned compact summary of
+    adapter-provided relations, and normalized candidate count.  The fixed
+    width is a baseline architecture choice rather than environment ontology.
     """
 
     def __init__(self, env, cfg, device="cpu"):
@@ -1301,6 +1373,15 @@ class SharedAblationBase:
         self.device = device
         self.name = str(name)
 
+        if bool(self.cfg.get("confirmatory", False)) or bool(
+            self.cfg.get("strict_causal_profile", False)
+        ):
+            raise ValueError(
+                "SharedAblationBase is a legacy compatibility baseline with "
+                "derived, non-typed peripheral items and is excluded from "
+                "Paper A/B strict or confirmatory runs"
+            )
+
         self.use_belief = bool(use_belief)
         self.use_multi_memory = bool(use_multi_memory)
         self.use_two_timescale = bool(use_two_timescale)
@@ -1308,6 +1389,20 @@ class SharedAblationBase:
         self.n_agents = int(self.env_adapter.n_agents)
         self.obs_dim = int(self.env_adapter.obs_dim)
         self.action_dim = int(self.env_adapter.max_action_dim)
+
+        # Use the same adapter-owned candidate contract as FinalCIGAMF so
+        # representation and comparator paths consume the same information
+        # budget. ``None`` intentionally denotes the dense reference regime.
+        self.candidate_max_degree = self.cfg.get("candidate_max_degree", None)
+        self.candidate_neighbors_by_ego = {
+            ego: bounded_candidate_neighbors(
+                self.env_adapter, ego, self.candidate_max_degree
+            )
+            for ego in range(self.n_agents)
+        }
+        self.measured_edge_count = int(sum(
+            len(ids) for ids in self.candidate_neighbors_by_ego.values()
+        ))
 
         self.core_dim = int(cfg["core_dim"])
         self.periph_dim = int(cfg["periph_dim"])
@@ -1351,6 +1446,7 @@ class SharedAblationBase:
             use_belief_input=cfg.get("proxy_use_belief_input", False),
             ensemble_dropout=cfg.get("proxy_ensemble_dropout", 0.0),
             seed=cfg.get("seed", 0),
+            forced_only_training=cfg.get("proxy_forced_only_training", False),
         )
 
         self.pair_rel_module = PairRelationalModule(
@@ -1359,11 +1455,12 @@ class SharedAblationBase:
             action_dim=self.action_dim,
             hidden_dim=self.core_dim,
             shadow_dim=cfg["shadow_dim"],
-            rel_feat_dim=6,
+            rel_feat_dim=int(getattr(self.env_adapter, "relation_feature_dim", 6)),
             lr=cfg["core_lr"],
             bc_buffer_size=cfg.get("bc_buffer_size", 200000),
             grad_clip=cfg.get("bc_grad_clip", 1.0),
             shadow_loss_weight=cfg.get("shadow_loss_weight", 0.35),
+            candidate_neighbors_by_ego=self.candidate_neighbors_by_ego,
             device=device,
         )
 
@@ -1372,16 +1469,19 @@ class SharedAblationBase:
             num_slots=cfg["num_memory_slots"],
             memory_dim=cfg["periph_memory_dim"],
             out_dim=self.periph_dim,
-            mu_floor=cfg.get("periph_mu_floor", 0.02),
-            beta_floor=cfg.get("periph_beta_floor", 0.05),
+            mu_floor=cfg.get("periph_mu_floor", 0.0),
+            beta_floor=cfg.get("periph_beta_floor", 0.0),
+            beta_mode=cfg.get("periph_beta_mode", "capacity"),
+            lambda_sigma=cfg.get("periph_lambda_sigma", 1.0),
             semantic_mass=cfg.get("periph_semantic_mass", 0.5),
-            use_uniform_mix=cfg.get("periph_use_uniform_mix", True),
-            uniform_mix=cfg.get("periph_uniform_mix", 0.25),
+            use_uniform_mix=cfg.get("periph_use_uniform_mix", False),
+            uniform_mix=cfg.get("periph_uniform_mix", 0.0),
             lb_coeff=cfg.get("periph_lb_coeff", 0.5),
             orth_coeff=cfg.get("periph_orth_coeff", 1e-2),
-            # Shared legacy ablations do not own an influence-signature
-            # tracker. Their peripheral input is therefore explicitly marked
-            # as derived rather than being misreported as a full 5D treatment.
+            sigma_hi=cfg.get("periph_sigma_D_hi", 0.5),
+            # This compatibility baseline does not own an
+            # InfluenceSignatureTracker.  Its derived items are deliberately
+            # isolated from strict Paper A/B paths by the constructor guard.
             require_full_signature=False,
             allow_legacy_items=True,
         ).to(device)
@@ -1395,7 +1495,7 @@ class SharedAblationBase:
             top_k=cfg["belief_top_k"],
             pooled_hidden=cfg["belief_pooled_hidden"],
             out_dim=self.belief_dim,
-            priority_mu_floor=cfg.get("belief_priority_mu_floor", 0.02),
+            priority_mu_floor=cfg.get("belief_priority_mu_floor", 0.0),
         ).to(device)
 
         self.policy_value = PolicyValueNet(
@@ -1491,13 +1591,15 @@ class SharedAblationBase:
             lambda_0=self.cfg["belief_lambda_0"],
             uncertainty_scale=self.cfg["belief_uncertainty_scale"],
             tau=self.cfg.get(
-                "belief_tau_enter", self.cfg.get("belief_tau", 0.005)
+                "belief_tau_in",
+                self.cfg.get("belief_tau_enter", self.cfg.get("belief_tau", 0.005)),
             ),
-            tau_in=1.0,
+            tau_in=self.cfg.get(
+                "belief_tau_in",
+                self.cfg.get("belief_tau_enter", self.cfg.get("belief_tau", 0.005)),
+            ),
             tau_out=self.cfg.get(
-                "belief_hysteresis_ratio",
-                self.cfg.get("belief_tau_out", 0.35)
-                / max(self.cfg.get("belief_tau_in", 0.55), 1e-8),
+                "belief_tau_out", self.cfg.get("belief_tau_exit", 0.00175)
             ),
             weak_prior_top_k=self.cfg["seed_core_top_k"],
         )
@@ -2340,7 +2442,7 @@ class SharedAblationBase:
             state = self.belief_modules[ego].get_state_dict()
 
             for _, item in state.items():
-                mu_vals.append(float(item["mu_bar"]))
+                mu_vals.append(float(item["capacity_bar"]))
                 p_vals.append(float(item["p_core"]))
 
         mean_mu = float(np.mean(np.abs(mu_vals))) if len(mu_vals) > 0 else 0.0

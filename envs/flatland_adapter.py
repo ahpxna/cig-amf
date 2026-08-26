@@ -42,7 +42,10 @@ class FlatlandCIGAdapter:
     def relation_features(self, ego, target): return self.env.relation_features(ego, target)
     def pair_features(self, ego, target): return self.relation_features(ego, target)
     def neighbour_features(self, ego, neighbour, action):
-        onehot = np.zeros(5, dtype=np.float32); onehot[int(action)] = 1.0
+        action = int(action)
+        if action < 0 or action >= self.max_action_dim:
+            raise ValueError("neighbour action is outside the adapter action space")
+        onehot = np.zeros(5, dtype=np.float32); onehot[action] = 1.0
         agent = self.env.rail_env.agents[int(neighbour)]
         active = float(getattr(agent, "position", None) is not None)
         malfunction = float(getattr(getattr(agent, "malfunction_handler", None), "malfunction_down_counter", 0) > 0)
@@ -62,6 +65,10 @@ class FlatlandCIGAdapter:
         # The adapter's third channel is normalized distance to the first
         # reachable shared conflict; no core module interprets this index.
         return float(1.0 / (1.0 + max(0.0, self.relation_features(ego, neighbour)[2])))
+    def candidate_neighbors(self, ego, max_degree):
+        ids = [j for j in range(int(self.n_agents)) if int(j) != int(ego)]
+        ids.sort(key=lambda j: (-self.weak_prior_score(ego, j), int(j)))
+        return ids[: int(max_degree)]
     def feature_snapshot(self):
         return {"relations": np.stack([[self.relation_features(i, j) if i != j else np.zeros(6)
                                          for j in range(self.n_agents)] for i in range(self.n_agents)])}
@@ -401,6 +408,7 @@ class FlatlandCIGEnvironment(ExternalPopulationMixin):
             list(self.last_actions),
             self._behaviour_override,
             copy.deepcopy(self._route_cache),
+            int(self._step_count),
         )
     def restore_state(self, state):
         (

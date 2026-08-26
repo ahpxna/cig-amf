@@ -211,6 +211,10 @@ class AdaptiveResourceFlowArena:
     def set_mode(self, mode: str):
         self.mode = str(mode)
 
+    def get_structure_regime_id(self):
+        """Expose the environment-owned structural phase to causal replay."""
+        return int(self.current_phase) if self.mode == "structural_shift" else 0
+
     # =========================================================
     # Static layout
     # =========================================================

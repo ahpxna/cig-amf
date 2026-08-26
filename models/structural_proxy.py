@@ -44,14 +44,11 @@ The correction vectorizes the ensemble dimension:
     5. n_ensemble forwards, backwards, and updates become one of each over E.
 
 `self.buffer` intentionally remains a deque of Python dictionaries because
-drift_probe.py reads that structure directly. Sampling avoids the former
-O(n_ensemble * buffer_size) Python scan: 800,000 operations for a 200k buffer
-and four members. Each member instead receives a fixed NumPy permutation mask
-computed once at initialization. It identifies approximately bootstrap_ratio
-of buffer ranks visible to that member; C-level filtering plus weighted
-random.choices oversamples interventions. Per-call mask redraws are forbidden:
-[BB1] in GPU_OPTIMIZATION_CONTRACT.md explains that they eventually expose
-nearly the entire buffer to every member and reproduce v1's collapse.
+drift_probe.py reads that structure directly.  Each replay sample receives an
+immutable SplitMix64 bootstrap-membership vector at insertion, so deque
+eviction/reindexing cannot change which ensemble members train on it.
+Per-call mask redraws are forbidden because they eventually expose nearly the
+entire buffer to every member and reproduce v1's collapse.
 
 BACKWARD COMPATIBILITY
 
@@ -70,7 +67,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from envs.causal_adapter import OmniArenaAdapter, PUBLIC_ROLES
+from envs.causal_adapter import resolve_env_adapter
 from utils.latency_protocol import LATENCY_ONSET_ABS_FLOOR, LATENCY_ONSET_FRACTION
 
 try:
@@ -373,8 +370,8 @@ class LocalCounterfactualProxyEnsemble:
                  + [pi(A|s)-q(A|s)] / b(A|s)
                    * [R - f_hat(s,A)].
 
-    Here ``q`` is the fixed uniform candidate-action reference and ``b`` is
-    the logged epsilon-forcing behaviour policy. This is a fixed stochastic-
+    Here ``q`` is the fixed reference rule, uniform over the state-valid
+    action set, and ``b`` is the logged epsilon-forcing behaviour policy. This is a fixed stochastic-
     policy value contrast, not the realised-action quantity
     ``psi(A)-E_pi[psi]``. The latter has a different residual coefficient and
     is intentionally not used by confirmatory H1. A row-level orthogonal
@@ -424,6 +421,7 @@ class LocalCounterfactualProxyEnsemble:
         pair_feat_dim: int = 0,
         context_item_dim: int = 0,
         debug_verbose: bool = False,
+        forced_only_training: bool = False,
     ):
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
@@ -434,6 +432,7 @@ class LocalCounterfactualProxyEnsemble:
         self.pair_feat_dim = int(pair_feat_dim)
         self.context_item_dim = int(context_item_dim)
         self.debug_verbose = bool(debug_verbose)
+        self.forced_only_training = bool(forced_only_training)
         self.n_ensemble = int(n_ensemble)
         self.hidden = int(hidden)
         self.lr = float(lr)
@@ -670,10 +669,18 @@ class LocalCounterfactualProxyEnsemble:
     def _one_hot(self, actions) -> torch.Tensor:
         """actions: array-like [B] -> [B, action_dim] float32"""
         if isinstance(actions, torch.Tensor):
-            a = actions.to(device=self.device, dtype=torch.long)
+            raw = actions.detach().to(device=self.device)
+            if not bool(torch.all(torch.isfinite(raw))):
+                raise ValueError("action identities must be finite")
+            if not bool(torch.all(raw == torch.floor(raw))):
+                raise ValueError("action identities must be integers")
+            a = raw.to(dtype=torch.long)
         else:
+            raw = np.asarray(actions)
+            if not np.all(np.isfinite(raw)) or not np.all(raw == np.floor(raw)):
+                raise ValueError("action identities must be finite integers")
             a = torch.tensor(
-                np.asarray(actions, dtype=np.int64),
+                raw.astype(np.int64, copy=False),
                 dtype=torch.long,
                 device=self.device,
             )
@@ -681,9 +688,27 @@ class LocalCounterfactualProxyEnsemble:
         if a.dim() == 0:
             a = a.unsqueeze(0)
 
-        a = a.clamp(min=0, max=self.action_dim - 1)
+        if bool(torch.any((a < 0) | (a >= self.action_dim))):
+            raise ValueError(
+                f"action identities must lie in [0, {self.action_dim})"
+            )
 
         return F.one_hot(a, num_classes=self.action_dim).to(dtype=torch.float32)
+
+    def _validate_action_id(self, action, *, name: str) -> int:
+        """Validate one categorical action without coercion or clipping."""
+        try:
+            raw = float(action)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be an integer action identity") from exc
+        if not np.isfinite(raw) or raw != int(raw):
+            raise ValueError(f"{name} must be a finite integer action identity")
+        value = int(raw)
+        if value < 0 or value >= self.action_dim:
+            raise ValueError(
+                f"{name} must lie in [0, {self.action_dim}), got {value}"
+            )
+        return value
 
     def _to_float_tensor(self, x, expected_dim=None) -> torch.Tensor:
         if isinstance(x, torch.Tensor):
@@ -746,6 +771,14 @@ class LocalCounterfactualProxyEnsemble:
         context_mask=None,
         context_block=None,
         context_target_id=None,
+        target_action_proposed=None,
+        target_action_executed=None,
+        target_pi=None,
+        target_q=None,
+        target_b=None,
+        target_epsilon=None,
+        structure_regime_id=0,
+        policy_version=0,
     ):
         """
         Add one supervised sample.
@@ -811,12 +844,16 @@ class LocalCounterfactualProxyEnsemble:
         if not np.any(membership):
             membership[sample_id % self.n_ensemble] = True
 
+        action_i_id = self._validate_action_id(action_i, name="action_i")
+        observed_action_j_id = self._validate_action_id(
+            observed_action_j, name="observed_action_j"
+        )
         sample = {
             "ego_id": int(ego_id),
             "neighbor_id": int(neighbor_id),
             "obs_i": self._normalise_vector(obs_i, self.obs_dim),
-            "action_i": int(action_i),
-            "observed_action_j": int(observed_action_j),
+            "action_i": action_i_id,
+            "observed_action_j": observed_action_j_id,
             "z_core_excl_j": self._normalise_vector(z_core_excl_j, self.core_dim),
             "m_periph_excl_j": self._normalise_vector(
                 m_periph_excl_j, self.periph_dim
@@ -852,13 +889,111 @@ class LocalCounterfactualProxyEnsemble:
                 if valid_action_mask is None
                 else np.asarray(valid_action_mask, dtype=bool).reshape(self.action_dim)
             ),
+            # Canonical typed-replay fields. Keep the historical aliases above
+            # for compatibility, but never lose proposed versus executed
+            # treatment identity or the state-valid reference rule.
+            "action_i_executed": action_i_id,
+            "pair_feat_ij": (
+                np.zeros((self.pair_feat_dim,), dtype=np.float32)
+                if pair_feat is None
+                else self._normalise_vector(pair_feat, self.pair_feat_dim)
+            ),
+            "target_action_proposed": int(
+                observed_action_j_id if target_action_proposed is None
+                else self._validate_action_id(
+                    target_action_proposed, name="target_action_proposed"
+                )
+            ),
+            "target_action_executed": int(
+                observed_action_j_id if target_action_executed is None
+                else self._validate_action_id(
+                    target_action_executed, name="target_action_executed"
+                )
+            ),
+            "target_was_forced": bool(was_forced),
+            "target_epsilon": (
+                None if target_epsilon is None else float(target_epsilon)
+            ),
+            "structure_regime_id": int(structure_regime_id),
+            "policy_version": int(policy_version),
             "episode_id": episode_id,
             "timestep": timestep,
         }
+        target_mask = sample["valid_action_mask"]
+        proposed = sample["target_action_proposed"]
+        executed = sample["target_action_executed"]
+        if not (0 <= proposed < self.action_dim and 0 <= executed < self.action_dim):
+            raise ValueError("target action identity is outside the action space")
+        if not bool(target_mask[proposed]):
+            raise ValueError("proposed target action is invalid under its mask")
+        if not bool(target_mask[executed]):
+            raise ValueError("executed target action is invalid under its mask")
+        pi_vec = (
+            np.asarray(policy_probs_j, dtype=np.float32).reshape(-1)
+            if target_pi is None and policy_probs_j is not None
+            else target_pi
+        )
+        if pi_vec is None:
+            pi_vec = target_mask.astype(np.float32)
+        pi_vec = np.asarray(pi_vec, dtype=np.float32).reshape(-1)
+        if pi_vec.shape != (self.action_dim,) or not np.all(np.isfinite(pi_vec)):
+            raise ValueError("target_pi must be a finite action-probability vector")
+        if np.any(pi_vec < 0.0) or np.any(pi_vec[~target_mask] > 1e-8):
+            raise ValueError("target_pi must be non-negative and zero on invalid actions")
+        pi_vec = np.where(target_mask, np.maximum(pi_vec, 0.0), 0.0)
+        pi_vec /= max(float(pi_vec.sum()), self.eps)
+        q_vec = (
+            target_q if target_q is not None else target_mask.astype(np.float32)
+        )
+        q_vec = np.asarray(q_vec, dtype=np.float32).reshape(-1)
+        if (
+            q_vec.shape != (self.action_dim,)
+            or not np.all(np.isfinite(q_vec))
+            or np.any(q_vec < 0.0)
+            or np.any(q_vec[~target_mask] > 1e-8)
+        ):
+            raise ValueError("target_q must match the action dimension")
+        q_vec = np.where(target_mask, q_vec, 0.0)
+        q_vec /= max(float(q_vec.sum()), self.eps)
+        fixed_q = target_mask.astype(np.float32) / float(target_mask.sum())
+        if not np.allclose(q_vec, fixed_q, rtol=1e-5, atol=1e-6):
+            raise ValueError(
+                "target_q must be the fixed uniform rule over state-valid actions"
+            )
+        b_vec = pi_vec if target_b is None else np.asarray(target_b, dtype=np.float32).reshape(-1)
+        if (
+            b_vec.shape != (self.action_dim,)
+            or np.any(~np.isfinite(b_vec))
+            or np.any(b_vec < 0.0)
+            or np.any(b_vec[~target_mask] > 1e-8)
+        ):
+            raise ValueError("target_b must be a finite action-probability vector")
+        b_vec = np.where(target_mask, b_vec, 0.0)
+        b_vec /= max(float(b_vec.sum()), self.eps)
+        if target_epsilon is not None:
+            epsilon = float(target_epsilon)
+            if not np.isfinite(epsilon) or epsilon < 0.0 or epsilon > 1.0:
+                raise ValueError("target_epsilon must lie in [0, 1]")
+            expected_b = (1.0 - epsilon) * pi_vec + epsilon * q_vec
+            if not np.allclose(b_vec, expected_b, rtol=1e-5, atol=1e-6):
+                raise ValueError(
+                    "target_b must equal (1-epsilon)*target_pi + epsilon*target_q"
+                )
+        sample["target_pi"] = pi_vec
+        sample["target_q"] = q_vec
+        sample["target_b"] = b_vec
         if self.context_item_dim > 0:
             if context_block is not None:
                 sample["context_block"] = context_block
                 sample["context_target_id"] = int(context_target_id)
+                ids = np.asarray(context_block.get("neighbor_ids", ()), dtype=np.int64)
+                positions = np.flatnonzero(ids == int(context_target_id))
+                if positions.size != 1:
+                    raise ValueError("context block must contain exactly one target ID")
+                sample["context_block_id"] = context_block.get(
+                    "context_block_id", context_block.get("block_id")
+                )
+                sample["target_context_position"] = int(positions[0])
             else:
                 if context_items is None:
                     item_array = np.zeros(
@@ -879,8 +1014,10 @@ class LocalCounterfactualProxyEnsemble:
                     )
                     if mask_array.shape != (item_array.shape[0],):
                         raise ValueError("context_mask must have one entry per context item")
-                sample["context_items"] = item_array.copy()
-                sample["context_mask"] = mask_array.copy()
+                    sample["context_items"] = item_array.copy()
+                    sample["context_mask"] = mask_array.copy()
+                sample["context_block_id"] = None
+                sample["target_context_position"] = None
 
         self.buffer.append(sample)
 
@@ -1056,7 +1193,9 @@ class LocalCounterfactualProxyEnsemble:
             if block is None:
                 grouped[("legacy", index)] = [index]
             else:
-                grouped.setdefault(("block", id(block)), []).append(index)
+                grouped.setdefault(
+                    ("block", block.get("context_block_id", id(block))), []
+                ).append(index)
         for key, indices in grouped.items():
             sample = batch[indices[0]]
             block = sample.get("context_block")
@@ -1141,9 +1280,17 @@ class LocalCounterfactualProxyEnsemble:
         pool_positions = np.asarray([
             index for index, sample in enumerate(buf_list)
             if bool(sample.get("bootstrap_membership", [True] * self.n_ensemble)[member_idx])
+            and (
+                not self.forced_only_training
+                or bool(sample.get("was_forced", False))
+            )
         ], dtype=np.int64)
 
         if pool_positions.size == 0:
+            if self.forced_only_training:
+                # G1 is deliberately fail-closed: never silently fall back to
+                # factual rows when the randomized subset has no support yet.
+                return []
             # Only possible with a very small early-training buffer whose short
             # prefix misses the permutation; use the current full list and
             # never return an empty pool.
@@ -1224,9 +1371,6 @@ class LocalCounterfactualProxyEnsemble:
 
             if any(len(b) == 0 for b in member_batches):
 #                print("[TRAIN-DEBUG] SKIPPED — empty batch this step")
-                continue
-
-            if any(len(b) == 0 for b in member_batches):
                 continue
 
             obs_l, ai_l, aj_l, z_l, m_l, bl_l, tgt_l, valid_l = [], [], [], [], [], [], [], []
@@ -1367,8 +1511,18 @@ class LocalCounterfactualProxyEnsemble:
         # structural shift.
         holdout_residual_t = None
 
-        if holdout_size > 0 and len(self.buffer) > holdout_size:
-            ho_batch = random.sample(list(self.buffer), int(holdout_size))
+        if holdout_size > 0:
+            holdout_pool = [
+                sample for sample in self.buffer
+                if (
+                    not self.forced_only_training
+                    or bool(sample.get("was_forced", False))
+                )
+            ]
+        else:
+            holdout_pool = []
+        if holdout_size > 0 and len(holdout_pool) > holdout_size:
+            ho_batch = random.sample(holdout_pool, int(holdout_size))
 
             (ho_obs, ho_ai, ho_aj, ho_z, ho_m, ho_b, ho_target, ho_valid, ho_pf,
              _ho_bobs, ho_ctx, ho_ctx_mask) = (
@@ -1781,11 +1935,20 @@ class LocalCounterfactualProxyEnsemble:
                 fallback,
             )
 
-        idx_obs = torch.tensor(
-            np.asarray(action_j_obs, dtype=np.int64).reshape(-1),
-            dtype=torch.long,
-            device=self.device,
-        ).clamp(0, A - 1)  # [B]
+        raw_obs = np.asarray(action_j_obs).reshape(-1)
+        if raw_obs.shape != (B,):
+            raise ValueError(f"observed_action_j must have shape {(B,)}, got {raw_obs.shape}")
+        if not np.all(np.isfinite(raw_obs)):
+            raise ValueError("observed_action_j contains a non-finite action identity")
+        if not np.all(raw_obs == np.floor(raw_obs)):
+            raise ValueError("observed_action_j must contain integer action identities")
+        raw_obs = raw_obs.astype(np.int64, copy=False)
+        if np.any(raw_obs < 0) or np.any(raw_obs >= A):
+            raise ValueError(
+                f"observed_action_j must lie in [0, {A}); received "
+                f"min={int(raw_obs.min())}, max={int(raw_obs.max())}"
+            )
+        idx_obs = torch.tensor(raw_obs, dtype=torch.long, device=self.device)  # [B]
 
         idx_exp = (
             idx_obs.view(1, B, 1, 1).expand(E, B, 1, H)
@@ -1823,27 +1986,16 @@ class LocalCounterfactualProxyEnsemble:
             target_prob_obs = torch.gather(w, 1, idx_obs.view(B, 1)).squeeze(1)
 
         elif mode == "signed_oracle_matched":
-            cand = torch.tensor(
-                [a for a in self.candidate_actions if 0 <= a < A],
-                dtype=torch.long,
-                device=self.device,
-            )  # [n_cand]
-
-            if cand.numel() == 0:
-                cand = torch.arange(A, dtype=torch.long, device=self.device)
-
-            candidate_mask = torch.zeros(A, dtype=torch.bool, device=self.device)
-            candidate_mask[cand] = True
-            row_candidates = valid & candidate_mask.view(1, A)
-            empty = row_candidates.sum(dim=1) == 0
-            row_candidates[empty] = valid[empty]
-            q = row_candidates.to(torch.float32)
+            # The reference rule is uniform over *all* state-valid actions.
+            # ``candidate_actions`` is retained only for legacy diagnostics;
+            # using it here would silently change q and therefore the D
+            # estimand whenever a caller supplied a semantic action subset.
+            q = valid.to(torch.float32)
             q = q / q.sum(dim=1, keepdim=True)
             cand_mean = torch.einsum("ebah,ba->ebh", preds_all, q)
 
             effect_per_h = cand_mean - f_obs           # [E, B, H]
-            # q(a_obs|s) for the uniform candidate-action intervention.
-            # It is zero when the factual action is outside the candidate set.
+            # q(a_obs|s) for the uniform state-valid reference rule.
             target_prob_obs = torch.gather(q, 1, idx_obs.view(B, 1)).squeeze(1)
 
         elif mode == "signed_policy_contrast":
@@ -1867,19 +2019,9 @@ class LocalCounterfactualProxyEnsemble:
                 pi_full_arr, dtype=torch.float32, device=self.device,
             )
             pi_full = _normalize_over_valid(pi_full)
-            cand = torch.tensor(
-                [a for a in self.candidate_actions if 0 <= a < A],
-                dtype=torch.long,
-                device=self.device,
-            )
-            if cand.numel() == 0:
-                cand = torch.arange(A, dtype=torch.long, device=self.device)
-            candidate_mask = torch.zeros(A, dtype=torch.bool, device=self.device)
-            candidate_mask[cand] = True
-            row_candidates = valid & candidate_mask.view(1, A)
-            empty = row_candidates.sum(dim=1) == 0
-            row_candidates[empty] = valid[empty]
-            q = row_candidates.to(torch.float32)
+            # q is the fixed reference policy: uniform on the current valid
+            # action set, not on a hand-picked intervention subset.
+            q = valid.to(torch.float32)
             q = q / q.sum(dim=1, keepdim=True)
             q_mean = torch.einsum("ebah,ba->ebh", preds_all, q)
             pi_mean = torch.einsum("ebah,ba->ebh", preds_all, pi_full)
@@ -2127,6 +2269,7 @@ class LocalCounterfactualProxyEnsemble:
                 "c_lag_sigma": np.zeros((0, self.n_horizons), dtype=np.float32),
                 "latency_center": z,
                 "latency_onset": np.zeros((0,), dtype=np.int64),
+                "latency_onset_valid": z,
                 "latency_peak": np.zeros((0,), dtype=np.int64),
                 "latency_valid": z,
                 "mu_range": z,
@@ -2219,13 +2362,28 @@ class LocalCounterfactualProxyEnsemble:
             )
         )
 
-        # [SIG-5D] The latency component was removed, reducing the signature to
-        # R^5; see influence_signature.py. mu_per_h remains only as a raw
-        # horizon diagnostic and carries no latency-centroid claim.
+        # Paper A Eqs. (15)--(19) retain this lag-capacity spectrum.  Its
+        # centre and validity masks are exported through CausalPairSignal;
+        # Paper B transports that typed diagnostic while its default allocator
+        # vector remains the separate fixed 5D C/D profile.
 
-        # Capacity C is always the per-action response range, independent of
-        # the selected diagnostic effect mode.  It is the only quantity passed
-        # to the structural belief/core selector.
+        # Capacity C is the action range of the ensemble-mean response
+        # surface, exactly matching Paper A Eq. (13).  It is not the mean of
+        # per-head ranges: max/min are nonlinear and those two operations
+        # differ whenever heads disagree on the extremal action.  Per-head
+        # ranges remain the source of sigma_C disagreement below.
+        q_terminal = preds_all[:, :, :, -1]
+        q_mu = torch.mean(q_terminal, dim=0)                       # [B,A]
+        valid_terminal = torch.tensor(
+            valid_action_mask, dtype=torch.bool, device=self.device
+        )
+        c_mu = (
+            q_mu.masked_fill(~valid_terminal, -torch.inf).max(dim=1).values
+            - q_mu.masked_fill(~valid_terminal, torch.inf).min(dim=1).values
+        )
+
+        # Capacity disagreement is the standard deviation of each ensemble
+        # member's Eq. (13) range, not a calibrated interval.
         res_range = self._compute_effects(
             preds_all=preds_all,
             action_j_obs=a_j,
@@ -2233,7 +2391,6 @@ class LocalCounterfactualProxyEnsemble:
             mode="range",
         )
         c_effect = res_range["effect"]
-        c_mu = torch.mean(c_effect, dim=0)                         # [B]
         c_sigma = (
             torch.zeros_like(c_mu)
             if c_effect.shape[0] <= 1
@@ -2242,8 +2399,6 @@ class LocalCounterfactualProxyEnsemble:
 
         # q(a)=E_member[Q(a)] is exported for H1a response-surface calibration
         # and oracle diagnostics.  The runner does not use it as a graph input.
-        q_terminal = preds_all[:, :, :, -1]
-        q_mu = torch.mean(q_terminal, dim=0)                       # [B,A]
         q_sigma = (
             torch.zeros_like(q_mu)
             if q_terminal.shape[0] <= 1
@@ -2267,7 +2422,13 @@ class LocalCounterfactualProxyEnsemble:
             lag_preds_all.masked_fill(~valid_lag, -torch.inf).max(dim=2).values
             - lag_preds_all.masked_fill(~valid_lag, torch.inf).min(dim=2).values
         )  # [E,B,H]
-        c_lag_mu = torch.mean(c_lag_members, dim=0)
+        valid_lag_mean = torch.tensor(
+            valid_action_mask, dtype=torch.bool, device=self.device
+        ).view(B, self.action_dim, 1)
+        c_lag_mu = (
+            g_mu.masked_fill(~valid_lag_mean, -torch.inf).max(dim=1).values
+            - g_mu.masked_fill(~valid_lag_mean, torch.inf).min(dim=1).values
+        )
         c_lag_sigma = (
             torch.zeros_like(c_lag_mu)
             if c_lag_members.shape[0] <= 1
@@ -2284,11 +2445,17 @@ class LocalCounterfactualProxyEnsemble:
             (lag_mass * lag_axis).sum(dim=1)
             / torch.clamp(lag_total, min=self.eps)
         )
-        latency_valid = lag_total > self.eps
-        latency_center = torch.where(
-            latency_valid, latency_center, torch.full_like(latency_center, -1.0)
-        )
+        # Validity is peak-based: a tiny positive total spread with no
+        # supported lag must not be reported as a valid immediate response.
         peak_value, latency_peak = lag_mass.max(dim=1)
+        # ``L_cm/(H-1)`` is undefined for H=1.  A one-step response remains
+        # usable for Q/C/D, but must be explicitly latency-unsupported.
+        latency_valid = (
+            peak_value >= LATENCY_ONSET_ABS_FLOOR
+        ) & (self.n_horizons >= 2)
+        latency_center = torch.where(
+            latency_valid, latency_center, torch.zeros_like(latency_center)
+        )
         latency_peak = torch.where(
             latency_valid, latency_peak, torch.full_like(latency_peak, -1)
         )
@@ -2297,9 +2464,10 @@ class LocalCounterfactualProxyEnsemble:
             min=LATENCY_ONSET_ABS_FLOOR,
         )
         onset_mask = lag_mass >= onset_threshold.unsqueeze(1)
+        latency_onset_valid = latency_valid & onset_mask.any(dim=1)
         latency_onset = torch.argmax(onset_mask.to(torch.int64), dim=1)
         latency_onset = torch.where(
-            latency_valid, latency_onset, torch.full_like(latency_onset, -1)
+            latency_onset_valid, latency_onset, torch.full_like(latency_onset, -1)
         )
 
         self.latest_dr_correction_magnitude = float(
@@ -2341,6 +2509,7 @@ class LocalCounterfactualProxyEnsemble:
             "c_lag_sigma": to_np(c_lag_sigma),
             "latency_center": to_np(latency_center),
             "latency_onset": to_np(latency_onset),
+            "latency_onset_valid": to_np(latency_onset_valid.to(torch.float32)),
             "latency_peak": to_np(latency_peak),
             "latency_valid": to_np(latency_valid.to(torch.float32)),
             "dr_correction": to_np(diagnostic_res["dr_correction"]),
@@ -2463,39 +2632,21 @@ class LocalCounterfactualProxyEnsemble:
 
 
 # =========================================================================
-# [FIX-X1] x_ij — pair features for Equation 8
+# Pair features for Eq. 8
 # =========================================================================
 
-PAIR_FEAT_DIM = 5 + len(PUBLIC_ROLES)
 
+def build_pair_feat(adapter_or_env, ego, target, *, snapshot=None):
+    """Return generic pre-treatment ``x_ij`` through the adapter contract.
 
-def build_pair_feat(
-    positions,
-    agent_zone,
-    grid_size,
-    n_zones,
-    ego,
-    j,
-    agent_role=None,
-):
-    """Build ``x_ij`` from pre-treatment observable pair state.
-
-    The channels are relative row, relative column, L1 distance, same-zone,
-    normalized zone difference, and a one-hot target public role vector.
-    OmniArena exposes role in every observed neighbour record; it is a task
-    identity available before the intervention, not the oracle influence label.
-    Environments without public roles receive a neutral zero role feature.
-
-    WHY THIS IS REQUIRED (see FIX-X1 in LocalCounterfactualProxyNet.__init__):
-    In omni_arena, w_ij(s)=phi_ij*delta_ij(s), where delta_ij(s) is purely a
-    function of position: every _gate_ladder branch uses _dist(pos, anchor).
-    Without x_ij, f_theta has no input distinguishing j and therefore cannot
-    represent w_ij(s), regardless of training duration.
-
-    Use this same function on both the replay_builder push path and
-    final_runner scoring path. Divergent x_ij definitions cause silent,
-    difficult-to-detect train/serve skew.
+    Model code must not assume that relation coordinates denote grid rows,
+    zones, or distances.  ``snapshot`` is required when reconstructing a
+    historical replay row; otherwise the adapter reads the current state.
     """
-    return OmniArenaAdapter._pair_features_from_tables(
-        positions, agent_zone, grid_size, n_zones, ego, j, agent_role
+    adapter = resolve_env_adapter(adapter_or_env)
+    if snapshot is None:
+        return np.asarray(adapter.pair_features(int(ego), int(target)), dtype=np.float32)
+    return np.asarray(
+        adapter.pair_features_from_snapshot(snapshot, int(ego), int(target)),
+        dtype=np.float32,
     )

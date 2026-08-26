@@ -22,13 +22,18 @@ import torch
 try:
     from exp_common import ROOT, ensure_dir
     from run_paper_b_periphery import _memory_accounting
-    from run_paper_b_allocation import _decision_fidelity
+    from run_paper_b_allocation import (
+        _decision_fidelity, _oracle_capacity_direction_for_state,
+    )
 except ModuleNotFoundError:
     from scripts.exp_common import ROOT, ensure_dir
     from scripts.run_paper_b_periphery import _memory_accounting
-    from scripts.run_paper_b_allocation import _decision_fidelity
+    from scripts.run_paper_b_allocation import (
+        _decision_fidelity, _oracle_capacity_direction_for_state,
+    )
 
 import run_experiment as RE
+from envs.causal_adapter import bounded_candidate_neighbors, resolve_env_adapter
 from runners.h3_ablation_runner import H3NoMultiMemoryRunner
 
 
@@ -58,7 +63,7 @@ def _mean(values):
     return float(np.mean(values)) if values else float("nan")
 
 
-def _runner(variant, n_agents, seed, device, core_budget):
+def _runner(variant, n_agents, seed, device, core_budget, candidate_max_degree):
     # Every variant in a matched seed/population cell must start from the exact
     # same parameter RNG state.  Without this reset, sequential construction
     # confounds architecture differences with different random initialisation.
@@ -70,7 +75,14 @@ def _runner(variant, n_agents, seed, device, core_budget):
         "belief_adaptive_k_min": int(core_budget),
         "max_core_size": int(core_budget), "periph_require_full_signature": True,
         "periph_allow_legacy_items": False,
+        "strict_causal_profile": True,
+        "semantic_router_frozen": True,
     })
+    # The Paper-B scalability panel measures bounded candidate-edge execution,
+    # not an all-pairs system with a small full-core only.  Full-Explicit is
+    # deliberately exempt because it is the dense upper reference.
+    if variant != "Full-Explicit":
+        cfg["candidate_max_degree"] = int(candidate_max_degree)
     if variant == "Full-Explicit":
         # Configure the reference before construction so the runner's
         # episode-zero invariant activates every pair immediately.
@@ -168,26 +180,134 @@ def _decision_probe_with_latency(runner, n_states, seed):
     }
 
 
+def _candidate_oracle_recall_at_degree(
+    env, *, n_states, max_degree, horizon, discount, trials, seed,
+):
+    """Certify whether the fixed candidate provider retains oracle top-C edges.
+
+    Candidate construction is deliberately evaluated independently of learned
+    allocation.  For each bank state and ego, the unrestricted clone-state
+    oracle ranks all positive-capacity neighbours; recall is measured on the
+    top ``min(d_max, n_positive)`` set.  States with no causal edge are not
+    treated as automatic successes because they provide no pruning evidence.
+    """
+    if int(n_states) <= 0 or int(max_degree) <= 0:
+        raise ValueError("candidate oracle recall requires positive state and degree budgets")
+    adapter = resolve_env_adapter(env)
+    outer = env.clone_state()
+    hits = 0
+    comparisons = 0
+    evaluated_ego_states = 0
+    try:
+        bank = env.sample_state_bank(
+            n_states=int(n_states), burn_in=3,
+            bank_seed=int(seed), min_remaining_steps=int(horizon),
+        )
+        for state_index, state in enumerate(bank):
+            capacities, _ = _oracle_capacity_direction_for_state(
+                env, state, horizon=int(horizon), discount=float(discount),
+                trials=int(trials),
+                seed=int(seed) + 100003 * int(state_index),
+            )
+            env.restore_state(copy.deepcopy(state))
+            for ego, scores in capacities.items():
+                oracle_rank = [
+                    int(target) for target, capacity in sorted(
+                        scores.items(), key=lambda item: (-float(item[1]), int(item[0]))
+                    )
+                    if float(capacity) > 0.0
+                ][:int(max_degree)]
+                if not oracle_rank:
+                    continue
+                candidate_ids = set(bounded_candidate_neighbors(
+                    adapter, int(ego), int(max_degree),
+                ))
+                hits += sum(target in candidate_ids for target in oracle_rank)
+                comparisons += len(oracle_rank)
+                evaluated_ego_states += 1
+    finally:
+        env.restore_state(outer)
+    recall = float(hits / comparisons) if comparisons else float("nan")
+    return {
+        "candidate_oracle_recall_at_degree": recall,
+        "candidate_oracle_recall_hits": int(hits),
+        "candidate_oracle_recall_comparisons": int(comparisons),
+        "candidate_oracle_recall_evaluated_ego_states": int(evaluated_ego_states),
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", type=int, nargs="+", required=True)
     parser.add_argument("--agent-counts", type=int, nargs="+", default=[12, 24, 48])
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--core-budget", type=int, default=3)
+    parser.add_argument(
+        "--candidate-max-degree", type=int, default=8,
+        help=(
+            "Frozen policy-independent candidate degree for edge-scaling "
+            "variants. Full-Explicit remains dense by definition."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-recall-states", type=int, default=4,
+        help="Oracle-only state-bank size for the top-C candidate-recall gate.",
+    )
+    parser.add_argument(
+        "--candidate-recall-horizon", type=int, default=8,
+        help="Clone-state response horizon used by the candidate-recall oracle.",
+    )
+    parser.add_argument(
+        "--candidate-recall-trials", type=int, default=2,
+        help="Common-random-number trials per oracle action for candidate recall.",
+    )
+    parser.add_argument(
+        "--candidate-recall-min", type=float, default=0.80,
+        help="Frozen minimum oracle top-C recall@d_max required for a scaling claim.",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--out-root", default=os.path.join(ROOT, "results", "paper_b_scaling"))
     args = parser.parse_args(argv)
     if not args.seeds or any(value <= 1 for value in args.agent_counts):
         parser.error("seeds and agent counts greater than one are required")
+    if (
+        args.candidate_max_degree <= 0
+        or args.candidate_recall_states <= 0
+        or args.candidate_recall_horizon <= 0
+        or args.candidate_recall_trials <= 0
+        or not 0.0 <= args.candidate_recall_min <= 1.0
+    ):
+        parser.error("candidate recall budgets must be positive and its minimum must lie in [0, 1]")
     rows = []
     for seed in args.seeds:
         for n_agents in args.agent_counts:
             group = {}
             probe_seed = int(seed) + int(n_agents) * 1009 + 92009
+            degree = min(int(args.candidate_max_degree), int(n_agents) - 1)
+            # This uses a fresh, policy-independent environment instance so
+            # candidate recall cannot be affected by any variant's learned
+            # allocation or trajectory.  It is a prerequisite, not an
+            # end-to-end score.
+            oracle_env = RE.make_main_env(
+                task_mode="behavioral_drift", n_agents=int(n_agents),
+                max_steps=max(30, int(args.candidate_recall_horizon) + 8),
+                phase_length=40, seed=int(seed),
+            )
+            oracle_cfg = RE.default_cfg()
+            candidate_gate = _candidate_oracle_recall_at_degree(
+                oracle_env,
+                n_states=int(args.candidate_recall_states),
+                max_degree=degree,
+                horizon=int(args.candidate_recall_horizon),
+                discount=float(oracle_cfg["discount"]),
+                trials=int(args.candidate_recall_trials),
+                seed=probe_seed + 700001,
+            )
             for variant in VARIANTS:
                 runner = _runner(
                     variant, n_agents, seed, args.device,
                     min(args.core_budget, int(n_agents) - 1),
+                    degree,
                 )
                 history = runner.run(n_episodes=int(args.episodes), eval_every=10)
                 memory = _memory_accounting(runner)
@@ -199,6 +319,29 @@ def main(argv=None):
                     "seed": int(seed),
                     "n_agents": int(n_agents),
                     "episodes": int(args.episodes),
+                    "candidate_max_degree_protocol": int(
+                        degree
+                    ),
+                    "candidate_recall_applicable": int(
+                        variant not in {"Full-Explicit", "PureMeanField"}
+                    ),
+                    **(
+                        candidate_gate
+                        if variant not in {"Full-Explicit", "PureMeanField"}
+                        else {
+                            "candidate_oracle_recall_at_degree": float("nan"),
+                            "candidate_oracle_recall_hits": 0,
+                            "candidate_oracle_recall_comparisons": 0,
+                            "candidate_oracle_recall_evaluated_ego_states": 0,
+                        }
+                    ),
+                    "measured_edge_count": int(
+                        history.get("measured_edge_count", [0])[-1]
+                    ) if history.get("measured_edge_count") else 0,
+                    "mean_candidate_degree": _mean(history.get("d_bar", [])),
+                    "candidate_construction_subquadratic": bool(
+                        history.get("candidate_construction_subquadratic", [False])[-1]
+                    ) if history.get("candidate_construction_subquadratic") else False,
                     "mean_reward": _mean(history.get("mean_reward", [])),
                     "reward_per_agent": _mean(history.get("reward_per_agent", [])),
                     "throughput_total": _mean(
@@ -223,7 +366,18 @@ def main(argv=None):
     _atomic_json(os.path.join(out_root, "manifest.json"), {
         "experiment": "paper_b_runtime_memory_scaling",
         "complete": True, "seeds": args.seeds, "agent_counts": args.agent_counts,
-        "episodes": args.episodes, "variants": list(VARIANTS), "summary": summary,
+        "episodes": args.episodes,
+        "candidate_max_degree": int(args.candidate_max_degree),
+        "candidate_policy": "adapter-owned, policy-independent weak-prior candidate set",
+        "candidate_oracle_recall": {
+            "minimum": float(args.candidate_recall_min),
+            "states": int(args.candidate_recall_states),
+            "horizon": int(args.candidate_recall_horizon),
+            "trials": int(args.candidate_recall_trials),
+            "definition": "unrestricted oracle positive-C top-min(d_max,n_positive) recall",
+        },
+        "full_explicit_reference_is_dense": True,
+        "variants": list(VARIANTS), "summary": summary,
     })
     print(summary)
 

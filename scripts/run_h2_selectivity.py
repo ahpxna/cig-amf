@@ -188,6 +188,54 @@ def _mean_finite(values):
     return float(np.mean(finite)) if finite else float("nan")
 
 
+def _false_alarm_window_stats(events, *, start_episode, monitoring_horizon):
+    """Count non-overlapping detector-ready windows and false alarms.
+
+    CUSUM calibration controls the probability that a *monitoring trajectory*
+    of a frozen horizon crosses threshold.  Comparing that target with
+    ``n_triggers / episodes`` mixes two different denominators.  H2 therefore
+    reconstructs independent, non-overlapping post-intervention windows of the
+    same calibrated horizon, resetting a partial window whenever the detector
+    is not monitoring-ready (e.g. reference recalibration after a trigger).
+    """
+    horizon = int(monitoring_horizon or 0)
+    if horizon <= 0:
+        return {
+            "monitoring_window_count": 0,
+            "false_alarm_window_count": 0,
+            "false_alarm_window_rate": float("nan"),
+        }
+    selected = sorted(
+        (event for event in events if int(event.get("episode", -1)) >= int(start_episode)),
+        key=lambda event: int(event.get("episode", -1)),
+    )
+    current = []
+    windows = 0
+    false_alarms = 0
+    previous_episode = None
+    for event in selected:
+        episode = int(event.get("episode", -1))
+        ready = bool(event.get("drift_monitoring_ready", 0))
+        contiguous = previous_episode is None or episode == previous_episode + 1
+        previous_episode = episode
+        if not ready or not contiguous:
+            current = []
+            if not ready:
+                continue
+        current.append(event)
+        if len(current) == horizon:
+            windows += 1
+            false_alarms += int(any(bool(row.get("triggered", 0)) for row in current))
+            current = []
+    return {
+        "monitoring_window_count": int(windows),
+        "false_alarm_window_count": int(false_alarms),
+        "false_alarm_window_rate": (
+            float(false_alarms / windows) if windows > 0 else float("nan")
+        ),
+    }
+
+
 def _fixed_estimand_panel(
     env,
     structural_factor,
@@ -460,6 +508,17 @@ def _capture_frozen_learning_checkpoint(runner):
             ]
 
     runtime_state = {}
+    # These counters index causal replay/profile labels.  Restoring only
+    # tensors while leaving them advanced would make matched H2 arms differ
+    # in target age/version even with identical model state.
+    runtime_state["runner_causal_clock"] = {
+        "interaction_step": int(getattr(runner, "_interaction_step", 0)),
+        "policy_version": int(getattr(runner, "_policy_version", 0)),
+        "episodes_completed": int(getattr(runner, "episodes_completed", 0)),
+        "profile_update_step": copy.deepcopy(
+            getattr(runner, "_profile_update_step", {})
+        ),
+    }
     for name in (
         "belief_modules", "sig_tracker", "scheduler", "drift", "matdet", "recip"
     ):
@@ -567,6 +626,14 @@ def _restore_frozen_learning_checkpoint(runner, checkpoint):
         optimizer.load_state_dict(state)
 
     runtime = checkpoint.get("runtime_state", {})
+    causal_clock = runtime.get("runner_causal_clock")
+    if causal_clock is not None:
+        runner._interaction_step = int(causal_clock["interaction_step"])
+        runner._policy_version = int(causal_clock["policy_version"])
+        runner.episodes_completed = int(causal_clock["episodes_completed"])
+        runner._profile_update_step = copy.deepcopy(
+            causal_clock["profile_update_step"]
+        )
     for name in (
         "belief_modules", "sig_tracker", "scheduler", "drift", "matdet", "recip"
     ):
@@ -656,6 +723,7 @@ def _apply_cusum_calibration(
     # CUSUM configuration name.
     cfg["z_threshold"] = float(calibration["cusum_threshold"])
     cfg["cusum_false_alarm_target"] = float(calibration["target_false_alarm_rate"])
+    cfg["cusum_monitoring_horizon"] = int(calibration["monitoring_horizon"])
     cfg["cusum_calibration_reference_config_hash"] = str(
         calibration["reference_config_hash"]
     )
@@ -880,6 +948,13 @@ def run_one(
     RE.set_global_seed(seed)
     cfg = RE.default_cfg()
     cfg["seed"] = seed
+    # The four factorial arms are confirmatory Paper-A tracking evidence.
+    # Set this before runner construction so the runner rejects legacy
+    # profiles, uniform-memory compatibility mixing, capped forcing, and an
+    # unproven CUSUM threshold.
+    cfg["confirmatory"] = True
+    cfg["strict_causal_profile"] = True
+    cfg["semantic_router_frozen"] = True
     _apply_tracker_control(model, cfg)
     _configure_h2_monitoring_cfg(cfg)
     expected_cusum_hash = _h2_cusum_reference_hash(
@@ -1222,6 +1297,11 @@ def run_one(
         max_steps=max_steps,
         eval_every=eval_every,
     )
+    false_alarm_windows = _false_alarm_window_stats(
+        events,
+        start_episode=(intervention_episode if behavioral_factor and not structural_factor else 1),
+        monitoring_horizon=int(cfg.get("cusum_monitoring_horizon", 0)),
+    )
     metric_applicable = bool(has_influence_matrix)
     summary = {
         "run_id": run_id,
@@ -1323,6 +1403,11 @@ def run_one(
         "cusum_false_alarm_target": float(
             cfg.get("cusum_false_alarm_target", float("nan"))
         ),
+        "cusum_monitoring_horizon": int(cfg.get("cusum_monitoring_horizon", 0)),
+        "cusum_calibration_reference_config_hash": str(
+            cfg.get("cusum_calibration_reference_config_hash", "")
+        ),
+        **false_alarm_windows,
         "cusum_allowance": float(cfg.get("drift_cusum_allowance", float("nan"))),
         "cusum_threshold": float(cfg.get(
             "drift_cusum_threshold", cfg.get("z_threshold", float("nan"))
@@ -1806,9 +1891,27 @@ def main(argv=None):
                     "n_triggers_behavioral": behavioral["n_triggers"],
                     "n_triggers_control": control["n_triggers"],
                     "n_triggers_combined": combined["n_triggers"],
-                    "behavioral_false_trigger_rate": float(
+                    # Legacy per-episode quantity is retained only as a
+                    # diagnostic.  The scientific false-alarm endpoint uses
+                    # detector-ready windows matched to the calibration horizon.
+                    "behavioral_false_trigger_rate_legacy_per_episode": float(
                         behavioral["n_triggers"] / max(1, args.episodes)
                     ),
+                    "behavioral_false_alarm_window_rate": behavioral[
+                        "false_alarm_window_rate"
+                    ],
+                    "behavioral_false_alarm_window_count": behavioral[
+                        "false_alarm_window_count"
+                    ],
+                    "behavioral_monitoring_window_count": behavioral[
+                        "monitoring_window_count"
+                    ],
+                    "cusum_monitoring_horizon": behavioral[
+                        "cusum_monitoring_horizon"
+                    ],
+                    "cusum_calibration_reference_config_hash": behavioral[
+                        "cusum_calibration_reference_config_hash"
+                    ],
                     "cusum_false_alarm_target": structural["cusum_false_alarm_target"],
                     "cusum_allowance": structural["cusum_allowance"],
                     "cusum_threshold": structural["cusum_threshold"],

@@ -13,10 +13,11 @@ paper to concede that it does not claim w_hat = w.
 
 This file fixes the problem at its source. With probability epsilon, agent j
 is FORCED to choose a uniformly random action instead of following its policy.
-Once a_j is genuinely randomized, every confounding path is cut
-MECHANICALLY. This is a literal do(a_j), not an approximation: the equivalent
-of a randomized controlled trial that would cost millions in medicine, but is
-free here because the simulator is under experimental control.
+On forced rows, action assignment is randomized conditional on the recorded
+state-valid action set. This supplies a known treatment mechanism and overlap
+for the specified response-model context. It does not eliminate hidden state,
+response-model misspecification, post-treatment conditioning, or continuation-
+regime mismatch; clone-state interventions remain the calibration standard.
 
 =============================================================================
 IMPORTANT CONSEQUENCE: PROPENSITY IS EXACT
@@ -28,13 +29,12 @@ agent j at step t is the mixture
 
 for valid actions; invalid actions retain probability zero.
 
-b_j is KNOWN EXACTLY because pi_j is the learner's own network and eps is a
-chosen constant. Propensity normally has to be estimated in off-policy
-evaluation and is a major source of error. Here it is exact, so the augmented
-inverse-propensity term can use the logged data-generating probability. This
-does not by itself make a row-level conditional effect doubly robust; that
-requires an orthogonal second-stage learner or aggregation over repeated
-contexts.
+b_j is known for the recorded state-valid action set because pi_j is the
+learner's execution policy and eps is chosen by the protocol. The augmented
+inverse-propensity term therefore uses the logged data-generating probability.
+Known propensity alone does not establish conditional causal identification;
+calibration remains conditional on the measurement context and continuation
+regime used by the clone-state oracle.
 
 Epsilon forcing also guarantees the POSITIVITY/OVERLAP assumption:
 
@@ -46,9 +46,45 @@ meaningless. Version 1 did not state this assumption anywhere.
 =============================================================================
 """
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class ActionExecutionRecord:
+    """Immutable action-time record used by causal replay and diagnostics."""
+
+    agent_id: int
+    valid_action_mask: tuple
+    learner_probs: tuple
+    reference_probs: tuple
+    behavior_probs: tuple
+    proposed_action: int
+    executed_action: int
+    was_forced: bool
+    epsilon_used: float
+
+    @property
+    def forced(self) -> bool:
+        """Compatibility alias for older diagnostics."""
+        return self.was_forced
+
+    @property
+    def target_policy_probs(self) -> tuple:
+        """Return the paper's target policy ``pi`` at this action time.
+
+        In ordinary training this is the learner policy.  H1 may substitute
+        its prespecified frozen evaluation policy and H2 may apply a declared
+        behavioural intervention; both remain the target ``pi`` used in the
+        logged mixture ``b=(1-epsilon)pi+epsilon q``.
+        """
+        return self.learner_probs
+
+    @property
+    def behaviour_probability(self) -> float:
+        return float(self.behavior_probs[self.executed_action])
 
 
 class EpsilonForcedActionController:
@@ -127,6 +163,7 @@ class EpsilonForcedActionController:
         self.total_steps = 0
         self.total_forced = 0
         self.total_eligible = 0
+        self.last_execution_records: Tuple[ActionExecutionRecord, ...] = ()
 
     # ------------------------------------------------------------------
     # Epsilon schedule
@@ -269,6 +306,11 @@ class EpsilonForcedActionController:
                 b_j(a | s), the effective behaviour policy used by the DR
                 estimator.
         """
+        if len(actions) != self.n_agents:
+            raise ValueError("actions must contain one action per agent")
+        proposed = np.asarray(actions, dtype=np.int64).reshape(-1)
+        if np.any(proposed < 0) or np.any(proposed >= self.action_dim):
+            raise ValueError("proposed actions contain an out-of-range action ID")
         probs = np.asarray(policy_probs, dtype=np.float32)
 
         if probs.shape != (self.n_agents, self.action_dim):
@@ -285,8 +327,15 @@ class EpsilonForcedActionController:
                     "valid_action_masks must match policy_probs and retain at "
                     "least one action per agent"
                 )
-        probs = np.where(valid, np.clip(probs, 0.0, None), 0.0)
-        probs = probs / np.clip(probs.sum(axis=1, keepdims=True), 1e-8, None)
+        if not np.all(np.isfinite(probs)) or np.any(probs < 0.0):
+            raise ValueError("policy_probs must be finite and non-negative")
+        if np.any(~valid[np.arange(self.n_agents), proposed]):
+            raise ValueError("proposed action is invalid under its action mask")
+        probs = np.where(valid, probs, 0.0)
+        row_mass = probs.sum(axis=1, keepdims=True)
+        if np.any(~np.isfinite(row_mass)) or np.any(row_mass <= 0.0):
+            raise ValueError("policy_probs assign no mass to valid actions")
+        probs = probs / row_mass
 
         # ---- 1. Decide which agents are forced ---------------------------
         # eps_vec is uniform unless set_priority enables uncertainty-based
@@ -371,6 +420,21 @@ class EpsilonForcedActionController:
         # Renormalize to guard against floating-point error.
         row_sum = np.sum(effective_probs, axis=1, keepdims=True)  # [n_agents, 1]
         effective_probs = effective_probs / np.clip(row_sum, 1e-8, None)
+
+        self.last_execution_records = tuple(
+            ActionExecutionRecord(
+                agent_id=int(j),
+                valid_action_mask=tuple(bool(x) for x in valid[j]),
+                learner_probs=tuple(float(x) for x in probs[j]),
+                reference_probs=tuple(float(x) for x in uniform[j]),
+                behavior_probs=tuple(float(x) for x in effective_probs[j]),
+                proposed_action=int(proposed[j]),
+                executed_action=int(actions[j]),
+                was_forced=bool(forced_mask[j]),
+                epsilon_used=float(e[j, 0]),
+            )
+            for j in range(self.n_agents)
+        )
 
         # ---- 4. Statistics ------------------------------------------------
         self.total_steps += self.n_agents

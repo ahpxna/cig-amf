@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from envs.causal_adapter import resolve_env_adapter
+from envs.causal_adapter import bounded_candidate_neighbors, resolve_env_adapter
 from models.structural_proxy import (
     LocalCounterfactualProxyEnsemble,
 )
@@ -31,14 +31,18 @@ def _current_behavioral_phase(env):
 
 
 def _safe_distribution(values, action_dim):
-    """Return a finite probability vector, falling back to uniform."""
+    """Validate and normalize a policy distribution without silent fallback."""
     arr = np.asarray(values, dtype=np.float64).reshape(-1)
     if arr.shape != (int(action_dim),) or not np.all(np.isfinite(arr)):
-        return np.full(int(action_dim), 1.0 / float(action_dim), dtype=np.float32)
-    arr = np.clip(arr, 0.0, None)
+        raise ValueError(
+            f"policy distribution must have finite shape {(int(action_dim),)}, "
+            f"got {arr.shape}"
+        )
+    if np.any(arr < 0.0):
+        raise ValueError("policy distribution contains a negative probability")
     total = float(arr.sum())
     if total <= 0.0:
-        return np.full(int(action_dim), 1.0 / float(action_dim), dtype=np.float32)
+        raise ValueError("policy distribution has no positive mass")
     return (arr / total).astype(np.float32)
 
 
@@ -53,7 +57,8 @@ class FinalCIGAMFRunner:
         - every ego i maintains a separate belief for directed pair (i,j).
 
     2. Ego-centric directed influence graph:
-        - belief_modules[ego] stores b_ij = (mu_bar, sigma_bar, p_core).
+        - belief_modules[ego] stores the structural C belief and its
+          uncertainty; allocation uses the lower-confidence score G.
         - core/peripheral partitions are ego-specific.
 
     3. Pair-specific relational latent:
@@ -105,6 +110,23 @@ class FinalCIGAMFRunner:
         self.n_agents = int(self.env_adapter.n_agents)
         self.obs_dim = int(self.env_adapter.obs_dim)
         self.action_dim = int(self.env_adapter.max_action_dim)
+        self.candidate_max_degree = self.cfg.get("candidate_max_degree", None)
+        self.candidate_neighbors_by_ego = {
+            ego: bounded_candidate_neighbors(
+                self.env_adapter, ego, self.candidate_max_degree
+            )
+            for ego in range(self.n_agents)
+        }
+        self.measured_edge_count = int(sum(
+            len(ids) for ids in self.candidate_neighbors_by_ego.values()
+        ))
+        # Current reference adapters construct bounded candidates by a dense
+        # weak-prior scan.  The edge set is bounded, but the constructor is
+        # not yet subquadratic; keep this explicit so scaling reports cannot
+        # overclaim population-linear execution.
+        self.candidate_construction_subquadratic = bool(
+            getattr(self.env_adapter, "candidate_construction_subquadratic", False)
+        )
 
         self.core_dim = int(cfg["core_dim"])
         self.periph_dim = int(cfg["periph_dim"])
@@ -117,6 +139,47 @@ class FinalCIGAMFRunner:
                 "causal_horizon and proxy_n_horizons must be identical: "
                 f"received {causal_horizon} and {proxy_horizon}"
             )
+        confirmatory = bool(cfg.get("confirmatory", False))
+        strict_causal_profile = bool(cfg.get("strict_causal_profile", False))
+        structural_core_rule = str(cfg.get("belief_core_rule", "lcb")).strip().lower()
+        if (confirmatory or strict_causal_profile) and (
+            structural_core_rule in {"signed", "p_core"}
+            or bool(cfg.get("allow_legacy_signed_core", False))
+        ):
+            raise ValueError(
+                "Paper-contract CIG-AMF requires G=C-kappa*sigma_C "
+                "allocation in the structural belief and forbids legacy "
+                "signed/p_core rules; use an explicit matched-k selector "
+                "ablation outside the confirmatory structural core"
+            )
+        cusum_threshold = cfg.get("drift_cusum_threshold")
+        if cusum_threshold is None:
+            if confirmatory:
+                raise ValueError(
+                    "confirmatory runs require a calibrated drift_cusum_threshold"
+                )
+            # Development-only compatibility alias.  Confirmatory manifests
+            # must carry the frozen no-change calibration value explicitly.
+            cusum_threshold = cfg.get("z_threshold", 8.0)
+        cusum_threshold = float(cusum_threshold)
+        if not np.isfinite(cusum_threshold) or cusum_threshold <= 0.0:
+            raise ValueError("drift_cusum_threshold must be a positive finite value")
+        if confirmatory:
+            # Page-CUSUM is a calibrated tracking claim, not a detector with
+            # a convenient default threshold.  The H2 launcher loads these
+            # values from the frozen no-change artifact before constructing a
+            # runner.  Requiring the artifact identifiers prevents a numeric
+            # threshold copied from a development run from being presented as
+            # confirmatory evidence.
+            far_target = float(cfg.get("cusum_false_alarm_target", float("nan")))
+            reference_hash = str(
+                cfg.get("cusum_calibration_reference_config_hash", "")
+            ).strip()
+            if not (0.0 < far_target < 1.0) or not reference_hash:
+                raise ValueError(
+                    "confirmatory tracking requires a frozen CUSUM calibration "
+                    "artifact identifier and false-alarm target"
+                )
         proxy_pair_feat_dim = cfg.get("proxy_pair_feat_dim")
         if proxy_pair_feat_dim is None:
             proxy_pair_feat_dim = self.env_adapter.pair_feature_dim
@@ -142,7 +205,11 @@ class FinalCIGAMFRunner:
             effect_mode=cfg.get(
                 "proxy_effect_mode", "signed_policy_contrast"
             ),
-            use_doubly_robust=cfg.get("proxy_use_doubly_robust", True),
+            # Row-level AIPW is a diagnostic estimator only.  The online
+            # signature path is the plug-in C/D estimator specified by the
+            # papers; never enable DR merely because a custom config omitted
+            # the key.
+            use_doubly_robust=cfg.get("proxy_use_doubly_robust", False),
             iw_clip=cfg.get("proxy_iw_clip", 10.0),
             bootstrap_ratio=cfg.get("proxy_bootstrap_ratio", 0.8),
             use_belief_input=cfg.get("proxy_use_belief_input", False),
@@ -153,6 +220,7 @@ class FinalCIGAMFRunner:
             pair_feat_dim=proxy_pair_feat_dim,
             context_item_dim=proxy_context_item_dim,
             debug_verbose=cfg.get("debug_verbose", False),
+            forced_only_training=cfg.get("proxy_forced_only_training", False),
         )
 
         self.pair_rel_module = PairRelationalModule(
@@ -161,12 +229,13 @@ class FinalCIGAMFRunner:
             action_dim=self.action_dim,
             hidden_dim=self.core_dim,
             shadow_dim=cfg["shadow_dim"],
-            rel_feat_dim=6,
+            rel_feat_dim=int(getattr(self.env_adapter, "relation_feature_dim", 6)),
             lr=cfg["core_lr"],
             bc_buffer_size=cfg.get("bc_buffer_size", 200000),
             grad_clip=cfg.get("bc_grad_clip", 1.0),
-            shadow_loss_weight=cfg.get("shadow_loss_weight", 0.35),
+            shadow_loss_weight=cfg.get("shadow_loss_weight", 0.25),
             state_mode=cfg.get("pair_state_mode", "recurrent"),
+            candidate_neighbors_by_ego=self.candidate_neighbors_by_ego,
             device=device,
         )
 
@@ -175,13 +244,19 @@ class FinalCIGAMFRunner:
             num_slots=cfg["num_memory_slots"],
             memory_dim=cfg["periph_memory_dim"],
             out_dim=self.periph_dim,
-            mu_floor=cfg.get("periph_mu_floor", 0.02),
-            beta_floor=cfg.get("periph_beta_floor", 0.05),
+            mu_floor=cfg.get("periph_mu_floor", 0.0),
+            beta_floor=cfg.get("periph_beta_floor", 0.0),
             beta_mode=cfg.get("periph_beta_mode", "capacity"),
             semantic_mass=cfg.get("periph_semantic_mass", 0.5),
-            use_uniform_mix=cfg.get("periph_use_uniform_mix", True),
-            uniform_mix=cfg.get("periph_uniform_mix", 0.25),
-            lb_coeff=cfg.get("periph_lb_coeff", 0.5),
+            lambda_sigma=cfg.get("periph_lambda_sigma", 1.0),
+            use_uniform_mix=cfg.get("periph_use_uniform_mix", False),
+            uniform_mix=cfg.get("periph_uniform_mix", 0.0),
+            lb_coeff=cfg.get("periph_lb_coeff", 1e-2),
+            tau_role=cfg.get("periph_tau_D", 0.05),
+            sigma_hi=cfg.get("periph_sigma_D_hi", 0.5),
+            temperature_D=cfg.get("periph_temperature_D", 0.05),
+            temperature_0=cfg.get("periph_temperature_0", 0.05),
+            temperature_sigma=cfg.get("periph_temperature_sigma", 0.05),
             # [FIX-2] orth_coeff previously ignored cfg and remained at 1e-2.
             # The No-AuxLoss ablation then disabled only L_lb while L_orth
             # remained active, failing to isolate Eq. 26-27 L_aux.
@@ -193,12 +268,20 @@ class FinalCIGAMFRunner:
             ),
             allow_legacy_items=cfg.get("periph_allow_legacy_items", False),
         ).to(device)
+        if (confirmatory or strict_causal_profile) and (
+            bool(self.periph_module.allow_legacy_items)
+            or bool(self.periph_module.use_uniform_mix)
+        ):
+            raise ValueError(
+                "Paper-contract CIG-AMF requires retained typed C/D profiles "
+                "and disables uniform-memory compatibility mixing"
+            )
 
         self.belief_summary_builder = BeliefSummaryBuilder(
             top_k=cfg["belief_top_k"],
             pooled_hidden=cfg["belief_pooled_hidden"],
             out_dim=self.belief_dim,
-            priority_mu_floor=cfg.get("belief_priority_mu_floor", 0.02),
+            priority_mu_floor=cfg.get("belief_priority_mu_floor", 0.0),
         ).to(device)
 
         self.policy_value = PolicyValueNet(
@@ -211,6 +294,13 @@ class FinalCIGAMFRunner:
         ).to(device)
         if bool(cfg.get("freeze_downstream_policy_value", False)):
             for parameter in self.policy_value.parameters():
+                parameter.requires_grad_(False)
+        if bool(cfg.get("freeze_belief_summary_learning", False)):
+            # Representation-isolation panels hold the common structural
+            # summary fixed.  Otherwise a periphery comparison can change
+            # both M_i and the learned B_i projection, invalidating the
+            # claimed attribution of decision-fidelity differences.
+            for parameter in self.belief_summary_builder.parameters():
                 parameter.requires_grad_(False)
 
         self.policy_optim = torch.optim.Adam(
@@ -226,9 +316,7 @@ class FinalCIGAMFRunner:
             alpha_slow_ratio=cfg.get("slow_ratio", 0.05),
             accel_factor=cfg.get("accel_factor", 4.0),
             accel_duration=cfg.get("accel_duration", 8),
-            z_threshold=cfg.get(
-                "drift_cusum_threshold", cfg.get("z_threshold", 3.0)
-            ),
+            z_threshold=cusum_threshold,
             require_both=cfg.get("require_both", False),
             refractory=cfg.get("refractory", 10),
             inflation_factor=cfg.get("inflation_factor", 2.5),
@@ -239,6 +327,10 @@ class FinalCIGAMFRunner:
             window=cfg.get("sig_tracker_window", 30),
             direction_window=cfg.get("sig_tracker_direction_window", 5),
         )
+        # C/D tracker values are slow targets for Eq. (14), not instantaneous
+        # pair labels. Their action-time age is measured in environment steps
+        # and stale supervision is masked by a configured step bound.
+        self._profile_update_step = {}
         self.forcer = EpsilonForcedActionController(
             n_agents=self.n_agents,
             action_dim=self.action_dim,
@@ -251,6 +343,13 @@ class FinalCIGAMFRunner:
             anneal_episodes=cfg.get("forcer_anneal_episodes", 60),
             rng=np.random.RandomState(cfg.get("seed", 0)),
         )
+        if (confirmatory or strict_causal_profile) and cfg.get(
+            "forcer_max_forced_per_step"
+        ) is not None:
+            raise ValueError(
+                "Paper-contract causal runs cannot cap simultaneous forcing: "
+                "the cap changes the known behaviour propensity"
+            )
         self.heads = EgoConditionedHeads(
             latent_dim=self.pair_rel_module.hidden_dim,
         ).to(self.device)
@@ -267,9 +366,7 @@ class FinalCIGAMFRunner:
             seed=cfg.get("seed", 0),
             device=self.device,
             cusum_allowance=cfg.get("drift_cusum_allowance", 0.5),
-            cusum_threshold=cfg.get(
-                "drift_cusum_threshold", cfg.get("z_threshold", 8.0)
-            ),
+            cusum_threshold=cusum_threshold,
         )
         self.matdet = MatrixDriftDetector(window=cfg.get("matdet_window", 20))
         self.recip = ReciprocityTracker(
@@ -298,26 +395,31 @@ class FinalCIGAMFRunner:
         self.belief_modules = {
             ego: BayesLightBeliefState(
                 ego_id=ego,
-                neighbor_ids=[j for j in range(self.n_agents) if j != ego],
+                neighbor_ids=self.candidate_neighbors_by_ego[ego],
                 lambda_0=cfg["belief_lambda_0"],
                 uncertainty_scale=cfg["belief_uncertainty_scale"],
-                tau=cfg.get("belief_tau_enter", cfg.get("belief_tau", 0.005)),
-                tau_in=1.0,
+                tau=cfg.get(
+                    "belief_tau_in",
+                    cfg.get("belief_tau_enter", cfg.get("belief_tau", 0.005)),
+                ),
+                tau_in=cfg.get(
+                    "belief_tau_in",
+                    cfg.get("belief_tau_enter", cfg.get("belief_tau", 0.005)),
+                ),
                 tau_out=cfg.get(
-                    "belief_hysteresis_ratio",
-                    cfg.get("belief_tau_out", 0.35)
-                    / max(cfg.get("belief_tau_in", 0.55), 1e-8),
+                    "belief_tau_out",
+                    cfg.get("belief_tau_exit", 0.00175),
                 ),
                 weak_prior_top_k=cfg["seed_core_top_k"],
                 min_core_size=(
                     self.n_agents - 1 if full_explicit_mode
-                    else cfg.get("min_core_size", 1)
+                else cfg.get("min_core_size", 2)
                 ),
                 max_core_size=(
                     self.n_agents - 1 if full_explicit_mode
-                    else cfg.get("max_core_size", 4)
+                else cfg.get("max_core_size", 4)
                 ),
-                sigma_floor=cfg.get("sigma_floor", 0.05),
+                sigma_floor=cfg.get("sigma_floor", 0.08),
                 # v2 defaults match belief_layer.py recommendations and
                 # preserve behaviour when cfg omits them.
                 core_rule=cfg.get("belief_core_rule", "lcb"),
@@ -325,16 +427,19 @@ class FinalCIGAMFRunner:
                 alpha_decay=cfg.get("belief_alpha_decay", 0.7),
                 adaptive_k=(
                     False if full_explicit_mode
-                    else cfg.get("belief_adaptive_k", False)
+                    else cfg.get("belief_adaptive_k", True)
                 ),
                 adaptive_k_min=(
                     self.n_agents - 1 if full_explicit_mode
-                    else cfg.get(
-                        "belief_adaptive_k_min", cfg.get("min_core_size", 1)
+                else cfg.get(
+                        "belief_adaptive_k_min", cfg.get("min_core_size", 2)
                     )
                 ),
                 signed_balance=cfg.get("belief_signed_balance", 0.5),
                 sigma_alpha_max=cfg.get("belief_sigma_alpha_max", 1.0),
+                allow_legacy_signed_core=cfg.get(
+                    "allow_legacy_signed_core", False
+                ),
             )
             for ego in range(self.n_agents)
         }
@@ -366,6 +471,8 @@ class FinalCIGAMFRunner:
             "mean_uncertainty": [],
             "mean_core_size": [],
             "mean_core_switches": [],
+            "mean_capacity": [],
+            "max_g": [],
             "mean_mu": [],
             "max_p": [],
             "runtime": [],
@@ -397,6 +504,17 @@ class FinalCIGAMFRunner:
             "pushed_proxy_samples": [],
             "promoted": [],
             "demoted": [],
+            "measured_edge_count": [],
+            "candidate_max_degree": [],
+            "candidate_construction_subquadratic": [],
+            "E_t": [],
+            "K_t": [],
+            "d_bar": [],
+            "k_bar": [],
+            "active_core_pair_count": [],
+            "causal_latency_valid_fraction": [],
+            "causal_latency_onset_valid_fraction": [],
+            "causal_latency_cm_mean": [],
         }
 
         # ``run`` is intentionally re-entrant because the H2/H3 protocols
@@ -405,6 +523,12 @@ class FinalCIGAMFRunner:
         # ``episode_events`` retains the per-episode event stream even when
         # scalar metrics are sampled less frequently through ``eval_every``.
         self.episodes_completed = 0
+        self._interaction_step = 0
+        # Version every causal replay row.  ``structure_regime_id`` is owned
+        # by the environment when it exposes one; the runner never fabricates
+        # a structural change from a detector alarm.  ``policy_version`` is
+        # incremented after each learner update.
+        self._policy_version = 0
         self.episode_events = []
         self._last_behavioral_phase = None
         self._latest_direction_matrix = np.zeros(
@@ -415,39 +539,80 @@ class FinalCIGAMFRunner:
     # Construction helpers
     # ============================================================
 
+    def _current_structure_regime_id(self) -> int:
+        """Return the environment-declared structural regime, or base regime.
+
+        A Page-CUSUM trigger is evidence for adaptation, not ground truth that
+        the environment mechanism changed.  It therefore must not mutate this
+        identifier.  Adapters/environments that expose a regime counter can
+        provide ``get_structure_regime_id()`` or ``structure_regime_id``.
+        """
+        for owner in (self.env_adapter, self.env):
+            getter = getattr(owner, "get_structure_regime_id", None)
+            value = getter() if callable(getter) else getattr(
+                owner, "structure_regime_id", None
+            )
+            if value is None:
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "structure_regime_id must be an integer when declared"
+                ) from exc
+            if not np.isfinite(numeric) or int(numeric) != numeric or numeric < 0:
+                raise ValueError(
+                    "structure_regime_id must be a non-negative finite integer"
+                )
+            return int(numeric)
+        return 0
+
     def _make_belief_state(self, ego):
         """
         Create BayesLightBeliefState.
 
-        Includes a fallback for belief_layer.py versions that do not yet accept
-        min_core_size or sigma_floor. Updated versions take the first branch.
+        Construct the same C-only belief contract used during normal runner
+        initialization.  This helper remains public for ablation code; it
+        must not silently recreate the retired ratio-based/signed legacy
+        configuration.
         """
-        common_kwargs = dict(
+        full_explicit_mode = (
+            str(self.cfg.get("core_selection_mode", "structural_capacity"))
+            .strip().lower() == "full_explicit"
+        )
+        return BayesLightBeliefState(
             ego_id=ego,
-            neighbor_ids=[j for j in range(self.n_agents) if j != ego],
+            neighbor_ids=self._candidate_ids(ego),
             lambda_0=self.cfg["belief_lambda_0"],
             uncertainty_scale=self.cfg["belief_uncertainty_scale"],
-            tau=self.cfg.get(
-                "belief_tau_enter", self.cfg.get("belief_tau", 0.005)
-            ),
-            tau_in=1.0,
-            tau_out=self.cfg.get(
-                "belief_hysteresis_ratio",
-                self.cfg.get("belief_tau_out", 0.35)
-                / max(self.cfg.get("belief_tau_in", 0.55), 1e-8),
-            ),
+            tau=self.cfg.get("belief_tau_in", self.cfg.get("belief_tau_enter", 0.005)),
+            tau_in=self.cfg.get("belief_tau_in", self.cfg.get("belief_tau_enter", 0.005)),
+            tau_out=self.cfg.get("belief_tau_out", self.cfg.get("belief_tau_exit", 0.00175)),
             weak_prior_top_k=self.cfg["seed_core_top_k"],
+            min_core_size=(
+                self.n_agents - 1 if full_explicit_mode
+                else self.cfg.get("min_core_size", 2)
+            ),
+            max_core_size=(
+                self.n_agents - 1 if full_explicit_mode
+                else self.cfg.get("max_core_size", 4)
+            ),
+            sigma_floor=self.cfg.get("sigma_floor", 0.08),
+            core_rule=self.cfg.get("belief_core_rule", "lcb"),
+            kappa=self.cfg.get("belief_kappa", 1.0),
+            alpha_decay=self.cfg.get("belief_alpha_decay", 0.7),
+            adaptive_k=(
+                False if full_explicit_mode
+                else self.cfg.get("belief_adaptive_k", True)
+            ),
+            adaptive_k_min=(
+                self.n_agents - 1 if full_explicit_mode
+                else self.cfg.get("belief_adaptive_k_min", self.cfg.get("min_core_size", 2))
+            ),
+            signed_balance=self.cfg.get("belief_signed_balance", 0.5),
+            sigma_alpha_max=self.cfg.get("belief_sigma_alpha_max", 1.0),
+            allow_legacy_signed_core=self.cfg.get("allow_legacy_signed_core", False),
         )
-
-        try:
-            return BayesLightBeliefState(
-                **common_kwargs,
-                min_core_size=self.cfg.get("min_core_size", 1),
-                sigma_floor=self.cfg.get("sigma_floor", 0.0),
-                max_core_size=self.cfg.get("max_core_size",4)
-            )
-        except TypeError:
-            return BayesLightBeliefState(**common_kwargs)
 
     # ============================================================
     # Stage 0 weak structural prior
@@ -468,9 +633,7 @@ class FinalCIGAMFRunner:
         """
         scores = {}
 
-        for j in range(self.n_agents):
-            if j == ego:
-                continue
+        for j in self._candidate_ids(ego):
 
             scores[j] = float(self.env_adapter.weak_prior_score(ego, j))
 
@@ -499,13 +662,15 @@ class FinalCIGAMFRunner:
     # Belief / core / peripheral summaries
     # ============================================================
 
+    def _candidate_ids(self, ego):
+        """Measured neighbour set N_i^t fixed before causal allocation."""
+        return list(self.candidate_neighbors_by_ego[int(ego)])
+
     def _build_belief_items_for_ego(self, ego):
         belief_state = self.belief_modules[ego].get_state_dict()
         items = []
 
-        for j in range(self.n_agents):
-            if j == ego:
-                continue
+        for j in self._candidate_ids(ego):
 
             pair_norm = np.linalg.norm(
                 self.pair_rel_module.get_pair_latent(ego, j)
@@ -522,7 +687,9 @@ class FinalCIGAMFRunner:
             )
 
         if len(items) == 0:
-            return np.zeros((0, 9), dtype=np.float32)
+            return np.zeros(
+                (0, int(self.belief_summary_builder.item_dim)), dtype=np.float32
+            )
 
         return np.stack(items, axis=0).astype(np.float32)
 
@@ -543,7 +710,7 @@ class FinalCIGAMFRunner:
         core_set = self.belief_modules[ego].get_core_set()
         return self.pair_rel_module.get_core_summary(ego, core_set)
 
-    def _build_periph_inputs_for_ego(self, ego):
+    def _build_periph_inputs_for_ego(self, ego, causal_pair_signals=None):
         belief_mod = self.belief_modules[ego]
         periph_ids = sorted(list(belief_mod.get_peripheral_set()))
         belief_state = belief_mod.get_state_dict()
@@ -562,7 +729,51 @@ class FinalCIGAMFRunner:
                 int(j): self.sig_tracker.get_context_validity(ego, j)
                 for j in periph_ids
             },
+            causal_pair_signals=(
+                None
+                if causal_pair_signals is None
+                else {
+                    int(j): causal_pair_signals[int(j)]
+                    for j in periph_ids
+                    if int(j) in causal_pair_signals
+                }
+            ),
         )
+
+    def _cd_target_for_pair(self, ego_id, neighbor_id):
+        """Return timestamped slow C/D supervision for the pair encoder."""
+        ego_id = int(ego_id)
+        neighbor_id = int(neighbor_id)
+        target_step = self._profile_update_step.get((ego_id, neighbor_id))
+        current_step = int(getattr(self, "_interaction_step", 0))
+        if target_step is None:
+            age = 10**9
+            target_timestamp = -1
+        else:
+            target_step = int(target_step)
+            age = max(0, current_step - target_step)
+            target_timestamp = target_step
+        valid_action_count = int(
+            np.count_nonzero(self.env_adapter.valid_action_mask(neighbor_id))
+        )
+        signal = self.sig_tracker.get_pair_signal(
+            ego_id,
+            neighbor_id,
+            timestamp=target_timestamp,
+            structure_regime_id=self._current_structure_regime_id(),
+            support_valid=bool(target_step is not None and valid_action_count >= 2),
+            valid_action_count=valid_action_count,
+        )
+        return {
+            "target": signal.allocator_profile[:2],
+            "age": int(age),
+            "timestamp": int(target_timestamp),
+            # A C/D label is usable only when it came from an actual scored
+            # response surface.  The age threshold is applied by
+            # PairRelationalModule; this flag prevents its initial zero state
+            # from becoming fabricated supervision.
+            "valid": bool(signal.support_valid and target_step is not None),
+        }
 
     def _periph_summary_tensor_from_inputs(self, inputs):
         return self.periph_module(inputs)
@@ -750,8 +961,8 @@ class FinalCIGAMFRunner:
             else getattr(self.env, "last_actions", {})
         )
         rows = []
-        for other in range(self.n_agents):
-            if other in (ego, exclude_j):
+        for other in self._candidate_ids(ego):
+            if other == exclude_j:
                 continue
             try:
                 action_index = int(action_source[other])
@@ -785,7 +996,7 @@ class FinalCIGAMFRunner:
             current_actions if current_actions is not None
             else getattr(self.env, "last_actions", {})
         )
-        ids = [other for other in range(self.n_agents) if other != int(ego)]
+        ids = self._candidate_ids(ego)
         rows = []
         for other in ids:
             try:
@@ -797,7 +1008,14 @@ class FinalCIGAMFRunner:
             np.stack(rows, axis=0).astype(np.float32)
             if rows else np.zeros((0, adapter.context_item_dim), dtype=np.float32)
         )
-        return {"neighbor_ids": np.asarray(ids, dtype=np.int64), "items": items}
+        return {
+            "context_block_id": (
+                int(getattr(self, "_interaction_step", 0)) * max(1, self.n_agents)
+                + int(ego)
+            ),
+            "neighbor_ids": np.asarray(ids, dtype=np.int64),
+            "items": items,
+        }
 
     def _raw_proxy_context_excluding_from_block(self, block, exclude_j):
         """Legacy fixed-width context summary derived by sum-minus-one."""
@@ -835,8 +1053,10 @@ class FinalCIGAMFRunner:
         policy_fn = getattr(self.env, "scripted_policy", None)
         if callable(policy_fn):
             action = int(policy_fn(int(agent_id)))
+            if action < 0 or action >= self.action_dim:
+                raise ValueError("scripted policy returned an invalid action")
             out = np.zeros(self.action_dim, dtype=np.float32)
-            out[np.clip(action, 0, self.action_dim - 1)] = 1.0
+            out[action] = 1.0
             return out
 
         return np.full(self.action_dim, 1.0 / float(self.action_dim), dtype=np.float32)
@@ -867,10 +1087,17 @@ class FinalCIGAMFRunner:
                 )
 
         def _masked_distribution(row, mask):
-            masked = np.where(mask, np.asarray(row, dtype=np.float32), 0.0)
+            row = np.asarray(row, dtype=np.float32).reshape(-1)
+            if row.shape != (self.action_dim,) or not np.all(np.isfinite(row)):
+                raise ValueError("policy distribution has invalid shape or values")
+            if np.any(row < 0.0):
+                raise ValueError("policy distribution contains a negative probability")
+            masked = np.where(mask, row, 0.0)
             total = float(masked.sum())
             if not np.isfinite(total) or total <= 0.0:
-                masked = mask.astype(np.float32)
+                raise ValueError(
+                    "policy distribution assigns no mass to the state's valid actions"
+                )
             return masked / float(masked.sum())
 
         learned = np.stack([
@@ -998,6 +1225,7 @@ class FinalCIGAMFRunner:
             "periph_context_excluding": {},
             "proxy_context_excluding": {},
             "proxy_context_blocks": {},
+            "pair_signal_cache": {},
             "value_cache": {},
             "policy_logits": None,
             # [FIX-X1] Snapshot geometry at this timestep so replay_builder can
@@ -1014,7 +1242,31 @@ class FinalCIGAMFRunner:
 
         for ego in range(self.n_agents):
             belief_items = self._build_belief_items_for_ego(ego)
-            periph_inputs = self._build_periph_inputs_for_ego(ego)
+            pair_signals = {}
+            for j in self._candidate_ids(ego):
+                pair = (int(ego), int(j))
+                profile_timestamp = self._profile_update_step.get(pair)
+                valid_action_count = int(
+                    np.count_nonzero(self.env_adapter.valid_action_mask(int(j)))
+                )
+                pair_signals[int(j)] = self.sig_tracker.get_pair_signal(
+                    ego,
+                    int(j),
+                    timestamp=(
+                        -1 if profile_timestamp is None else int(profile_timestamp)
+                    ),
+                    structure_regime_id=self._current_structure_regime_id(),
+                    valid_action_count=valid_action_count,
+                    # A valid-action set alone establishes overlap, not a
+                    # measured causal profile.  Before the first proxy score,
+                    # the typed object must remain explicitly unsupported.
+                    support_valid=bool(
+                        profile_timestamp is not None and valid_action_count >= 2
+                    ),
+                )
+            periph_inputs = self._build_periph_inputs_for_ego(
+                ego, causal_pair_signals=pair_signals
+            )
 
             belief_summary_np = self._belief_summary_np_from_items(belief_items)
             periph_summary_np = self._periph_summary_np_from_inputs(periph_inputs)
@@ -1029,10 +1281,9 @@ class FinalCIGAMFRunner:
             cache["core_context_excluding"][ego] = {}
             cache["periph_context_excluding"][ego] = {}
             cache["proxy_context_excluding"][ego] = {}
+            cache["pair_signal_cache"][ego] = pair_signals
 
-            for j in range(self.n_agents):
-                if j == ego:
-                    continue
+            for j in self._candidate_ids(ego):
 
                 cache["core_context_excluding"][ego][j] = self._core_context_excluding(
                     ego,
@@ -1073,12 +1324,18 @@ class FinalCIGAMFRunner:
             device=self.device,
         )
 
+        valid_action_masks = np.stack([
+            self.env_adapter.valid_action_mask(agent)
+            for agent in range(self.n_agents)
+        ], axis=0)
+
         with torch.no_grad():
             logits, values = self.policy_value(
                 obs_t,
                 core_t,
                 periph_t,
                 belief_t,
+                valid_action_mask=valid_action_masks,
             )
 
             probs = torch.softmax(logits, dim=-1)
@@ -1088,10 +1345,6 @@ class FinalCIGAMFRunner:
             learned_probs_np = probs.detach().cpu().numpy()
             logits_np = logits.detach().cpu().numpy()
 
-        valid_action_masks = np.stack([
-            self.env_adapter.valid_action_mask(agent)
-            for agent in range(self.n_agents)
-        ], axis=0)
         probs_np, scripted_probs_np, adapter_diagnostics = self._execution_policy_adapter(
             learned_probs_np,
             valid_action_masks=valid_action_masks,
@@ -1113,7 +1366,7 @@ class FinalCIGAMFRunner:
         # probability. Using raw probabilities silently introduces systematic
         # DR bias without an exception or warning.
         actions_list = [int(sampled[ego]) for ego in range(self.n_agents)]
-        _pre_forcing = list(actions_list)          # [VERIFY-F1]
+        pre_forcing_actions = list(actions_list)
         forced_mask, effective_probs = self.forcer.apply(
             actions=actions_list,
             policy_probs=probs_np,
@@ -1140,7 +1393,7 @@ class FinalCIGAMFRunner:
             if fidx:
                 self._vf1_n_forced = getattr(self, "_vf1_n_forced", 0) + len(fidx)
                 self._vf1_n_changed = getattr(self, "_vf1_n_changed", 0) + sum(
-                    1 for k in fidx if actions_list[k] != _pre_forcing[k]
+                    1 for k in fidx if actions_list[k] != pre_forcing_actions[k]
                 )
                 hist = getattr(self, "_vf1_hist", None)
                 if hist is None:
@@ -1164,13 +1417,19 @@ class FinalCIGAMFRunner:
         for ego in range(self.n_agents):
             block = self._raw_proxy_context_block(ego, current_actions=actions_list)
             cache["proxy_context_blocks"][ego] = block
-            for j in range(self.n_agents):
-                if j != ego:
-                    cache["proxy_context_excluding"][ego][j] = (
-                        self._raw_proxy_context_excluding_from_block(block, j)
-                    )
+            for j in self._candidate_ids(ego):
+                cache["proxy_context_excluding"][ego][j] = (
+                    self._raw_proxy_context_excluding_from_block(block, j)
+                )
 
         cache["forced_mask"] = forced_mask
+        cache["action_execution_records"] = tuple(
+            self.forcer.last_execution_records
+        )
+        # Paper B Eq. (13) models the pre-forcing behavioural policy action.
+        # Executed actions remain separately stored for environment dynamics
+        # and causal-response replay.
+        cache["pre_forcing_actions"] = list(pre_forcing_actions)
         cache["behaviour_probs"] = effective_probs
         # Save raw policy probabilities (π_j(a|s)) as well; useful for
         # downstream diagnostics and for runners that expect policy_probs
@@ -1263,6 +1522,7 @@ class FinalCIGAMFRunner:
                 {
                     "obs_all": [x.copy() for x in obs_all],
                     "actions": list(actions_list),
+                    "pre_forcing_actions": list(cache["pre_forcing_actions"]),
                     "rewards": list(rewards),
                     "belief_items_cache": cache["belief_items_cache"],
                     "behaviour_probs": cache.get("behaviour_probs"),
@@ -1283,6 +1543,10 @@ class FinalCIGAMFRunner:
                     "value_cache": cache["value_cache"],
                     "geom_snapshot": cache["geom_snapshot"],   # [FIX-X1]
                     "forced_mask": cache["forced_mask"],
+                    "action_execution_records": cache.get("action_execution_records", ()),
+                    "pair_signal_cache": cache.get("pair_signal_cache", {}),
+                    "structure_regime_id": self._current_structure_regime_id(),
+                    "policy_version": int(self._policy_version),
                     
                     "env_snapshot_before_step": env_snapshot_before_step,
                     "env_snapshot_after_step": env_snapshot_after_step,
@@ -1312,15 +1576,19 @@ class FinalCIGAMFRunner:
                 self.pair_rel_module.add_bc_transition(
                     observations={a: prev_obs_all[a] for a in range(self.n_agents)},
                     actions={a: prev_actions[a] for a in range(self.n_agents)},
-                    next_actions={a: actions_list[a] for a in range(self.n_agents)},
+                    next_actions={
+                        a: cache["pre_forcing_actions"][a]
+                        for a in range(self.n_agents)
+                    },
+                    next_forced_mask=cache["forced_mask"],
+                    next_valid_action_masks=cache.get("valid_action_masks"),
+                    next_actions_are_pre_forcing=True,
                     env=self.env,
                     h_prev_snapshot=prev_h_snapshot,
-                    cd_target_fn=lambda ego_id, nb_id: np.asarray(
-                        [
-                            self.belief_modules[ego_id].debiased_mu(nb_id),
-                            self.sig_tracker.get_signature(ego_id, nb_id)[1],
-                        ],
-                        dtype=np.float32,
+                    cd_target_fn=self._cd_target_for_pair,
+                    max_cd_target_age=self.cfg.get(
+                        "cd_target_max_age_steps",
+                        self.cfg.get("cd_target_max_age_episodes", 1),
                     ),
                 )
 
@@ -1335,7 +1603,10 @@ class FinalCIGAMFRunner:
                 if prev_forced_mask is not None:
                     self._record_reciprocity(
                         prev_h_snapshot=prev_h_snapshot,
-                        actions_list=actions_list,
+                        # Behavioural-cloning/reciprocity targets refer to the
+                        # neighbour policy action before the current forcing
+                        # draw, never to the randomized intervention action.
+                        actions_list=cache["pre_forcing_actions"],
                         prev_forced_mask=prev_forced_mask,
                     )
 
@@ -1355,6 +1626,8 @@ class FinalCIGAMFRunner:
             prev_env_snapshot_before_step = env_snapshot_before_step
             prev_h_snapshot = h_snapshot_before_latent_update
             prev_forced_mask = cache["forced_mask"]
+
+            self._interaction_step += 1
 
             obs_all = next_obs_all
 
@@ -1423,6 +1696,18 @@ class FinalCIGAMFRunner:
 
         self.forcer.step_episode()
 
+        if bool(self.cfg.get("confirmatory", False)) or bool(
+            self.cfg.get("strict_causal_profile", False)
+        ):
+            legacy_seen = int(
+                getattr(self.proxy, "signature_legacy_items_seen", 0)
+                + getattr(self.periph_module, "signature_legacy_items_seen", 0)
+            )
+            if legacy_seen:
+                raise RuntimeError(
+                    "paper-contract CIG-AMF run observed legacy-derived C/D signatures"
+                )
+
         return trajectory, ep_reward, runtime
 
     def _record_reciprocity(self, prev_h_snapshot, actions_list, prev_forced_mask):
@@ -1435,8 +1720,7 @@ class FinalCIGAMFRunner:
         pairs = [
             (ego, j)
             for ego in range(self.n_agents)
-            for j in range(self.n_agents)
-            if j != ego
+            for j in self._candidate_ids(ego)
         ]
 
         if len(pairs) == 0:
@@ -1619,6 +1903,7 @@ class FinalCIGAMFRunner:
                 core_t,
                 periph_t,
                 belief_t,
+                valid_action_mask=step.get("valid_action_masks"),
             )
             valid_rows = step.get("valid_action_masks")
             if valid_rows is not None:
@@ -1670,7 +1955,9 @@ class FinalCIGAMFRunner:
             value_loss = F.mse_loss(value, ret_t, reduction="none")
             entropy = dist.entropy()
 
-            loss_vec = policy_loss + 0.5 * value_loss - 0.01 * entropy
+            critic_coeff = float(self.cfg.get("critic_loss_coeff", 0.5))
+            entropy_coeff = float(self.cfg.get("entropy_coeff", 0.01))
+            loss_vec = policy_loss + critic_coeff * value_loss - entropy_coeff * entropy
 
             total_loss = total_loss + loss_vec.sum()
             total_actor_loss = total_actor_loss + policy_loss.sum()
@@ -1696,10 +1983,11 @@ class FinalCIGAMFRunner:
             list(self.policy_value.parameters())
             + list(self.periph_module.parameters())
             + list(self.belief_summary_builder.parameters()),
-            0.5,
+            float(self.cfg.get("policy_grad_clip", 0.5)),
         )
 
         self.policy_optim.step()
+        self._policy_version += 1
 
         return {
             # [FIX-8] The old loss included auxiliary terms, so aux dominated
@@ -1806,9 +2094,7 @@ class FinalCIGAMFRunner:
             )
             neighbor_ids = []
 
-            for j in range(self.n_agents):
-                if j == ego:
-                    continue
+            for j in self._candidate_ids(ego):
 
                 obs_i_batch.append(obs_i)
                 action_i_batch.append(action_i)
@@ -1906,6 +2192,10 @@ class FinalCIGAMFRunner:
                     self._signature_context_key(ego, j) for j in neighbor_ids
                 ],
             )
+            for j in neighbor_ids:
+                self._profile_update_step[(int(ego), int(j))] = int(
+                    getattr(self, "_interaction_step", 0)
+                )
 
             mu_sigma = {
                 j: (float(c_mu_arr[k]), float(c_sigma_arr[k]))
@@ -1999,7 +2289,9 @@ class FinalCIGAMFRunner:
         # Precompute H-step returns for all timesteps to provide
         # observed_returns into the proxy scoring call for DR correction.
         try:
-            h_returns = self.replay_builder.build_h_step_returns(trajectory, self.n_agents)
+            h_returns = self.replay_builder.build_h_step_returns(
+                trajectory, self.n_agents, complete_only=True
+            )
         except Exception:
             h_returns = [None for _ in range(len(trajectory))]
 
@@ -2039,7 +2331,7 @@ class FinalCIGAMFRunner:
         probe_z = float(drift_info.get("z", 0.0) or 0.0)
         probe_cusum = float(drift_info.get("cusum", 0.0) or 0.0)
 
-        # Trigger 2: jump in the signed influence matrix.
+        # Trigger 2: jump in the directional diagnostic matrix.
         matrix_z = 0.0
         if last_influence_matrix is not None:
             self.matdet.update(last_influence_matrix)
@@ -2112,20 +2404,54 @@ class FinalCIGAMFRunner:
         return 2.0 * precision * recall / (precision + recall)
 
     def _belief_population_stats(self):
-        mu_vals = []
-        p_vals = []
+        capacity_vals = []
+        g_vals = []
 
         for ego in range(self.n_agents):
             state = self.belief_modules[ego].get_state_dict()
 
             for _, item in state.items():
-                mu_vals.append(float(item["mu_bar"]))
-                p_vals.append(float(item["p_core"]))
+                capacity_vals.append(float(item["capacity_bar"]))
+                g_vals.append(float(item.get("g_score", item.get("lcb_score", 0.0))))
 
-        mean_mu = float(np.mean(np.clip(mu_vals, 0.0, None))) if len(mu_vals) > 0 else 0.0
-        max_p = float(np.max(p_vals)) if len(p_vals) > 0 else 0.0
+        mean_capacity = float(np.mean(np.clip(capacity_vals, 0.0, None))) if capacity_vals else 0.0
+        max_g = float(np.max(g_vals)) if g_vals else 0.0
 
-        return mean_mu, max_p
+        return mean_capacity, max_g
+
+    def _causal_latency_stats(self):
+        """Summarise typed Paper-A latency diagnostics without changing B's 5D view."""
+        signals = []
+        for ego in range(self.n_agents):
+            for neighbor in self._candidate_ids(ego):
+                signals.append(
+                    self.sig_tracker.get_pair_signal(
+                        ego,
+                        neighbor,
+                        timestamp=int(self._profile_update_step.get(
+                            (int(ego), int(neighbor)), -1
+                        )),
+                        structure_regime_id=self._current_structure_regime_id(),
+                        valid_action_count=int(np.count_nonzero(
+                            self.env_adapter.valid_action_mask(neighbor)
+                        )),
+                        support_valid=bool(
+                            (int(ego), int(neighbor)) in self._profile_update_step
+                            and np.count_nonzero(
+                                self.env_adapter.valid_action_mask(neighbor)
+                            ) >= 2
+                        ),
+                    )
+                )
+        if not signals:
+            return 0.0, 0.0, 0.0
+        valid = [signal for signal in signals if signal.latency_valid]
+        onset_valid = [signal for signal in signals if signal.latency_onset_valid]
+        return (
+            float(len(valid)) / float(len(signals)),
+            float(len(onset_valid)) / float(len(signals)),
+            float(np.mean([signal.latency_cm for signal in valid])) if valid else 0.0,
+        )
 
     def get_influence_matrix(self):
         """Return the current structural-capacity matrix C used by the core."""
@@ -2328,7 +2654,35 @@ class FinalCIGAMFRunner:
         )
         throughput_total = agent_steps / max(total_runtime, 1e-9)
 
-        mean_mu, max_p = self._belief_population_stats()
+        mean_capacity, max_g = self._belief_population_stats()
+        latency_valid_fraction, latency_onset_valid_fraction, latency_cm_mean = (
+            self._causal_latency_stats()
+        )
+
+        # Explicit accounting required by Paper B's scaling contract.  A
+        # dense run reports its true quadratic edge count; only a bounded
+        # adapter candidate set can legitimately be interpreted as edge-linear.
+        edge_count = int(self.measured_edge_count)
+        core_pair_count = int(len(getattr(
+            self.pair_rel_module, "active_core_pairs", ()
+        )))
+        candidate_degree_mean = float(edge_count) / float(max(1, self.n_agents))
+        core_degree_mean = float(core_pair_count) / float(max(1, self.n_agents))
+        n_steps = int(len(trajectory))
+
+        def _state_bytes(states):
+            total = 0
+            for value in (states or {}).values():
+                if isinstance(value, torch.Tensor):
+                    total += int(value.numel() * value.element_size())
+            return int(total)
+
+        shadow_bytes = _state_bytes(getattr(self.pair_rel_module, "shadow_states", {}))
+        core_bytes = _state_bytes(getattr(self.pair_rel_module, "full_states", {}))
+        periphery_items = int(sum(
+            len(self.belief_modules[ego].get_peripheral_set())
+            for ego in range(self.n_agents)
+        ))
 
         return {
             "mean_reward": float(np.mean(episode_reward)),
@@ -2339,12 +2693,43 @@ class FinalCIGAMFRunner:
             "mean_uncertainty": float(np.mean(uncs)),
             "mean_core_size": float(np.mean(core_sizes)),
             "mean_core_switches": float(np.mean(core_switches)),
-            "mean_mu": float(mean_mu),
-            "max_p": float(max_p),
+            "mean_capacity": float(mean_capacity),
+            "max_g": float(max_g),
+            "causal_latency_valid_fraction": float(latency_valid_fraction),
+            "causal_latency_onset_valid_fraction": float(
+                latency_onset_valid_fraction
+            ),
+            "causal_latency_cm_mean": float(latency_cm_mean),
+            # Deprecated telemetry aliases retained for historical CSV readers.
+            "mean_mu": float(mean_capacity),
+            "max_p": float(max_g),
             "runtime": float(rollout_runtime),
             "throughput_agent_steps_per_sec": float(throughput),
             "episode_runtime_total": float(total_runtime),
             "throughput_total_agent_steps_per_sec": float(throughput_total),
+            "measured_edge_count": int(self.measured_edge_count),
+            "candidate_max_degree": (
+                None if self.candidate_max_degree is None
+                else int(self.candidate_max_degree)
+            ),
+            "candidate_construction_subquadratic": bool(
+                self.candidate_construction_subquadratic
+            ),
+            "active_core_pair_count": int(
+                len(getattr(self.pair_rel_module, "active_core_pairs", ()))
+            ),
+            "N": int(self.n_agents),
+            "E_t": edge_count,
+            "K_t": core_pair_count,
+            "d_bar": candidate_degree_mean,
+            "k_bar": core_degree_mean,
+            "proxy_pair_updates": int(edge_count * n_steps),
+            "shadow_pair_updates": int(edge_count * n_steps),
+            "core_pair_updates": int(core_pair_count * n_steps),
+            "periphery_items_processed": periphery_items,
+            "shadow_bytes": shadow_bytes,
+            "core_state_bytes": core_bytes,
+            "wallclock_ms": float(total_runtime * 1000.0),
         }
 
     # ============================================================
@@ -2425,7 +2810,6 @@ class FinalCIGAMFRunner:
                 heads_optim=self.heads_optim,
                 w_contrastive=self.cfg.get("heads_w_contrastive", 0.3),
                 w_influence=self.cfg.get("heads_w_influence", 1.0),
-                cd_target_fn=None,
             )
             bc_runtime = time.time() - t_bc
 
@@ -2466,7 +2850,12 @@ class FinalCIGAMFRunner:
             # remains fixed: reactive tau/sigma/kappa changes would turn the
             # stated uncertainty-penalized rule into a hidden threshold controller.
             is_stage_transition = (stage_before_episode_step == 0 and stage_after_episode_step == 1)
+            semantic_router_frozen = bool(self.cfg.get("confirmatory", False)) or bool(
+                self.cfg.get("semantic_router_frozen", False)
+            )
             is_periodic_calib = (
+                not semantic_router_frozen
+                and
                 stage_after_episode_step == 1
                 and (
                     episode_number % int(self.cfg.get("semantic_calibration_every", 25)) == 0
@@ -2475,11 +2864,19 @@ class FinalCIGAMFRunner:
 
             if is_stage_transition:
                 self._reset_switch_counters_if_available()
-                self.pair_rel_module.fit_cd_normalization(
+                cd_norm_fitted = self.pair_rel_module.fit_cd_normalization(
                     min_samples=self.cfg.get("cd_normalization_min_samples", 32)
                 )
+                if bool(self.cfg.get("confirmatory", False)) and not cd_norm_fitted:
+                    raise RuntimeError(
+                        "confirmatory run could not freeze C/D normalization "
+                        "from the pre-confirmatory training replay"
+                    )
 
-            if is_stage_transition or is_periodic_calib:
+            # Validation may fit router thresholds from the development
+            # stream.  Confirmatory runs use the explicit frozen values
+            # supplied in config and never retune them on their own results.
+            if (is_stage_transition or is_periodic_calib) and not semantic_router_frozen:
                 calib_reason = "stage transition" if is_stage_transition else "periodic"
                 print(f"[SEMANTIC-CALIBRATION] ep={episode_number} reason={calib_reason}")
 
@@ -2518,6 +2915,10 @@ class FinalCIGAMFRunner:
                 "episode": episode_number,
                 "triggered": int(graph_info["triggered"]),
                 "trigger_count": int(trigger_count_now),
+                "drift_phase": str(graph_info.get("drift_phase", "unknown")),
+                "drift_monitoring_ready": int(
+                    bool(graph_info.get("drift_monitoring_ready", False))
+                ),
                 "structural_shift": int(
                     controlled_structural_shift
                     or structural_shift_magnitude > 0.0
@@ -2577,6 +2978,8 @@ class FinalCIGAMFRunner:
                 self.history["mean_core_switches"].append(snapshot["mean_core_switches"])
                 self.history["mean_mu"].append(snapshot["mean_mu"])
                 self.history["max_p"].append(snapshot["max_p"])
+                self.history["mean_capacity"].append(snapshot["mean_capacity"])
+                self.history["max_g"].append(snapshot["max_g"])
                 self.history["runtime"].append(snapshot["runtime"])
                 self.history["throughput_agent_steps_per_sec"].append(
                     snapshot["throughput_agent_steps_per_sec"]
@@ -2648,6 +3051,31 @@ class FinalCIGAMFRunner:
                 )
                 self.history["promoted"].append(int(graph_info["promoted"]))
                 self.history["demoted"].append(int(graph_info["demoted"]))
+                self.history["measured_edge_count"].append(
+                    int(snapshot.get("measured_edge_count", self.measured_edge_count))
+                )
+                self.history["candidate_max_degree"].append(
+                    snapshot.get("candidate_max_degree", self.candidate_max_degree)
+                )
+                self.history["candidate_construction_subquadratic"].append(
+                    bool(snapshot.get("candidate_construction_subquadratic", False))
+                )
+                self.history["E_t"].append(int(snapshot.get("E_t", 0)))
+                self.history["K_t"].append(int(snapshot.get("K_t", 0)))
+                self.history["d_bar"].append(float(snapshot.get("d_bar", 0.0)))
+                self.history["k_bar"].append(float(snapshot.get("k_bar", 0.0)))
+                self.history["active_core_pair_count"].append(
+                    int(snapshot.get("active_core_pair_count", 0))
+                )
+                self.history["causal_latency_valid_fraction"].append(
+                    float(snapshot.get("causal_latency_valid_fraction", 0.0))
+                )
+                self.history["causal_latency_onset_valid_fraction"].append(
+                    float(snapshot.get("causal_latency_onset_valid_fraction", 0.0))
+                )
+                self.history["causal_latency_cm_mean"].append(
+                    float(snapshot.get("causal_latency_cm_mean", 0.0))
+                )
 
                 print(
                     f"[Final-CIGAMF ep {episode_number:04d}] "

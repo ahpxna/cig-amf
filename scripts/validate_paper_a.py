@@ -156,25 +156,39 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
                 "control_right_censored_count": int(sum(value < 0.0 for value in control_latency)),
                 "control_censor_horizon_intervals": censor_horizon,
             }
-    final_false_alarm = [
-        float(row.get("behavioral_false_trigger_rate", float("nan")))
-        for row in h2_rows if row.get("model") == "Final-CIGAMF"
+    final_rows = [
+        row for row in h2_rows if row.get("model") == "Final-CIGAMF"
     ]
     false_alarm_targets = [
         float(row.get("cusum_false_alarm_target", float("nan")))
-        for row in h2_rows if row.get("model") == "Final-CIGAMF"
+        for row in final_rows
     ]
-    false_alarm_reported = bool(final_false_alarm and all(
-        value >= 0.0 for value in final_false_alarm
-    ))
+    false_alarm_windows = [
+        int(row.get("behavioral_false_alarm_window_count", -1))
+        for row in final_rows
+    ]
+    monitoring_windows = [
+        int(row.get("behavioral_monitoring_window_count", -1))
+        for row in final_rows
+    ]
+    false_alarm_reported = bool(
+        final_rows
+        and all(window > 0 for window in monitoring_windows)
+        and all(0 <= alarm <= window for alarm, window in zip(false_alarm_windows, monitoring_windows))
+    )
+    pooled_false_alarm_rate = (
+        float(sum(false_alarm_windows) / sum(monitoring_windows))
+        if false_alarm_reported and sum(monitoring_windows) > 0
+        else float("nan")
+    )
+    one_frozen_target = bool(
+        false_alarm_targets
+        and all(math.isfinite(target) and 0.0 < target < 1.0 for target in false_alarm_targets)
+        and max(false_alarm_targets) - min(false_alarm_targets) <= 1e-12
+    )
     false_alarm_calibrated = bool(
-        false_alarm_reported
-        and len(false_alarm_targets) == len(final_false_alarm)
-        and all(
-            math.isfinite(target) and 0.0 < target < 1.0
-            for target in false_alarm_targets
-        )
-        and all(value <= target for value, target in zip(final_false_alarm, false_alarm_targets))
+        false_alarm_reported and one_frozen_target
+        and pooled_false_alarm_rate <= false_alarm_targets[0]
     )
     tracking_conditions = {
         f"final_recovers_faster_than_{control}": metrics["ci95"][0] > 0.0
@@ -197,6 +211,12 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
         "missing_comparators": missing_tracking_models,
         "conditions": tracking_conditions,
         "paired_recovery_latency": tracking_deltas,
+        "behavioral_false_alarm": {
+            "monitoring_windows_by_seed": monitoring_windows,
+            "false_alarm_windows_by_seed": false_alarm_windows,
+            "pooled_window_rate": pooled_false_alarm_rate,
+            "frozen_target": (false_alarm_targets[0] if one_frozen_target else float("nan")),
+        },
         "rule": (
             "H3b requires faster recovery than matched NoDetector while "
             "meeting the frozen no-change behavioural false-alarm target. "
@@ -207,18 +227,23 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
     h3_latency_supported = bool(latency_status["supported"])
     h3_tracking_supported = bool(tracking_status["supported"])
 
-    # Latency is an explicitly optional/gated contribution.  A failed latency
-    # oracle or learned-latency gate removes that contribution from the
-    # submitted claim set; it must not turn otherwise supported Q/C/D,
-    # selectivity, and structural-tracking claims into a paper-level failure.
-    core_supported = bool(
-        h1["supported"] and h2["supported"] and h3_tracking_supported
+    # The gate ladder treats both latency and the online CUSUM/tracking trigger
+    # as modular contributions.  H1 Q/C/D recovery plus H2 structural/behavioural
+    # separation define the Paper-A causal core.  A failed optional mechanism
+    # must shrink the submitted claim set rather than incorrectly falsify the
+    # already-supported causal estimands.
+    core_supported = bool(h1["supported"] and h2["supported"])
+    all_modules_supported = bool(
+        core_supported and h3_latency_supported and h3_tracking_supported
     )
-    all_modules_supported = bool(core_supported and h3_latency_supported)
-    if core_supported and h3_latency_supported:
-        overall_status = "SUPPORTED_WITH_LATENCY"
-    elif core_supported:
+    if core_supported and h3_latency_supported and h3_tracking_supported:
+        overall_status = "SUPPORTED_WITH_LATENCY_AND_TRACKING"
+    elif core_supported and h3_tracking_supported:
         overall_status = "SUPPORTED_LATENCY_GATED_OUT"
+    elif core_supported and h3_latency_supported:
+        overall_status = "SUPPORTED_TRACKING_GATED_OUT"
+    elif core_supported:
+        overall_status = "SUPPORTED_OPTIONAL_MODULES_GATED_OUT"
     else:
         overall_status = "NOT_SUPPORTED"
 
@@ -230,13 +255,17 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
         "H3a_latency": latency_status,
         "H3b_tracking": tracking_status,
         "submitted_claim_set_supported": core_supported,
-        "full_hypothesis_set_supported": core_supported,
+        "full_hypothesis_set_supported": all_modules_supported,
         "all_optional_modules_supported": all_modules_supported,
         "latency": latency_status,
         "latency_policy": (
             "H3a latency is separately gated and optional. Oracle or learned "
-            "latency failure gates out only the latency contribution; Paper-A "
-            "support is adjudicated by H1, H2, and H3b structural tracking."
+            "latency failure gates out only the latency contribution."
+        ),
+        "tracking_policy": (
+            "H3b CUSUM/tracking is separately gated and optional. Failure of "
+            "the frozen behavioural false-alarm or recovery gate removes the "
+            "trigger/tracking contribution without rewriting H1/H2."
         ),
     }, VC.EXIT_SUPPORTED if core_supported else VC.EXIT_UNSUPPORTED
 

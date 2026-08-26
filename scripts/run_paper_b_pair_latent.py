@@ -100,6 +100,8 @@ def _base_cfg(seed, core_budget):
         "max_core_size": int(core_budget),
         "periph_require_full_signature": True,
         "periph_allow_legacy_items": False,
+        "strict_causal_profile": True,
+        "semantic_router_frozen": True,
         # Oracle-fixed representation panels must not silently reselect the
         # core on a scheduler tick.  Pair state and BC learning remain active.
         "freeze_graph_updates": True,
@@ -116,8 +118,14 @@ def _env(seed):
 
 def _initial_checkpoint(seed, core_budget, device, pretrain_episodes=60):
     RE.set_global_seed(seed)
+    cfg = _base_cfg(seed, core_budget)
+    # The subsequent comparison uses an oracle-fixed core, but the common
+    # checkpoint must first train the response proxy and populate typed C/D
+    # profiles.  Freezing graph updates here would leave every auxiliary
+    # profile unsupported and make BC+CD variants indistinguishable from BC.
+    cfg["freeze_graph_updates"] = False
     runner = RE.make_runner(
-        "Final-CIGAMF", _env(seed), _base_cfg(seed, core_budget), device
+        "Final-CIGAMF", _env(seed), cfg, device
     )
     runner.run(n_episodes=int(pretrain_episodes), eval_every=max(1, int(pretrain_episodes)))
     checkpoint = _capture_frozen_learning_checkpoint(runner)
@@ -132,11 +140,26 @@ def _cd_retrieval_mae(runner):
         for neighbor in belief.neighbor_ids:
             if (int(ego), int(neighbor)) not in active_pairs:
                 continue
+            profile_timestamp = runner._profile_update_step.get(
+                (int(ego), int(neighbor))
+            )
+            valid_action_count = int(np.count_nonzero(
+                runner.env_adapter.valid_action_mask(int(neighbor))
+            ))
+            signal = runner.sig_tracker.get_pair_signal(
+                ego,
+                neighbor,
+                timestamp=(-1 if profile_timestamp is None else int(profile_timestamp)),
+                structure_regime_id=runner._current_structure_regime_id(),
+                valid_action_count=valid_action_count,
+                support_valid=bool(
+                    profile_timestamp is not None and valid_action_count >= 2
+                ),
+            )
+            if not signal.support_valid:
+                continue
             latents.append(runner.pair_rel_module.get_pair_latent(ego, neighbor))
-            targets.append([
-                belief.debiased_mu(neighbor),
-                runner.sig_tracker.get_signature(ego, neighbor)[1],
-            ])
+            targets.append(signal.allocator_profile[:2])
     if not latents:
         return float("nan")
     target = np.asarray(targets, dtype=np.float32)
@@ -157,11 +180,26 @@ def _latent_profile_geometry(runner):
         for neighbor in belief.neighbor_ids:
             if (int(ego), int(neighbor)) not in active_pairs:
                 continue
+            profile_timestamp = runner._profile_update_step.get(
+                (int(ego), int(neighbor))
+            )
+            valid_action_count = int(np.count_nonzero(
+                runner.env_adapter.valid_action_mask(int(neighbor))
+            ))
+            signal = runner.sig_tracker.get_pair_signal(
+                ego,
+                neighbor,
+                timestamp=(-1 if profile_timestamp is None else int(profile_timestamp)),
+                structure_regime_id=runner._current_structure_regime_id(),
+                valid_action_count=valid_action_count,
+                support_valid=bool(
+                    profile_timestamp is not None and valid_action_count >= 2
+                ),
+            )
+            if not signal.support_valid:
+                continue
             latents.append(runner.pair_rel_module.get_pair_latent(ego, neighbor))
-            profiles.append([
-                belief.debiased_mu(neighbor),
-                runner.sig_tracker.get_signature(ego, neighbor)[1],
-            ])
+            profiles.append(signal.allocator_profile[:2])
     if len(latents) < 3:
         return float("nan")
     z = np.asarray(latents, dtype=np.float64)

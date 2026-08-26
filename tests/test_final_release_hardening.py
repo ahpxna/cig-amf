@@ -159,6 +159,7 @@ class FinalReleaseHardeningTests(unittest.TestCase):
         raw = _RailEnvCloneFromDouble()
         env = FlatlandCIGEnvironment(raw, observation_width=4)
         env._obs = [np.ones(4, dtype=np.float32) for _ in range(2)]
+        env._step_count = 5
         state = env.clone_state()
         cloned_raw = state[0]
         self.assertIsNot(cloned_raw, raw)
@@ -166,6 +167,9 @@ class FinalReleaseHardeningTests(unittest.TestCase):
         self.assertEqual(cloned_raw.payload, raw.payload)
         raw.payload["nested"].append(99)
         self.assertNotEqual(cloned_raw.payload, raw.payload)
+        env._step_count = 99
+        env.restore_state(state)
+        self.assertEqual(env._step_count, 5)
 
     def test_flatland_action_mask_safe_stop_and_invalid_topology_fail_closed(self):
         from envs.flatland_adapter import FlatlandCIGEnvironment
@@ -226,6 +230,33 @@ class FinalReleaseHardeningTests(unittest.TestCase):
         self.assertFalse(cyborg.step([0, 0])[2])
         self.assertTrue(cyborg.step([0, 0])[2])
 
+    def test_cyborg_clone_restore_preserves_adapter_step_budget(self):
+        from envs.external.cyborg import CybORGCIGEnvironment
+
+        env = CybORGCIGEnvironment(_CyborgNeverDone(), observation_width=4, max_steps=3)
+        env.reset(seed=1)
+        env.step([0, 0])
+        state = env.clone_state()
+        self.assertEqual(env._step_count, 1)
+        env.step([0, 0])
+        self.assertEqual(env._step_count, 2)
+        env.restore_state(state)
+        self.assertEqual(env._step_count, 1)
+        self.assertFalse(env.step([0, 0])[2])
+        self.assertTrue(env.step([0, 0])[2])
+
+    def test_generic_external_oracle_rejects_pseudo_replicated_trials(self):
+        from envs.external.rware import RWARECIGEnvironment
+        from tests.test_external_adapters import _RWAREDouble
+
+        env = RWARECIGEnvironment(_RWAREDouble(), observation_width=8)
+        env.reset(seed=3)
+        with self.assertRaisesRegex(ValueError, "pseudo-replication"):
+            env.oracle_lag_response(
+                ego_id=0, agent_j=1, intervention_action=1, horizon=2, n_trials=2,
+                continuation_policy=env.fixed_continuation_policy,
+            )
+
     def test_external_h1_requires_active_response_support(self):
         from scripts.run_external_suite import _h1_smoke
 
@@ -277,6 +308,43 @@ class FinalReleaseHardeningTests(unittest.TestCase):
         self.assertEqual(len(history["mean_reward"]), 1)
         self.assertTrue(np.isfinite(history["mean_reward"][0]))
 
+    def test_oracle_core_ranks_by_all_action_capacity_not_single_signed_effect(self):
+        import run_experiment as RE
+        from runners.baseline_runner import OracleCoreRunner
+
+        class Adapter:
+            def valid_action_mask(self, agent):
+                return np.asarray([True, True, True], dtype=bool)
+
+        class Env:
+            n_agents = 3
+            causal_adapter = Adapter()
+            def __init__(self):
+                self.calls = []
+            def get_obs_dim(self): return 2
+            def get_action_dim(self): return 3
+            def clone_state(self): return {"x": 1}
+            def restore_state(self, state): return None
+            def compute_oracle_capacity_all_egos_from_current_state(self, agent_j, **kwargs):
+                self.calls.append(int(agent_j))
+                table = {
+                    0: np.asarray([0.0, 0.9, 0.2]),
+                    1: np.asarray([0.8, 0.0, 0.3]),
+                    2: np.asarray([0.1, 0.7, 0.0]),
+                }
+                return table[int(agent_j)]
+            def compute_oracle_influence_all_egos_from_current_state(self, *args, **kwargs):
+                raise AssertionError("legacy single-action oracle must not be used")
+
+        env = Env()
+        cfg = RE.smoke_cfg(); cfg["seed_core_top_k"] = 1
+        runner = OracleCoreRunner(env, cfg, device="cpu")
+        runner._refresh_core_if_needed()
+        self.assertEqual(env.calls, [0, 1, 2])
+        self.assertEqual(runner._cached_core[0], [1])
+        self.assertEqual(runner._cached_core[1], [0])
+        self.assertEqual(runner._cached_core[2], [1])
+
     def test_default_config_uses_truthful_hysteresis_names_and_no_dead_h1_thresholds(self):
         import run_experiment as RE
 
@@ -301,6 +369,8 @@ class FinalReleaseHardeningTests(unittest.TestCase):
                 "episodes": 20,
                 "eval_every": 1,
                 "behavioral_false_trigger_rate": 0.01,
+                "behavioral_monitoring_window_count": 100,
+                "behavioral_false_alarm_window_count": 1,
                 "cusum_false_alarm_target": 0.05,
             },
             {
@@ -323,6 +393,29 @@ class FinalReleaseHardeningTests(unittest.TestCase):
         self.assertEqual(report["overall_status"], "SUPPORTED_LATENCY_GATED_OUT")
         self.assertFalse(report["H3a_latency"]["supported"])
         self.assertFalse(report["H3a_latency"]["oracle_artifact_present"])
+        self.assertEqual(code, PA.VC.EXIT_SUPPORTED)
+
+    def test_paper_a_failed_tracking_gates_out_only_optional_trigger(self):
+        from scripts import validate_paper_a as PA
+
+        h1_rows = [{"seed": 1}]
+        h2_rows = [
+            {"seed": 2, "model": "Final-CIGAMF", "recovery_latency": -1.0,
+             "episodes": 20, "eval_every": 1, "behavioral_false_trigger_rate": 0.20,
+             "cusum_false_alarm_target": 0.05},
+            {"seed": 2, "model": "NoDetector", "recovery_latency": 3.0,
+             "episodes": 20, "eval_every": 1, "behavioral_false_trigger_rate": 0.0,
+             "cusum_false_alarm_target": 0.05},
+        ]
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(PA.CR, "_load_h1_complete_rows", return_value=(h1_rows, {}, {})), \
+             mock.patch.object(PA.CR, "_load_h2_complete_rows", return_value=(h2_rows, {})), \
+             mock.patch.object(PA.VC, "_h1_status", return_value={"supported": True, "status": "SUPPORTED"}), \
+             mock.patch.object(PA.VC, "_h2_status", return_value={"supported": True, "status": "SUPPORTED"}):
+            report, code = PA.validate(root, [1], [2], "confirmatory")
+        self.assertTrue(report["submitted_claim_set_supported"])
+        self.assertFalse(report["H3b_tracking"]["supported"])
+        self.assertTrue(report["overall_status"].startswith("SUPPORTED"))
         self.assertEqual(code, PA.VC.EXIT_SUPPORTED)
 
     def test_omniarena_latency_onset_uses_shared_protocol_constants(self):

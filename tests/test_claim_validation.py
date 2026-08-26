@@ -31,6 +31,7 @@ def _h2_rows():
                     "estimand_capacity_beta_behavioral": 0.02,
                     "estimand_direction_beta_behavioral": 0.40,
                     "behavioral_false_trigger_rate": 0.01,
+                    "behavioral_false_alarm_window_rate": 0.01,
                     "recovery_latency": latency,
                     "n_shift_events": 2,
                     "n_recovered_shifts": (

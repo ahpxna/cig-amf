@@ -28,6 +28,7 @@ from utils.latency_protocol import (
 
 
 ROLE_ORDER = ("blocker", "gatekeeper", "relay", "controller")
+PROTOCOL_VERSION = "latency_oracle_capacity_spectrum_v2"
 
 
 def _finite_median(values):
@@ -250,7 +251,7 @@ def run_gate(
 
     summary = _profile_summary(rows, min_response_mass=float(min_response_mass))
     return {
-        "protocol_version": "latency_oracle_capacity_spectrum_v2",
+        "protocol_version": PROTOCOL_VERSION,
         "continuation_policy": "OmniArena.scripted_policy",
         "seed": int(seed),
         "n_states": int(n_states),

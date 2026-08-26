@@ -135,23 +135,26 @@ class CybORGCIGEnvironment(ExternalPopulationMixin):
             [obs.copy() for obs in self._obs],
             tuple(self.last_actions),
             str(self._behaviour_override),
+            int(self._step_count),
         )
 
     def restore_state(self, state):
-        raw_env, obs, last_actions, behaviour = state
+        raw_env, obs, last_actions, behaviour, step_count = state
         self.raw_env = self._deepcopy_raw_env(raw_env)
         self._obs = [np.asarray(item, dtype=np.float32).copy() for item in obs]
         self.last_actions = [int(action) for action in last_actions]
         self._behaviour_override = str(behaviour)
+        self._step_count = int(step_count)
 
     def _copy_cloned_state(self, state):
         """Copy an adapter snapshot without invoking broken stock reducers."""
-        raw_env, obs, last_actions, behaviour = state
+        raw_env, obs, last_actions, behaviour, step_count = state
         return (
             self._deepcopy_raw_env(raw_env),
             [np.asarray(item, dtype=np.float32).copy() for item in obs],
             tuple(int(action) for action in last_actions),
             str(behaviour),
+            int(step_count),
         )
 
     def fixed_continuation_policy(self, agent):

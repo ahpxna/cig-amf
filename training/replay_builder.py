@@ -216,14 +216,45 @@ class MultiEgoReplayBuilder:
             # for that sample via behaviour_prob_j=None, as designed.
             forced_mask = step.get("forced_mask")
             behaviour_probs = step.get("behaviour_probs")
+            execution_records = step.get("action_execution_records")
+            records_by_agent = {}
+            if execution_records:
+                for record in execution_records:
+                    try:
+                        agent_id = int(record.agent_id)
+                    except (AttributeError, TypeError, ValueError) as exc:
+                        raise ValueError(
+                            "action_execution_records must contain typed action records"
+                        ) from exc
+                    if agent_id in records_by_agent or not 0 <= agent_id < n_agents:
+                        raise ValueError("action execution record agent IDs are malformed")
+                    records_by_agent[agent_id] = record
+                if len(records_by_agent) != n_agents:
+                    raise ValueError(
+                        "typed action execution records must cover every agent"
+                    )
 
             for ego in range(n_agents):
                 obs_i = env_adapter.observation(obs_all, ego)
                 action_i = int(actions[ego])
+                context_block = step.get("proxy_context_blocks", {}).get(ego)
+                if context_block is None:
+                    raise KeyError(
+                        "candidate-restricted proxy replay requires a ContextBlock"
+                    )
+                candidate_ids = [
+                    int(j) for j in np.asarray(
+                        context_block.get("neighbor_ids", ()), dtype=np.int64
+                    ).reshape(-1)
+                ]
+                if len(candidate_ids) != len(set(candidate_ids)) or ego in candidate_ids:
+                    raise ValueError("ContextBlock contains invalid candidate neighbour IDs")
 
-                for j in range(n_agents):
-                    if j == ego:
-                        continue
+                for j in candidate_ids:
+
+                    record = records_by_agent.get(int(j))
+                    if execution_records and record is None:
+                        raise RuntimeError("missing typed action execution record")
 
                     # [FIX-X1] x_ij at the correct time t comes from the geometry
                     # snapshot captured by the runner. env.positions now holds
@@ -248,7 +279,6 @@ class MultiEgoReplayBuilder:
                     # not a copied leave-one-out table per (ego, target) pair.
                     # This is the sum-minus-one DeepSets representation and
                     # reduces collection storage from O(N^3) to O(N^2).
-                    context_block = step.get("proxy_context_blocks", {}).get(ego)
                     context_target_id = int(j)
                     try:
                         context_items, context_mask = step[
@@ -256,24 +286,83 @@ class MultiEgoReplayBuilder:
                         ][ego][j]
                     except (KeyError, TypeError, ValueError):
                         context_items, context_mask = None, None
-                    target_h = h_returns[t][ego]
                     target_lags = lag_rewards[t][ego]
                     target_lag_mask = lag_valid_masks[t][ego]
                     horizon_complete = bool(np.all(target_lag_mask > 0.5))
+                    # H-step returns are only identified on complete windows.
+                    # A time-limit tail is right-censored; keep a finite
+                    # placeholder for legacy storage but mark the row via
+                    # horizon_complete/target_lag_valid_mask so no H-step
+                    # estimator consumes it.  Compute the completeness flag
+                    # before reading it; this path must remain valid for the
+                    # final runner's first and last trajectory transitions.
+                    target_h = (
+                        h_returns[t][ego]
+                        if horizon_complete and h_returns[t] is not None
+                        else 0.0
+                    )
 
-                    was_forced = False
-                    behaviour_prob_j = None
-
-                    if forced_mask is not None:
-                        was_forced = bool(forced_mask[j])
-
-                    if behaviour_probs is not None:
-                        # b_j(a_j_obs | s) is the EFFECTIVE propensity including
-                        # forcing, not raw policy_probs. Confusing the two causes
-                        # silent systematic bias in the DR estimator.
-                        behaviour_prob_j = float(
-                            behaviour_probs[j][int(actions[j])]
+                    if record is not None:
+                        valid_mask_j = np.asarray(
+                            record.valid_action_mask, dtype=bool
+                        ).reshape(-1)
+                        target_pi_j = np.asarray(
+                            record.target_policy_probs, dtype=np.float32
+                        ).reshape(-1)
+                        q_j = np.asarray(
+                            record.reference_probs, dtype=np.float32
+                        ).reshape(-1)
+                        b_j = np.asarray(
+                            record.behavior_probs, dtype=np.float32
+                        ).reshape(-1)
+                        proposed_action_j = int(record.proposed_action)
+                        executed_action_j = int(record.executed_action)
+                        target_epsilon_j = float(record.epsilon_used)
+                        was_forced = bool(record.was_forced)
+                        if executed_action_j != int(actions[j]):
+                            raise ValueError(
+                                "typed action record disagrees with trajectory executed action"
+                            )
+                        if target_pi_j.shape != (int(proxy_ensemble.action_dim),) \
+                                or q_j.shape != target_pi_j.shape \
+                                or b_j.shape != target_pi_j.shape:
+                            raise ValueError("typed action policy vectors have wrong shape")
+                        behaviour_prob_j = float(b_j[executed_action_j])
+                    else:
+                        was_forced = False
+                        behaviour_prob_j = None
+                        if forced_mask is not None:
+                            was_forced = bool(forced_mask[j])
+                        if behaviour_probs is not None:
+                            # b_j(a_j_obs | s) is the effective propensity including
+                            # forcing, not raw policy probabilities.
+                            behaviour_prob_j = float(
+                                behaviour_probs[j][int(actions[j])]
+                            )
+                        valid_mask_j = (
+                            None
+                            if step.get("valid_action_masks") is None
+                            else np.asarray(step["valid_action_masks"][j], dtype=bool)
                         )
+                        target_pi_j = (
+                            None if step.get("policy_probs") is None
+                            else step["policy_probs"][j]
+                        )
+                        q_j = None
+                        b_j = None
+                        proposed_action_j = int(
+                            step.get("pre_forcing_actions", actions)[j]
+                        )
+                        executed_action_j = int(actions[j])
+                        target_epsilon_j = None
+                    if valid_mask_j is not None:
+                        if valid_mask_j.shape != (int(proxy_ensemble.action_dim),) or not np.any(valid_mask_j):
+                            raise ValueError(
+                                "trajectory valid_action_masks contains an invalid "
+                                f"row for neighbour={j}"
+                            )
+                        if q_j is None:
+                            q_j = valid_mask_j.astype(np.float32) / float(valid_mask_j.sum())
 
                     # [VERIFY-F1b] Measure at the buffer-write boundary. For
                     # was_forced=True samples, a_j must be approximately uniform
@@ -293,7 +382,7 @@ class MultiEgoReplayBuilder:
                         neighbor_id=j,
                         obs_i=obs_i,
                         action_i=action_i,
-                        observed_action_j=int(actions[j]),
+                        observed_action_j=executed_action_j,
                         z_core_excl_j=z_ex,
                         m_periph_excl_j=m_ex,
                         belief_summary=belief_summary,
@@ -304,21 +393,27 @@ class MultiEgoReplayBuilder:
                         behaviour_prob_j=behaviour_prob_j,
                         was_forced=was_forced,
                         pair_feat=pair_feat,   # [FIX-X1]
-                        policy_probs_j=(
-                            None
-                            if step.get("policy_probs") is None
-                            else step["policy_probs"][j]
-                        ),
-                        valid_action_mask=(
-                            None if step.get("valid_action_masks") is None
-                            else step["valid_action_masks"][j]
-                        ),
+                        policy_probs_j=target_pi_j,
+                        valid_action_mask=valid_mask_j,
                         episode_id=step.get("episode_id"),
                         timestep=step.get("timestep", t),
                         context_items=context_items,
                         context_mask=context_mask,
                         context_block=context_block,
                         context_target_id=context_target_id,
+                        target_action_proposed=proposed_action_j,
+                        target_action_executed=executed_action_j,
+                        target_pi=target_pi_j,
+                        # q_j(a|x) is the fixed reference rule: uniform over
+                        # the actions valid at this state.  Store the actual
+                        # probability vector, not the boolean mask.
+                        target_q=q_j,
+                        target_b=(
+                            b_j
+                        ),
+                        target_epsilon=target_epsilon_j,
+                        structure_regime_id=int(step.get("structure_regime_id", 0)),
+                        policy_version=int(step.get("policy_version", 0)),
                     )
 
                     pushed += 1

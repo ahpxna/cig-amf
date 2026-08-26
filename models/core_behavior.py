@@ -1,5 +1,6 @@
 from collections import deque
 import random
+from typing import Optional
 
 import numpy as np
 import torch
@@ -133,6 +134,7 @@ class PairRelationalModule:
         grad_clip=1.0,
         shadow_loss_weight=0.35,
         state_mode="recurrent",
+        candidate_neighbors_by_ego=None,
     ):
         self.n_agents = int(n_agents)
         self.obs_dim = int(obs_dim)
@@ -149,6 +151,16 @@ class PairRelationalModule:
             raise ValueError(
                 "state_mode must be recurrent, feedforward, aggregate, or pooled"
             )
+        supplied_candidates = candidate_neighbors_by_ego or {}
+        self.candidate_neighbors_by_ego = {
+            int(ego): tuple(
+                int(j) for j in supplied_candidates.get(
+                    ego, [j for j in range(self.n_agents) if j != ego]
+                )
+                if int(j) != int(ego)
+            )
+            for ego in range(self.n_agents)
+        }
 
         # Backward compatibility: some older versions use max_bc_buffer.
         if max_bc_buffer is not None:
@@ -201,9 +213,7 @@ class PairRelationalModule:
         # expensive recurrent modelling, rather than only downstream use of
         # an already-computed latent.
         for i in range(self.n_agents):
-            for j in range(self.n_agents):
-                if i == j:
-                    continue
+            for j in self.candidate_neighbors_by_ego[i]:
 
                 pair = (int(i), int(j))
 
@@ -253,8 +263,20 @@ class PairRelationalModule:
     # ============================================================
 
     def _one_hot_action_np(self, action):
-        a = int(action)
-        a = max(0, min(self.action_dim - 1, a))
+        # Action identities are categorical data.  Never coerce malformed
+        # replay labels into a boundary class: that would silently change the
+        # behavioural target and invalidate the BC contract.
+        try:
+            value = float(action)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"action identity must be an integer, got {action!r}") from exc
+        if not np.isfinite(value) or value != int(value):
+            raise ValueError(f"action identity must be a finite integer, got {action!r}")
+        a = int(value)
+        if a < 0 or a >= self.action_dim:
+            raise ValueError(
+                f"action identity must lie in [0, {self.action_dim}), got {a}"
+            )
 
         x = np.zeros((self.action_dim,), dtype=np.float32)
         x[a] = 1.0
@@ -270,7 +292,10 @@ class PairRelationalModule:
         if a.dim() == 0:
             a = a.unsqueeze(0)
 
-        a = torch.clamp(a, min=0, max=self.action_dim - 1)
+        if bool(torch.any((a < 0) | (a >= self.action_dim))):
+            raise ValueError(
+                f"action identity must lie in [0, {self.action_dim})"
+            )
 
         return F.one_hot(a, num_classes=self.action_dim).to(dtype=torch.float32)
 
@@ -314,15 +339,10 @@ class PairRelationalModule:
         """
         Build xi_ij.
 
-        The default rel_feat_dim is 6:
-            0 rel_row
-            1 rel_col
-            2 manhattan distance normalised
-            3 same_zone
-            4 zone_diff normalised
-            5 same_role / role_match indicator if available
-
-        Pad or truncate when rel_feat_dim differs from 6.
+        ``xi_ij`` is adapter-owned.  This module never assigns semantics to
+        feature positions; its fixed width is only a model boundary.  Adapter
+        metadata remains available outside the learned representation for
+        diagnostics and visualisation.
         """
         ego_id = int(ego_id)
         neighbor_id = int(neighbor_id)
@@ -467,9 +487,7 @@ class PairRelationalModule:
                 obs_i = self._get_from_container(obs_all, ego)
                 action_i = self._get_from_container(actions, ego)
 
-                for j in range(self.n_agents):
-                    if j == ego:
-                        continue
+                for j in self.candidate_neighbors_by_ego[int(ego)]:
 
                     pair = (int(ego), int(j))
 
@@ -522,14 +540,10 @@ class PairRelationalModule:
             if self.state_mode == "aggregate":
                 # Remove ego identity from the relational state while
                 # retaining a neighbour-specific aggregate baseline.
-                for neighbor in range(self.n_agents):
-                    pairs = [
-                        (ego, neighbor)
-                        for ego in range(self.n_agents)
-                        if ego != neighbor and (ego, neighbor) in self.full_states
-                    ]
-                    if not pairs:
-                        continue
+                incoming = {}
+                for pair in self.full_states:
+                    incoming.setdefault(int(pair[1]), []).append(pair)
+                for pairs in incoming.values():
                     shared = torch.mean(
                         torch.cat([self.full_states[pair] for pair in pairs], dim=0),
                         dim=0,
@@ -541,13 +555,12 @@ class PairRelationalModule:
             if self.state_mode == "pooled":
                 # Genuine aggregate-only baseline: a neighbour gets one
                 # cheap shared state, not a hidden ego-specific full state.
-                for neighbor in range(self.n_agents):
-                    states = [
-                        self.shadow_states[(ego, neighbor)]
-                        for ego in range(self.n_agents) if ego != neighbor
-                    ]
+                incoming_shadow = {}
+                for (_ego, neighbor), state in self.shadow_states.items():
+                    incoming_shadow.setdefault(int(neighbor), []).append(state)
+                for neighbor, states in incoming_shadow.items():
                     self.pooled_states[neighbor] = torch.mean(
-                        torch.cat(states, dim=0), dim=0, keepdim=True
+                            torch.cat(states, dim=0), dim=0, keepdim=True
                     ).detach()
 
     # ============================================================
@@ -711,8 +724,7 @@ class PairRelationalModule:
         ego_id = int(ego_id)
 
         all_neighbors = [
-            j for j in range(self.n_agents)
-            if j != ego_id
+            j for j in self.candidate_neighbors_by_ego[ego_id]
         ]
 
         core_ids = [
@@ -773,15 +785,21 @@ class PairRelationalModule:
         actions,
         next_actions,
         env,
+        next_forced_mask=None,
+        next_valid_action_masks=None,
+        next_actions_are_pre_forcing: bool = False,
         h_prev_snapshot=None,
         s_prev_snapshot=None,
         cd_target_fn=None,
+        max_cd_target_age: Optional[int] = None,
     ):
         """
         Add supervised one-step behavioural prediction samples.
 
         Target:
-            context at t -> neighbour action a_j at t+1
+            context at t -> neighbour pre-forcing behavioural action at t+1.
+            If only executed next actions are available, labels from forced
+            neighbours are masked rather than treated as policy behaviour.
 
         Stored fields:
             x_full_t:
@@ -793,7 +811,7 @@ class PairRelationalModule:
             s_prev:
                 s_ij^{t-1}, captured before online update when available.
             target_action:
-                a_j^{t+1}
+                pre-forcing A~_j^{t+1}
 
         Critical fix:
             train_bc() will run encoder forward again:
@@ -805,16 +823,41 @@ class PairRelationalModule:
             obs_i = self._get_from_container(observations, ego)
             action_i = self._get_from_container(actions, ego)
 
-            for j in range(self.n_agents):
-                if j == ego:
-                    continue
+            for j in self.candidate_neighbors_by_ego[int(ego)]:
 
                 pair = (int(ego), int(j))
 
                 obs_j = self._get_from_container(observations, j)
                 action_j = self._get_from_container(actions, j)
                 target_action_j = int(self._get_from_container(next_actions, j))
-                target_action_j = max(0, min(self.action_dim - 1, target_action_j))
+                if target_action_j < 0 or target_action_j >= self.action_dim:
+                    raise ValueError(
+                        f"BC target action for neighbour={j} must lie in "
+                        f"[0, {self.action_dim}), got {target_action_j}"
+                    )
+                if next_valid_action_masks is not None:
+                    mask_row = np.asarray(
+                        self._get_from_container(next_valid_action_masks, j),
+                        dtype=bool,
+                    ).reshape(-1)
+                    if mask_row.shape != (self.action_dim,) or not np.any(mask_row):
+                        raise ValueError("next valid-action mask is malformed")
+                    if not bool(mask_row[target_action_j]):
+                        raise ValueError(
+                            f"BC target action {target_action_j} is invalid for neighbour={j}"
+                        )
+                else:
+                    mask_row = np.ones((self.action_dim,), dtype=bool)
+                if (
+                    not bool(next_actions_are_pre_forcing)
+                    and next_forced_mask is not None
+                    and bool(
+                    self._get_from_container(next_forced_mask, j)
+                    )
+                ):
+                    # A caller providing only post-forcing actions must not
+                    # label randomized interventions as behaviour policy.
+                    continue
 
                 rel_feat = self._rel_features_np(ego, j, env)
 
@@ -882,15 +925,50 @@ class PairRelationalModule:
                         "full_active": bool(pair in self.full_states),
                         "s_prev": s_prev.astype(np.float32),
                         "target_action": int(target_action_j),
-                        "cd_target": (
-                            None
-                            if cd_target_fn is None
-                            else np.asarray(
-                                cd_target_fn(int(ego), int(j)), dtype=np.float32
-                            ).reshape(2)
-                        ),
+                        "target_valid_mask": np.asarray(mask_row, dtype=bool).copy(),
+                        "cd_target": None,
+                        "cd_target_valid": False,
+                        "cd_target_age": None,
+                        "cd_target_timestamp": None,
                     }
                 )
+                if cd_target_fn is not None:
+                    raw_target = cd_target_fn(int(ego), int(j))
+                    target_timestamp = None
+                    target_is_valid = True
+                    if isinstance(raw_target, dict):
+                        target = raw_target.get("target")
+                        target_age = raw_target.get("age")
+                        target_timestamp = raw_target.get("timestamp")
+                        target_is_valid = bool(raw_target.get("valid", True))
+                    elif isinstance(raw_target, tuple):
+                        if len(raw_target) == 3:
+                            target, target_age, target_timestamp = raw_target
+                        elif len(raw_target) == 2:
+                            target, target_age = raw_target
+                        else:
+                            raise ValueError(
+                                "cd_target_fn tuple must be (target, age) or "
+                                "(target, age, timestamp)"
+                            )
+                    else:
+                        target, target_age = raw_target, None
+                    if target_is_valid and (
+                        max_cd_target_age is None
+                        or target_age is None
+                        or int(target_age) <= int(max_cd_target_age)
+                    ):
+                        value = np.asarray(target, dtype=np.float32).reshape(-1)
+                        if value.shape != (2,) or not np.all(np.isfinite(value)):
+                            raise ValueError("cd_target_fn must return a finite [C,D] target")
+                        self.bc_buffer[-1]["cd_target"] = value
+                        self.bc_buffer[-1]["cd_target_valid"] = True
+                    self.bc_buffer[-1]["cd_target_age"] = (
+                        None if target_age is None else int(target_age)
+                    )
+                    self.bc_buffer[-1]["cd_target_timestamp"] = (
+                        None if target_timestamp is None else int(target_timestamp)
+                    )
 
     def _sample_bc_batch(self, batch_size):
         if len(self.bc_buffer) == 0:
@@ -955,7 +1033,17 @@ class PairRelationalModule:
             device=self.device,
         )
 
-        return x_full_t, x_shadow_t, h_prev_t, s_prev_t, target_t
+        target_valid_mask = np.stack(
+            [np.asarray(b.get("target_valid_mask", np.ones(self.action_dim)), dtype=bool)
+             for b in batch], axis=0
+        )
+        if target_valid_mask.shape != (len(batch), self.action_dim) or not bool(target_valid_mask.any(axis=1).all()):
+            raise ValueError("BC target valid-action masks are malformed")
+        target_valid_mask_t = torch.tensor(
+            target_valid_mask, dtype=torch.bool, device=self.device
+        )
+
+        return x_full_t, x_shadow_t, h_prev_t, s_prev_t, target_t, target_valid_mask_t
 
     def train_bc(
         self,
@@ -1010,10 +1098,11 @@ class PairRelationalModule:
         pair buffer mixes egos. Same-neighbour/different-ego examples become
         hard negatives only when their C/D targets differ materially.
 
-        cd_target_fn: callable(ego_id, neighbor_id) -> ``[C,D]``.  C is the
-        current debiased structural-capacity belief and D comes from the fast
-        response signature tracker.  None disables the C/D head while keeping
-        the action-prediction objective.
+        cd_target_fn: callable(ego_id, neighbor_id) -> a timestamped mapping
+        containing ``target=[C,D]``, ``age``, and ``valid``.  The target is a
+        slow pair-profile supervision signal, not an implicitly exact label
+        for every recurrent transition.  Invalid or over-age labels are
+        masked while the action-prediction objective remains active.
         """
         self.last_bc_batch_count = 0
         self.last_heads_loss = 0.0
@@ -1051,6 +1140,7 @@ class PairRelationalModule:
                 h_prev_t,
                 s_prev_t,
                 target_t,
+                target_valid_mask_t,
             ) = self._bc_batch_to_tensors(batch)
 
             full_active = torch.tensor(
@@ -1067,7 +1157,10 @@ class PairRelationalModule:
                     x_full_t[full_active], recurrent_state
                 )
                 logits_full = self.bc_head(z_next)
-                full_loss = F.cross_entropy(logits_full, target_t[full_active])
+                full_logits = logits_full.masked_fill(
+                    ~target_valid_mask_t[full_active], -torch.inf
+                )
+                full_loss = F.cross_entropy(full_logits, target_t[full_active])
             else:
                 z_next = None
                 full_loss = torch.zeros((), dtype=torch.float32, device=self.device)
@@ -1075,7 +1168,10 @@ class PairRelationalModule:
             s_next = self.shadow_encoder(x_shadow_t, s_prev_t)
             z_from_shadow = self.shadow_to_full(s_next)
             logits_shadow = self.bc_head(z_from_shadow)
-            shadow_loss = F.cross_entropy(logits_shadow, target_t)
+            shadow_logits = logits_shadow.masked_fill(
+                ~target_valid_mask_t, -torch.inf
+            )
+            shadow_loss = F.cross_entropy(shadow_logits, target_t)
 
             loss = full_loss + self.shadow_loss_weight * shadow_loss
 
@@ -1095,7 +1191,9 @@ class PairRelationalModule:
                 # [E2] Use z_next with gradients intact so full_encoder must
                 # encode ego information in z_ij; see this method's docstring.
                 labelled = [
-                    sample.get("cd_target") is not None
+                    bool(self.cd_normalization_frozen)
+                    and bool(sample.get("cd_target_valid", False))
+                    and sample.get("cd_target") is not None
                     and bool(sample.get("full_active", False))
                     for sample in batch
                 ]

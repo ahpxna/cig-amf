@@ -73,35 +73,172 @@ DISTINCTION FROM THE CLOSEST PRIOR WORK
 """
 
 from collections import deque
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 
-# Number of signature dimensions.
-# [SIG-5D] 6 -> 5: remove latency.
-# Experimental evidence required this removal. The T4 H-sweep over
-# H in {1,2,3,5,8} showed that 3/4 declared roles did NOT change sign and all
-# saturated at H=2, giving a sign-flip role fraction of 0.25, below the 0.30
-# threshold. All four roles had the SAME latency profile, so the arena does
-# not generate a separable latency ladder. Retaining a sixth dimension would
-# describe an unmeasurable quantity. The multi-horizon head is RETAINED because
-# it still supplies v_tim and DR; only the signature component is removed.
-# See the paper's Limitations section.
+# Paper B's allocator vector is the five-dimensional structural/behavioural
+# projection of its retained eight-coordinate profile in Eq. (2)--(3).
+# Allocation consumes only this projection; representation consumes the
+# complete typed profile below, including context and latency masks.
 SIGNATURE_DIM = 5
-
-# Dimension names used in the paper's centroid heat map.
 SIGNATURE_NAMES = ("capacity", "direction", "sigma_capacity", "sigma_direction", "context_std")
+
+
+@dataclass(frozen=True)
+class CausalPairSignal:
+    """Typed Paper-A signal transported to Paper-B without magic sentinels."""
+
+    ego_id: int
+    target_id: int
+    timestamp: int
+    structure_regime_id: int
+    capacity: float
+    direction: float
+    sigma_capacity: float
+    sigma_direction: float
+    context_variation: float
+    context_valid: bool
+    latency_onset: int
+    latency_peak: int
+    latency_cm: float
+    latency_valid: bool
+    latency_onset_valid: bool
+    support_valid: bool
+    valid_action_count: int
+    latency_horizon: int
+    estimator_version: int = 1
+
+    def __post_init__(self):
+        """Enforce the typed boundary's validity-mask/sentinel contract."""
+        nonnegative = {
+            "capacity": self.capacity,
+            "sigma_capacity": self.sigma_capacity,
+            "sigma_direction": self.sigma_direction,
+            "context_variation": self.context_variation,
+        }
+        for name, value in nonnegative.items():
+            if not np.isfinite(float(value)) or float(value) < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if not np.isfinite(float(self.direction)):
+            raise ValueError("direction must be finite")
+        if int(self.valid_action_count) < 0:
+            raise ValueError("valid_action_count must be non-negative")
+        if int(self.latency_horizon) < 0:
+            raise ValueError("latency_horizon must be non-negative")
+        # With one valid action, C=max(Q)-min(Q)=0 but there is no treatment
+        # contrast. Such a row cannot be support-valid for capacity ranking,
+        # latency, or C/D pair supervision.
+        if bool(self.support_valid) and int(self.valid_action_count) < 2:
+            raise ValueError(
+                "support_valid requires at least two state-valid target actions"
+            )
+        if bool(self.latency_valid):
+            if int(self.latency_horizon) < 2:
+                raise ValueError(
+                    "valid normalized latency requires a horizon of at least two"
+                )
+            if (
+                int(self.latency_peak) < 0
+                or int(self.latency_peak) >= int(self.latency_horizon)
+                or not np.isfinite(float(self.latency_cm))
+                or float(self.latency_cm) < 0.0
+                or float(self.latency_cm) > float(self.latency_horizon - 1)
+            ):
+                raise ValueError(
+                    "valid latency requires an in-horizon peak and finite CM"
+                )
+        else:
+            if int(self.latency_peak) != -1 or float(self.latency_cm) != 0.0:
+                raise ValueError(
+                    "invalid latency must use peak=-1 and CM=0"
+                )
+        if bool(self.latency_onset_valid):
+            if (
+                not bool(self.latency_valid)
+                or int(self.latency_onset) < 0
+                or int(self.latency_onset) >= int(self.latency_horizon)
+            ):
+                raise ValueError(
+                    "valid latency onset requires valid latency and onset>=0"
+                )
+        elif int(self.latency_onset) != -1:
+            raise ValueError("invalid latency onset must use onset=-1")
+
+    # Paper notation aliases keep the typed boundary self-documenting while
+    # retaining Pythonic field names for internal callers.
+    @property
+    def C(self) -> float:
+        return float(self.capacity)
+
+    @property
+    def D(self) -> float:
+        return float(self.direction)
+
+    @property
+    def sigma_C(self) -> float:
+        return float(self.sigma_capacity)
+
+    @property
+    def sigma_D(self) -> float:
+        return float(self.sigma_direction)
+
+    @property
+    def v_ctx(self) -> float:
+        return float(self.context_variation)
+
+    @property
+    def allocator_profile(self) -> np.ndarray:
+        return np.asarray(
+            [
+                self.capacity,
+                self.direction,
+                self.sigma_capacity,
+                self.sigma_direction,
+                self.context_variation,
+            ],
+            dtype=np.float32,
+        )
+
+    @property
+    def normalized_latency(self) -> float:
+        """Return Paper-B's ``L_cm/(H-1)`` only when latency is supported."""
+        if not bool(self.latency_representation_valid):
+            return 0.0
+        return float(self.latency_cm) / float(int(self.latency_horizon) - 1)
+
+    @property
+    def latency_representation_valid(self) -> bool:
+        """Whether latency has both a spectrum and current action support."""
+        return bool(self.latency_valid and self.support_valid)
+
+    @property
+    def retained_profile(self) -> np.ndarray:
+        """Return Paper B Eq. (3): ``[C,D,sC,sD,vctx,mctx,L~,mL]``."""
+        return np.asarray(
+            [
+                self.capacity,
+                self.direction,
+                self.sigma_capacity,
+                self.sigma_direction,
+                self.context_variation,
+                float(bool(self.context_valid)),
+                self.normalized_latency,
+                float(bool(self.latency_representation_valid)),
+            ],
+            dtype=np.float32,
+        )
 
 # Role labels.
 ROLE_BENEFICIAL = 0   # Strong positive influence.
 ROLE_HARMFUL = 1      # Strong negative influence.
 ROLE_NEUTRAL = 2      # Influence near zero.
-ROLE_ANOMALOUS = 3    # High uncertainty; not yet understood.
+ROLE_UNCERTAIN = 3    # High ensemble disagreement, not an anomaly claim.
 
-ROLE_NAMES = ("beneficial", "harmful", "neutral", "anomalous")
-# Compatibility alias retained for older result readers; labels are English.
-ROLE_NAMES_VI = ("beneficial", "harmful", "neutral", "anomalous")
+ROLE_NAMES = ("beneficial", "harmful", "neutral", "uncertain")
+ROLE_NAMES_VI = ROLE_NAMES
 
 N_SEMANTIC_ROLES = 4
 
@@ -110,14 +247,14 @@ class InfluenceSignatureTracker:
     """
     Track a multidimensional influence profile for EVERY directed pair (i, j).
 
-    Runner usage immediately after calling proxy.score_batch_full():
+    Runner usage records distinct structural and behavioural coordinates:
 
         tracker.update(
-            ego_id=ego,
-            neighbor_id=j,
-            signed_mu=out["mu"][b],
-            sigma=out["sigma"][b],
-            context_key=env.agent_zone[ego],   # or any other context identifier
+            ego_id=ego, neighbor_id=j,
+            capacity=out["c_mu"][b], direction=out["d_mu"][b],
+            sigma_capacity=out["c_sigma"][b],
+            sigma_direction=out["d_sigma"][b],
+            context_key=adapter.context_key(ego, j),
         )
 
     Subsequent access:
@@ -129,10 +266,10 @@ class InfluenceSignatureTracker:
         window:
             Number of recent observations retained for temporal_std.
         tau_role:
-            |signed_mu| threshold separating beneficial/harmful roles from
+        |direction| threshold separating beneficial/harmful roles from
             the neutral role.
         sigma_hi:
-            Sigma threshold for the anomalous role. It should be derived from
+            Sigma threshold for the uncertain route. It should be derived from
             an observed sigma percentile, not hard-coded; use auto_calibrate().
         normalise:
             If True, get_signature_matrix returns per-dimension z-scores.
@@ -148,6 +285,7 @@ class InfluenceSignatureTracker:
         sigma_hi: float = 0.5,
         normalise: bool = True,
         eps: float = 1e-8,
+        allow_legacy_direction_fallback: bool = False,
     ):
         self.n_agents = int(n_agents)
         self.window = int(window)
@@ -156,6 +294,7 @@ class InfluenceSignatureTracker:
         self.sigma_hi = float(sigma_hi)
         self.normalise = bool(normalise)
         self.eps = float(eps)
+        self.allow_legacy_direction_fallback = bool(allow_legacy_direction_fallback)
 
         # C and D must remain distinct: C tracks standardised structural
         # capacity, while D tracks the current execution policy's direction.
@@ -166,6 +305,12 @@ class InfluenceSignatureTracker:
 
         # Contextuality is defined on C, not policy-dependent D.
         self._context_capacity: Dict[Tuple[int, int], Dict] = {}
+        self._latency_hist: Dict[Tuple[int, int], deque] = {}
+        self._latency_valid_hist: Dict[Tuple[int, int], deque] = {}
+        self._latency_onset_hist: Dict[Tuple[int, int], deque] = {}
+        self._latency_onset_valid_hist: Dict[Tuple[int, int], deque] = {}
+        self._latency_peak_hist: Dict[Tuple[int, int], deque] = {}
+        self._latency_horizon_hist: Dict[Tuple[int, int], deque] = {}
 
         self._n_obs: Dict[Tuple[int, int], int] = {}
 
@@ -185,13 +330,19 @@ class InfluenceSignatureTracker:
         direction: Optional[float] = None,
         sigma_capacity: Optional[float] = None,
         sigma_direction: Optional[float] = None,
+        latency_center: Optional[float] = None,
+        latency_valid: Optional[float] = None,
+        latency_onset: Optional[int] = None,
+        latency_peak: Optional[int] = None,
+        latency_onset_valid: Optional[float] = None,
+        latency_horizon: Optional[int] = None,
     ):
         """
         Record one C/D response-profile observation for the pair.
 
         ``signed_mu``/``sigma`` are legacy aliases for direction and its
-        uncertainty.  Their fallback capacity is ``abs(direction)`` so older
-        callers remain executable but cannot be used for a C/D claim.
+        uncertainty. They are accepted only for explicit compatibility paths;
+        Paper A/B launchers must provide separate C and D coordinates.
 
         context_key:
             Any hashable context identifier: a zone ID, a coarse hash of
@@ -200,14 +351,29 @@ class InfluenceSignatureTracker:
         """
         key = (int(ego_id), int(neighbor_id))
 
-        if capacity is None:
+        if capacity is None or direction is None:
+            if not self.allow_legacy_direction_fallback:
+                raise ValueError(
+                    "Final CIG-AMF requires distinct capacity C and direction D; "
+                    "legacy C=|D| conversion is disabled"
+                )
             capacity = abs(float(0.0 if signed_mu is None else signed_mu))
-        if direction is None:
             direction = float(0.0 if signed_mu is None else signed_mu)
         if sigma_capacity is None:
             sigma_capacity = float(0.0 if sigma is None else sigma)
         if sigma_direction is None:
             sigma_direction = float(0.0 if sigma is None else sigma)
+
+        for name, value in (
+            ("capacity", capacity),
+            ("sigma_capacity", sigma_capacity),
+            ("sigma_direction", sigma_direction),
+            ("direction", direction),
+        ):
+            if not np.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+        if float(capacity) < 0.0 or float(sigma_capacity) < 0.0 or float(sigma_direction) < 0.0:
+            raise ValueError("capacity and uncertainties must be non-negative")
 
         if key not in self._capacity_hist:
             self._capacity_hist[key] = deque(maxlen=self.window)
@@ -215,12 +381,45 @@ class InfluenceSignatureTracker:
             self._sigma_capacity_hist[key] = deque(maxlen=self.window)
             self._sigma_direction_hist[key] = deque(maxlen=self.direction_window)
             self._context_capacity[key] = {}
+            self._latency_hist[key] = deque(maxlen=self.window)
+            self._latency_valid_hist[key] = deque(maxlen=self.window)
+            self._latency_onset_hist[key] = deque(maxlen=self.window)
+            self._latency_peak_hist[key] = deque(maxlen=self.window)
+            self._latency_onset_valid_hist[key] = deque(maxlen=self.window)
+            self._latency_horizon_hist[key] = deque(maxlen=self.window)
             self._n_obs[key] = 0
 
         self._capacity_hist[key].append(max(0.0, float(capacity)))
         self._direction_hist[key].append(float(direction))
         self._sigma_capacity_hist[key].append(max(0.0, float(sigma_capacity)))
         self._sigma_direction_hist[key].append(max(0.0, float(sigma_direction)))
+        horizon = int(0 if latency_horizon is None else latency_horizon)
+        if horizon < 0:
+            raise ValueError("latency_horizon must be non-negative")
+        # H=1 can estimate a one-step response but cannot define L_cm/(H-1).
+        valid_latency = bool(latency_valid) and horizon >= 2
+        latency_value = float(-1.0 if latency_center is None else latency_center)
+        if valid_latency and not np.isfinite(latency_value):
+            raise ValueError("valid latency_center must be finite")
+        self._latency_valid_hist[key].append(float(valid_latency))
+        self._latency_hist[key].append(latency_value if valid_latency else -1.0)
+        self._latency_onset_hist[key].append(
+            int(-1 if latency_onset is None or not valid_latency else latency_onset)
+        )
+        self._latency_peak_hist[key].append(
+            int(-1 if latency_peak is None or not valid_latency else latency_peak)
+        )
+        self._latency_horizon_hist[key].append(horizon)
+        onset_valid = (
+            bool(latency_onset_valid)
+            if latency_onset_valid is not None
+            else (latency_onset is not None and int(latency_onset) >= 0)
+        )
+        if onset_valid and (not valid_latency or latency_onset is None or int(latency_onset) < 0):
+            raise ValueError("valid latency onset requires valid latency and onset>=0")
+        if valid_latency and (latency_peak is None or int(latency_peak) < 0):
+            raise ValueError("valid latency requires peak>=0")
+        self._latency_onset_valid_hist[key].append(float(onset_valid))
         self._n_obs[key] += 1
 
         if context_key is not None:
@@ -246,10 +445,46 @@ class InfluenceSignatureTracker:
             proxy_out: Dictionary from score_batch_full; requires mu and sigma.
             context_keys: List of length B, or None.
         """
-        d_mu = np.asarray(proxy_out.get("d_mu", proxy_out["mu"])).reshape(-1)
-        d_sigma = np.asarray(proxy_out.get("d_sigma", proxy_out["sigma"])).reshape(-1)
-        c_mu = np.asarray(proxy_out.get("c_mu", proxy_out.get("mu_range", np.abs(d_mu)))).reshape(-1)
-        c_sigma = np.asarray(proxy_out.get("c_sigma", d_sigma)).reshape(-1)
+        if "d_mu" in proxy_out:
+            d_mu = np.asarray(proxy_out["d_mu"])
+        elif self.allow_legacy_direction_fallback and "mu" in proxy_out:
+            d_mu = np.asarray(proxy_out["mu"])
+        else:
+            raise ValueError("proxy output must provide distinct d_mu and c_mu")
+        if "d_sigma" in proxy_out:
+            d_sigma = np.asarray(proxy_out["d_sigma"])
+        elif self.allow_legacy_direction_fallback and "sigma" in proxy_out:
+            d_sigma = np.asarray(proxy_out["sigma"])
+        else:
+            raise ValueError("proxy output must provide distinct d_sigma and c_sigma")
+        if "c_mu" in proxy_out:
+            c_mu = np.asarray(proxy_out["c_mu"])
+        elif self.allow_legacy_direction_fallback and "mu_range" in proxy_out:
+            c_mu = np.asarray(proxy_out["mu_range"])
+        else:
+            raise ValueError("proxy output must provide structural capacity c_mu")
+        if "c_sigma" in proxy_out:
+            c_sigma = np.asarray(proxy_out["c_sigma"])
+        elif self.allow_legacy_direction_fallback:
+            c_sigma = d_sigma
+        else:
+            raise ValueError("proxy output must provide structural uncertainty c_sigma")
+        d_mu = d_mu.reshape(-1)
+        d_sigma = d_sigma.reshape(-1)
+        c_mu = c_mu.reshape(-1)
+        c_sigma = c_sigma.reshape(-1)
+        latency_center = np.asarray(
+            proxy_out.get("latency_center", np.full_like(c_mu, -1.0))
+        ).reshape(-1)
+        latency_valid = np.asarray(
+            proxy_out.get("latency_valid", np.zeros_like(c_mu))
+        ).reshape(-1)
+        latency_onset_valid = np.asarray(
+            proxy_out.get("latency_onset_valid", np.zeros_like(c_mu))
+        ).reshape(-1)
+        horizon = int(np.asarray(
+            proxy_out.get("c_lag_mu", np.zeros((1, 1)))
+        ).shape[-1])
 
         for b, j in enumerate(neighbor_ids):
             self.update(
@@ -259,6 +494,18 @@ class InfluenceSignatureTracker:
                 direction=float(d_mu[b]),
                 sigma_capacity=float(c_sigma[b]),
                 sigma_direction=float(d_sigma[b]),
+                latency_center=(
+                    float(latency_center[b])
+                ),
+                latency_valid=float(latency_valid[b]),
+                latency_onset=int(np.asarray(
+                    proxy_out.get("latency_onset", np.full_like(c_mu, -1))
+                ).reshape(-1)[b]),
+                latency_peak=int(np.asarray(
+                    proxy_out.get("latency_peak", np.full_like(c_mu, -1))
+                ).reshape(-1)[b]),
+                latency_onset_valid=float(latency_onset_valid[b]),
+                latency_horizon=horizon,
                 context_key=(
                     None if context_keys is None else context_keys[b]
                 ),
@@ -270,7 +517,8 @@ class InfluenceSignatureTracker:
 
     def get_signature(self, ego_id: int, neighbor_id: int) -> np.ndarray:
         """
-        Returns ``[C, D, sigma_C, sigma_D, v_ctx]``.
+        Returns the Paper B allocator view ``[C, D, sigma_C, sigma_D, v_ctx]``.
+        The typed :class:`CausalPairSignal` retains context/latency masks.
         """
         key = (int(ego_id), int(neighbor_id))
 
@@ -304,11 +552,59 @@ class InfluenceSignatureTracker:
             if len(ctx_means) > 1
             else 0.0
         )
-
-
         return np.array(
-            [capacity, direction, sigma_capacity, sigma_direction, context_std],
+            [
+                capacity,
+                direction,
+                sigma_capacity,
+                sigma_direction,
+                context_std,
+            ],
             dtype=np.float32,
+        )
+
+    def get_pair_signal(
+        self,
+        ego_id: int,
+        neighbor_id: int,
+        *,
+        timestamp: int = -1,
+        structure_regime_id: int = 0,
+        support_valid: bool = True,
+        valid_action_count: int = 0,
+    ) -> CausalPairSignal:
+        """Return the typed C/D/latency signal consumed across the boundary."""
+        key = (int(ego_id), int(neighbor_id))
+        profile = self.get_signature(*key)
+        # Latency is an action-time measurement, not a slow averaged belief.
+        # Export the latest response spectrum and its masks together.  Using
+        # ``any``/a window average here would incorrectly make a now-invalid
+        # signal appear valid because an older update happened to be valid.
+        valid_hist = self._latency_valid_hist.get(key, ())
+        onset_valid_hist = self._latency_onset_valid_hist.get(key, ())
+        center_hist = self._latency_hist.get(key, ())
+        onset_hist = self._latency_onset_hist.get(key, ())
+        peak_hist = self._latency_peak_hist.get(key, ())
+        horizon_hist = self._latency_horizon_hist.get(key, ())
+        valid = bool(valid_hist and bool(valid_hist[-1]))
+        onset_valid = bool(onset_valid_hist and bool(onset_valid_hist[-1]))
+        onset = int(onset_hist[-1]) if onset_hist else -1
+        peak = int(peak_hist[-1]) if peak_hist else -1
+        center = float(center_hist[-1]) if center_hist else 0.0
+        horizon = int(horizon_hist[-1]) if horizon_hist else 0
+        return CausalPairSignal(
+            ego_id=int(ego_id), target_id=int(neighbor_id),
+            timestamp=int(timestamp), structure_regime_id=int(structure_regime_id),
+            capacity=float(profile[0]), direction=float(profile[1]),
+            sigma_capacity=float(profile[2]), sigma_direction=float(profile[3]),
+            context_variation=float(profile[4]), context_valid=bool(self.get_context_validity(*key)),
+            latency_onset=onset if onset_valid else -1,
+            latency_peak=peak if valid else -1,
+            latency_cm=center if valid else 0.0,
+            latency_valid=valid, latency_onset_valid=onset_valid,
+            support_valid=bool(support_valid),
+            valid_action_count=int(valid_action_count),
+            latency_horizon=horizon,
         )
 
     def get_context_validity(
@@ -374,7 +670,7 @@ class InfluenceSignatureTracker:
         initialization. Differentiable SOFT assignment is implemented by
         soft_role_assignment().
 
-        Priority order matters: anomalous is evaluated FIRST. When a neighbour
+        Priority order matters: uncertainty is evaluated FIRST. When a neighbour
         is not understood (high sigma), assigning it to beneficial or harmful
         is arbitrary; isolating it is safer.
 
@@ -387,7 +683,7 @@ class InfluenceSignatureTracker:
         sigma_direction = float(sig[3])
 
         if sigma_direction > self.sigma_hi:
-            return ROLE_ANOMALOUS
+            return ROLE_UNCERTAIN
 
         if abs(direction) < self.tau_role:
             return ROLE_NEUTRAL
@@ -553,23 +849,23 @@ def soft_role_assignment(
     sigma: np.ndarray,
     tau_role: float = 0.05,
     sigma_hi: float = 0.5,
-    sharpness: float = 3.0,
+    temperature_D: float = 0.05,
+    temperature_0: float = 0.05,
+    temperature_sigma: float = 0.05,
 ) -> np.ndarray:
     """
     Soft version of get_role(), returning a distribution over four roles
     instead of one hard label.
 
-    Soft assignment is necessary because gradients cannot flow through hard
-    if/else assignment. Near a boundary (mu = tau_role ± epsilon), hard labels
-    also jump discontinuously and cause instability. A sigmoid with slope
-    `sharpness` provides a smooth transition.
+    This diagnostic mirror uses the same Paper-B router as the runtime
+    module.  Direction determines beneficial/harmful/neutral valence and
+    epistemic disagreement determines the separate uncertain route:
 
-    Gate structure:
-        g_anom  = sigmoid(k * (sigma - sigma_hi))        "not understood"
-        g_sure  = 1 - g_anom                             "understood"
-        g_pos   = sigmoid(k * (mu - tau))                "sufficiently positive"
-        g_neg   = sigmoid(k * (-mu - tau))               "sufficiently negative"
-        g_neu   = 1 - g_pos - g_neg  (clamp >= 0)        "near zero"
+    ``a=sigmoid((sigma_D-sigma_hi)/T_sigma)`` and
+    ``v=softmax([(D-tau_D)/T_D, (-D-tau_D)/T_D,
+                 (tau_D-|D|)/T_0])``.
+
+    Returned mass is ``[(1-a)v+, (1-a)v-, (1-a)v0, a]``.
 
     Args:
         signed_mu: np [N]
@@ -577,7 +873,7 @@ def soft_role_assignment(
 
     Returns:
         float32 array of shape [N, 4], with each row summing to one.
-        Columns: [beneficial, harmful, neutral, anomalous].
+        Columns: [beneficial, harmful, neutral, uncertain].
     """
     mu = np.asarray(signed_mu, dtype=np.float64).reshape(-1)   # [N]
     sg = np.asarray(sigma, dtype=np.float64).reshape(-1)       # [N]
@@ -585,43 +881,25 @@ def soft_role_assignment(
     if mu.shape[0] == 0:
         return np.zeros((0, N_SEMANTIC_ROLES), dtype=np.float32)
 
-    # -----------------------------------------------------------------
-    # NORMALIZE SLOPE BY THE THRESHOLD. A unit test caught this defect.
-    #
-    # Directly using sigmoid(sharpness * (mu - tau)) makes the slope depend
-    # on the SCALE of mu. With sharpness=10 and tau=0.05:
-    #     at mu = 0, which should be completely neutral,
-    #     g_pos = sigmoid(10 * (-0.05)) = sigmoid(-0.5) = 0.378  (!!)
-    #     -> g_neu = 1 - 0.378 - 0.378 = 0.244 < g_pos
-    #     -> mu = 0 is incorrectly assigned as beneficial. WRONG.
-    #
-    # Fix: divide sharpness by the threshold to make it DIMENSIONLESS, meaning
-    # "the transition spans this many multiples of tau's width."
-    #     k_mu = sharpness / tau  ->  at mu=0: sigmoid(-sharpness)
-    # With sharpness=3: sigmoid(-3)=0.047 -> g_neu = 0.906. CORRECT.
-    # -----------------------------------------------------------------
-    k_mu = float(sharpness) / max(float(tau_role), 1e-8)
-    k_sg = float(sharpness) / max(float(sigma_hi), 1e-8)
-
-    sigmoid = lambda x: 1.0 / (1.0 + np.exp(-np.clip(x, -60.0, 60.0)))
-
-    g_anom = sigmoid(k_sg * (sg - sigma_hi))       # [N]
-    g_sure = 1.0 - g_anom                          # [N]
-
-    g_pos = sigmoid(k_mu * (mu - tau_role))        # [N]
-    g_neg = sigmoid(k_mu * (-mu - tau_role))       # [N]
-    g_neu = np.clip(1.0 - g_pos - g_neg, 0.0, 1.0)  # [N]
-
+    if min(float(temperature_D), float(temperature_0), float(temperature_sigma)) <= 0.0:
+        raise ValueError("semantic routing temperatures must be positive")
+    logits = np.stack([
+        (mu - float(tau_role)) / float(temperature_D),
+        (-mu - float(tau_role)) / float(temperature_D),
+        (float(tau_role) - np.abs(mu)) / float(temperature_0),
+    ], axis=1)
+    logits -= np.max(logits, axis=1, keepdims=True)
+    valence = np.exp(np.clip(logits, -60.0, 60.0))
+    valence /= np.clip(np.sum(valence, axis=1, keepdims=True), 1e-12, None)
+    uncertain = 1.0 / (1.0 + np.exp(-np.clip(
+        (sg - float(sigma_hi)) / float(temperature_sigma), -60.0, 60.0
+    )))
+    certain = 1.0 - uncertain
     out = np.zeros((mu.shape[0], N_SEMANTIC_ROLES), dtype=np.float64)
-
-    out[:, ROLE_BENEFICIAL] = g_sure * g_pos
-    out[:, ROLE_HARMFUL] = g_sure * g_neg
-    out[:, ROLE_NEUTRAL] = g_sure * g_neu
-    out[:, ROLE_ANOMALOUS] = g_anom
-
-    # Normalize to sum to one; g_pos + g_neg + g_neu may differ slightly.
-    row_sum = np.sum(out, axis=1, keepdims=True)   # [N, 1]
-    out = out / np.clip(row_sum, 1e-12, None)
+    out[:, ROLE_BENEFICIAL] = certain * valence[:, 0]
+    out[:, ROLE_HARMFUL] = certain * valence[:, 1]
+    out[:, ROLE_NEUTRAL] = certain * valence[:, 2]
+    out[:, ROLE_UNCERTAIN] = uncertain
 
     return out.astype(np.float32)
 

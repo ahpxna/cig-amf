@@ -283,6 +283,8 @@ def _cfg(seed, core_budget):
         "periph_require_full_signature": True,
         "periph_allow_legacy_items": False,
         "periph_use_uniform_mix": False,
+        "strict_causal_profile": True,
+        "semantic_router_frozen": True,
     })
     return cfg
 
@@ -431,6 +433,7 @@ def _representation_isolation_probe(
     cfg = _cfg(seed, core_budget)
     cfg.update({key: value for key, value in spec.items() if key != "runner"})
     cfg["freeze_downstream_policy_value"] = True
+    cfg["freeze_belief_summary_learning"] = True
     cfg["freeze_policy_learning"] = False
     cfg["freeze_graph_updates"] = True
     env = _env(seed)

@@ -7,7 +7,7 @@ through ``env.causal_adapter`` or register a wrapper at construction time.
 
 from __future__ import annotations
 
-from typing import Optional, Protocol, runtime_checkable
+from typing import Dict, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -62,6 +62,8 @@ class CausalMultiAgentEnvAdapter(Protocol):
     def context_key(self, ego: int, neighbour: int): ...
 
     def weak_prior_score(self, ego: int, neighbour: int) -> float: ...
+
+    def candidate_neighbors(self, ego: int, max_degree: Optional[int]): ...
 
     def feature_snapshot(self) -> dict: ...
 
@@ -212,8 +214,11 @@ class OmniArenaAdapter:
         ], dtype=np.float32)
 
     def neighbour_features(self, ego, neighbour, action):
+        action = int(action)
+        if action < 0 or action >= self.max_action_dim:
+            raise ValueError("neighbour action is outside the adapter action space")
         action_onehot = np.zeros((self.max_action_dim,), dtype=np.float32)
-        action_onehot[int(np.clip(action, 0, self.max_action_dim - 1))] = 1.0
+        action_onehot[action] = 1.0
         return np.concatenate([
             self.pair_features(ego, neighbour),
             action_onehot,
@@ -261,6 +266,12 @@ class OmniArenaAdapter:
             + (0.25 if float(pair[3]) > 0.5 else 0.0)
             + role_bonus.get(role, 0.0)
         )
+
+    def candidate_neighbors(self, ego, max_degree):
+        """Policy-independent bounded candidates for Eq. (28)."""
+        ids = [j for j in range(self.n_agents) if int(j) != int(ego)]
+        ids.sort(key=lambda j: (-self.weak_prior_score(ego, j), int(j)))
+        return ids[: int(max_degree)]
 
     def feature_snapshot(self):
         return {
@@ -435,8 +446,11 @@ class TinyOracleResourceFlowAdapter:
         return out
 
     def neighbour_features(self, ego, neighbour, action):
+        action = int(action)
+        if action < 0 or action >= self.max_action_dim:
+            raise ValueError("neighbour action is outside the adapter action space")
         onehot = np.zeros((self.max_action_dim,), dtype=np.float32)
-        onehot[int(np.clip(action, 0, self.max_action_dim - 1))] = 1.0
+        onehot[action] = 1.0
         return np.concatenate((self.pair_features(ego, neighbour), onehot)).astype(np.float32)
 
     def context_key(self, ego, neighbour):
@@ -451,6 +465,11 @@ class TinyOracleResourceFlowAdapter:
     def weak_prior_score(self, ego, neighbour):
         pair = self.pair_features(ego, neighbour)
         return float(1.0 / (1.0 + pair[2] * self.env.grid_size) + 0.2 * pair[3])
+
+    def candidate_neighbors(self, ego, max_degree):
+        ids = [j for j in range(self.n_agents) if int(j) != int(ego)]
+        ids.sort(key=lambda j: (-self.weak_prior_score(ego, j), int(j)))
+        return ids[: int(max_degree)]
 
     def feature_snapshot(self):
         zone_state = []
@@ -544,3 +563,42 @@ def compact_relation_features(adapter, ego, target, width):
     out = np.zeros((int(width),), dtype=np.float32)
     out[:min(out.size, raw.size)] = raw[:min(out.size, raw.size)]
     return out
+
+
+def bounded_candidate_neighbors(
+    adapter: CausalMultiAgentEnvAdapter,
+    ego: int,
+    max_degree: Optional[int],
+) -> list[int]:
+    """Return the authoritative policy-independent measured-neighbour set.
+
+    Paper A Eq. (28) and Paper B Eq. (28) require this set to be constructed
+    before causal scoring and independently of learned core allocation. A
+    ``None`` bound deliberately preserves unrestricted all-pairs measurement;
+    it must not be reported as a population-linear configuration.
+    """
+    ego = int(ego)
+    n_agents = int(adapter.n_agents)
+    if max_degree is None:
+        return [j for j in range(n_agents) if j != ego]
+    d_max = int(max_degree)
+    if d_max <= 0:
+        raise ValueError("candidate_max_degree must be positive or None")
+    provider = getattr(adapter, "candidate_neighbors", None)
+    if callable(provider):
+        supplied = [int(j) for j in provider(ego, d_max)]
+        ids = []
+        seen = set()
+        for j in supplied:
+            if j == ego or j < 0 or j >= n_agents or j in seen:
+                continue
+            ids.append(j)
+            seen.add(j)
+        if len(ids) > d_max:
+            raise ValueError("adapter candidate_neighbors exceeded d_max")
+        return ids
+    candidates = [j for j in range(n_agents) if j != ego]
+    candidates.sort(
+        key=lambda j: (-float(adapter.weak_prior_score(ego, j)), int(j))
+    )
+    return candidates[:d_max]

@@ -44,6 +44,16 @@ CIG_H1_THRESHOLD_CALIBRATION="${CIG_H1_THRESHOLD_CALIBRATION:-}"
 # confirmatory estimator/tracking claim.
 CIG_H1_ORACLE_SUPPORT="${CIG_H1_ORACLE_SUPPORT:-}"
 CIG_CUSUM_CALIBRATION="${CIG_CUSUM_CALIBRATION:-}"
+# Optional full-profile second-benchmark artifact for G8.
+CIG_EXTERNAL_GATE_ROOT="${CIG_EXTERNAL_GATE_ROOT:-}"
+# Paper-B scaling measures the candidate-restricted edge implementation. This
+# is explicit in the run manifest; it never licenses an O(N) claim unless the
+# adapter also reports subquadratic candidate construction.
+CIG_PAPER_B_CANDIDATE_MAX_DEGREE="${CIG_PAPER_B_CANDIDATE_MAX_DEGREE:-8}"
+CIG_PAPER_B_CANDIDATE_RECALL_STATES="${CIG_PAPER_B_CANDIDATE_RECALL_STATES:-}"
+CIG_PAPER_B_CANDIDATE_RECALL_HORIZON="${CIG_PAPER_B_CANDIDATE_RECALL_HORIZON:-8}"
+CIG_PAPER_B_CANDIDATE_RECALL_TRIALS="${CIG_PAPER_B_CANDIDATE_RECALL_TRIALS:-2}"
+CIG_PAPER_B_CANDIDATE_RECALL_MIN="${CIG_PAPER_B_CANDIDATE_RECALL_MIN:-0.80}"
 
 usage() {
   sed -n '2,18p' "$0"
@@ -102,18 +112,24 @@ case "$CIG_RUN_ID" in
 esac
 
 if [ "$CIG_QUICK" -eq 1 ]; then
+  CIG_PAPER_B_CANDIDATE_RECALL_STATES="${CIG_PAPER_B_CANDIDATE_RECALL_STATES:-1}"
   CIG_DEFAULT_H1_SEEDS="0"
   CIG_DEFAULT_H23_SEEDS="0"
+  CIG_DEFAULT_GATE_SEEDS="0"
   CIG_H2_EPISODES="${CIG_H2_EPISODES:-60}"
   CIG_H3_EPISODES="${CIG_H3_EPISODES:-60}"
   CIG_LATENCY_TRAIN_EPISODES="${CIG_LATENCY_TRAIN_EPISODES:-2}"
   CIG_PAPER_B_SELECTOR_STATES="${CIG_PAPER_B_SELECTOR_STATES:-2}"
   CIG_MODE="quick"
 else
+  CIG_PAPER_B_CANDIDATE_RECALL_STATES="${CIG_PAPER_B_CANDIDATE_RECALL_STATES:-4}"
   # Untouched confirmatory seeds.  Development seeds remain opt-in through
   # CIG_H1_SEEDS/CIG_RUN_SEEDS and are recorded as non-confirmatory metadata.
   CIG_DEFAULT_H1_SEEDS="101 102 103 104 105 106 107 108"
   CIG_DEFAULT_H23_SEEDS="201 202 203 204 205 206 207 208"
+  # G0-G4 are preregistered feasibility gates, not a preview of the
+  # confirmatory H1/H2 seeds. Keep their seed set disjoint.
+  CIG_DEFAULT_GATE_SEEDS="301 302 303 304 305"
   CIG_H2_EPISODES="${CIG_H2_EPISODES:-400}"
   CIG_H3_EPISODES="${CIG_H3_EPISODES:-200}"
   CIG_LATENCY_TRAIN_EPISODES="${CIG_LATENCY_TRAIN_EPISODES:-200}"
@@ -123,13 +139,34 @@ fi
 
 CIG_H23_SEED_TEXT="${CIG_RUN_SEEDS:-$CIG_DEFAULT_H23_SEEDS}"
 CIG_H1_SEED_TEXT="${CIG_H1_SEEDS:-${CIG_RUN_SEEDS:-$CIG_DEFAULT_H1_SEEDS}}"
+CIG_GATE_SEED_TEXT="${CIG_GATE_SEEDS:-$CIG_DEFAULT_GATE_SEEDS}"
 CIG_LATENCY_ORACLE_STATES="${CIG_LATENCY_ORACLE_STATES:-12}"
 CIG_LATENCY_ORACLE_TRIALS="${CIG_LATENCY_ORACLE_TRIALS:-2}"
 CIG_H2_PRETRAIN_EPISODES="${CIG_H2_PRETRAIN_EPISODES:-60}"
 CIG_PAPER_B_SCALING_AGENTS="${CIG_PAPER_B_SCALING_AGENTS:-12 24 48}"
+if [ "$CIG_QUICK" -eq 1 ]; then
+  CIG_GATE_N_AGENTS="${CIG_GATE_N_AGENTS:-6}"
+  CIG_GATE_ORACLE_STATES="${CIG_GATE_ORACLE_STATES:-1}"
+  CIG_GATE_H1_TRAIN_EPISODES="${CIG_GATE_H1_TRAIN_EPISODES:-2}"
+  CIG_GATE_H1_STATES="${CIG_GATE_H1_STATES:-2}"
+  CIG_GATE_G3_STATES="${CIG_GATE_G3_STATES:-1}"
+  CIG_GATE_ALLOCATION_EPISODES="${CIG_GATE_ALLOCATION_EPISODES:-2}"
+  CIG_GATE_ALLOCATION_MAX_STEPS="${CIG_GATE_ALLOCATION_MAX_STEPS:-8}"
+  CIG_GATE_ALLOCATION_FINAL_WINDOW="${CIG_GATE_ALLOCATION_FINAL_WINDOW:-2}"
+else
+  CIG_GATE_N_AGENTS="${CIG_GATE_N_AGENTS:-24}"
+  CIG_GATE_ORACLE_STATES="${CIG_GATE_ORACLE_STATES:-4}"
+  CIG_GATE_H1_TRAIN_EPISODES="${CIG_GATE_H1_TRAIN_EPISODES:-30}"
+  CIG_GATE_H1_STATES="${CIG_GATE_H1_STATES:-16}"
+  CIG_GATE_G3_STATES="${CIG_GATE_G3_STATES:-3}"
+  CIG_GATE_ALLOCATION_EPISODES="${CIG_GATE_ALLOCATION_EPISODES:-40}"
+  CIG_GATE_ALLOCATION_MAX_STEPS="${CIG_GATE_ALLOCATION_MAX_STEPS:-30}"
+  CIG_GATE_ALLOCATION_FINAL_WINDOW="${CIG_GATE_ALLOCATION_FINAL_WINDOW:-10}"
+fi
 read -r -a CIG_H1_SEED_ARRAY <<< "$CIG_H1_SEED_TEXT"
 read -r -a CIG_H23_SEED_ARRAY <<< "$CIG_H23_SEED_TEXT"
-if [ "${#CIG_H1_SEED_ARRAY[@]}" -eq 0 ] || [ "${#CIG_H23_SEED_ARRAY[@]}" -eq 0 ]; then
+read -r -a CIG_GATE_SEED_ARRAY <<< "$CIG_GATE_SEED_TEXT"
+if [ "${#CIG_H1_SEED_ARRAY[@]}" -eq 0 ] || [ "${#CIG_H23_SEED_ARRAY[@]}" -eq 0 ] || [ "${#CIG_GATE_SEED_ARRAY[@]}" -eq 0 ]; then
   echo "CIG_RUN_SEEDS resolved to an empty seed list." >&2
   exit 2
 fi
@@ -155,7 +192,7 @@ if [ "$CIG_MODE" = "confirmatory" ] && [ "${CIG_ALLOW_DIRTY_CONFIRMATORY:-0}" !=
     exit 2
   fi
 fi
-for CIG_SEED in "${CIG_H1_SEED_ARRAY[@]}" "${CIG_H23_SEED_ARRAY[@]}"; do
+for CIG_SEED in "${CIG_H1_SEED_ARRAY[@]}" "${CIG_H23_SEED_ARRAY[@]}" "${CIG_GATE_SEED_ARRAY[@]}"; do
   case "$CIG_SEED" in
     *[!0-9]*|"")
       echo "Invalid seed '$CIG_SEED'; seeds must be non-negative integers." >&2
@@ -185,9 +222,29 @@ for CIG_SEED in "${CIG_H23_SEED_ARRAY[@]}"; do
   CIG_SEEN_SEEDS="$CIG_SEEN_SEEDS$CIG_SEED "
 done
 
+CIG_SEEN_GATE_SEEDS=" "
+for CIG_SEED in "${CIG_GATE_SEED_ARRAY[@]}"; do
+  case "$CIG_SEEN_GATE_SEEDS" in
+    *" $CIG_SEED "*)
+      echo "Duplicate scientific-precheck seed '$CIG_SEED' is pseudo-replication." >&2
+      exit 2
+      ;;
+  esac
+  CIG_SEEN_GATE_SEEDS="$CIG_SEEN_GATE_SEEDS$CIG_SEED "
+  case " ${CIG_H1_SEED_ARRAY[*]} ${CIG_H23_SEED_ARRAY[*]} " in
+    *" $CIG_SEED "*)
+      if [ "$CIG_MODE" = "confirmatory" ]; then
+        echo "Scientific-precheck seed '$CIG_SEED' overlaps a confirmatory H1/H2 seed." >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
 for CIG_EPISODE_BUDGET in "$CIG_H2_EPISODES" "$CIG_H2_PRETRAIN_EPISODES" "$CIG_H3_EPISODES" \
   "$CIG_LATENCY_ORACLE_STATES" "$CIG_LATENCY_ORACLE_TRIALS" \
-  "$CIG_LATENCY_TRAIN_EPISODES"; do
+  "$CIG_LATENCY_TRAIN_EPISODES" "$CIG_GATE_ALLOCATION_EPISODES" \
+  "$CIG_GATE_ALLOCATION_MAX_STEPS" "$CIG_GATE_ALLOCATION_FINAL_WINDOW"; do
   case "$CIG_EPISODE_BUDGET" in
     *[!0-9]*|""|0)
       echo "Episode budgets must be positive integers." >&2
@@ -198,6 +255,30 @@ done
 case "$CIG_PAPER_B_SELECTOR_STATES" in
   *[!0-9]*|""|0)
     echo "CIG_PAPER_B_SELECTOR_STATES must be a positive integer." >&2
+    exit 2
+    ;;
+esac
+case "$CIG_PAPER_B_CANDIDATE_MAX_DEGREE" in
+  *[!0-9]*|""|0)
+    echo "CIG_PAPER_B_CANDIDATE_MAX_DEGREE must be a positive integer." >&2
+    exit 2
+    ;;
+esac
+for CIG_CANDIDATE_RECALL_BUDGET in \
+  "$CIG_PAPER_B_CANDIDATE_RECALL_STATES" \
+  "$CIG_PAPER_B_CANDIDATE_RECALL_HORIZON" \
+  "$CIG_PAPER_B_CANDIDATE_RECALL_TRIALS"; do
+  case "$CIG_CANDIDATE_RECALL_BUDGET" in
+    *[!0-9]*|""|0)
+      echo "Paper-B candidate-recall budgets must be positive integers." >&2
+      exit 2
+      ;;
+  esac
+done
+case "$CIG_PAPER_B_CANDIDATE_RECALL_MIN" in
+  0|0.*|1|1.0|1.00|1.000) ;;
+  *)
+    echo "CIG_PAPER_B_CANDIDATE_RECALL_MIN must lie in [0,1]." >&2
     exit 2
     ;;
 esac
@@ -236,6 +317,10 @@ if [ "$CIG_QUICK" -eq 0 ]; then
     echo "Confirmatory H2/H3 require at least 8 unique paired seeds." >&2
     exit 2
   fi
+  if [ "${#CIG_GATE_SEED_ARRAY[@]}" -lt 3 ]; then
+    echo "Confirmatory G0-G4 prechecks require at least 3 disjoint gate seeds." >&2
+    exit 2
+  fi
   if [ "$CIG_H2_EPISODES" -lt 400 ] || [ "$CIG_H3_EPISODES" -lt 200 ]; then
     echo "Confirmatory budgets require H2>=400 and H3>=200 episodes." >&2
     echo "Use --quick for reduced protocol-path checks." >&2
@@ -269,6 +354,7 @@ printf 'category\tlabel\texit_code\telapsed_seconds\tlog\n' > "$CIG_STATUS_TSV"
   printf 'legacy_h3=%s\n' "$CIG_RUN_LEGACY_H3"
   printf 'h1_seeds=%s\n' "${CIG_H1_SEED_ARRAY[*]}"
   printf 'h2_h3_seeds=%s\n' "${CIG_H23_SEED_ARRAY[*]}"
+  printf 'scientific_precheck_seeds=%s\n' "${CIG_GATE_SEED_ARRAY[*]}"
   printf 'h2_episodes=%s\n' "$CIG_H2_EPISODES"
   printf 'h2_pretrain_episodes=%s\n' "$CIG_H2_PRETRAIN_EPISODES"
   printf 'h3_episodes=%s\n' "$CIG_H3_EPISODES"
@@ -277,9 +363,23 @@ printf 'category\tlabel\texit_code\telapsed_seconds\tlog\n' > "$CIG_STATUS_TSV"
   printf 'latency_train_episodes=%s\n' "$CIG_LATENCY_TRAIN_EPISODES"
   printf 'paper_b_selector_states=%s\n' "$CIG_PAPER_B_SELECTOR_STATES"
   printf 'paper_b_scaling_agents=%s\n' "$CIG_PAPER_B_SCALING_AGENTS"
+  printf 'paper_b_candidate_max_degree=%s\n' "$CIG_PAPER_B_CANDIDATE_MAX_DEGREE"
+  printf 'paper_b_candidate_recall_states=%s\n' "$CIG_PAPER_B_CANDIDATE_RECALL_STATES"
+  printf 'paper_b_candidate_recall_horizon=%s\n' "$CIG_PAPER_B_CANDIDATE_RECALL_HORIZON"
+  printf 'paper_b_candidate_recall_trials=%s\n' "$CIG_PAPER_B_CANDIDATE_RECALL_TRIALS"
+  printf 'paper_b_candidate_recall_min=%s\n' "$CIG_PAPER_B_CANDIDATE_RECALL_MIN"
   printf 'h1_threshold_calibration=%s\n' "$CIG_H1_THRESHOLD_CALIBRATION"
   printf 'h1_oracle_support=%s\n' "$CIG_H1_ORACLE_SUPPORT"
   printf 'cusum_calibration=%s\n' "$CIG_CUSUM_CALIBRATION"
+  printf 'external_gate_root=%s\n' "$CIG_EXTERNAL_GATE_ROOT"
+  printf 'gate_n_agents=%s\n' "$CIG_GATE_N_AGENTS"
+  printf 'gate_oracle_states=%s\n' "$CIG_GATE_ORACLE_STATES"
+  printf 'gate_h1_train_episodes=%s\n' "$CIG_GATE_H1_TRAIN_EPISODES"
+  printf 'gate_h1_states=%s\n' "$CIG_GATE_H1_STATES"
+  printf 'gate_g3_states=%s\n' "$CIG_GATE_G3_STATES"
+  printf 'gate_allocation_episodes=%s\n' "$CIG_GATE_ALLOCATION_EPISODES"
+  printf 'gate_allocation_max_steps=%s\n' "$CIG_GATE_ALLOCATION_MAX_STEPS"
+  printf 'gate_allocation_final_window=%s\n' "$CIG_GATE_ALLOCATION_FINAL_WINDOW"
   printf 'git_commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || printf unknown)"
   git status --porcelain --untracked-files=normal 2>/dev/null > "$CIG_RUN_DIR/git_status_porcelain.txt"
   if [ ! -s "$CIG_RUN_DIR/git_status_porcelain.txt" ]; then
@@ -374,6 +474,7 @@ echo "Profile: $([ "$CIG_CLAIMS_ONLY" -eq 1 ] && printf claims-only || printf co
 echo "Device: $CIG_DEVICE"
 echo "H1 seeds: ${CIG_H1_SEED_ARRAY[*]}"
 echo "H2/H3 seeds: ${CIG_H23_SEED_ARRAY[*]}"
+echo "G0-G4 precheck seeds: ${CIG_GATE_SEED_ARRAY[*]}"
 CIG_H1_VARIANT_COUNT=$("$CIG_PYTHON" -c 'from scripts.run_h1_calibration import VARIANTS; print(len(VARIANTS))')
 CIG_H2_MODEL_COUNT=$("$CIG_PYTHON" -c 'from scripts.run_h2_selectivity import MODELS; print(len(MODELS))')
 CIG_H3_VARIANT_COUNT=$("$CIG_PYTHON" -c 'from scripts.run_h3_slots import VARIANTS; print(len(VARIANTS))' 2>/dev/null || printf 6)
@@ -507,6 +608,39 @@ if [ "${#CIG_OPERATIONAL_FAILURES[@]}" -gt 0 ]; then
   exit 2
 fi
 
+CIG_PRECHECK_ARGS=(
+  --experiment0 "$CIG_RUN_DIR/experiment0_gate.json"
+  --seeds "${CIG_GATE_SEED_ARRAY[@]}"
+  --protocol-mode "$CIG_MODE"
+  --device "$CIG_DEVICE"
+  --n-agents "$CIG_GATE_N_AGENTS"
+  --oracle-states "$CIG_GATE_ORACLE_STATES"
+  --h1-train-episodes "$CIG_GATE_H1_TRAIN_EPISODES"
+  --h1-states "$CIG_GATE_H1_STATES"
+  --g3-states "$CIG_GATE_G3_STATES"
+  --allocation-episodes "$CIG_GATE_ALLOCATION_EPISODES"
+  --allocation-max-steps "$CIG_GATE_ALLOCATION_MAX_STEPS"
+  --allocation-final-window "$CIG_GATE_ALLOCATION_FINAL_WINDOW"
+  --out "$CIG_RUN_DIR/scientific_prechecks_g0_g4.json"
+  --work-root "$CIG_RUN_DIR/scientific_prechecks_work"
+)
+if [ "$CIG_QUICK" -eq 0 ]; then
+  CIG_PRECHECK_ARGS+=(--threshold-calibration "$CIG_H1_THRESHOLD_CALIBRATION")
+fi
+run_logged "scientific_precheck" "G0-G4 oracle/forced-only scientific prechecks" "35_scientific_prechecks.log" \
+  "$CIG_PYTHON" scripts/run_scientific_prechecks.py "${CIG_PRECHECK_ARGS[@]}"
+if [ "${#CIG_OPERATIONAL_FAILURES[@]}" -gt 0 ]; then
+  finish_metadata "INVALID_SCIENTIFIC_PRECHECK"
+  exit 2
+fi
+if [ "$CIG_MODE" = "confirmatory" ] && ! "$CIG_PYTHON" -c \
+  'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); sys.exit(0 if p.get("core_prechecks_pass") else 1)' \
+  "$CIG_RUN_DIR/scientific_prechecks_g0_g4.json"; then
+  echo "SCIENTIFIC PRECHECK FAIL: at least one of G0-G4 failed; expensive learned panels were not started." >&2
+  finish_metadata "COMPLETE_PRECHECK_NOT_SUPPORTED"
+  exit 3
+fi
+
 if [ "$CIG_QUICK" -eq 0 ] && [ "$CIG_CLAIMS_ONLY" -eq 0 ]; then
   run_logged "structure_value" "Tier 0 oracle structure regret" "30_structure_value_tier0.log" \
     "$CIG_PYTHON" envs/structure_value_tier0.py
@@ -629,6 +763,11 @@ run_logged "scalability" "Paper-B reward-compute-memory scaling" "67_paper_b_sca
   "$CIG_PYTHON" scripts/run_paper_b_scaling.py \
   --seeds "${CIG_H23_SEED_ARRAY[@]}" \
   --agent-counts $CIG_PAPER_B_SCALING_AGENTS \
+  --candidate-max-degree "$CIG_PAPER_B_CANDIDATE_MAX_DEGREE" \
+  --candidate-recall-states "$CIG_PAPER_B_CANDIDATE_RECALL_STATES" \
+  --candidate-recall-horizon "$CIG_PAPER_B_CANDIDATE_RECALL_HORIZON" \
+  --candidate-recall-trials "$CIG_PAPER_B_CANDIDATE_RECALL_TRIALS" \
+  --candidate-recall-min "$CIG_PAPER_B_CANDIDATE_RECALL_MIN" \
   --episodes "$CIG_H3_EPISODES" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/paper_b_scaling"
@@ -674,6 +813,17 @@ run_paper_validation "Validate Paper B" "73_validate_paper_b.log" \
   --run-root "$CIG_RUN_DIR" \
   --expected-seeds "${CIG_H23_SEED_ARRAY[@]}" \
   --protocol-mode "$CIG_MODE"
+CIG_GATE_VALIDATION_ARGS=(
+  --run-root "$CIG_RUN_DIR"
+  --prechecks "$CIG_RUN_DIR/scientific_prechecks_g0_g4.json"
+  --protocol-mode "$CIG_MODE"
+  --out "$CIG_RUN_DIR/scientific_gate_status.json"
+)
+if [ -n "$CIG_EXTERNAL_GATE_ROOT" ]; then
+  CIG_GATE_VALIDATION_ARGS+=(--external-root "$CIG_EXTERNAL_GATE_ROOT")
+fi
+run_paper_validation "Validate scientific gate ladder G0-G9" "74_validate_scientific_gates.log" \
+  "$CIG_PYTHON" scripts/validate_scientific_gates.py "${CIG_GATE_VALIDATION_ARGS[@]}"
 
 # ---------------------------------------------------------------------------
 # 9. Final manifest summary.
@@ -689,6 +839,7 @@ echo "Command manifest: $CIG_STATUS_TSV"
 echo "Summary table: $CIG_RUN_DIR/summary_tables.md"
 echo "Paper-A claim report: $CIG_RUN_DIR/paper_a_claim_status.json"
 echo "Paper-B claim report: $CIG_RUN_DIR/paper_b_claim_status.json"
+echo "Scientific gate ladder: $CIG_RUN_DIR/scientific_gate_status.json"
 
 if [ "${#CIG_OPERATIONAL_FAILURES[@]}" -gt 0 ]; then
   printf '  - %s\n' "${CIG_OPERATIONAL_FAILURES[@]}"

@@ -27,15 +27,13 @@ class BeliefItemEncoder(nn.Module):
 class BeliefSummaryBuilder(nn.Module):
     """B_i = [global_stats || top-k structural profile || pooled context]
 
-item format:
-    0: mu_bar
-    1: sigma_bar
-    2: p_core
+item format (the relation suffix is adapter-owned and opaque to the model):
+    0: capacity_bar
+    1: sigma_capacity_bar
+    2: g_score = C - kappa*sigma_C
     3: in_core
-    4: in_seed_core
-    5: rel_row
-    6: rel_col
-    7: zone_diff
+    4: in_seed_core (diagnostic membership)
+    5--7: compact adapter relation features
     8: pair_latent_norm
 
 Follow paper:
@@ -48,7 +46,7 @@ Follow paper:
         top_k: int = 4,
         pooled_hidden: int = 24,
         out_dim: int = 64,
-        priority_mu_floor: float = 0.02,
+        priority_mu_floor: float = 0.0,
     ):
         super().__init__()
 
@@ -56,6 +54,11 @@ Follow paper:
         self.item_dim = 9
         self.pooled_hidden = int(pooled_hidden)
         self.priority_mu_floor = float(priority_mu_floor)
+        if abs(self.priority_mu_floor) > 1e-12:
+            raise ValueError(
+                "belief summaries use the literal G=C-kappa*sigma score; "
+                "priority_mu_floor is not part of the final contract"
+            )
 
         self.item_enc = BeliefItemEncoder(
             item_dim=self.item_dim,
@@ -88,9 +91,15 @@ Follow paper:
 
         return np.array(
             [
-                float(b["mu_bar"]),
-                float(b["sigma_bar"]),
-                float(b["p_core"]),
+                float(b["capacity_bar"]),
+                float(b["sigma_capacity_bar"]),
+                float(
+                    b.get(
+                        "g_score",
+                        float(b.get("capacity_bar", 0.0))
+                        - float(b.get("sigma_capacity_bar", b.get("sigma_bar", 0.0))),
+                    )
+                ),
                 float(b["in_core"]),
                 float(b["in_seed_core"]),
                 *[float(value) for value in relation],
@@ -161,7 +170,7 @@ Follow paper:
 
         mu_col = items[:, 0]
         sigma_col = items[:, 1]
-        p_col = items[:, 2]
+        g_col = items[:, 2]
         in_core_col = items[:, 3]
         in_seed_col = items[:, 4]
 
@@ -171,8 +180,8 @@ Follow paper:
                 self._std(mu_col),
                 torch.mean(sigma_col),
                 self._std(sigma_col),
-                torch.mean(p_col),
-                self._std(p_col),
+                torch.mean(g_col),
+                self._std(g_col),
                 torch.mean(in_core_col),
                 torch.mean(in_seed_col),
                 torch.tensor(
@@ -184,21 +193,11 @@ Follow paper:
             dim=0,
         ).unsqueeze(0)
 
-        # Fix Stage 0 priority:
-        # Essence:
-        #     confidence = clamp(1 - sigma, 0, 1)
-        #     priority = |mu| * (0.5 + p) * confidence
-        #
-        # When sigma=1 and mu=0, priority=0 for all items, top-k is decided
-        # almost by index. This version uses soft confidence and mu_floor.
-        sigma_safe = torch.clamp(sigma_col, min=0.0)
-        confidence = 1.0 / (1.0 + sigma_safe)
-
-        priority = (
-            (torch.abs(mu_col) + self.priority_mu_floor)
-            * (0.5 + p_col)
-            * confidence
-        )
+        # Top-k follows the same lower-confidence-bound score G used by the
+        # structural allocator.  This keeps the public belief summary aligned
+        # with the paper's C-only selection semantics instead of reintroducing
+        # a probability-like p_core proxy.
+        priority = g_col
 
         top_idx = torch.argsort(priority, descending=True)[: self.top_k]
         top_items = items[top_idx]

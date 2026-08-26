@@ -64,10 +64,25 @@ def _load_panel(root, directory, filename, expected_variants, expected_seeds):
 
 
 def _load_scaling(root, expected_seeds):
-    return _load_panel(
+    rows, manifest = _load_panel(
         root, "paper_b_scaling", "summary_paper_b_scaling.csv",
         EXPECTED_SCALING, expected_seeds,
     )
+    degree = int(manifest.get("candidate_max_degree", 0))
+    if degree <= 0:
+        raise ValueError("scaling manifest omits a positive candidate_max_degree")
+    if not manifest.get("candidate_policy"):
+        raise ValueError("scaling manifest omits the frozen candidate policy")
+    recall = manifest.get("candidate_oracle_recall")
+    if not isinstance(recall, dict):
+        raise ValueError("scaling manifest omits the oracle candidate-recall protocol")
+    minimum = float(recall.get("minimum", float("nan")))
+    if not math.isfinite(minimum) or not 0.0 <= minimum <= 1.0:
+        raise ValueError("scaling manifest has an invalid candidate-recall minimum")
+    for key in ("states", "horizon", "trials"):
+        if int(recall.get(key, 0)) <= 0:
+            raise ValueError(f"scaling candidate-recall protocol omits positive {key}")
+    return rows, manifest
 
 
 def _load_adaptive_budget(root, expected_seeds):
@@ -360,6 +375,11 @@ def validate(run_root, expected_seeds, protocol_mode):
             - float(adaptive["policy_logit_l2_to_full_explicit"])
         )
     # Scaling rows must include the paper-promised fidelity and latency metrics.
+    bounded_edge_accounting_valid = True
+    candidate_oracle_recall_valid = True
+    candidate_construction_subquadratic_valid = True
+    candidate_recall_protocol = scaling_manifest["candidate_oracle_recall"]
+    candidate_recall_minimum = float(candidate_recall_protocol["minimum"])
     for row in scaling_rows:
         for key in (
             "policy_logit_l2_to_full_explicit", "value_mae_to_full_explicit",
@@ -368,6 +388,33 @@ def validate(run_root, expected_seeds, protocol_mode):
         ):
             if not math.isfinite(float(row.get(key, float("nan")))):
                 raise ValueError(f"scaling row omits finite {key}")
+        variant = row["variant"]
+        n_agents = int(row["n_agents"])
+        if variant == "Full-Explicit":
+            # This is intentionally the dense upper reference, never evidence
+            # for candidate-restricted edge scaling.
+            continue
+        if variant == "PureMeanField":
+            # Mean field has no directed pair-state allocation.
+            continue
+        d_max = int(row.get("candidate_max_degree_protocol", 0))
+        edges = int(row.get("measured_edge_count", -1))
+        if d_max <= 0 or edges < 0 or edges > n_agents * d_max:
+            bounded_edge_accounting_valid = False
+        recall = float(row.get("candidate_oracle_recall_at_degree", float("nan")))
+        comparisons = int(row.get("candidate_oracle_recall_comparisons", 0))
+        if (
+            int(row.get("candidate_recall_applicable", 0)) != 1
+            or not math.isfinite(recall)
+            or comparisons <= 0
+            or recall < candidate_recall_minimum
+        ):
+            candidate_oracle_recall_valid = False
+        construction_flag = str(
+            row.get("candidate_construction_subquadratic", "false")
+        ).strip().lower()
+        if construction_flag not in {"1", "true", "yes"}:
+            candidate_construction_subquadratic_valid = False
 
     metrics = {
         "c_core_minus_absd_selector_f1": c_vs_d,
@@ -494,6 +541,21 @@ def validate(run_root, expected_seeds, protocol_mode):
             float(row["mean_core_cost_gap_to_adaptive"]) <= 0.5 + 1e-9
             for row in adaptive_rows
             if int(row.get("matched_to_adaptive", 0)) == 1
+        ),
+        "candidate_restricted_edge_accounting_is_valid": bool(
+            bounded_edge_accounting_valid
+        ),
+        "candidate_restricted_oracle_recall_is_valid": bool(
+            candidate_oracle_recall_valid
+        ),
+        # Bounded measured edges alone are not a population-linear claim: a
+        # dense candidate constructor remains quadratic.  This condition is
+        # deliberately separate so the report can retain honest O(E) results
+        # without licensing the stronger O(N) wording.
+        "population_linear_scaling_claim_is_eligible": bool(
+            bounded_edge_accounting_valid
+            and candidate_oracle_recall_valid
+            and candidate_construction_subquadratic_valid
         ),
     }
     secondary_predictions = {

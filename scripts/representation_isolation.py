@@ -11,6 +11,8 @@ import copy
 
 import numpy as np
 
+from models.influence_signature import CausalPairSignal
+
 
 def collect_teacher_trajectory(runner, episodes: int):
     """Collect immutable common state/action trajectories from one teacher."""
@@ -31,6 +33,33 @@ def replay_pair_history(runner, traces, *, train_bc: bool, bc_steps: int):
     module = runner.pair_rel_module
     if bool(runner.cfg.get("freeze_representation_state", False)):
         raise ValueError("matched-history replay requires mutable representation state")
+    def cached_cd_target(step, ego, neighbour):
+        """Read the action-time typed C/D profile cached with the history.
+
+        The isolation panel must not synthesize a current slow-belief label
+        after replaying a different runner.  The cached signal is the profile
+        available at the same pre-action state as the representation sample;
+        its timestamp is preserved and its age is zero by construction.
+        """
+        signal = (
+            step.get("pair_signal_cache", {})
+            .get(int(ego), {})
+            .get(int(neighbour))
+        )
+        if not isinstance(signal, CausalPairSignal):
+            return {
+                "target": None,
+                "age": None,
+                "timestamp": None,
+                "valid": False,
+            }
+        return {
+            "target": signal.allocator_profile[:2],
+            "age": 0,
+            "timestamp": int(signal.timestamp),
+            "valid": bool(signal.support_valid),
+        }
+
     for trajectory in traces:
         previous = None
         for step in trajectory:
@@ -41,16 +70,25 @@ def replay_pair_history(runner, traces, *, train_bc: bool, bc_steps: int):
             h_before = module.clone_full_states_np()
             if previous is not None:
                 runner.env_adapter.restore_state(previous["before"])
+                next_pre_forcing = step.get("pre_forcing_actions", actions)
+                next_masks = step.get("valid_action_masks")
                 module.add_bc_transition(
                     observations={agent: previous["obs"][agent] for agent in range(runner.n_agents)},
                     actions={agent: previous["actions"][agent] for agent in range(runner.n_agents)},
-                    next_actions={agent: actions[agent] for agent in range(runner.n_agents)},
+                    next_actions={
+                        agent: int(next_pre_forcing[agent])
+                        for agent in range(runner.n_agents)
+                    },
+                    next_forced_mask=step.get("forced_mask"),
+                    next_valid_action_masks=next_masks,
+                    next_actions_are_pre_forcing=(
+                        "pre_forcing_actions" in step
+                    ),
                     env=runner.env,
                     h_prev_snapshot=previous["h_before"],
-                    cd_target_fn=lambda ego, neighbour: np.asarray([
-                        runner.belief_modules[ego].debiased_mu(neighbour),
-                        runner.sig_tracker.get_signature(ego, neighbour)[1],
-                    ], dtype=np.float32),
+                    cd_target_fn=lambda ego, neighbour, source=previous: (
+                        cached_cd_target(source, ego, neighbour)
+                    ),
                 )
             runner.env_adapter.restore_state(before)
             module.step_population(obs_all=obs, actions=actions, env=runner.env)
@@ -60,9 +98,26 @@ def replay_pair_history(runner, traces, *, train_bc: bool, bc_steps: int):
                 "obs": copy.deepcopy(obs),
                 "actions": actions,
                 "h_before": h_before,
+                "pair_signal_cache": copy.deepcopy(
+                    step.get("pair_signal_cache", {})
+                ),
             }
-        if train_bc and not bool(runner.cfg.get("freeze_pair_bc_learning", False)):
-            module.train_bc(n_steps=int(bc_steps))
+    if train_bc and not bool(runner.cfg.get("freeze_pair_bc_learning", False)):
+        # Paper B freezes the C/D normalizer on the common pre-confirmatory
+        # history before applying L_CD/L_con.  Fitting after the complete
+        # shared replay avoids a variant-specific first-trajectory scale.
+        if not bool(module.cd_normalization_frozen):
+            module.fit_cd_normalization(
+                min_samples=int(runner.cfg.get("cd_normalization_min_samples", 32))
+            )
+        module.train_bc(
+            n_steps=int(bc_steps),
+            batch_size=int(runner.cfg.get("bc_batch_size", 256)),
+            heads=runner.heads,
+            heads_optim=runner.heads_optim,
+            w_influence=float(runner.cfg.get("heads_w_influence", 1.0)),
+            w_contrastive=float(runner.cfg.get("heads_w_contrastive", 0.3)),
+        )
 
 
 def terminal_states(traces, n_states: int):
@@ -82,6 +137,10 @@ def train_periphery_on_teacher_history(runner, traces):
     """Optimise representation-only modules against a fixed downstream net."""
     if not bool(runner.cfg.get("freeze_downstream_policy_value", False)):
         raise ValueError("representation isolation requires frozen downstream policy/value")
+    if not bool(runner.cfg.get("freeze_belief_summary_learning", False)):
+        raise ValueError(
+            "representation isolation requires a frozen common belief summary"
+        )
     if bool(runner.cfg.get("freeze_policy_learning", False)):
         raise ValueError("representation isolation must allow representation gradients")
     metrics = []

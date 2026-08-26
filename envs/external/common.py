@@ -44,8 +44,9 @@ class ExternalCIGAdapter:
     def neighbour_features(self, ego, neighbour, action):
         onehot = np.zeros((self.max_action_dim,), dtype=np.float32)
         action = int(action)
-        if 0 <= action < self.max_action_dim:
-            onehot[action] = 1.0
+        if action < 0 or action >= self.max_action_dim:
+            raise ValueError("neighbour action is outside the adapter action space")
+        onehot[action] = 1.0
         extra = np.asarray(self.env.mechanism_features(neighbour), dtype=np.float32).reshape(-1)
         padded = np.zeros((4,), dtype=np.float32)
         padded[: min(4, extra.size)] = extra[:4]
@@ -113,6 +114,10 @@ class ExternalPopulationMixin:
     def weak_prior_score(self, ego, neighbour):
         rel = np.asarray(self.relation_features(ego, neighbour), dtype=np.float64)
         return float(1.0 / (1.0 + np.linalg.norm(rel)))
+    def candidate_neighbors(self, ego, max_degree):
+        ids = [j for j in range(int(self.n_agents)) if int(j) != int(ego)]
+        ids.sort(key=lambda j: (-self.weak_prior_score(ego, j), int(j)))
+        return ids[: int(max_degree)]
     def feature_snapshot(self):
         return {"relations": np.stack([
             np.stack([
@@ -123,8 +128,11 @@ class ExternalPopulationMixin:
     def pair_features_from_snapshot(self, snapshot, ego, target):
         return np.asarray(snapshot["relations"][int(ego), int(target)], dtype=np.float32)
 
-    def _rollout_reward_sequence(self, forced, horizon, continuation_policy):
+    def _rollout_reward_sequence(
+        self, forced, horizon, continuation_policy, *, return_mask=False
+    ):
         rewards_by_lag = []
+        valid = []
         done = False
         for lag in range(int(horizon)):
             actions = [int(continuation_policy(i)) for i in range(self.n_agents)]
@@ -132,11 +140,19 @@ class ExternalPopulationMixin:
                 actions[int(forced[0])] = int(forced[1])
             _, rewards, done, _ = self.step(actions)
             rewards_by_lag.append(np.asarray(rewards, dtype=np.float64))
+            valid.append(True)
             if done:
+                # A wrapper cannot infer whether this is an absorbing terminal
+                # or a time-limit truncation.  Never turn an unobserved tail
+                # into observed zero rewards; callers receive a censoring mask.
                 for _ in range(lag + 1, int(horizon)):
                     rewards_by_lag.append(np.zeros((self.n_agents,), dtype=np.float64))
+                    valid.append(False)
                 break
-        return np.stack(rewards_by_lag, axis=0)
+        values = np.stack(rewards_by_lag, axis=0)
+        if return_mask:
+            return values, np.asarray(valid, dtype=bool)
+        return values
 
     def _copy_cloned_state(self, state):
         return copy.deepcopy(state)
@@ -146,6 +162,11 @@ class ExternalPopulationMixin:
         forced_step=0, continuation_policy=None, crn_seed=None, discount=0.95,
     ):
         del crn_seed  # determinism comes from clone/restore for these wrappers.
+        if int(n_trials) != 1:
+            raise ValueError(
+                "generic external clone-state oracle is deterministic; "
+                "n_trials must be 1 to avoid pseudo-replication"
+            )
         horizon = int(horizon)
         forced_step = int(forced_step)
         if not 0 <= forced_step < horizon:
@@ -155,18 +176,22 @@ class ExternalPopulationMixin:
         snapshot = self.clone_state()
         response = np.zeros((horizon,), dtype=np.float64)
         try:
-            for _ in range(max(1, int(n_trials))):
+            for _ in range(1):
                 self.restore_state(self._copy_cloned_state(snapshot))
-                base = self._rollout_reward_sequence(None, horizon, continuation_policy)[:, int(ego_id)]
+                base, base_mask = self._rollout_reward_sequence(
+                    None, horizon, continuation_policy, return_mask=True
+                )
                 self.restore_state(self._copy_cloned_state(snapshot))
-                alt = self._rollout_reward_sequence(
+                alt, alt_mask = self._rollout_reward_sequence(
                     (int(agent_j), int(intervention_action), forced_step),
-                    horizon, continuation_policy,
-                )[:, int(ego_id)]
-                response += alt - base
+                    horizon, continuation_policy, return_mask=True
+                )
+                base = base[:, int(ego_id)]
+                alt = alt[:, int(ego_id)]
+                valid_mask = base_mask & alt_mask
+                response += np.where(valid_mask, alt - base, 0.0)
         finally:
             self.restore_state(snapshot)
-        response /= float(max(1, int(n_trials)))
         mass = np.abs(response)
         total_mass = float(mass.sum())
         if total_mass <= 1e-12:
@@ -189,6 +214,8 @@ class ExternalPopulationMixin:
             "response_mass": total_mass,
             "horizon": horizon,
             "forced_step": forced_step,
+            "lag_valid_mask": valid_mask.astype(bool),
+            "horizon_complete": bool(np.all(valid_mask)),
         }
 
     # external_contract.require_panel looks for this shorter alias.
