@@ -43,6 +43,7 @@ except ModuleNotFoundError:
 import run_experiment as RE
 from envs.causal_adapter import build_dynamic_candidate_map, resolve_env_adapter
 from runners.h3_ablation_runner import H3NoMultiMemoryRunner
+from utils.paper_contracts import PAPER_B_SELECTOR_ORACLE_HORIZON
 
 
 VARIANTS = (
@@ -463,8 +464,12 @@ def main(argv=None):
     )
     parser.add_argument(
         "--candidate-recall-horizon", type=int,
-        default=int(RE.default_cfg()["causal_horizon"]),
-        help="Primary structural horizon used by the dynamic candidate-recall oracle.",
+        default=int(PAPER_B_SELECTOR_ORACLE_HORIZON),
+        help=(
+            "One-step structural horizon used by the confirmatory Paper-B "
+            "selector/candidate-recall oracle. Delayed-path validation is a "
+            "separate H>1 latency panel."
+        ),
     )
     parser.add_argument("--candidate-cell-width", type=float, default=4.0)
     parser.add_argument("--candidate-stencil-radius", type=int, default=1)

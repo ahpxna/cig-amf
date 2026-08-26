@@ -51,7 +51,13 @@ CIG_EXTERNAL_GATE_ROOT="${CIG_EXTERNAL_GATE_ROOT:-}"
 # adapter also reports subquadratic candidate construction.
 CIG_PAPER_B_CANDIDATE_MAX_DEGREE="${CIG_PAPER_B_CANDIDATE_MAX_DEGREE:-8}"
 CIG_PAPER_B_CANDIDATE_RECALL_STATES="${CIG_PAPER_B_CANDIDATE_RECALL_STATES:-}"
-CIG_PAPER_B_CANDIDATE_RECALL_HORIZON="${CIG_PAPER_B_CANDIDATE_RECALL_HORIZON:-8}"
+PAPER_B_SELECTOR_ORACLE_HORIZON="$(
+  "$CIG_PYTHON" -c 'from utils.paper_contracts import PAPER_B_SELECTOR_ORACLE_HORIZON; print(PAPER_B_SELECTOR_ORACLE_HORIZON)'
+)" || {
+  echo "Could not load the frozen Paper-B selector-oracle horizon contract." >&2
+  exit 2
+}
+CIG_PAPER_B_CANDIDATE_RECALL_HORIZON="${CIG_PAPER_B_CANDIDATE_RECALL_HORIZON:-$PAPER_B_SELECTOR_ORACLE_HORIZON}"
 CIG_PAPER_B_CANDIDATE_RECALL_TRIALS="${CIG_PAPER_B_CANDIDATE_RECALL_TRIALS:-2}"
 CIG_PAPER_B_CANDIDATE_RECALL_MIN="${CIG_PAPER_B_CANDIDATE_RECALL_MIN:-0.80}"
 CIG_PAPER_B_CANDIDATE_RECALL_STABILITY_MIN="${CIG_PAPER_B_CANDIDATE_RECALL_STABILITY_MIN:-0.80}"
@@ -327,6 +333,11 @@ case "$CIG_PAPER_B_CANDIDATE_MAX_DEGREE" in
     exit 2
     ;;
 esac
+if [ "$CIG_PAPER_B_CANDIDATE_RECALL_HORIZON" != "$PAPER_B_SELECTOR_ORACLE_HORIZON" ]; then
+  echo "Paper-B confirmatory selector/candidate-recall horizon is frozen to $PAPER_B_SELECTOR_ORACLE_HORIZON; received $CIG_PAPER_B_CANDIDATE_RECALL_HORIZON." >&2
+  exit 2
+fi
+
 for CIG_CANDIDATE_RECALL_BUDGET in \
   "$CIG_PAPER_B_CANDIDATE_RECALL_STATES" \
   "$CIG_PAPER_B_CANDIDATE_RECALL_HORIZON" \
@@ -633,8 +644,11 @@ run_logged "preflight" "Behaviour-cloning loss controls" "02_bc_loss_control.log
   "$CIG_PYTHON" test_bc_loss_control.py
 
 if [ -d "$CIG_ROOT/tests" ]; then
+  # Pytest is the canonical regression collector for this repository.  It
+  # also collects unittest.TestCase classes, whereas unittest discovery
+  # silently skips pytest-style test functions.
   run_logged "preflight" "Protocol regression tests" "03_protocol_tests.log" \
-    "$CIG_PYTHON" -m unittest discover -s tests -p 'test_*.py' -v
+    "$CIG_PYTHON" -m pytest -q tests
 fi
 
 if [ "${#CIG_OPERATIONAL_FAILURES[@]}" -gt 0 ]; then

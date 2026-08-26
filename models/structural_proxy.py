@@ -423,6 +423,7 @@ class LocalCounterfactualProxyEnsemble:
         debug_verbose: bool = False,
         forced_only_training: bool = False,
         response_ipw_ablation: bool = False,
+        strict_typed_rows: bool = False,
     ):
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
@@ -438,6 +439,10 @@ class LocalCounterfactualProxyEnsemble:
         # loss. Epsilon forcing supplies support; inverse-propensity weighting
         # is a separately named variance-sensitive ablation, not the default.
         self.response_ipw_ablation = bool(response_ipw_ablation)
+        # Paper-locked rows must carry the complete action-time treatment
+        # contract.  Legacy/development callers may still use compatibility
+        # fallbacks, but confirmatory or strict causal profiles fail closed.
+        self.strict_typed_rows = bool(strict_typed_rows)
         self.n_ensemble = int(n_ensemble)
         self.hidden = int(hidden)
         self.lr = float(lr)
@@ -803,6 +808,27 @@ class LocalCounterfactualProxyEnsemble:
             state_key:
                 Context identifier such as zone ID or coarse position hash.
         """
+        if self.strict_typed_rows:
+            missing = []
+            required = {
+                "valid_action_mask": valid_action_mask,
+                "target_action_proposed": target_action_proposed,
+                "target_action_executed": target_action_executed,
+                "target_pi": target_pi,
+                "target_q": target_q,
+                "target_b": target_b,
+                "target_epsilon": target_epsilon,
+            }
+            for name, value in required.items():
+                if value is None:
+                    missing.append(name)
+            if missing:
+                raise ValueError(
+                    "strict/confirmatory proxy rows require the complete typed "
+                    "action-time treatment contract; missing: "
+                    + ", ".join(missing)
+                )
+
         if target_lag_rewards is not None and target_returns_multi is not None:
             raise ValueError(
                 "Provide target_lag_rewards or target_returns_multi, not both"

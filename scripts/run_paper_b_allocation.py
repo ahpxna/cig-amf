@@ -23,6 +23,7 @@ except ModuleNotFoundError:
 
 import run_experiment as RE
 from envs.causal_adapter import resolve_env_adapter
+from utils.paper_contracts import PAPER_B_SELECTOR_ORACLE_HORIZON
 try:
     from run_h2_selectivity import (
         _capture_frozen_learning_checkpoint,
@@ -238,8 +239,11 @@ def _oracle_capacity_direction_for_state(
     exact state.  H=1 is required so the oracle and learned allocation score do
     not silently differ only because their continuation regimes differ.
     """
-    if int(horizon) != 1:
-        raise ValueError("Paper-B selector oracle is standardized to horizon=1")
+    if int(horizon) != int(PAPER_B_SELECTOR_ORACLE_HORIZON):
+        raise ValueError(
+            "Paper-B selector oracle is standardized to "
+            f"horizon={PAPER_B_SELECTOR_ORACLE_HORIZON}"
+        )
     if target_policy_probs is None:
         raise ValueError("current frozen target-policy probabilities are required")
     target_policy_probs = np.asarray(target_policy_probs, dtype=np.float64)
@@ -699,16 +703,27 @@ def main(argv=None):
     parser.add_argument("--variants", nargs="+", choices=list(VARIANTS), default=None)
     parser.add_argument("--out-root", default=os.path.join(ROOT, "results", "paper_b_allocation"))
     args = parser.parse_args(argv)
+    if args.oracle_trials < 2:
+        parser.error(
+            "--oracle-trials must be at least 2 so oracle rankings are not "
+            "defined by a single stochastic rollout per action"
+        )
+    if args.oracle_replicates < 2:
+        parser.error(
+            "--oracle-replicates must be at least 2 for the independent "
+            "top-k ranking-stability gate"
+        )
     if (
         args.episodes <= 0 or args.pretrain_episodes <= 0
         or args.selector_states <= 0 or args.challenge_oversample <= 0
-        or args.oracle_trials < 2 or args.oracle_replicates < 2
         or not 0.0 <= args.oracle_stability_min <= 1.0
         or args.core_budget <= 0 or args.agent_count <= args.core_budget
         or not args.seeds
     ):
         parser.error(
-            "episodes, pretrain episodes, core budget, and seeds must be positive"
+            "episodes, pretrain episodes, selector/challenge state budgets, "
+            "core budget, agent count, and seeds must satisfy their positive "
+            "confirmatory constraints"
         )
     if len(set(args.seeds)) != len(args.seeds):
         parser.error("seeds must be unique")

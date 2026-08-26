@@ -267,6 +267,7 @@ class FinalCIGAMFRunner:
             debug_verbose=cfg.get("debug_verbose", False),
             forced_only_training=cfg.get("proxy_forced_only_training", False),
             response_ipw_ablation=cfg.get("proxy_response_ipw_ablation", False),
+            strict_typed_rows=(confirmatory or strict_causal_profile),
         )
 
         self.pair_rel_module = PairRelationalModule(
