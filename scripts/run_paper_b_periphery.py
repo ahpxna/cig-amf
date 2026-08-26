@@ -39,12 +39,14 @@ from models.single_mean_memory import SingleMeanPeripheral
 try:
     from representation_isolation import (
         collect_teacher_trajectory, terminal_states, train_periphery_on_teacher_history,
-        teacher_history_hashes, replay_pair_history,
+        teacher_history_hashes, replay_pair_history, collect_aligned_reference_targets,
+        probe_periphery_on_teacher_history, reference_targets_as_probe, _reference_target_hash,
     )
 except ModuleNotFoundError:
     from scripts.representation_isolation import (
         collect_teacher_trajectory, terminal_states, train_periphery_on_teacher_history,
-        teacher_history_hashes, replay_pair_history,
+        teacher_history_hashes, replay_pair_history, collect_aligned_reference_targets,
+        probe_periphery_on_teacher_history, reference_targets_as_probe, _reference_target_hash,
     )
 
 
@@ -186,7 +188,14 @@ def _memory_accounting(runner):
     return {
         "trainable_parameter_bytes": int(trainable),
         "persistent_representation_state_bytes": int(persistent),
+        # Analytic storage accounting only.  This intentionally excludes
+        # optimizer state, replay, temporary tensors and allocator peaks; the
+        # scaling panel records runtime peak memory separately.
         "representation_memory_bytes": int(trainable + persistent),
+        "representation_memory_accounting_protocol": (
+            "analytic_trainable_parameters_plus_persistent_representation_state"
+        ),
+        "representation_memory_is_runtime_peak": 0,
     }
 
 
@@ -443,10 +452,15 @@ def _run_variant(
 
 
 def _representation_isolation_probe(
-    name, seed, core_budget, device, checkpoint, oracle_capacity, traces, bank,
+    name, seed, core_budget, device, checkpoint, oracle_capacity, traces,
+    reference_targets,
 ):
-    """Train only peripheral representation against a frozen common policy."""
+    """Train only peripheral representation against frozen Full-Explicit targets."""
     spec = VARIANTS[name]
+    if spec["runner"] == "full":
+        # The reference is not a trainable periphery arm.  Returning the exact
+        # target history prevents a vacuous empty-periphery "training" pass.
+        return reference_targets_as_probe(reference_targets)
     cfg = _cfg(seed, core_budget)
     cfg.update({key: value for key, value in spec.items() if key != "runner"})
     cfg["freeze_downstream_policy_value"] = True
@@ -456,39 +470,18 @@ def _representation_isolation_probe(
     env = _env(seed)
     if bool(spec.get("match_semantic_memory", False)):
         cfg.update(_matched_single_mean_dimensions(cfg, action_dim=env.get_action_dim()))
-    if spec["runner"] == "full":
-        cfg["core_selection_mode"] = "full_explicit"
     runner = (
         H3NoMultiMemoryRunner(env, cfg, device=device)
         if spec["runner"] == "single"
         else RE.make_runner("Final-CIGAMF", env, cfg, device)
     )
     _restore_shared_state(runner, checkpoint)
-    _seed_oracle_core(runner, core_budget, oracle_capacity,
-                      full_explicit=(spec["runner"] == "full"))
-    train_periphery_on_teacher_history(runner, traces)
-    # Reset the shared recurrent/belief state to the common checkpoint while
-    # retaining the just-trained peripheral module, then replay the immutable
-    # teacher actions.  Fidelity is probed only at each trace terminal so the
-    # environment snapshot and recurrent representation refer to the same t.
-    _restore_shared_state(runner, checkpoint)
-    _seed_oracle_core(
-        runner, core_budget, oracle_capacity,
-        full_explicit=(spec["runner"] == "full"),
-    )
-    probes = []
-    for trace in traces:
-        if not trace:
-            continue
-        replay_pair_history(runner, [trace], train_bc=False, bc_steps=0)
-        terminal = terminal_states([trace], n_states=1)
-        probes.append(_probe_state_bank(runner, terminal))
-    if not probes:
-        raise ValueError("periphery fidelity requires non-empty teacher traces")
-    return {
-        key: np.concatenate([item[key] for item in probes], axis=0)
-        for key in ("logits", "values", "actions")
-    }
+    _seed_oracle_core(runner, core_budget, oracle_capacity, full_explicit=False)
+    train_periphery_on_teacher_history(runner, traces, reference_targets)
+    # Probe exactly the same immutable pre-action rows that supplied the
+    # Full-Explicit targets.  No forcing, sampling, V-trace, or state-bank
+    # reconstruction enters the fidelity metric.
+    return probe_periphery_on_teacher_history(runner, traces)
 
 
 def main(argv=None):
@@ -535,11 +528,27 @@ def main(argv=None):
             raise RuntimeError(
                 "Paper-B periphery isolation teacher produced zero peripheral items"
             )
-        fidelity_bank = [
-            copy.deepcopy(trace[-1]["env_snapshot_after_step"])
-            for trace in teacher_traces if trace
-        ]
-        state_bank_hash = _state_bank_sha256(fidelity_bank)
+        # Build the decision target from a true Full-Explicit reference on the
+        # same factual pre-action history.  The reference is collected once per
+        # seed and then hashed; every representation arm consumes exactly this
+        # immutable target tensor.
+        reference_cfg = _cfg(seed, args.core_budget)
+        reference_cfg.update({
+            "core_selection_mode": "full_explicit",
+            "freeze_policy_learning": True,
+            "freeze_graph_updates": True,
+        })
+        reference_runner = RE.make_runner(
+            "Final-CIGAMF", _env(seed), reference_cfg, args.device
+        )
+        _restore_shared_state(reference_runner, checkpoint)
+        _seed_oracle_core(
+            reference_runner, args.core_budget, oracle_capacity, full_explicit=True
+        )
+        reference_targets = collect_aligned_reference_targets(
+            reference_runner, teacher_traces
+        )
+        reference_target_hash = _reference_target_hash(reference_targets)
         variants = {}
         for name in selected_variants:
             variants[name] = _run_variant(
@@ -549,11 +558,11 @@ def main(argv=None):
         isolation_probes = {
             name: _representation_isolation_probe(
                 name, seed, args.core_budget, args.device, checkpoint,
-                oracle_capacity, teacher_traces, fidelity_bank,
+                oracle_capacity, teacher_traces, reference_targets,
             )
             for name in selected_variants
         }
-        reference = isolation_probes.get("Full-Explicit")
+        reference = reference_targets_as_probe(reference_targets)
         for name, (row, probe) in variants.items():
             if reference is None:
                 row.update({
@@ -566,13 +575,13 @@ def main(argv=None):
                 row.update(_decision_fidelity(isolation_probes[name], reference))
                 row["decision_fidelity_reference"] = "Full-Explicit"
                 row["decision_fidelity_protocol"] = (
-                    "common_checkpoint_frozen_downstream_teacher_forced_history"
+                    "common_checkpoint_full_explicit_distillation_on_immutable_pre_action_history"
                 )
                 row["decision_fidelity_history_steps"] = int(sum(
                     len(trace) for trace in teacher_traces
                 ))
             row.update(provenance)
-            row["decision_fidelity_state_bank_sha256"] = state_bank_hash
+            row["full_explicit_target_sha256"] = reference_target_hash
             row["decision_fidelity_downstream_checkpoint_sha256"] = str(
                 checkpoint["sha256"]
             )
@@ -594,6 +603,8 @@ def main(argv=None):
         "variants": list(selected_variants),
         "isolation_teacher": "oracle_fixed_k_core_common_history",
         "isolation_teacher_requires_nonempty_periphery": True,
+        "isolation_objective": "KL_full_to_variant_plus_value_MSE_plus_periphery_aux",
+        "isolation_reference": "aligned_full_explicit_pre_action_targets",
         "memory_budget_control": {
             "variant": "Single-Mean-Matched",
             "target": "Semantic-Free trainable peripheral parameter bytes",

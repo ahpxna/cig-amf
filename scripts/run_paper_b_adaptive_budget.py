@@ -1,9 +1,9 @@
 """Paper-B entropy-adaptive core-budget panel.
 
-Adaptive k is compared with every fixed integer k in [k_min, k_max].  A
-single fixed-k comparator is selected from pooled *representation-cost* data
-(K_t/N), never reward, then reused for every seed.  This preserves paired
-inference and prevents the matched comparator itself from changing by seed.
+Adaptive k is compared with every fixed integer k in [k_min, k_max]. A
+single fixed-k comparator is frozen from a disjoint pilot seed set using only
+Adaptive-K representation cost (K_t/N), never reward or confirmatory
+trajectories. The frozen comparator is then reused for every confirmatory seed.
 """
 from __future__ import annotations
 
@@ -127,6 +127,13 @@ def _run(seed, episodes, device, variant, k_min, k_max, n_agents=24):
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", type=int, nargs="+", required=True)
+    parser.add_argument(
+        "--matching-seeds", type=int, nargs="+", default=[10001, 10002, 10003],
+        help=(
+            "Disjoint pilot seeds used only to freeze the matched fixed-k "
+            "comparator from Adaptive-K K_t/N cost before confirmatory runs."
+        ),
+    )
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--k-min", type=int, default=2)
     parser.add_argument("--k-max", type=int, default=5)
@@ -138,6 +145,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not args.seeds or len(set(args.seeds)) != len(args.seeds):
         parser.error("--seeds must be non-empty and unique")
+    if not args.matching_seeds or len(set(args.matching_seeds)) != len(args.matching_seeds):
+        parser.error("--matching-seeds must be non-empty and unique")
+    if set(args.seeds) & set(args.matching_seeds):
+        parser.error("matching seeds must be disjoint from confirmatory --seeds")
     if (
         args.episodes <= 0 or args.k_min < 1 or args.k_max < args.k_min
         or args.agent_count <= args.k_max
@@ -147,6 +158,27 @@ def main(argv=None):
     variants = ["Adaptive-K"] + [
         f"Fixed-K-{k}" for k in range(int(args.k_min), int(args.k_max) + 1)
     ] + ["Full-Explicit"]
+
+    # Freeze the matched comparator on disjoint pilot seeds before any
+    # confirmatory trajectory is generated.  Fixed-K cost is nominally k per
+    # ego in this panel, so nearest-integer matching needs only Adaptive-K
+    # pilot runs and cannot inspect confirmatory outcomes.
+    pilot_adaptive_rows = []
+    for seed in args.matching_seeds:
+        pilot_row, _ = _run(
+            seed, args.episodes, args.device, "Adaptive-K", args.k_min, args.k_max,
+            n_agents=args.agent_count,
+        )
+        pilot_adaptive_rows.append(pilot_row)
+    pilot_adaptive_cost = _mean(
+        row["mean_core_cost_per_ego"] for row in pilot_adaptive_rows
+    )
+    if not np.isfinite(pilot_adaptive_cost):
+        raise RuntimeError("pilot Adaptive-K cost is non-finite")
+    matched_k = int(np.floor(float(pilot_adaptive_cost) + 0.5))
+    matched_k = int(np.clip(matched_k, int(args.k_min), int(args.k_max)))
+    matched = f"Fixed-K-{matched_k}"
+
     results_by_seed = {}
     for seed in args.seeds:
         results_by_seed[int(seed)] = {
@@ -157,20 +189,10 @@ def main(argv=None):
             for variant in variants
         }
 
-    fixed_names = [name for name in variants if name.startswith("Fixed-K-")]
+    # Descriptive confirmatory cost only; it does not select the comparator.
     adaptive_cost = _mean(
         results_by_seed[int(seed)]["Adaptive-K"][0]["mean_core_cost_per_ego"]
         for seed in args.seeds
-    )
-    fixed_costs = {
-        name: _mean(
-            results_by_seed[int(seed)][name][0]["mean_core_cost_per_ego"]
-            for seed in args.seeds
-        )
-        for name in fixed_names
-    }
-    matched = min(
-        fixed_names, key=lambda name: abs(float(fixed_costs[name]) - adaptive_cost)
     )
 
     rows = []
@@ -208,7 +230,13 @@ def main(argv=None):
         "k_max": int(args.k_max),
         "agent_count": int(args.agent_count),
         "variants": variants,
-        "matching_rule": "single fixed k nearest pooled adaptive mean K_t/N cost; selected without reward",
+        "matching_rule": (
+            "single fixed k frozen from disjoint pilot Adaptive-K mean K_t/N; "
+            "nearest integer within [k_min,k_max]; no reward or confirmatory trajectory used"
+        ),
+        "matching_seeds": [int(seed) for seed in args.matching_seeds],
+        "matching_seed_disjoint": True,
+        "pilot_adaptive_core_cost_per_ego": float(pilot_adaptive_cost),
         "matched_fixed_variant": matched,
         "pooled_adaptive_core_cost_per_ego": float(adaptive_cost),
         "summary": summary,

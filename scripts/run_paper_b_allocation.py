@@ -58,7 +58,9 @@ def _decision_probe(runner, n_states, seed):
         for state in bank:
             runner.env.restore_state(copy.deepcopy(state))
             obs = runner.env._get_obs_all()
-            selected, cache = runner._select_actions_population(obs)
+            selected, cache = runner._select_actions_population(
+                obs, apply_forcing=False
+            )
             logits.append(np.asarray(cache["policy_logits"], dtype=np.float64))
             values.append(np.asarray(
                 [cache["value_cache"][ego] for ego in range(runner.n_agents)],
@@ -205,7 +207,9 @@ def _policy_context_for_state(runner, state):
     try:
         runner.env.restore_state(copy.deepcopy(state))
         obs_all = runner.env._get_obs_all()
-        _sampled, cache = runner._select_actions_population(obs_all)
+        _sampled, cache = runner._select_actions_population(
+            obs_all, apply_forcing=False
+        )
         logits = np.asarray(cache["policy_logits"], dtype=np.float64)
         actions = np.argmax(logits, axis=-1).astype(np.int64)
         probs = np.asarray(cache["policy_probs"], dtype=np.float64)
@@ -337,6 +341,66 @@ def _oracle_capacity_for_state(
     return capacities
 
 
+
+
+def _mean_score_tables(tables):
+    """Elementwise mean of oracle ego->neighbour score tables."""
+    if not tables:
+        raise ValueError("oracle score table list is empty")
+    egos = set(tables[0])
+    if any(set(table) != egos for table in tables[1:]):
+        raise ValueError("oracle replicas disagree on ego keys")
+    out = {}
+    for ego in sorted(egos):
+        neighbours = set(tables[0][ego])
+        if any(set(table[ego]) != neighbours for table in tables[1:]):
+            raise ValueError("oracle replicas disagree on neighbour keys")
+        out[int(ego)] = {
+            int(j): float(np.mean([float(table[ego][j]) for table in tables]))
+            for j in neighbours
+        }
+    return out
+
+
+def _topk_jaccard(left_scores, right_scores, ego, k, *, absolute=False):
+    def transform(row):
+        return {
+            int(j): abs(float(v)) if absolute else float(v)
+            for j, v in row.items()
+        }
+    left = _top_k(transform(left_scores[int(ego)]), ego, k)
+    right = _top_k(transform(right_scores[int(ego)]), ego, k)
+    union = left | right
+    return 1.0 if not union else float(len(left & right) / len(union))
+
+
+def _oracle_replica_summary(replicas, core_budget):
+    """Return averaged C/D plus worst-ego top-k repeatability across replicas."""
+    if len(replicas) < 2:
+        raise ValueError("oracle ranking stability requires at least two replicas")
+    capacities = [item[0] for item in replicas]
+    directions = [item[1] for item in replicas]
+    c_mean = _mean_score_tables(capacities)
+    d_mean = _mean_score_tables(directions)
+    c_jaccards, d_jaccards = [], []
+    base_c, base_d = capacities[0], directions[0]
+    for replica_c, replica_d in zip(capacities[1:], directions[1:]):
+        for ego in base_c:
+            c_jaccards.append(
+                _topk_jaccard(base_c, replica_c, ego, core_budget, absolute=False)
+            )
+            d_jaccards.append(
+                _topk_jaccard(base_d, replica_d, ego, core_budget, absolute=True)
+            )
+    return {
+        "capacity": c_mean,
+        "direction": d_mean,
+        "min_c_topk_jaccard": float(min(c_jaccards)) if c_jaccards else 1.0,
+        "min_absd_topk_jaccard": float(min(d_jaccards)) if d_jaccards else 1.0,
+        "mean_c_topk_jaccard": float(np.mean(c_jaccards)) if c_jaccards else 1.0,
+        "mean_absd_topk_jaccard": float(np.mean(d_jaccards)) if d_jaccards else 1.0,
+    }
+
 def _mean_oracle_capacity(oracle_bank):
     if not oracle_bank:
         raise ValueError("oracle capacity bank is empty")
@@ -440,10 +504,13 @@ def _isolation_rows(
                 behaviour_probs=None,
                 policy_probs=np.asarray(common["policy_probs"], dtype=np.float64),
             )
-            decision_actions, decision_cache = runner._select_actions_population(obs_all)
-            actions = [
-                int(decision_actions[agent]) for agent in range(runner.n_agents)
-            ]
+            _decision_actions, decision_cache = runner._select_actions_population(obs_all)
+            # Fidelity is a deterministic property of the policy distribution,
+            # not of epsilon-forcing/sampling noise.  Always derive the compared
+            # action from the masked policy logits.
+            actions = np.argmax(
+                np.asarray(decision_cache["policy_logits"], dtype=np.float64), axis=-1
+            ).astype(np.int64).tolist()
             for ego, belief in runner.belief_modules.items():
                 predicted_ranking = sorted(
                     belief.get_core_set(),
@@ -619,6 +686,14 @@ def main(argv=None):
         help="Oracle-only oversampling factor used to construct C* vs |D*| disagreement states.",
     )
     parser.add_argument("--oracle-trials", type=int, default=8)
+    parser.add_argument(
+        "--oracle-replicates", type=int, default=2,
+        help="Independent CRN oracle replicas used to gate top-k ranking stability.",
+    )
+    parser.add_argument(
+        "--oracle-stability-min", type=float, default=0.80,
+        help="Frozen minimum worst-ego top-k Jaccard for both C* and |D*|.",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--agent-count", type=int, default=24)
     parser.add_argument("--variants", nargs="+", choices=list(VARIANTS), default=None)
@@ -627,7 +702,8 @@ def main(argv=None):
     if (
         args.episodes <= 0 or args.pretrain_episodes <= 0
         or args.selector_states <= 0 or args.challenge_oversample <= 0
-        or args.oracle_trials < 2
+        or args.oracle_trials < 2 or args.oracle_replicates < 2
+        or not 0.0 <= args.oracle_stability_min <= 1.0
         or args.core_budget <= 0 or args.agent_count <= args.core_budget
         or not args.seeds
     ):
@@ -669,16 +745,33 @@ def main(argv=None):
             _policy_context_for_state(reference_runner, state)
             for state in candidate_states
         ]
-        candidate_oracles = [
-            _oracle_capacity_direction_for_state(
-                reference_runner.env, state, horizon=horizon, discount=discount,
-                trials=args.oracle_trials, seed=bank_seed + state_index * 100003,
-                target_policy_probs=teacher_contexts_all[state_index]["policy_probs"],
+        candidate_oracles = []
+        for state_index, state in enumerate(candidate_states):
+            replicas = [
+                _oracle_capacity_direction_for_state(
+                    reference_runner.env, state, horizon=horizon, discount=discount,
+                    trials=args.oracle_trials,
+                    seed=(
+                        bank_seed + state_index * 100003
+                        + replica_index * 10000019
+                    ),
+                    target_policy_probs=teacher_contexts_all[state_index]["policy_probs"],
+                )
+                for replica_index in range(int(args.oracle_replicates))
+            ]
+            candidate_oracles.append(
+                _oracle_replica_summary(replicas, args.core_budget)
             )
-            for state_index, state in enumerate(candidate_states)
+        stable_flags = [
+            bool(
+                item["min_c_topk_jaccard"] >= float(args.oracle_stability_min)
+                and item["min_absd_topk_jaccard"] >= float(args.oracle_stability_min)
+            )
+            for item in candidate_oracles
         ]
         challenge_flags = []
-        for c_scores, d_scores in candidate_oracles:
+        for item in candidate_oracles:
+            c_scores, d_scores = item["capacity"], item["direction"]
             has_disagreement = any(
                 _top_k(c_scores[ego], ego, args.core_budget) != _top_k(
                     {j: abs(float(v)) for j, v in d_scores[ego].items()},
@@ -687,17 +780,25 @@ def main(argv=None):
                 for ego in c_scores
             )
             challenge_flags.append(bool(has_disagreement))
+        stable_indices = [index for index, flag in enumerate(stable_flags) if flag]
+        if len(stable_indices) < int(args.selector_states):
+            raise RuntimeError(
+                "oracle selector bank failed the frozen ranking-stability gate: "
+                f"stable={len(stable_indices)} required={int(args.selector_states)} "
+                f"threshold={float(args.oracle_stability_min):.3f}"
+            )
         selected_indices = sorted(
-            range(candidate_count), key=lambda index: (not challenge_flags[index], index)
+            stable_indices, key=lambda index: (not challenge_flags[index], index)
         )[:int(args.selector_states)]
         state_bank = [candidate_states[index] for index in selected_indices]
-        oracle_bank = [candidate_oracles[index][0] for index in selected_indices]
+        oracle_bank = [candidate_oracles[index]["capacity"] for index in selected_indices]
         oracle_direction_bank = [
-            candidate_oracles[index][1] for index in selected_indices
+            candidate_oracles[index]["direction"] for index in selected_indices
         ]
+        selected_stability = [candidate_oracles[index] for index in selected_indices]
         teacher_contexts = [teacher_contexts_all[index] for index in selected_indices]
         mean_oracle_capacity = _mean_oracle_capacity(oracle_bank)
-        rows.extend(_isolation_rows(
+        isolation_rows = _isolation_rows(
             selected_variants,
             seed,
             args.core_budget,
@@ -708,7 +809,24 @@ def main(argv=None):
             oracle_direction_bank,
             teacher_contexts,
             n_agents=args.agent_count,
-        ))
+        )
+        stability_summary = {
+            "oracle_min_c_topk_jaccard": float(min(
+                item["min_c_topk_jaccard"] for item in selected_stability
+            )),
+            "oracle_min_absd_topk_jaccard": float(min(
+                item["min_absd_topk_jaccard"] for item in selected_stability
+            )),
+            "oracle_mean_c_topk_jaccard": float(np.mean([
+                item["mean_c_topk_jaccard"] for item in selected_stability
+            ])),
+            "oracle_mean_absd_topk_jaccard": float(np.mean([
+                item["mean_absd_topk_jaccard"] for item in selected_stability
+            ])),
+        }
+        for row in isolation_rows:
+            row.update(stability_summary)
+        rows.extend(isolation_rows)
         end_to_end = {}
         for variant in selected_variants:
             end_to_end[variant] = _end_to_end_row(
@@ -751,6 +869,10 @@ def main(argv=None):
         "challenge_oversample": args.challenge_oversample,
         "challenge_selected_state_count_by_seed": "see summary disagreement_pair_state_count",
         "oracle_trials": args.oracle_trials,
+        "oracle_replicates": int(args.oracle_replicates),
+        "oracle_stability_min": float(args.oracle_stability_min),
+        "oracle_stability_gate": "worst-ego top-k Jaccard for C* and |D*|",
+        "oracle_stable_candidate_count_by_seed": "fail-closed before state selection",
         "selector_bank_seed_rule": "training_seed_plus_88001",
         "selector_bank_held_out": True,
         "variants": {name: VARIANTS[name] for name in selected_variants},

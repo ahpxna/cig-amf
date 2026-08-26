@@ -12,6 +12,8 @@ import hashlib
 import pickle
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 from models.influence_signature import CausalPairSignal
 
@@ -189,17 +191,266 @@ def terminal_states(traces, n_states: int):
     return [states[int(index)] for index in indices]
 
 
-def train_periphery_on_teacher_history(runner, traces):
-    """Optimise representation-only modules against a fixed downstream net."""
+def _reference_target_hash(reference_targets):
+    """Stable hash of the exact Full-Explicit logits/value targets."""
+    if not reference_targets or not any(reference_targets):
+        raise ValueError("reference target history is empty")
+    canonical = []
+    for trajectory in reference_targets:
+        row = []
+        for target in trajectory:
+            row.append((
+                np.asarray(target["logits"], dtype=np.float32),
+                np.asarray(target["values"], dtype=np.float32),
+                np.asarray(target["valid_action_masks"], dtype=bool),
+            ))
+        canonical.append(row)
+    return hashlib.sha256(
+        pickle.dumps(canonical, protocol=pickle.HIGHEST_PROTOCOL)
+    ).hexdigest()
+
+
+def _teacher_step_tensors(runner, step):
+    """Build the common non-peripheral inputs for one immutable teacher step."""
+    obs = torch.as_tensor(
+        np.stack([
+            runner.env_adapter.observation(step["obs_all"], ego)
+            for ego in range(runner.n_agents)
+        ]),
+        dtype=torch.float32, device=runner.device,
+    )
+    core = torch.as_tensor(
+        np.stack([step["core_summary_cache"][ego] for ego in range(runner.n_agents)]),
+        dtype=torch.float32, device=runner.device,
+    )
+    belief = torch.stack([
+        runner._belief_summary_tensor_from_items(step["belief_items_cache"][ego])
+        for ego in range(runner.n_agents)
+    ], dim=0)
+    valid = np.asarray(step.get("valid_action_masks"), dtype=bool)
+    if valid.shape != (runner.n_agents, runner.action_dim) or np.any(valid.sum(axis=1) == 0):
+        raise ValueError("teacher history contains malformed valid-action masks")
+    return obs, core, belief, valid
+
+
+def collect_aligned_reference_targets(runner, traces):
+    """Collect Full-Explicit targets on the exact factual pre-action history.
+
+    The reference runner starts from the same frozen checkpoint as the
+    representation variants, promotes every neighbour to the explicit tier, and
+    is then teacher-forced through the immutable factual action sequence.  The
+    target at each row is computed *before* the factual action is applied, so the
+    recurrent pair state and environment state refer to the same timestep.
+    Forcing/sampling is never invoked on this path.
+    """
+    if str(runner.cfg.get("core_selection_mode", "")).strip().lower() != "full_explicit":
+        raise ValueError("reference target collection requires a Full-Explicit runner")
+    targets = []
+    for trajectory in traces:
+        trajectory_targets = []
+        for step in trajectory:
+            before = copy.deepcopy(step["env_snapshot_before_step"])
+            after = copy.deepcopy(step["env_snapshot_after_step"])
+            runner.env_adapter.restore_state(before)
+            obs = torch.as_tensor(
+                np.stack([
+                    runner.env_adapter.observation(step["obs_all"], ego)
+                    for ego in range(runner.n_agents)
+                ]),
+                dtype=torch.float32, device=runner.device,
+            )
+            core = torch.as_tensor(
+                np.stack([runner._core_summary_for_ego(ego) for ego in range(runner.n_agents)]),
+                dtype=torch.float32, device=runner.device,
+            )
+            # Hold the belief projection common across the isolation arms.  The
+            # Full-Explicit target differs only in the explicit relational
+            # representation, not in a separately evolving belief encoder.
+            belief = torch.stack([
+                runner._belief_summary_tensor_from_items(step["belief_items_cache"][ego])
+                for ego in range(runner.n_agents)
+            ], dim=0)
+            periph = torch.as_tensor(
+                np.stack([
+                    runner._periph_summary_np_from_inputs([])
+                    for _ego in range(runner.n_agents)
+                ]),
+                dtype=torch.float32, device=runner.device,
+            )
+            valid = np.asarray(step.get("valid_action_masks"), dtype=bool)
+            if valid.shape != (runner.n_agents, runner.action_dim) or np.any(valid.sum(axis=1) == 0):
+                raise ValueError("reference history contains malformed valid-action masks")
+            with torch.no_grad():
+                logits, values = runner.policy_value(
+                    obs, core, periph, belief, valid_action_mask=valid
+                )
+            trajectory_targets.append({
+                "logits": logits.detach().cpu().numpy().astype(np.float32),
+                "values": values.detach().cpu().numpy().astype(np.float32),
+                "valid_action_masks": valid.copy(),
+            })
+            actions = [int(value) for value in step["actions"]]
+            runner.pair_rel_module.step_population(
+                obs_all=step["obs_all"], actions=actions, env=runner.env
+            )
+            runner.env_adapter.restore_state(after)
+        targets.append(trajectory_targets)
+    return targets
+
+
+def _masked_policy_kl(student_logits, teacher_logits, valid_mask):
+    """KL(teacher||student) over state-valid actions only, without 0*inf NaNs."""
+    valid = torch.as_tensor(valid_mask, dtype=torch.bool, device=student_logits.device)
+    if valid.shape != student_logits.shape or teacher_logits.shape != student_logits.shape:
+        raise ValueError("distillation logits/mask shape mismatch")
+    if not bool(valid.any(dim=1).all()):
+        raise ValueError("distillation mask contains an empty valid-action row")
+    student_masked = student_logits.masked_fill(~valid, -torch.inf)
+    teacher_masked = teacher_logits.masked_fill(~valid, -torch.inf)
+    teacher_prob = torch.softmax(teacher_masked, dim=-1)
+    student_logp = torch.log_softmax(student_masked, dim=-1)
+    teacher_logp = torch.where(
+        valid, torch.log(torch.clamp(teacher_prob, min=1e-12)), torch.zeros_like(teacher_prob)
+    )
+    terms = torch.where(
+        valid, teacher_prob * (teacher_logp - student_logp), torch.zeros_like(teacher_prob)
+    )
+    return terms.sum(dim=-1).mean()
+
+
+def train_periphery_on_teacher_history(runner, traces, reference_targets):
+    """Train only peripheral representation by Full-Explicit distillation.
+
+    This intentionally does not call ``runner.update_policy``.  That routine
+    consumes teacher-cached V-trace/value targets while differentiating through
+    the current representation arm, creating a hybrid objective that is neither
+    clean off-policy RL nor a controlled representation test.
+    """
     if not bool(runner.cfg.get("freeze_downstream_policy_value", False)):
         raise ValueError("representation isolation requires frozen downstream policy/value")
     if not bool(runner.cfg.get("freeze_belief_summary_learning", False)):
-        raise ValueError(
-            "representation isolation requires a frozen common belief summary"
-        )
-    if bool(runner.cfg.get("freeze_policy_learning", False)):
-        raise ValueError("representation isolation must allow representation gradients")
+        raise ValueError("representation isolation requires a frozen common belief summary")
+    if len(traces) != len(reference_targets):
+        raise ValueError("teacher/reference trajectory count mismatch")
+    for parameter in runner.policy_value.parameters():
+        if parameter.requires_grad:
+            raise ValueError("downstream policy/value parameters must be frozen")
+    for parameter in runner.belief_summary_builder.parameters():
+        if parameter.requires_grad:
+            raise ValueError("belief-summary parameters must be frozen")
+    trainable = [p for p in runner.periph_module.parameters() if p.requires_grad]
+    if not trainable:
+        return []
+    optim = torch.optim.Adam(
+        trainable, lr=float(runner.cfg.get("representation_distill_lr", runner.cfg.get("policy_lr", 1e-3)))
+    )
+    lambda_pi = float(runner.cfg.get("representation_distill_policy_coeff", 1.0))
+    lambda_v = float(runner.cfg.get("representation_distill_value_coeff", 1.0))
+    lambda_aux = float(runner.cfg.get("representation_distill_aux_coeff", 1.0))
     metrics = []
-    for trajectory in traces:
-        metrics.append(runner.update_policy(trajectory))
+    for trajectory, target_trajectory in zip(traces, reference_targets):
+        if len(trajectory) != len(target_trajectory):
+            raise ValueError("teacher/reference timestep count mismatch")
+        total = None
+        policy_total = None
+        value_total = None
+        aux_total = None
+        count = 0
+        for step, target in zip(trajectory, target_trajectory):
+            obs, core, belief, valid = _teacher_step_tensors(runner, step)
+            periph_rows, aux_rows = [], []
+            for ego in range(runner.n_agents):
+                out = runner._periph_full_from_inputs(step["periph_inputs_cache"][ego])
+                periph_rows.append(out["memory"])
+                aux_rows.append(out["aux_loss"])
+            periph = torch.stack(periph_rows, dim=0)
+            logits, values = runner.policy_value(
+                obs, core, periph, belief, valid_action_mask=valid
+            )
+            teacher_logits = torch.as_tensor(
+                target["logits"], dtype=torch.float32, device=runner.device
+            )
+            teacher_values = torch.as_tensor(
+                target["values"], dtype=torch.float32, device=runner.device
+            )
+            pi_loss = _masked_policy_kl(logits, teacher_logits, valid)
+            v_loss = F.mse_loss(values, teacher_values)
+            aux_loss = torch.stack([
+                item if torch.is_tensor(item) else torch.as_tensor(item, dtype=torch.float32, device=runner.device)
+                for item in aux_rows
+            ]).mean() if aux_rows else torch.zeros((), device=runner.device)
+            loss = lambda_pi * pi_loss + lambda_v * v_loss + lambda_aux * aux_loss
+            total = loss if total is None else total + loss
+            policy_total = pi_loss if policy_total is None else policy_total + pi_loss
+            value_total = v_loss if value_total is None else value_total + v_loss
+            aux_total = aux_loss if aux_total is None else aux_total + aux_loss
+            count += 1
+        if count <= 0:
+            continue
+        optim.zero_grad(set_to_none=True)
+        loss = total / float(count)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            trainable, float(runner.cfg.get("policy_grad_clip", 0.5))
+        )
+        optim.step()
+        metrics.append({
+            "loss": float(loss.detach().cpu()),
+            "policy_kl": float((policy_total / float(count)).detach().cpu()),
+            "value_mse": float((value_total / float(count)).detach().cpu()),
+            "aux_loss": float((aux_total / float(count)).detach().cpu()),
+        })
     return metrics
+
+
+def probe_periphery_on_teacher_history(runner, traces):
+    """Numerically side-effect-free probe on immutable pre-action rows."""
+    logits, values, actions = [], [], []
+    module = runner.periph_module
+    setter = getattr(module, "set_diagnostics_enabled", None)
+    previous_diag = setter(False) if callable(setter) else None
+    try:
+        for trajectory in traces:
+            for step in trajectory:
+                obs, core, belief, valid = _teacher_step_tensors(runner, step)
+                periph = torch.stack([
+                    runner._periph_summary_tensor_from_inputs(
+                        step["periph_inputs_cache"][ego]
+                    )
+                    for ego in range(runner.n_agents)
+                ], dim=0)
+                with torch.no_grad():
+                    step_logits, step_values = runner.policy_value(
+                        obs, core, periph, belief, valid_action_mask=valid
+                    )
+                arr = step_logits.detach().cpu().numpy().astype(np.float64)
+                logits.append(arr)
+                values.append(step_values.detach().cpu().numpy().astype(np.float64))
+                actions.append(np.argmax(arr, axis=-1).astype(np.int64))
+    finally:
+        if callable(setter) and previous_diag is not None:
+            setter(previous_diag)
+    if not logits:
+        raise ValueError("cannot probe an empty teacher history")
+    return {
+        "logits": np.stack(logits, axis=0),
+        "values": np.stack(values, axis=0),
+        "actions": np.stack(actions, axis=0),
+    }
+
+
+def reference_targets_as_probe(reference_targets):
+    logits, values, actions = [], [], []
+    for trajectory in reference_targets:
+        for target in trajectory:
+            arr = np.asarray(target["logits"], dtype=np.float64)
+            logits.append(arr)
+            values.append(np.asarray(target["values"], dtype=np.float64))
+            actions.append(np.argmax(arr, axis=-1).astype(np.int64))
+    if not logits:
+        raise ValueError("reference target history is empty")
+    return {
+        "logits": np.stack(logits, axis=0),
+        "values": np.stack(values, axis=0),
+        "actions": np.stack(actions, axis=0),
+    }

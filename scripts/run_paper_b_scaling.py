@@ -16,6 +16,13 @@ import os
 import tempfile
 import time
 import random
+import inspect
+import threading
+
+try:
+    import psutil
+except ImportError:  # confirmatory validation fails closed when unavailable
+    psutil = None
 
 import numpy as np
 import torch
@@ -114,41 +121,60 @@ def _runner(
     return RE.make_runner("Final-CIGAMF", env, cfg, device)
 
 
+def _set_periphery_diagnostics(runner, enabled):
+    module = getattr(runner, "periph_module", None)
+    setter = getattr(module, "set_diagnostics_enabled", None)
+    if callable(setter):
+        return setter(bool(enabled))
+    return None
+
+
+def _select_for_probe(runner, obs):
+    """Deterministic architecture inference; never sample or epsilon-force."""
+    selector = runner._select_actions_population
+    parameters = inspect.signature(selector).parameters
+    if "apply_forcing" in parameters:
+        return selector(obs, apply_forcing=False)
+    # PureMeanField has no intervention controller in this interface.
+    return selector(obs)
+
+
+def _sync_device(runner):
+    device = getattr(runner, "device", None)
+    if torch.cuda.is_available() and device is not None and str(device).startswith("cuda"):
+        torch.cuda.synchronize(device)
+
+
 def _decision_probe_with_latency(runner, n_states, seed):
     bank = runner.env.sample_state_bank(
         n_states=int(n_states), burn_in=3, bank_seed=int(seed)
     )
     outer = runner.env.clone_state()
     logits, values, actions, latencies = [], [], [], []
+    previous_diag = _set_periphery_diagnostics(runner, False)
     try:
         for state in bank:
             runner.env.restore_state(copy.deepcopy(state))
             obs = runner.env._get_obs_all()
+            # No RNG/forcing snapshot is necessary on Final-CIGAMF because the
+            # scaling path is deterministic and apply_forcing=False.  Keep RNG
+            # restoration for legacy/PureMeanField interfaces that may sample.
             np_state = np.random.get_state()
             py_state = random.getstate()
             torch_state = torch.get_rng_state()
             cuda_state = (
                 torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
             )
-            forcer = getattr(runner, "forcer", None)
-            forcer_state = (
-                copy.deepcopy(forcer.state_dict())
-                if forcer is not None and callable(getattr(forcer, "state_dict", None))
-                else None
-            )
+            _sync_device(runner)
             started = time.perf_counter()
-            result = runner._select_actions_population(obs)
+            result = _select_for_probe(runner, obs)
+            _sync_device(runner)
             latencies.append(time.perf_counter() - started)
-            # The scaling probe is observational.  It may time the complete
-            # action-selection path, but it must not advance forcing counters or
-            # RNG streams used by the subsequent run.
             np.random.set_state(np_state)
             random.setstate(py_state)
             torch.set_rng_state(torch_state)
             if cuda_state is not None:
                 torch.cuda.set_rng_state_all(cuda_state)
-            if forcer_state is not None:
-                forcer.load_state_dict(forcer_state)
             if (
                 isinstance(result, tuple) and len(result) == 2
                 and isinstance(result[1], dict)
@@ -161,9 +187,6 @@ def _decision_probe_with_latency(runner, n_states, seed):
                 )
                 actions_arr = np.argmax(logits_arr, axis=-1).astype(np.int64)
             elif isinstance(result, tuple) and len(result) == 3:
-                # PureMeanField keeps its historical action-selection interface.
-                # Reconstruct the same masked policy logits for a comparable
-                # decision-fidelity probe without changing the training API.
                 selected, values_np, mean_field = result
                 obs_batch = np.stack([
                     runner.env_adapter.observation(obs, ego)
@@ -194,6 +217,8 @@ def _decision_probe_with_latency(runner, n_states, seed):
             values.append(values_arr)
             actions.append(actions_arr)
     finally:
+        if previous_diag is not None:
+            _set_periphery_diagnostics(runner, previous_diag)
         runner.env.restore_state(outer)
     latency = np.asarray(latencies, dtype=np.float64) * 1000.0
     return {
@@ -204,7 +229,93 @@ def _decision_probe_with_latency(runner, n_states, seed):
         "inference_latency_mean_ms": float(np.mean(latency)),
         "inference_latency_p50_ms": float(np.percentile(latency, 50)),
         "inference_latency_p95_ms": float(np.percentile(latency, 95)),
-        "inference_latency_protocol": "side_effect_restored_full_action_selection",
+        "inference_latency_protocol": (
+            "deterministic_policy_inference_without_sampling_or_epsilon_forcing"
+        ),
+    }
+
+
+def _runtime_memory_probe(runner, n_states, seed):
+    """Measure process/GPU peak memory on a separate deterministic probe.
+
+    CPU RSS is sampled in a dedicated thread and is therefore intentionally
+    not mixed with the latency timing panel. GPU allocator peaks use PyTorch's
+    native peak counters. Analytic parameter/state storage remains a distinct
+    quantity reported by `_memory_accounting`.
+    """
+    if psutil is None:
+        raise RuntimeError(
+            "Paper-B confirmatory runtime-memory scaling requires psutil; "
+            "install the pinned requirements before running this panel"
+        )
+    bank = runner.env.sample_state_bank(
+        n_states=int(n_states), burn_in=3, bank_seed=int(seed)
+    )
+    outer = runner.env.clone_state()
+    process = psutil.Process(os.getpid())
+    baseline_rss = int(process.memory_info().rss)
+    peak_rss = [baseline_rss]
+    stop = threading.Event()
+
+    def sample_rss():
+        while not stop.is_set():
+            try:
+                peak_rss[0] = max(peak_rss[0], int(process.memory_info().rss))
+            except Exception:
+                pass
+            stop.wait(0.001)
+
+    cuda_device = getattr(runner, "device", None)
+    use_cuda = (
+        torch.cuda.is_available()
+        and cuda_device is not None
+        and str(cuda_device).startswith("cuda")
+    )
+    previous_diag = _set_periphery_diagnostics(runner, False)
+    sampler = threading.Thread(target=sample_rss, daemon=True)
+    if use_cuda:
+        torch.cuda.synchronize(cuda_device)
+        torch.cuda.reset_peak_memory_stats(cuda_device)
+        cuda_baseline_alloc = int(torch.cuda.memory_allocated(cuda_device))
+        cuda_baseline_reserved = int(torch.cuda.memory_reserved(cuda_device))
+    else:
+        cuda_baseline_alloc = 0
+        cuda_baseline_reserved = 0
+    sampler.start()
+    try:
+        for state in bank:
+            runner.env.restore_state(copy.deepcopy(state))
+            obs = runner.env._get_obs_all()
+            _select_for_probe(runner, obs)
+        _sync_device(runner)
+        peak_rss[0] = max(peak_rss[0], int(process.memory_info().rss))
+        if use_cuda:
+            peak_cuda_alloc = int(torch.cuda.max_memory_allocated(cuda_device))
+            peak_cuda_reserved = int(torch.cuda.max_memory_reserved(cuda_device))
+        else:
+            peak_cuda_alloc = 0
+            peak_cuda_reserved = 0
+    finally:
+        stop.set()
+        sampler.join(timeout=1.0)
+        if previous_diag is not None:
+            _set_periphery_diagnostics(runner, previous_diag)
+        runner.env.restore_state(outer)
+    return {
+        "runtime_peak_process_rss_bytes": int(peak_rss[0]),
+        "runtime_peak_process_rss_delta_bytes": int(max(0, peak_rss[0] - baseline_rss)),
+        "runtime_peak_cuda_allocated_bytes": int(peak_cuda_alloc),
+        "runtime_peak_cuda_allocated_delta_bytes": int(
+            max(0, peak_cuda_alloc - cuda_baseline_alloc)
+        ),
+        "runtime_peak_cuda_reserved_bytes": int(peak_cuda_reserved),
+        "runtime_peak_cuda_reserved_delta_bytes": int(
+            max(0, peak_cuda_reserved - cuda_baseline_reserved)
+        ),
+        "runtime_memory_protocol": (
+            "separate_deterministic_probe_sampled_process_rss_and_torch_cuda_peaks"
+        ),
+        "runtime_memory_state_count": int(len(bank)),
     }
 
 
@@ -342,6 +453,9 @@ def main(argv=None):
                 probe, latency = _decision_probe_with_latency(
                     runner, n_states=4, seed=probe_seed
                 )
+                runtime_memory = _runtime_memory_probe(
+                    runner, n_states=4, seed=probe_seed + 17
+                )
                 group[variant] = ({
                     "variant": variant,
                     "seed": int(seed),
@@ -381,6 +495,7 @@ def main(argv=None):
                     ),
                     **latency,
                     **memory,
+                    **runtime_memory,
                 }, probe)
             reference = group["Full-Explicit"][1]
             for variant in VARIANTS:
@@ -409,6 +524,15 @@ def main(argv=None):
             "definition": "unrestricted oracle positive-C top-min(d_max,n_positive) recall",
         },
         "full_explicit_reference_is_dense": True,
+        "inference_latency_protocol": (
+            "deterministic_policy_inference_without_sampling_or_epsilon_forcing"
+        ),
+        "runtime_memory_protocol": (
+            "separate_deterministic_probe_sampled_process_rss_and_torch_cuda_peaks"
+        ),
+        "analytic_memory_protocol": (
+            "analytic_trainable_parameters_plus_persistent_representation_state"
+        ),
         "variants": list(VARIANTS), "summary": summary,
     })
     print(summary)

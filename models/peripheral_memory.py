@@ -257,6 +257,10 @@ class PeripheralMultiMemory(nn.Module):
         self.signature_full_items_seen = 0
         self.signature_legacy_items_seen = 0
         self.last_signature_source = "none"
+        # Evaluation/scaling probes may disable streaming diagnostics so the
+        # measured policy forward is numerically side-effect free. Training
+        # and dedicated H3 diagnostic passes leave this enabled.
+        self.diagnostics_enabled = True
         # Typed Paper-A signals are retained alongside the 5D allocator view.
         # The full Paper-B profile, including latency/masks, is concatenated
         # into the representation item; allocation remains 5D C/D-based.
@@ -467,8 +471,9 @@ class PeripheralMultiMemory(nn.Module):
             upgraded[:, ITEM_CONTEXT_VALID] = 0.0
             upgraded[:, ITEM_REL_ROW:] = legacy[:, 5:]
             x = upgraded
-            self.signature_legacy_items_seen += int(legacy.shape[0])
-            self.last_signature_source = "legacy_derived"
+            if self.diagnostics_enabled:
+                self.signature_legacy_items_seen += int(legacy.shape[0])
+                self.last_signature_source = "legacy_derived"
 
         if x.shape[-1] != FULL_ITEM_DIM:
             raise ValueError(
@@ -586,10 +591,11 @@ class PeripheralMultiMemory(nn.Module):
 
         row_sum = torch.clamp(probs.sum(dim=1, keepdim=True), min=self.eps)  # [N,1]
 
-        with torch.no_grad():
-            self.g_uncertain_usage_ema.mul_(1.0 - self.uncertain_ema_alpha).add_(
-                self.uncertain_ema_alpha * uncertainty.mean()
-            )
+        if self.diagnostics_enabled:
+            with torch.no_grad():
+                self.g_uncertain_usage_ema.mul_(1.0 - self.uncertain_ema_alpha).add_(
+                    self.uncertain_ema_alpha * uncertainty.mean()
+                )
 
         return probs / row_sum  # [N, 4]
 
@@ -673,6 +679,8 @@ class PeripheralMultiMemory(nn.Module):
         items: torch.Tensor,
     ):
         """Update streaming diagnostics that distinguish both collapse modes."""
+        if not self.diagnostics_enabled:
+            return
         with torch.no_grad():
             n_items = int(slot_probs.shape[0])
             if n_items == 0:
@@ -1196,14 +1204,15 @@ class PeripheralMultiMemory(nn.Module):
                 *[float(value) for value in relation],
             ])
 
-        self.signature_full_items_seen += int(full_count)
-        self.signature_legacy_items_seen += int(legacy_count)
-        if full_count and legacy_count:
-            self.last_signature_source = "mixed"
-        elif full_count:
-            self.last_signature_source = "full_profile"
-        else:
-            self.last_signature_source = "legacy_derived"
+        if self.diagnostics_enabled:
+            self.signature_full_items_seen += int(full_count)
+            self.signature_legacy_items_seen += int(legacy_count)
+            if full_count and legacy_count:
+                self.last_signature_source = "mixed"
+            elif full_count:
+                self.last_signature_source = "full_profile"
+            else:
+                self.last_signature_source = "legacy_derived"
 
         return np.asarray(rows, dtype=np.float32)
 
@@ -1214,6 +1223,12 @@ class PeripheralMultiMemory(nn.Module):
     # =====================================================================
     # Diagnostics.
     # =====================================================================
+
+    def set_diagnostics_enabled(self, enabled: bool):
+        """Enable/disable streaming-only diagnostics without changing inference."""
+        previous = bool(self.diagnostics_enabled)
+        self.diagnostics_enabled = bool(enabled)
+        return previous
 
     def reset_slot_diagnostics(self):
         """Reset streaming statistics before a fixed held-out probe pass.

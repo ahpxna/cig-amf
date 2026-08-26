@@ -85,6 +85,13 @@ def _load_scaling(root, expected_seeds):
     return rows, manifest
 
 
+def _mean_finite(values):
+    values = [float(value) for value in values if math.isfinite(float(value))]
+    if not values:
+        raise ValueError("expected at least one finite value")
+    return sum(values) / float(len(values))
+
+
 def _load_adaptive_budget(root, expected_seeds):
     panel_root = os.path.join(root, "paper_b_adaptive_budget")
     with open(os.path.join(panel_root, "manifest.json"), encoding="utf-8") as handle:
@@ -103,8 +110,25 @@ def _load_adaptive_budget(root, expected_seeds):
     manifest_matched = str(manifest.get("matched_fixed_variant", "")).strip()
     if not manifest_matched.startswith("Fixed-K-"):
         raise ValueError("adaptive-budget manifest omits the pooled matched fixed-k variant")
-    if "selected without reward" not in str(manifest.get("matching_rule", "")):
-        raise ValueError("adaptive-budget matching rule must be reward-independent")
+    matching_rule = str(manifest.get("matching_rule", ""))
+    if "disjoint pilot" not in matching_rule or "no reward" not in matching_rule:
+        raise ValueError(
+            "adaptive-budget comparator must be frozen on disjoint pilot cost only"
+        )
+    matching_seeds = [int(seed) for seed in manifest.get("matching_seeds", [])]
+    if (
+        not matching_seeds
+        or len(set(matching_seeds)) != len(matching_seeds)
+        or set(matching_seeds) & set(expected_seeds)
+        or not bool(manifest.get("matching_seed_disjoint", False))
+    ):
+        raise ValueError(
+            "adaptive-budget matching seeds must be non-empty, unique, and disjoint "
+            "from confirmatory seeds"
+        )
+    pilot_cost = float(manifest.get("pilot_adaptive_core_cost_per_ego", float("nan")))
+    if not math.isfinite(pilot_cost):
+        raise ValueError("adaptive-budget manifest omits finite pilot matching cost")
     for seed in expected_seeds:
         subset = [row for row in rows if int(row["seed"]) == int(seed)]
         names = {row["variant"] for row in subset}
@@ -117,12 +141,26 @@ def _load_adaptive_budget(root, expected_seeds):
         matched_names.add(matched[0]["variant"])
         if matched[0]["variant"] != manifest_matched:
             raise ValueError("adaptive-budget matched fixed k changed across seeds")
-        if float(matched[0]["mean_core_cost_gap_to_adaptive"]) > 0.5 + 1e-9:
-            raise ValueError("adaptive-budget fixed comparison is not cost matched")
+        if not math.isfinite(float(matched[0].get("mean_core_cost_gap_to_adaptive", float("nan")))):
+            raise ValueError("adaptive-budget row omits realised cost gap")
         if not math.isfinite(float(matched[0].get("mean_K_t", float("nan")))):
             raise ValueError("adaptive-budget matching must report K_t cost")
     if matched_names != {manifest_matched}:
         raise ValueError("adaptive-budget panel does not use one pooled fixed-k comparator")
+    adaptive_cost = _mean_finite([
+        float(row["mean_core_cost_per_ego"])
+        for row in rows if row["variant"] == "Adaptive-K"
+    ])
+    matched_cost = _mean_finite([
+        float(row["mean_core_cost_per_ego"])
+        for row in rows if row["variant"] == manifest_matched
+    ])
+    realised_gap = abs(float(adaptive_cost) - float(matched_cost))
+    if realised_gap > 0.5 + 1e-9:
+        raise ValueError(
+            "pilot-frozen adaptive comparator is not matched in pooled confirmatory cost"
+        )
+    manifest["realised_confirmatory_cost_gap"] = float(realised_gap)
     return rows, manifest
 
 
@@ -149,7 +187,7 @@ def _paired(rows, treatment, control, metric, panel=None):
 
 
 def validate(run_root, expected_seeds, protocol_mode):
-    allocation, _ = _load_panel(
+    allocation, allocation_manifest = _load_panel(
         run_root, "paper_b_allocation", "summary_paper_b_allocation.csv",
         EXPECTED_ALLOCATION, expected_seeds,
     )
@@ -168,14 +206,25 @@ def validate(run_root, expected_seeds, protocol_mode):
             "paper": "B", "overall_status": "SMOKE_ONLY",
             "panels_complete": True,
         }, VC.EXIT_SMOKE_ONLY
-    required_isolation_protocol = "common_checkpoint_frozen_downstream_teacher_forced_history"
-    for row in pair_rows + periphery_rows:
+    pair_isolation_protocol = "common_checkpoint_frozen_downstream_teacher_forced_history"
+    periphery_isolation_protocol = (
+        "common_checkpoint_full_explicit_distillation_on_immutable_pre_action_history"
+    )
+    for row in pair_rows:
         if row.get("decision_fidelity_reference") == "not_collected":
-            raise ValueError("Paper-B representation fidelity reference is missing")
-        if row.get("decision_fidelity_protocol") != required_isolation_protocol:
+            raise ValueError("Paper-B pair fidelity reference is missing")
+        if row.get("decision_fidelity_protocol") != pair_isolation_protocol:
             raise ValueError(
-                "Paper-B representation fidelity must use a shared checkpoint, "
-                "frozen downstream policy/value, and teacher-forced history"
+                "Paper-B pair fidelity must use a shared checkpoint, frozen "
+                "downstream policy/value, and teacher-forced pair history"
+            )
+    for row in periphery_rows:
+        if row.get("decision_fidelity_reference") == "not_collected":
+            raise ValueError("Paper-B periphery fidelity reference is missing")
+        if row.get("decision_fidelity_protocol") != periphery_isolation_protocol:
+            raise ValueError(
+                "Paper-B periphery fidelity must use frozen Full-Explicit "
+                "distillation targets on one immutable pre-action history"
             )
     # Periphery isolation must be backed by one immutable, non-empty
     # peripheral teacher history and one common fidelity state bank.  A protocol
@@ -189,7 +238,7 @@ def validate(run_root, expected_seeds, protocol_mode):
         for key in (
             "teacher_trace_sha256",
             "teacher_action_history_sha256",
-            "decision_fidelity_state_bank_sha256",
+            "full_explicit_target_sha256",
             "decision_fidelity_downstream_checkpoint_sha256",
         ):
             value = str(row.get(key, "")).strip()
@@ -199,7 +248,7 @@ def validate(run_root, expected_seeds, protocol_mode):
         fingerprint = tuple(str(row[key]) for key in (
             "teacher_trace_sha256",
             "teacher_action_history_sha256",
-            "decision_fidelity_state_bank_sha256",
+            "full_explicit_target_sha256",
             "decision_fidelity_downstream_checkpoint_sha256",
         ))
         previous = periphery_provenance.setdefault(seed, fingerprint)
@@ -207,6 +256,24 @@ def validate(run_root, expected_seeds, protocol_mode):
             raise ValueError(
                 "periphery variants within a seed did not share identical teacher/state provenance"
             )
+
+    oracle_replicates = int(allocation_manifest.get("oracle_replicates", 0))
+    oracle_stability_min = float(
+        allocation_manifest.get("oracle_stability_min", float("nan"))
+    )
+    if oracle_replicates < 2:
+        raise ValueError("allocation manifest omits independent oracle replicas")
+    if not math.isfinite(oracle_stability_min) or not 0.0 <= oracle_stability_min <= 1.0:
+        raise ValueError("allocation manifest has an invalid oracle stability threshold")
+    for row in allocation:
+        if row.get("panel") != "selector_isolation":
+            continue
+        for key in ("oracle_min_c_topk_jaccard", "oracle_min_absd_topk_jaccard"):
+            value = float(row.get(key, float("nan")))
+            if not math.isfinite(value) or value + 1e-12 < oracle_stability_min:
+                raise ValueError(
+                    f"allocation selector bank failed frozen oracle stability gate: {key}={value}"
+                )
 
     for row in allocation:
         if row.get("panel") == "selector_isolation" and row.get(
@@ -439,11 +506,28 @@ def validate(run_root, expected_seeds, protocol_mode):
             if not math.isfinite(float(row.get(key, float("nan")))):
                 raise ValueError(f"scaling row omits finite {key}")
         if row.get("inference_latency_protocol") != (
-            "side_effect_restored_full_action_selection"
+            "deterministic_policy_inference_without_sampling_or_epsilon_forcing"
         ):
             raise ValueError(
-                "scaling latency must restore RNG and forcing state after every probe"
+                "scaling latency must measure deterministic policy inference without forcing"
             )
+        if row.get("representation_memory_accounting_protocol") != (
+            "analytic_trainable_parameters_plus_persistent_representation_state"
+        ):
+            raise ValueError("scaling row mislabels analytic representation memory")
+        if int(float(row.get("representation_memory_is_runtime_peak", 1))) != 0:
+            raise ValueError("analytic representation memory must not be labelled runtime peak")
+        if row.get("runtime_memory_protocol") != (
+            "separate_deterministic_probe_sampled_process_rss_and_torch_cuda_peaks"
+        ):
+            raise ValueError("scaling row omits the separate runtime-memory protocol")
+        for key in (
+            "runtime_peak_process_rss_bytes",
+            "runtime_peak_process_rss_delta_bytes",
+        ):
+            value = float(row.get(key, float("nan")))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"scaling row omits valid {key}")
         variant = row["variant"]
         n_agents = int(row["n_agents"])
         if variant == "Full-Explicit":
@@ -599,10 +683,9 @@ def validate(run_root, expected_seeds, protocol_mode):
         "semantic_memory_extends_reward_compute_pareto_frontier": (
             cis["scaling_semantic_pareto_nondominated"][0] > 0.5
         ),
-        "adaptive_budget_cost_match_is_valid": all(
-            float(row["mean_core_cost_gap_to_adaptive"]) <= 0.5 + 1e-9
-            for row in adaptive_rows
-            if int(row.get("matched_to_adaptive", 0)) == 1
+        "adaptive_budget_cost_match_is_valid": (
+            float(adaptive_manifest.get("realised_confirmatory_cost_gap", float("inf")))
+            <= 0.5 + 1e-9
         ),
         "candidate_restricted_edge_accounting_is_valid": bool(
             bounded_edge_accounting_valid

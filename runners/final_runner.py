@@ -1217,7 +1217,7 @@ class FinalCIGAMFRunner:
         }
         return executed.astype(np.float32), scripted.astype(np.float32), diagnostics
 
-    def _select_actions_population(self, obs_all):
+    def _select_actions_population(self, obs_all, *, apply_forcing=True):
         """
         Batched policy forward for the full population.
 
@@ -1366,28 +1366,34 @@ class FinalCIGAMFRunner:
             valid_action_masks=valid_action_masks,
         )
 
-        # Sample from the actually executed pre-forcing policy.  Sampling from
-        # the learned distribution here would leave H2's scripted mixture as a
-        # logging-only value and reintroduce the original behavioural-drift
-        # no-op.
-        sampled = np.asarray([
-            np.random.choice(self.action_dim, p=probs_np[ego])
-            for ego in range(self.n_agents)
-        ], dtype=np.int64)
+        if apply_forcing:
+            # Sample from the actually executed pre-forcing policy. Sampling from
+            # the learned distribution here would leave H2's scripted mixture as
+            # a logging-only value and reintroduce the behavioural-drift no-op.
+            sampled = np.asarray([
+                np.random.choice(self.action_dim, p=probs_np[ego])
+                for ego in range(self.n_agents)
+            ], dtype=np.int64)
+            actions_list = [int(sampled[ego]) for ego in range(self.n_agents)]
+            pre_forcing_actions = list(actions_list)
 
-        # [EpsilonForcedActionController] This must run after action sampling
-        # and before env.step(). apply() mutates forced entries in place and
-        # returns effective propensity eps*uniform+(1-eps)*pi, not raw policy
-        # probabilities. DR in replay_builder/proxy requires that behaviour
-        # probability. Using raw probabilities silently introduces systematic
-        # DR bias without an exception or warning.
-        actions_list = [int(sampled[ego]) for ego in range(self.n_agents)]
-        pre_forcing_actions = list(actions_list)
-        forced_mask, effective_probs = self.forcer.apply(
-            actions=actions_list,
-            policy_probs=probs_np,
-            valid_action_masks=valid_action_masks,
-        )
+            # [EpsilonForcedActionController] This must run after action sampling
+            # and before env.step(). apply() mutates forced entries in place and
+            # returns exact executed behaviour propensities.
+            forced_mask, effective_probs = self.forcer.apply(
+                actions=actions_list,
+                policy_probs=probs_np,
+                valid_action_masks=valid_action_masks,
+            )
+        else:
+            # Evaluation-only deterministic inference path.  It deliberately
+            # bypasses both categorical sampling and epsilon forcing so decision
+            # fidelity / latency probes measure the architecture rather than
+            # intervention noise.  Training callers retain apply_forcing=True.
+            actions_list = np.argmax(probs_np, axis=-1).astype(np.int64).tolist()
+            pre_forcing_actions = list(actions_list)
+            forced_mask = np.zeros(self.n_agents, dtype=bool)
+            effective_probs = np.asarray(probs_np, dtype=np.float64).copy()
 
         # ------------------------------------------------------------------
         # [VERIFY-F1] Verify that forced actions survive into the trajectory.
@@ -1405,7 +1411,10 @@ class FinalCIGAMFRunner:
         # actual changes signals a defect.
         # ------------------------------------------------------------------
         try:
-            fidx = [k for k in range(self.n_agents) if bool(forced_mask[k])]
+            fidx = (
+                [k for k in range(self.n_agents) if bool(forced_mask[k])]
+                if apply_forcing else []
+            )
             if fidx:
                 self._vf1_n_forced = getattr(self, "_vf1_n_forced", 0) + len(fidx)
                 self._vf1_n_changed = getattr(self, "_vf1_n_changed", 0) + sum(
@@ -1439,8 +1448,8 @@ class FinalCIGAMFRunner:
                 )
 
         cache["forced_mask"] = forced_mask
-        cache["action_execution_records"] = tuple(
-            self.forcer.last_execution_records
+        cache["action_execution_records"] = (
+            tuple(self.forcer.last_execution_records) if apply_forcing else tuple()
         )
         # Paper B Eq. (13) models the pre-forcing behavioural policy action.
         # Executed actions remain separately stored for environment dynamics
