@@ -808,9 +808,13 @@ class LocalCounterfactualProxyEnsemble:
             else target_returns_multi
         )
         if lag_values is None:
-            multi = np.full(
-                (self.n_horizons,), float(target_return_h), dtype=np.float32
-            )
+            if self.n_horizons != 1:
+                raise ValueError(
+                    "multi-lag proxy rows require direct target_lag_rewards; "
+                    "a single cumulative H-step target cannot be duplicated "
+                    "across lags without fabricating a latency spectrum"
+                )
+            multi = np.asarray([float(target_return_h)], dtype=np.float32)
         else:
             multi = np.asarray(lag_values, dtype=np.float32).reshape(-1)
 
@@ -1924,14 +1928,31 @@ class LocalCounterfactualProxyEnsemble:
                 )
             valid = torch.tensor(valid_arr, dtype=torch.bool, device=self.device)
 
-        def _normalize_over_valid(weights):
-            weights = torch.where(valid, weights, torch.zeros_like(weights))
-            row_sum = weights.sum(dim=1, keepdim=True)
+        def _normalize_over_valid(weights, *, allow_uniform_fallback=True):
+            invalid_mass = torch.where(
+                valid, torch.zeros_like(weights), weights
+            ).sum(dim=1, keepdim=True)
+            if not allow_uniform_fallback and bool(torch.any(invalid_mass > 1e-6)):
+                raise ValueError(
+                    "target policy must assign zero mass to invalid actions"
+                )
+            masked = torch.where(valid, weights, torch.zeros_like(weights))
+            row_sum = masked.sum(dim=1, keepdim=True)
+            if not allow_uniform_fallback:
+                if bool(torch.any(row_sum <= self.eps)):
+                    raise ValueError(
+                        "target policy has no probability mass on valid actions"
+                    )
+                if bool(torch.any(torch.abs(row_sum - 1.0) > 1e-5)):
+                    raise ValueError(
+                        "target policy must sum to one over the valid-action set"
+                    )
+                return masked / row_sum
             fallback = valid.to(weights.dtype)
             fallback = fallback / fallback.sum(dim=1, keepdim=True)
             return torch.where(
                 row_sum > self.eps,
-                weights / torch.clamp(row_sum, min=self.eps),
+                masked / torch.clamp(row_sum, min=self.eps),
                 fallback,
             )
 
@@ -2018,7 +2039,9 @@ class LocalCounterfactualProxyEnsemble:
             pi_full = torch.tensor(
                 pi_full_arr, dtype=torch.float32, device=self.device,
             )
-            pi_full = _normalize_over_valid(pi_full)
+            pi_full = _normalize_over_valid(
+                pi_full, allow_uniform_fallback=False
+            )
             # q is the fixed reference policy: uniform on the current valid
             # action set, not on a hand-picked intervention subset.
             q = valid.to(torch.float32)
@@ -2114,16 +2137,23 @@ class LocalCounterfactualProxyEnsemble:
             # conditional double robustness by attaching a residual to that
             # same row; those legacy modes therefore remain plug-in only.
             raw_inv_b = 1.0 / b_obs
-            dr_clipped_rows = int(
-                torch.sum(raw_inv_b > self.iw_clip).detach().cpu().item()
-            )
             dr_raw_inverse_max = float(
                 torch.max(raw_inv_b).detach().cpu().item()
             )
-            inv_b = torch.clamp(raw_inv_b, max=self.iw_clip)
-            contrast_weight = (
+            raw_contrast_weight = (
                 policy_prob_obs - target_prob_obs
-            ) * inv_b
+            ) * raw_inv_b
+            # Truncated AIPW is defined by clipping the complete signed
+            # coefficient (pi(A)-q(A))/b(A), not by clipping 1/b(A) first.
+            # Those operations are not equivalent when |pi(A)-q(A)| < 1.
+            dr_clipped_rows = int(
+                torch.sum(
+                    torch.abs(raw_contrast_weight) > self.iw_clip
+                ).detach().cpu().item()
+            )
+            contrast_weight = torch.clamp(
+                raw_contrast_weight, min=-self.iw_clip, max=self.iw_clip
+            )
 
             correction = residual * contrast_weight.view(1, B)  # [E, B]
 

@@ -527,6 +527,11 @@ def resolve_env_adapter(
 ):
     if adapter is not None:
         return adapter
+    # Callers are allowed to pass an adapter directly.  The previous resolver
+    # treated that object as though it were the raw environment and rejected
+    # it unless it happened to expose OmniArena internals.
+    if isinstance(env, CausalMultiAgentEnvAdapter):
+        return env
     provided = getattr(env, "causal_adapter", None)
     if callable(provided):
         provided = provided()

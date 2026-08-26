@@ -559,9 +559,10 @@ if [ "${#CIG_OPERATIONAL_FAILURES[@]}" -gt 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2b. Optional latency contribution. The learned direct-lag calibration runs
-# only after the all-action oracle establishes an identifiable mechanism.
-# Neither gate invalidates the primary Q/C/D contribution.
+# 2b. Retained latency falsification/recovery gate. The learned direct-lag
+# calibration runs only after the all-action oracle establishes an identifiable
+# delayed mechanism. A failure remains a reported negative H3 result; it does
+# not remove latency from the method after observing the gate.
 # ---------------------------------------------------------------------------
 run_logged "diagnostic" "Lag-specific oracle latency gate" "22_latency_oracle.log" \
   "$CIG_PYTHON" scripts/run_latency_oracle.py \
@@ -588,7 +589,7 @@ if "$CIG_PYTHON" -c \
     echo "SCIENTIFIC GATE FAIL: learned direct-lag latency (execution succeeded; latency claim remains unsupported)."
   fi
 else
-  echo "GATED OUT: learned latency calibration (oracle gate did not pass)."
+  echo "SCIENTIFIC GATE FAIL: oracle latency mechanism was not established; retained latency-recovery claim is unsupported."
 fi
 
 # ---------------------------------------------------------------------------

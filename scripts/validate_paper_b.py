@@ -99,6 +99,12 @@ def _load_adaptive_budget(root, expected_seeds):
     seeds = {int(row["seed"]) for row in rows}
     if seeds != set(expected_seeds):
         raise ValueError("adaptive-budget seed matrix mismatch")
+    matched_names = set()
+    manifest_matched = str(manifest.get("matched_fixed_variant", "")).strip()
+    if not manifest_matched.startswith("Fixed-K-"):
+        raise ValueError("adaptive-budget manifest omits the pooled matched fixed-k variant")
+    if "selected without reward" not in str(manifest.get("matching_rule", "")):
+        raise ValueError("adaptive-budget matching rule must be reward-independent")
     for seed in expected_seeds:
         subset = [row for row in rows if int(row["seed"]) == int(seed)]
         names = {row["variant"] for row in subset}
@@ -108,8 +114,15 @@ def _load_adaptive_budget(root, expected_seeds):
         matched = [row for row in fixed if int(row.get("matched_to_adaptive", 0)) == 1]
         if not fixed or len(matched) != 1:
             raise ValueError("adaptive-budget panel must identify one matched fixed-k row")
+        matched_names.add(matched[0]["variant"])
+        if matched[0]["variant"] != manifest_matched:
+            raise ValueError("adaptive-budget matched fixed k changed across seeds")
         if float(matched[0]["mean_core_cost_gap_to_adaptive"]) > 0.5 + 1e-9:
             raise ValueError("adaptive-budget fixed comparison is not cost matched")
+        if not math.isfinite(float(matched[0].get("mean_K_t", float("nan")))):
+            raise ValueError("adaptive-budget matching must report K_t cost")
+    if matched_names != {manifest_matched}:
+        raise ValueError("adaptive-budget panel does not use one pooled fixed-k comparator")
     return rows, manifest
 
 
@@ -164,10 +177,41 @@ def validate(run_root, expected_seeds, protocol_mode):
                 "Paper-B representation fidelity must use a shared checkpoint, "
                 "frozen downstream policy/value, and teacher-forced history"
             )
+    # Periphery isolation must be backed by one immutable, non-empty
+    # peripheral teacher history and one common fidelity state bank.  A protocol
+    # label alone is not evidence that variants consumed identical data.
+    periphery_provenance = {}
+    for row in periphery_rows:
+        if int(float(row.get("decision_fidelity_history_steps", 0))) <= 0:
+            raise ValueError("periphery fidelity history is empty")
+        if int(float(row.get("teacher_peripheral_item_count", 0))) <= 0:
+            raise ValueError("periphery isolation teacher contains no peripheral items")
+        for key in (
+            "teacher_trace_sha256",
+            "teacher_action_history_sha256",
+            "decision_fidelity_state_bank_sha256",
+            "decision_fidelity_downstream_checkpoint_sha256",
+        ):
+            value = str(row.get(key, "")).strip()
+            if len(value) != 64:
+                raise ValueError(f"periphery row omits valid {key}")
+        seed = int(float(row["seed"]))
+        fingerprint = tuple(str(row[key]) for key in (
+            "teacher_trace_sha256",
+            "teacher_action_history_sha256",
+            "decision_fidelity_state_bank_sha256",
+            "decision_fidelity_downstream_checkpoint_sha256",
+        ))
+        previous = periphery_provenance.setdefault(seed, fingerprint)
+        if previous != fingerprint:
+            raise ValueError(
+                "periphery variants within a seed did not share identical teacher/state provenance"
+            )
+
     for row in allocation:
         if row.get("panel") == "selector_isolation" and row.get(
             "decision_fidelity_protocol"
-        ) != "neutral_full_explicit_pretrain_selector_then_forward":
+        ) != "common_frozen_policy_context_selector_then_forward":
             raise ValueError("allocation fidelity must be computed after selector commit")
         if row.get("panel") == "selector_isolation" and row.get("checkpoint_role") != (
             "selector_neutral_full_explicit_pretrain"
@@ -380,6 +424,12 @@ def validate(run_root, expected_seeds, protocol_mode):
     candidate_construction_subquadratic_valid = True
     candidate_recall_protocol = scaling_manifest["candidate_oracle_recall"]
     candidate_recall_minimum = float(candidate_recall_protocol["minimum"])
+    if int(candidate_recall_protocol.get("horizon", -1)) != 1:
+        raise ValueError(
+            "Paper-B candidate recall must use the one-step capacity oracle"
+        )
+    if int(candidate_recall_protocol.get("trials", 0)) < 2:
+        raise ValueError("Paper-B candidate recall requires repeated CRN trials")
     for row in scaling_rows:
         for key in (
             "policy_logit_l2_to_full_explicit", "value_mae_to_full_explicit",
@@ -388,6 +438,12 @@ def validate(run_root, expected_seeds, protocol_mode):
         ):
             if not math.isfinite(float(row.get(key, float("nan")))):
                 raise ValueError(f"scaling row omits finite {key}")
+        if row.get("inference_latency_protocol") != (
+            "side_effect_restored_full_action_selection"
+        ):
+            raise ValueError(
+                "scaling latency must restore RNG and forcing state after every probe"
+            )
         variant = row["variant"]
         n_agents = int(row["n_agents"])
         if variant == "Full-Explicit":
@@ -399,6 +455,12 @@ def validate(run_root, expected_seeds, protocol_mode):
             continue
         d_max = int(row.get("candidate_max_degree_protocol", 0))
         edges = int(row.get("measured_edge_count", -1))
+        e_t = int(row.get("E_t", -1))
+        k_t = int(row.get("K_t", -1))
+        if e_t != edges:
+            raise ValueError("scaling E_t disagrees with measured_edge_count")
+        if k_t < 0 or k_t > e_t:
+            raise ValueError("scaling K_t must satisfy 0 <= K_t <= E_t")
         if d_max <= 0 or edges < 0 or edges > n_agents * d_max:
             bounded_edge_accounting_valid = False
         recall = float(row.get("candidate_oracle_recall_at_degree", float("nan")))

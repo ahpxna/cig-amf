@@ -1285,6 +1285,36 @@ class OmniArena:
             "behavior_mode": str(behavior_mode),
         }
 
+    def apply_factorial_intervention_for_oracle(
+        self, structural: bool, behavioral: bool, behavior_mode: str = "selfish"
+    ):
+        """Apply the same H2 mechanism change to a cloned oracle state.
+
+        Unlike :meth:`schedule_factorial_intervention`, this helper does not
+        reset positions or advance to a new sampled episode.  It exists only
+        for fixed-state estimand panels, where the pre-treatment state must be
+        held constant while the *mechanism* is changed.  Structural mutation
+        is delegated to ``_do_structural_shift`` under its reset guard so the
+        fixed panel and live arm cannot silently implement different lane/graph
+        updates.
+        """
+        if self._pending_factorial_intervention is not None:
+            raise RuntimeError(
+                "cannot apply an oracle factorial intervention while one is pending"
+            )
+        previous_guard = bool(getattr(self, "_in_reset", False))
+        if structural:
+            self._in_reset = True
+            try:
+                self._do_structural_shift()
+            finally:
+                self._in_reset = previous_guard
+            self._controlled_structural_event_active = True
+        if behavioral:
+            self._behaviour_override = str(behavior_mode)
+            self._controlled_behavioral_event_active = True
+
+
     def _apply_sgtp_delays(self, instantaneous):
         """Apply cloneable pair-specific transport delays to SGTP effects."""
         if not self.enable_sgtp_delays:

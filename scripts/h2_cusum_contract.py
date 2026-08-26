@@ -14,9 +14,9 @@ import os
 
 import numpy as np
 
-CONTRACT_PROTOCOL = "h2_cusum_null_contract_v2"
-COLLECTION_PROTOCOL = "cusum_no_change_residual_collection_v2"
-CALIBRATION_PROTOCOL = "page_cusum_no_change_v2"
+CONTRACT_PROTOCOL = "h2_cusum_null_contract_v3_residual_statistic"
+COLLECTION_PROTOCOL = "cusum_no_change_residual_collection_v3_fixed_horizon"
+CALIBRATION_PROTOCOL = "page_cusum_no_change_v3_provenance"
 MIN_NO_CHANGE_TRAJECTORIES = 40
 
 
@@ -58,6 +58,9 @@ def build_h2_cusum_contract(
         "manipulated_neighbor_roles": sorted(str(role) for role in manipulated_roles),
         "drift_warmup_batches": int(cfg["drift_warmup_batches"]),
         "drift_train_batches": int(cfg["drift_train_batches"]),
+        "drift_batch_size": int(cfg.get("drift_batch_size", 256)),
+        "drift_window": int(cfg.get("drift_window", 20)),
+        "drift_monitoring_statistic": "newest_complete_batch_mean_abs_discounted_return_residual",
         "drift_recalibrate_after": int(cfg["drift_recalibrate_after"]),
         "proxy_effect_mode": str(cfg["proxy_effect_mode"]),
         "proxy_use_belief_input": bool(cfg.get("proxy_use_belief_input", False)),
@@ -107,6 +110,7 @@ def validate_calibration_artifact(
         "reference_config_hash",
         "n_no_change_trajectories",
         "monitoring_horizon",
+        "source_checkpoint_sha256_by_seed",
     }
     missing = sorted(required.difference(calibration))
     if missing:
@@ -138,6 +142,16 @@ def validate_calibration_artifact(
         or len({int(seed) for seed in seeds}) != len(seeds)
     ):
         raise ValueError("CUSUM development seeds must be non-empty and unique")
+    checkpoint_hashes = calibration["source_checkpoint_sha256_by_seed"]
+    if (
+        not isinstance(checkpoint_hashes, dict)
+        or set(checkpoint_hashes) != {str(int(seed)) for seed in seeds}
+        or not all(_valid_sha256(value) for value in checkpoint_hashes.values())
+    ):
+        raise ValueError(
+            "CUSUM calibration must preserve one valid source checkpoint SHA-256 per development seed"
+        )
+
     n_trajectories = int(calibration["n_no_change_trajectories"])
     if n_trajectories < int(min_trajectories):
         raise ValueError(

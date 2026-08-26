@@ -362,7 +362,9 @@ class FinalCIGAMFRunner:
             n_horizons=causal_horizon,
             discount=cfg["discount"],
             warmup_batches=cfg.get("drift_warmup_batches", 200),
+            batch_size=cfg.get("drift_batch_size", 256),
             recalibrate_after=cfg.get("drift_recalibrate_after", 15),
+            window=cfg.get("drift_window", 20),
             seed=cfg.get("seed", 0),
             device=self.device,
             cusum_allowance=cfg.get("drift_cusum_allowance", 0.5),
@@ -399,12 +401,12 @@ class FinalCIGAMFRunner:
                 lambda_0=cfg["belief_lambda_0"],
                 uncertainty_scale=cfg["belief_uncertainty_scale"],
                 tau=cfg.get(
-                    "belief_tau_in",
-                    cfg.get("belief_tau_enter", cfg.get("belief_tau", 0.005)),
+                    "belief_tau_enter",
+                    cfg.get("belief_tau_in", cfg.get("belief_tau", 0.005)),
                 ),
                 tau_in=cfg.get(
-                    "belief_tau_in",
-                    cfg.get("belief_tau_enter", cfg.get("belief_tau", 0.005)),
+                    "belief_tau_enter",
+                    cfg.get("belief_tau_in", cfg.get("belief_tau", 0.005)),
                 ),
                 tau_out=cfg.get(
                     "belief_tau_out",
@@ -585,9 +587,9 @@ class FinalCIGAMFRunner:
             neighbor_ids=self._candidate_ids(ego),
             lambda_0=self.cfg["belief_lambda_0"],
             uncertainty_scale=self.cfg["belief_uncertainty_scale"],
-            tau=self.cfg.get("belief_tau_in", self.cfg.get("belief_tau_enter", 0.005)),
-            tau_in=self.cfg.get("belief_tau_in", self.cfg.get("belief_tau_enter", 0.005)),
-            tau_out=self.cfg.get("belief_tau_out", self.cfg.get("belief_tau_exit", 0.00175)),
+            tau=self.cfg.get("belief_tau_enter", self.cfg.get("belief_tau_in", 0.005)),
+            tau_in=self.cfg.get("belief_tau_enter", self.cfg.get("belief_tau_in", 0.005)),
+            tau_out=self.cfg.get("belief_tau_exit", self.cfg.get("belief_tau_out", 0.00175)),
             weak_prior_top_k=self.cfg["seed_core_top_k"],
             min_core_size=(
                 self.n_agents - 1 if full_explicit_mode
@@ -966,8 +968,15 @@ class FinalCIGAMFRunner:
                 continue
             try:
                 action_index = int(action_source[other])
-            except (KeyError, IndexError, TypeError):
-                action_index = 0
+            except (KeyError, IndexError, TypeError) as exc:
+                raise KeyError(
+                    f"raw causal context is missing the co-action for neighbour {other}"
+                ) from exc
+            if action_index < 0 or action_index >= self.action_dim:
+                raise ValueError(
+                    f"raw causal context contains invalid co-action {action_index} "
+                    f"for neighbour {other}"
+                )
             rows.append(
                 adapter.neighbour_features(ego, other, action_index)
             )
@@ -1001,8 +1010,15 @@ class FinalCIGAMFRunner:
         for other in ids:
             try:
                 action = int(action_source[other])
-            except (KeyError, IndexError, TypeError):
-                action = 0
+            except (KeyError, IndexError, TypeError) as exc:
+                raise KeyError(
+                    f"raw causal context block is missing the co-action for neighbour {other}"
+                ) from exc
+            if action < 0 or action >= self.action_dim:
+                raise ValueError(
+                    f"raw causal context block contains invalid co-action {action} "
+                    f"for neighbour {other}"
+                )
             rows.append(adapter.neighbour_features(ego, other, action))
         items = (
             np.stack(rows, axis=0).astype(np.float32)
@@ -2978,8 +2994,12 @@ class FinalCIGAMFRunner:
                 self.history["mean_core_switches"].append(snapshot["mean_core_switches"])
                 self.history["mean_mu"].append(snapshot["mean_mu"])
                 self.history["max_p"].append(snapshot["max_p"])
-                self.history["mean_capacity"].append(snapshot["mean_capacity"])
-                self.history["max_g"].append(snapshot["max_g"])
+                self.history.setdefault("mean_capacity", []).append(
+                    snapshot.get("mean_capacity", snapshot.get("mean_mu", 0.0))
+                )
+                self.history.setdefault("max_g", []).append(
+                    snapshot.get("max_g", snapshot.get("max_p", 0.0))
+                )
                 self.history["runtime"].append(snapshot["runtime"])
                 self.history["throughput_agent_steps_per_sec"].append(
                     snapshot["throughput_agent_steps_per_sec"]
@@ -3051,29 +3071,29 @@ class FinalCIGAMFRunner:
                 )
                 self.history["promoted"].append(int(graph_info["promoted"]))
                 self.history["demoted"].append(int(graph_info["demoted"]))
-                self.history["measured_edge_count"].append(
-                    int(snapshot.get("measured_edge_count", self.measured_edge_count))
+                self.history.setdefault("measured_edge_count", []).append(
+                    int(snapshot.get("measured_edge_count", getattr(self, "measured_edge_count", 0)))
                 )
-                self.history["candidate_max_degree"].append(
-                    snapshot.get("candidate_max_degree", self.candidate_max_degree)
+                self.history.setdefault("candidate_max_degree", []).append(
+                    snapshot.get("candidate_max_degree", getattr(self, "candidate_max_degree", None))
                 )
-                self.history["candidate_construction_subquadratic"].append(
+                self.history.setdefault("candidate_construction_subquadratic", []).append(
                     bool(snapshot.get("candidate_construction_subquadratic", False))
                 )
-                self.history["E_t"].append(int(snapshot.get("E_t", 0)))
-                self.history["K_t"].append(int(snapshot.get("K_t", 0)))
-                self.history["d_bar"].append(float(snapshot.get("d_bar", 0.0)))
-                self.history["k_bar"].append(float(snapshot.get("k_bar", 0.0)))
-                self.history["active_core_pair_count"].append(
+                self.history.setdefault("E_t", []).append(int(snapshot.get("E_t", 0)))
+                self.history.setdefault("K_t", []).append(int(snapshot.get("K_t", 0)))
+                self.history.setdefault("d_bar", []).append(float(snapshot.get("d_bar", 0.0)))
+                self.history.setdefault("k_bar", []).append(float(snapshot.get("k_bar", 0.0)))
+                self.history.setdefault("active_core_pair_count", []).append(
                     int(snapshot.get("active_core_pair_count", 0))
                 )
-                self.history["causal_latency_valid_fraction"].append(
+                self.history.setdefault("causal_latency_valid_fraction", []).append(
                     float(snapshot.get("causal_latency_valid_fraction", 0.0))
                 )
-                self.history["causal_latency_onset_valid_fraction"].append(
+                self.history.setdefault("causal_latency_onset_valid_fraction", []).append(
                     float(snapshot.get("causal_latency_onset_valid_fraction", 0.0))
                 )
-                self.history["causal_latency_cm_mean"].append(
+                self.history.setdefault("causal_latency_cm_mean", []).append(
                     float(snapshot.get("causal_latency_cm_mean", 0.0))
                 )
 

@@ -98,16 +98,16 @@ def _latency_gate(run_root):
     path = Path(run_root) / "latency_oracle.json"
     if not path.is_file():
         return gate_record(
-            "G6", False, required=False,
+            "G6", False, required=True,
             metrics={"artifact_present": False},
-            rule="lag-specific oracle must establish an identifiable latency mechanism",
-            failure_action="gate out/delete latency contribution",
+            rule="lag-specific oracle must test the retained latency estimand",
+            failure_action="report the retained latency-recovery claim as unsupported",
         )
     payload = load_json(path, "latency oracle")
     protocol_ok = payload.get("protocol_version") == LATENCY_ORACLE_PROTOCOL
     passed = bool(protocol_ok and payload.get("gate_pass", False))
     return gate_record(
-        "G6", passed, required=False,
+        "G6", passed, required=True,
         metrics={
             "artifact_present": True,
             "gate_pass": bool(payload.get("gate_pass", False)),
@@ -116,8 +116,8 @@ def _latency_gate(run_root):
             "latency_onset_fraction": payload.get("latency_onset_fraction"),
             "latency_onset_rule": payload.get("latency_onset_rule"),
         },
-        rule="lag-specific oracle latency gate must pass before retaining latency",
-        failure_action="gate out/delete latency contribution",
+        rule="lag-specific oracle latency gate must pass to support latency recovery",
+        failure_action="retain the latency estimand but report latency recovery as unsupported",
     )
 
 
@@ -364,14 +364,16 @@ def validate(
 
     required_core = ["G0", "G1", "G2", "G3", "G4", "G5"]
     core_pass = all(bool(gates[name]["passed"]) for name in required_core)
+    paper_a_full_pass = bool(core_pass and gates["G6"]["passed"] and gates["G7"]["passed"])
     scope = {
         "paper_A_QCD_selectivity": "SUPPORTED" if core_pass else "NOT_SUPPORTED",
-        "latency": "KEEP" if gates["G6"]["passed"] else "DELETE_OR_GATE_OUT",
+        "paper_A_full_claim_set": "SUPPORTED" if paper_a_full_pass else "NOT_SUPPORTED",
+        "latency": "SUPPORTED" if gates["G6"]["passed"] else "RETAINED_BUT_RECOVERY_UNSUPPORTED",
         "trigger_tracking": "KEEP" if gates["G7"]["passed"] else "DELETE_OR_GATE_OUT",
         "generalisation": "SECOND_BENCHMARK" if gates["G8"]["passed"] else "CUSTOM_DOMAIN_ONLY",
         "system_claim": "SCALABLE_SYSTEM" if gates["G9"]["passed"] else "SELECTIVE_REPRESENTATION_ARCHITECTURE_ONLY",
     }
-    overall = "SUPPORTED" if core_pass else "NOT_SUPPORTED"
+    overall = "SUPPORTED" if paper_a_full_pass else "NOT_SUPPORTED"
     payload = {
         "schema_version": GATE_SCHEMA_VERSION,
         "protocol_version": PROTOCOL_VERSION,
@@ -382,11 +384,13 @@ def validate(
         "gates": gates,
         "claim_scope": scope,
         "interpretation": (
-            "G0-G5 adjudicate the causal/allocation core. G6-G9 are modular scope "
-            "gates and must reduce the submitted claim set rather than being silently ignored."
+            "G0-G5 adjudicate the causal/allocation core. G6 latency and G7 "
+            "tracking are retained Paper-A H3 gates; failure leaves H1/H2 "
+            "reportable but prevents full submitted Paper-A support. G8-G9 "
+            "scope generalisation and scalable-system claims."
         ),
     }
-    return payload, EXIT_SUPPORTED if core_pass else EXIT_UNSUPPORTED
+    return payload, EXIT_SUPPORTED if paper_a_full_pass else EXIT_UNSUPPORTED
 
 
 def main(argv=None):

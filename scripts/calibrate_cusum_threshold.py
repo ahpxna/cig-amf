@@ -114,6 +114,9 @@ def main(argv=None):
         "source": {"path": os.path.abspath(args.no_change_z_json), "sha256": digest},
         "source_protocol": source.get("protocol", "unspecified"),
         "development_seeds": source_seeds,
+        "source_checkpoint_sha256_by_seed": source.get(
+            "checkpoint_sha256_by_seed", {}
+        ),
         "reference_config_hash": source_config_hash,
         **calibration,
     }

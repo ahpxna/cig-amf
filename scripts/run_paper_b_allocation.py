@@ -64,9 +64,12 @@ def _decision_probe(runner, n_states, seed):
                 [cache["value_cache"][ego] for ego in range(runner.n_agents)],
                 dtype=np.float64,
             ))
-            actions.append(np.asarray(
-                [selected[ego] for ego in range(runner.n_agents)], dtype=np.int64,
-            ))
+            # Fidelity compares the policy decision rule, not epsilon-forced
+            # sampled actions.  The cached logits are already valid-action
+            # masked by PolicyValueNet.
+            actions.append(np.argmax(
+                np.asarray(cache["policy_logits"], dtype=np.float64), axis=-1
+            ).astype(np.int64))
     finally:
         runner.env.restore_state(outer)
     return {
@@ -122,6 +125,13 @@ def _cfg(seed, core_budget, selector="structural_capacity"):
         "periph_allow_legacy_items": False,
         "strict_causal_profile": True,
         "semantic_router_frozen": True,
+        # Allocation truth is standardized at h=1.  This removes the
+        # continuation-policy mismatch that otherwise makes C^rho from an
+        # environment-scripted oracle incomparable with a learned-policy
+        # response estimator.  Paper-A latency remains an upstream diagnostic;
+        # Paper-B allocation does not require a long-horizon oracle ranking.
+        "causal_horizon": 1,
+        "proxy_n_horizons": 1,
     })
     return cfg
 
@@ -176,10 +186,64 @@ def _top_k(scores, ego, core_budget):
     )[:int(core_budget)])
 
 
+def _policy_context_for_state(runner, state):
+    """Return a side-effect-free frozen current-policy context for one state.
+
+    The selector-isolation bank must not let each variant choose a different
+    factual co-action or target policy.  We therefore query one neutral runner
+    once per state, keep deterministic argmax co-actions plus the pre-forcing
+    policy probabilities, and restore RNG/forcer/environment state afterwards.
+    """
+    outer = runner.env.clone_state()
+    np_state = np.random.get_state()
+    forcer = getattr(runner, "forcer", None)
+    forcer_state = (
+        copy.deepcopy(forcer.state_dict())
+        if forcer is not None and callable(getattr(forcer, "state_dict", None))
+        else None
+    )
+    try:
+        runner.env.restore_state(copy.deepcopy(state))
+        obs_all = runner.env._get_obs_all()
+        _sampled, cache = runner._select_actions_population(obs_all)
+        logits = np.asarray(cache["policy_logits"], dtype=np.float64)
+        actions = np.argmax(logits, axis=-1).astype(np.int64)
+        probs = np.asarray(cache["policy_probs"], dtype=np.float64)
+        valid = np.asarray(cache["valid_action_masks"], dtype=bool)
+        if probs.shape != valid.shape or logits.shape != probs.shape:
+            raise RuntimeError("frozen policy context has inconsistent tensor shapes")
+        return {
+            "actions": actions,
+            "policy_probs": probs,
+            "valid_action_masks": valid,
+            "policy_logits": logits,
+        }
+    finally:
+        runner.env.restore_state(outer)
+        np.random.set_state(np_state)
+        if forcer_state is not None:
+            forcer.load_state_dict(forcer_state)
+
+
 def _oracle_capacity_direction_for_state(
-    env, state, horizon, discount, trials, seed
+    env, state, horizon, discount, trials, seed, target_policy_probs=None
 ):
-    """Compute clone-state all-action oracle C* and D* for every directed pair."""
+    """Compute one-step clone-state oracle C* and current-policy D*.
+
+    ``target_policy_probs`` must come from the frozen common policy at this
+    exact state.  H=1 is required so the oracle and learned allocation score do
+    not silently differ only because their continuation regimes differ.
+    """
+    if int(horizon) != 1:
+        raise ValueError("Paper-B selector oracle is standardized to horizon=1")
+    if target_policy_probs is None:
+        raise ValueError("current frozen target-policy probabilities are required")
+    target_policy_probs = np.asarray(target_policy_probs, dtype=np.float64)
+    expected = (int(env.n_agents), int(env.get_action_dim()))
+    if target_policy_probs.shape != expected:
+        raise ValueError(
+            f"target_policy_probs must have shape {expected}, got {target_policy_probs.shape}"
+        )
     outer = env.clone_state()
     capacities, directions = {}, {}
     try:
@@ -209,10 +273,20 @@ def _oracle_capacity_direction_for_state(
                     continue
                 env.restore_state(copy.deepcopy(state))
                 env.set_behaviour_override("cooperative")
-                pi = np.asarray(
-                    env.scripted_policy_distribution(source), dtype=np.float64
-                )[valid_actions]
-                pi = pi / np.clip(pi.sum(), 1e-12, None)
+                pi_full = np.asarray(
+                    target_policy_probs[int(source)], dtype=np.float64
+                )
+                if (
+                    not np.all(np.isfinite(pi_full))
+                    or np.any(pi_full < 0.0)
+                    or float(pi_full[valid_actions].sum()) <= 0.0
+                    or float(pi_full[~np.isin(np.arange(pi_full.size), valid_actions)].sum()) > 1e-8
+                ):
+                    raise ValueError(
+                        "frozen target policy violates the valid-action probability contract"
+                    )
+                pi = pi_full[valid_actions]
+                pi = pi / float(pi.sum())
                 q = np.full(valid_actions.size, 1.0 / valid_actions.size)
                 action_values = []
                 for action in valid_actions:
@@ -241,10 +315,24 @@ def _oracle_capacity_direction_for_state(
 
 
 def _oracle_capacity_for_state(
-    env, state, horizon, discount, trials, seed
+    env, state, horizon, discount, trials, seed, target_policy_probs=None
 ):
+    if target_policy_probs is None:
+        # C itself is policy-contrast free at h=1.  Construct a valid reference
+        # only so the shared C/D oracle helper can execute; callers that consume
+        # D must pass the actual frozen current policy explicitly.
+        action_dim = int(env.get_action_dim())
+        rows = []
+        adapter = resolve_env_adapter(env)
+        for agent in range(int(env.n_agents)):
+            mask = np.asarray(adapter.valid_action_mask(agent), dtype=bool)
+            row = np.zeros(action_dim, dtype=np.float64)
+            row[mask] = 1.0 / float(np.count_nonzero(mask))
+            rows.append(row)
+        target_policy_probs = np.stack(rows, axis=0)
     capacities, _ = _oracle_capacity_direction_for_state(
-        env, state, horizon, discount, trials, seed
+        env, state, horizon, discount, trials, seed,
+        target_policy_probs=target_policy_probs,
     )
     return capacities
 
@@ -320,7 +408,7 @@ def _initial_checkpoint(seed, core_budget, device, n_agents=24):
 
 def _isolation_rows(
     variants, seed, core_budget, device, checkpoint, state_bank, oracle_bank,
-    oracle_direction_bank, n_agents=24,
+    oracle_direction_bank, teacher_contexts, n_agents=24,
 ):
     records = {variant: [] for variant in variants}
     for variant in variants:
@@ -340,18 +428,17 @@ def _isolation_rows(
             runner.env.set_behaviour_override("cooperative")
             runner.oracle_capacity_scores_by_ego = copy.deepcopy(oracle_scores)
             obs_all = runner.env._get_obs_all()
-            # First forward supplies the common factual action/policy context used
-            # to score every selector on this state. Decision fidelity is measured
-            # only after the selector has committed and pair allocation reconciled.
-            teacher_actions, teacher_cache = runner._select_actions_population(obs_all)
-            teacher_action_list = [
-                int(teacher_actions[agent]) for agent in range(runner.n_agents)
-            ]
+            # Every selector receives the *same* immutable factual co-actions
+            # and target policy from the neutral reference runner.  Using a
+            # variant's own first forward here makes the policy depend on the
+            # allocation before the allocation itself is scored.
+            common = teacher_contexts[int(state_index)]
+            teacher_action_list = [int(value) for value in common["actions"]]
             runner._score_all_pairs_and_update_beliefs(
                 obs_all=obs_all,
                 actions=teacher_action_list,
-                behaviour_probs=teacher_cache.get("behaviour_probs"),
-                policy_probs=teacher_cache.get("policy_probs"),
+                behaviour_probs=None,
+                policy_probs=np.asarray(common["policy_probs"], dtype=np.float64),
             )
             decision_actions, decision_cache = runner._select_actions_population(obs_all)
             actions = [
@@ -469,7 +556,7 @@ def _isolation_rows(
             ]),
             "decision_fidelity_reference": "Full-Explicit",
             "decision_fidelity_protocol": (
-                "neutral_full_explicit_pretrain_selector_then_forward"
+                "common_frozen_policy_context_selector_then_forward"
             ),
             "checkpoint_role": checkpoint.get("checkpoint_role", "unspecified"),
         })
@@ -531,7 +618,7 @@ def main(argv=None):
         "--challenge-oversample", type=int, default=3,
         help="Oracle-only oversampling factor used to construct C* vs |D*| disagreement states.",
     )
-    parser.add_argument("--oracle-trials", type=int, default=1)
+    parser.add_argument("--oracle-trials", type=int, default=8)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--agent-count", type=int, default=24)
     parser.add_argument("--variants", nargs="+", choices=list(VARIANTS), default=None)
@@ -540,7 +627,7 @@ def main(argv=None):
     if (
         args.episodes <= 0 or args.pretrain_episodes <= 0
         or args.selector_states <= 0 or args.challenge_oversample <= 0
-        or args.oracle_trials <= 0
+        or args.oracle_trials < 2
         or args.core_budget <= 0 or args.agent_count <= args.core_budget
         or not args.seeds
     ):
@@ -561,8 +648,12 @@ def main(argv=None):
         end_to_end_checkpoint = _initial_checkpoint(
             seed, args.core_budget, args.device, n_agents=args.agent_count
         )
+        # Generate the immutable factual policy context from the selector-neutral
+        # Full-Explicit checkpoint.  Using C-Core here would let the allocation
+        # under test alter the very policy used to define D* and the common
+        # co-action context before selectors are compared.
         reference_runner = _prepare_variant_runner(
-            "C-Core", seed, args.core_budget, args.device, isolation_checkpoint,
+            "Full-Explicit", seed, args.core_budget, args.device, isolation_checkpoint,
             n_agents=args.agent_count
         )
         reference_runner.env.set_behaviour_override("cooperative")
@@ -574,10 +665,15 @@ def main(argv=None):
             min_remaining_steps=horizon,
         )
         discount = float(reference_runner.cfg["discount"])
+        teacher_contexts_all = [
+            _policy_context_for_state(reference_runner, state)
+            for state in candidate_states
+        ]
         candidate_oracles = [
             _oracle_capacity_direction_for_state(
                 reference_runner.env, state, horizon=horizon, discount=discount,
                 trials=args.oracle_trials, seed=bank_seed + state_index * 100003,
+                target_policy_probs=teacher_contexts_all[state_index]["policy_probs"],
             )
             for state_index, state in enumerate(candidate_states)
         ]
@@ -599,6 +695,7 @@ def main(argv=None):
         oracle_direction_bank = [
             candidate_oracles[index][1] for index in selected_indices
         ]
+        teacher_contexts = [teacher_contexts_all[index] for index in selected_indices]
         mean_oracle_capacity = _mean_oracle_capacity(oracle_bank)
         rows.extend(_isolation_rows(
             selected_variants,
@@ -609,6 +706,7 @@ def main(argv=None):
             state_bank,
             oracle_bank,
             oracle_direction_bank,
+            teacher_contexts,
             n_agents=args.agent_count,
         ))
         end_to_end = {}

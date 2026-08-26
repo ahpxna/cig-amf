@@ -357,7 +357,7 @@ class FinalReleaseHardeningTests(unittest.TestCase):
         self.assertNotIn("h1_max_capacity_normalized_mae", cfg)
         self.assertNotIn("h1_max_direction_normalized_mae", cfg)
 
-    def test_paper_a_missing_optional_latency_artifact_gates_out_only_latency(self):
+    def test_paper_a_missing_latency_artifact_blocks_full_claim_set(self):
         from scripts import validate_paper_a as PA
 
         h1_rows = [{"seed": 1}]
@@ -389,13 +389,16 @@ class FinalReleaseHardeningTests(unittest.TestCase):
              mock.patch.object(PA.VC, "_h1_status", return_value={"supported": True, "status": "SUPPORTED"}), \
              mock.patch.object(PA.VC, "_h2_status", return_value={"supported": True, "status": "SUPPORTED"}):
             report, code = PA.validate(root, [1], [2], "confirmatory")
-        self.assertTrue(report["submitted_claim_set_supported"])
-        self.assertEqual(report["overall_status"], "SUPPORTED_LATENCY_GATED_OUT")
+        self.assertFalse(report["submitted_claim_set_supported"])
+        self.assertEqual(
+            report["overall_status"],
+            "PARTIALLY_SUPPORTED_RETAINED_H3_NOT_ESTABLISHED",
+        )
         self.assertFalse(report["H3a_latency"]["supported"])
         self.assertFalse(report["H3a_latency"]["oracle_artifact_present"])
-        self.assertEqual(code, PA.VC.EXIT_SUPPORTED)
+        self.assertEqual(code, PA.VC.EXIT_UNSUPPORTED)
 
-    def test_paper_a_failed_tracking_gates_out_only_optional_trigger(self):
+    def test_paper_a_failed_tracking_blocks_full_claim_set(self):
         from scripts import validate_paper_a as PA
 
         h1_rows = [{"seed": 1}]
@@ -413,10 +416,13 @@ class FinalReleaseHardeningTests(unittest.TestCase):
              mock.patch.object(PA.VC, "_h1_status", return_value={"supported": True, "status": "SUPPORTED"}), \
              mock.patch.object(PA.VC, "_h2_status", return_value={"supported": True, "status": "SUPPORTED"}):
             report, code = PA.validate(root, [1], [2], "confirmatory")
-        self.assertTrue(report["submitted_claim_set_supported"])
+        self.assertFalse(report["submitted_claim_set_supported"])
         self.assertFalse(report["H3b_tracking"]["supported"])
-        self.assertTrue(report["overall_status"].startswith("SUPPORTED"))
-        self.assertEqual(code, PA.VC.EXIT_SUPPORTED)
+        self.assertEqual(
+            report["overall_status"],
+            "PARTIALLY_SUPPORTED_RETAINED_H3_NOT_ESTABLISHED",
+        )
+        self.assertEqual(code, PA.VC.EXIT_UNSUPPORTED)
 
     def test_omniarena_latency_onset_uses_shared_protocol_constants(self):
         from envs.omni_arena import OmniArena

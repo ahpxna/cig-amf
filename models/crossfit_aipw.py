@@ -11,8 +11,70 @@ from dataclasses import dataclass
 import numpy as np
 
 
+def _partition_independent_context_summary(sample):
+    """Summarise raw leave-one-target context without learned state.
+
+    Cross-fitted AIPW is part of Paper A's measurement subsystem, so its X
+    representation must not consume core latents, peripheral memories, or
+    structural beliefs created downstream by the same causal estimates.
+    Replay may store either an explicit leave-one-target ``context_items``
+    table or one shared ``context_block`` plus the target position.
+    """
+    items = None
+    mask = None
+
+    if sample.get("context_items") is not None:
+        items = np.asarray(sample["context_items"], dtype=np.float64)
+        if items.ndim != 2:
+            raise ValueError("context_items must be a rank-2 raw item table")
+        mask = np.asarray(
+            sample.get("context_mask", np.ones(items.shape[0])), dtype=bool
+        ).reshape(-1)
+        if mask.shape != (items.shape[0],):
+            raise ValueError("context_mask must have one entry per raw context item")
+    elif sample.get("context_block") is not None:
+        block = sample["context_block"]
+        items = np.asarray(block.get("items"), dtype=np.float64)
+        ids = np.asarray(block.get("neighbor_ids"), dtype=np.int64).reshape(-1)
+        if items.ndim != 2 or items.shape[0] != ids.shape[0]:
+            raise ValueError("context_block raw items/neighbor_ids are malformed")
+        position = sample.get("target_context_position")
+        if position is None:
+            target_id = sample.get("neighbor_id")
+            matches = np.flatnonzero(ids == int(target_id)) if target_id is not None else np.asarray([], dtype=np.int64)
+            if matches.size != 1:
+                raise ValueError(
+                    "context_block requires an unambiguous target position for leave-one-out"
+                )
+            position = int(matches[0])
+        position = int(position)
+        if position < 0 or position >= items.shape[0]:
+            raise ValueError("target_context_position lies outside context_block")
+        mask = np.ones(items.shape[0], dtype=bool)
+        mask[position] = False
+    else:
+        raise ValueError(
+            "cross-fitted AIPW requires raw partition-independent context_items "
+            "or context_block; downstream z/m/belief fallbacks are forbidden"
+        )
+
+    if not np.all(np.isfinite(items)):
+        raise ValueError("raw context contains NaN or infinity")
+    active = items[mask]
+    width = int(items.shape[1])
+    if active.size == 0:
+        summed = np.zeros(width, dtype=np.float64)
+        squared = np.zeros(width, dtype=np.float64)
+        count = 0.0
+    else:
+        summed = np.sum(active, axis=0)
+        squared = np.sum(np.square(active), axis=0)
+        count = float(active.shape[0])
+    return np.concatenate([summed, squared, np.asarray([count])])
+
+
 def proxy_context_features(sample, action_dim):
-    """Return the pre-treatment X representation shared by both stages."""
+    """Return a fixed, pre-treatment, partition-independent X vector."""
     raw_action = sample["action_i"]
     if not np.isfinite(raw_action) or int(raw_action) != raw_action:
         raise ValueError("action_i must be a finite integer action identity")
@@ -27,10 +89,12 @@ def proxy_context_features(sample, action_dim):
         np.asarray(sample["obs_i"], dtype=np.float64).reshape(-1),
         action_i,
         np.asarray(sample["pair_feat"], dtype=np.float64).reshape(-1),
-        np.asarray(sample["z_core_excl_j"], dtype=np.float64).reshape(-1),
-        np.asarray(sample["m_periph_excl_j"], dtype=np.float64).reshape(-1),
+        _partition_independent_context_summary(sample),
     )
-    return np.concatenate(fields)
+    out = np.concatenate(fields)
+    if not np.all(np.isfinite(out)):
+        raise ValueError("cross-fit context contains NaN or infinity")
+    return out
 
 
 @dataclass

@@ -1,8 +1,9 @@
 """Paper-B entropy-adaptive core-budget panel.
 
-Adaptive k is compared with every fixed integer k in [k_min, k_max].  The
-closest fixed-k row is identified per seed after the run, making the matched
-average explicit-model cost comparison auditable rather than hand selected.
+Adaptive k is compared with every fixed integer k in [k_min, k_max].  A
+single fixed-k comparator is selected from pooled *representation-cost* data
+(K_t/N), never reward, then reused for every seed.  This preserves paired
+inference and prevents the matched comparator itself from changing by seed.
 """
 from __future__ import annotations
 
@@ -59,6 +60,8 @@ def _make_runner(
         "periph_allow_legacy_items": False,
         "strict_causal_profile": True,
         "semantic_router_frozen": True,
+        "causal_horizon": 1,
+        "proxy_n_horizons": 1,
     })
     if full_explicit:
         full_k = int(n_agents) - 1
@@ -105,6 +108,10 @@ def _run(seed, episodes, device, variant, k_min, k_max, n_agents=24):
         "mean_reward": _mean(history.get("mean_reward", [])),
         "final_reward": float(history.get("mean_reward", [float("nan")])[-1]),
         "mean_core_size": _mean(history.get("mean_core_size", [])),
+        "mean_K_t": _mean(history.get("K_t", [])),
+        "mean_core_cost_per_ego": (
+            _mean(history.get("K_t", [])) / float(max(1, int(n_agents)))
+        ),
         "core_size_variance": float(np.var(history.get("mean_core_size", [0.0]))),
         "mean_hit_min_rate": _mean(item["hit_min_rate"] for item in saturation),
         "mean_hit_max_rate": _mean(item["hit_max_rate"] for item in saturation),
@@ -140,32 +147,49 @@ def main(argv=None):
     variants = ["Adaptive-K"] + [
         f"Fixed-K-{k}" for k in range(int(args.k_min), int(args.k_max) + 1)
     ] + ["Full-Explicit"]
-    rows = []
+    results_by_seed = {}
     for seed in args.seeds:
-        results = {
+        results_by_seed[int(seed)] = {
             variant: _run(
                 seed, args.episodes, args.device, variant, args.k_min, args.k_max,
                 n_agents=args.agent_count
             )
             for variant in variants
         }
+
+    fixed_names = [name for name in variants if name.startswith("Fixed-K-")]
+    adaptive_cost = _mean(
+        results_by_seed[int(seed)]["Adaptive-K"][0]["mean_core_cost_per_ego"]
+        for seed in args.seeds
+    )
+    fixed_costs = {
+        name: _mean(
+            results_by_seed[int(seed)][name][0]["mean_core_cost_per_ego"]
+            for seed in args.seeds
+        )
+        for name in fixed_names
+    }
+    matched = min(
+        fixed_names, key=lambda name: abs(float(fixed_costs[name]) - adaptive_cost)
+    )
+
+    rows = []
+    for seed in args.seeds:
+        results = results_by_seed[int(seed)]
         reference = results["Full-Explicit"][1]
-        adaptive_cost = float(results["Adaptive-K"][0]["mean_core_size"])
-        fixed_names = [name for name in variants if name.startswith("Fixed-K-")]
-        matched = min(
-            fixed_names,
-            key=lambda name: abs(
-                float(results[name][0]["mean_core_size"]) - adaptive_cost
-            ),
+        adaptive_seed_cost = float(
+            results["Adaptive-K"][0]["mean_core_cost_per_ego"]
         )
         for variant, (row, probe) in results.items():
             row.update(_decision_fidelity(probe, reference))
             row["decision_fidelity_reference"] = "Full-Explicit"
+            row["matched_fixed_variant"] = matched
+            row["pooled_adaptive_core_cost_per_ego"] = float(adaptive_cost)
             if variant == matched:
                 row["matched_to_adaptive"] = 1
             if variant.startswith("Fixed-K-"):
                 row["mean_core_cost_gap_to_adaptive"] = abs(
-                    float(row["mean_core_size"]) - adaptive_cost
+                    float(row["mean_core_cost_per_ego"]) - adaptive_seed_cost
                 )
             rows.append(row)
 
@@ -184,7 +208,9 @@ def main(argv=None):
         "k_max": int(args.k_max),
         "agent_count": int(args.agent_count),
         "variants": variants,
-        "matching_rule": "nearest fixed integer k to observed adaptive mean core size per seed",
+        "matching_rule": "single fixed k nearest pooled adaptive mean K_t/N cost; selected without reward",
+        "matched_fixed_variant": matched,
+        "pooled_adaptive_core_cost_per_ego": float(adaptive_cost),
         "summary": summary,
     })
     print(summary)

@@ -3,6 +3,8 @@
 import argparse
 import copy
 import csv
+import hashlib
+import pickle
 import json
 import os
 import tempfile
@@ -17,6 +19,7 @@ try:
     )
     from run_paper_b_allocation import (
         _decision_probe, _mean_oracle_capacity, _oracle_capacity_for_state,
+        _policy_context_for_state,
     )
 except ModuleNotFoundError:
     from scripts.exp_common import ROOT, ensure_dir
@@ -26,6 +29,7 @@ except ModuleNotFoundError:
     )
     from scripts.run_paper_b_allocation import (
         _decision_probe, _mean_oracle_capacity, _oracle_capacity_for_state,
+        _policy_context_for_state,
     )
 
 import run_experiment as RE
@@ -35,10 +39,12 @@ from models.single_mean_memory import SingleMeanPeripheral
 try:
     from representation_isolation import (
         collect_teacher_trajectory, terminal_states, train_periphery_on_teacher_history,
+        teacher_history_hashes, replay_pair_history,
     )
 except ModuleNotFoundError:
     from scripts.representation_isolation import (
         collect_teacher_trajectory, terminal_states, train_periphery_on_teacher_history,
+        teacher_history_hashes, replay_pair_history,
     )
 
 
@@ -105,9 +111,9 @@ def _probe_state_bank(runner, bank):
                 [cache["value_cache"][agent] for agent in range(runner.n_agents)],
                 dtype=np.float64,
             ))
-            actions.append(np.asarray(
-                [selected[agent] for agent in range(runner.n_agents)], dtype=np.int64,
-            ))
+            actions.append(np.argmax(
+                np.asarray(cache["policy_logits"], dtype=np.float64), axis=-1
+            ).astype(np.int64))
     finally:
         runner.env.restore_state(outer)
     return {"logits": np.stack(logits), "values": np.stack(values), "actions": np.stack(actions)}
@@ -264,6 +270,14 @@ def _atomic_json(path, payload):
             os.unlink(temporary)
 
 
+def _state_bank_sha256(bank):
+    if not bank:
+        raise ValueError("fidelity state bank is empty")
+    return hashlib.sha256(
+        pickle.dumps(bank, protocol=pickle.HIGHEST_PROTOCOL)
+    ).hexdigest()
+
+
 def _mean(values):
     finite = [float(value) for value in values if np.isfinite(value)]
     return float(np.mean(finite)) if finite else float("nan")
@@ -285,6 +299,8 @@ def _cfg(seed, core_budget):
         "periph_use_uniform_mix": False,
         "strict_causal_profile": True,
         "semantic_router_frozen": True,
+        "causal_horizon": 1,
+        "proxy_n_horizons": 1,
     })
     return cfg
 
@@ -342,16 +358,17 @@ def _oracle_capacity_table(seed, checkpoint, core_budget, device, n_states=2):
         n_states=int(n_states), burn_in=3, bank_seed=bank_seed,
         min_remaining_steps=int(runner.cfg["causal_horizon"]),
     )
-    oracle_bank = [
-        _oracle_capacity_for_state(
+    oracle_bank = []
+    for index, state in enumerate(bank):
+        policy_context = _policy_context_for_state(runner, state)
+        oracle_bank.append(_oracle_capacity_for_state(
             runner.env, state,
             horizon=int(runner.cfg["causal_horizon"]),
             discount=float(runner.cfg["discount"]),
-            trials=1,
+            trials=8,
             seed=bank_seed + index * 100003,
-        )
-        for index, state in enumerate(bank)
-    ]
+            target_policy_probs=policy_context["policy_probs"],
+        ))
     return _mean_oracle_capacity(oracle_bank)
 
 
@@ -450,7 +467,28 @@ def _representation_isolation_probe(
     _seed_oracle_core(runner, core_budget, oracle_capacity,
                       full_explicit=(spec["runner"] == "full"))
     train_periphery_on_teacher_history(runner, traces)
-    return _probe_state_bank(runner, bank)
+    # Reset the shared recurrent/belief state to the common checkpoint while
+    # retaining the just-trained peripheral module, then replay the immutable
+    # teacher actions.  Fidelity is probed only at each trace terminal so the
+    # environment snapshot and recurrent representation refer to the same t.
+    _restore_shared_state(runner, checkpoint)
+    _seed_oracle_core(
+        runner, core_budget, oracle_capacity,
+        full_explicit=(spec["runner"] == "full"),
+    )
+    probes = []
+    for trace in traces:
+        if not trace:
+            continue
+        replay_pair_history(runner, [trace], train_bc=False, bc_steps=0)
+        terminal = terminal_states([trace], n_states=1)
+        probes.append(_probe_state_bank(runner, terminal))
+    if not probes:
+        raise ValueError("periphery fidelity requires non-empty teacher traces")
+    return {
+        key: np.concatenate([item[key] for item in probes], axis=0)
+        for key in ("logits", "values", "actions")
+    }
 
 
 def main(argv=None):
@@ -479,14 +517,29 @@ def main(argv=None):
         oracle_capacity = _oracle_capacity_table(
             seed, checkpoint, args.core_budget, args.device
         )
+        # The common history teacher must retain a real periphery.  A
+        # Full-Explicit teacher has P_i=empty and therefore produces empty
+        # periph_inputs_cache, making every "periphery-only" training arm
+        # scientifically vacuous.  Use the same oracle-fixed k-core for the
+        # immutable teacher history; Full-Explicit remains only the decision
+        # fidelity reference.
         teacher_cfg = _cfg(seed, args.core_budget)
-        teacher_cfg["core_selection_mode"] = "full_explicit"
+        teacher_cfg["core_selection_mode"] = "oracle_capacity"
         teacher_cfg["freeze_policy_learning"] = True
         teacher = RE.make_runner("Final-CIGAMF", _env(seed), teacher_cfg, args.device)
         _restore_shared_state(teacher, checkpoint)
-        _seed_oracle_core(teacher, args.core_budget, oracle_capacity, full_explicit=True)
+        _seed_oracle_core(teacher, args.core_budget, oracle_capacity, full_explicit=False)
         teacher_traces = collect_teacher_trajectory(teacher, max(1, int(args.episodes)))
-        fidelity_bank = terminal_states(teacher_traces, n_states=4)
+        provenance = teacher_history_hashes(teacher_traces)
+        if int(provenance["teacher_peripheral_item_count"]) <= 0:
+            raise RuntimeError(
+                "Paper-B periphery isolation teacher produced zero peripheral items"
+            )
+        fidelity_bank = [
+            copy.deepcopy(trace[-1]["env_snapshot_after_step"])
+            for trace in teacher_traces if trace
+        ]
+        state_bank_hash = _state_bank_sha256(fidelity_bank)
         variants = {}
         for name in selected_variants:
             variants[name] = _run_variant(
@@ -518,6 +571,11 @@ def main(argv=None):
                 row["decision_fidelity_history_steps"] = int(sum(
                     len(trace) for trace in teacher_traces
                 ))
+            row.update(provenance)
+            row["decision_fidelity_state_bank_sha256"] = state_bank_hash
+            row["decision_fidelity_downstream_checkpoint_sha256"] = str(
+                checkpoint["sha256"]
+            )
             rows.append(row)
     summary_path = os.path.join(out_root, "summary_paper_b_periphery.csv")
     with open(summary_path, "w", newline="", encoding="utf-8") as handle:
@@ -534,6 +592,8 @@ def main(argv=None):
         "pretrain_episodes": args.pretrain_episodes,
         "core_budget": args.core_budget,
         "variants": list(selected_variants),
+        "isolation_teacher": "oracle_fixed_k_core_common_history",
+        "isolation_teacher_requires_nonempty_periphery": True,
         "memory_budget_control": {
             "variant": "Single-Mean-Matched",
             "target": "Semantic-Free trainable peripheral parameter bytes",

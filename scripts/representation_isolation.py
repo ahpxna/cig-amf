@@ -8,6 +8,8 @@ held fixed.  End-to-end reward experiments intentionally remain separate.
 from __future__ import annotations
 
 import copy
+import hashlib
+import pickle
 
 import numpy as np
 
@@ -21,6 +23,39 @@ def collect_teacher_trajectory(runner, episodes: int):
         trajectory, _reward, _runtime = runner.collect_episode()
         traces.append(copy.deepcopy(trajectory))
     return traces
+
+
+
+
+def teacher_history_hashes(traces):
+    """Stable provenance hashes for the immutable teacher history.
+
+    The full trace hash protects state/cache provenance; the action hash makes
+    it cheap for validators to ensure every representation arm saw identical
+    factual actions even if auxiliary cache formats evolve.
+    """
+    if not traces or not any(traces):
+        raise ValueError("teacher history is empty")
+    full = hashlib.sha256(
+        pickle.dumps(traces, protocol=pickle.HIGHEST_PROTOCOL)
+    ).hexdigest()
+    actions = [
+        tuple(int(a) for a in step.get("actions", ()))
+        for trajectory in traces for step in trajectory
+    ]
+    action_hash = hashlib.sha256(
+        pickle.dumps(actions, protocol=pickle.HIGHEST_PROTOCOL)
+    ).hexdigest()
+    peripheral_items = sum(
+        sum(len(items) for items in step.get("periph_inputs_cache", {}).values())
+        for trajectory in traces for step in trajectory
+    )
+    return {
+        "teacher_trace_sha256": full,
+        "teacher_action_history_sha256": action_hash,
+        "teacher_history_steps": int(len(actions)),
+        "teacher_peripheral_item_count": int(peripheral_items),
+    }
 
 
 def replay_pair_history(runner, traces, *, train_bc: bool, bc_steps: int):
@@ -118,6 +153,27 @@ def replay_pair_history(runner, traces, *, train_bc: bool, bc_steps: int):
             w_influence=float(runner.cfg.get("heads_w_influence", 1.0)),
             w_contrastive=float(runner.cfg.get("heads_w_contrastive", 0.3)),
         )
+
+
+def probe_trace_terminals(runner, traces, probe_fn):
+    """Replay common factual history and probe only representation-aligned states.
+
+    A cloned environment snapshot is not sufficient for a recurrent model: pair
+    states and other representation memory must correspond to the same point in
+    history.  This helper advances the pair state with the teacher actions and
+    evaluates only the final post-step state of each replayed trace.
+    """
+    probes = []
+    for trace in traces:
+        if not trace:
+            continue
+        replay_pair_history(runner, [trace], train_bc=False, bc_steps=0)
+        state = copy.deepcopy(trace[-1]["env_snapshot_after_step"])
+        probes.append(probe_fn(runner, [state]))
+    if not probes:
+        raise ValueError("cannot probe an empty teacher history")
+    keys = ("logits", "values", "actions")
+    return {key: np.concatenate([probe[key] for probe in probes], axis=0) for key in keys}
 
 
 def terminal_states(traces, n_states: int):

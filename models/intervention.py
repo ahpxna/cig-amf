@@ -263,11 +263,38 @@ class EpsilonForcedActionController:
         fr = float(np.clip(floor_ratio, 1e-3, 1.0))
         w = fr + (1.0 - fr) * w
 
-        # Keep the TOTAL BUDGET unchanged: mean(eps_j) = eps.
+        # Preserve the TOTAL assigned intervention budget even when some
+        # high-priority agents saturate at probability 1.  A plain
+        # ``clip(eps * w, 0, 1)`` loses budget after saturation.  Solve the
+        # capped-simplex equation
+        #
+        #     mean(min(1, lambda * w_j)) = eps
+        #
+        # by monotone bisection instead.  This keeps the logged per-agent
+        # epsilon vector internally consistent with the requested budget.
         w = w / float(np.mean(w))
+        target_mean = float(np.clip(self.eps, 0.0, 1.0))
+        if target_mean <= 0.0:
+            eps_j = np.zeros_like(w)
+        elif target_mean >= 1.0:
+            eps_j = np.ones_like(w)
+        else:
+            lo = 0.0
+            hi = max(1.0, target_mean / max(float(np.min(w)), 1e-12))
+            while float(np.mean(np.minimum(1.0, hi * w))) < target_mean:
+                hi *= 2.0
+            for _ in range(80):
+                mid = 0.5 * (lo + hi)
+                if float(np.mean(np.minimum(1.0, mid * w))) < target_mean:
+                    lo = mid
+                else:
+                    hi = mid
+            eps_j = np.minimum(1.0, hi * w)
 
-        eps_j = np.clip(self.eps * w, 0.0, 1.0)
-
+        if not np.isclose(float(np.mean(eps_j)), target_mean, rtol=0.0, atol=1e-10):
+            raise RuntimeError(
+                "targeted forcing failed to preserve the assigned epsilon budget"
+            )
         self._eps_per_agent = eps_j.astype(np.float64)
 
     def get_eps_per_agent(self) -> np.ndarray:

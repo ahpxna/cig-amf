@@ -15,6 +15,7 @@ import json
 import os
 import tempfile
 import time
+import random
 
 import numpy as np
 import torch
@@ -23,13 +24,13 @@ try:
     from exp_common import ROOT, ensure_dir
     from run_paper_b_periphery import _memory_accounting
     from run_paper_b_allocation import (
-        _decision_fidelity, _oracle_capacity_direction_for_state,
+        _decision_fidelity, _oracle_capacity_for_state,
     )
 except ModuleNotFoundError:
     from scripts.exp_common import ROOT, ensure_dir
     from scripts.run_paper_b_periphery import _memory_accounting
     from scripts.run_paper_b_allocation import (
-        _decision_fidelity, _oracle_capacity_direction_for_state,
+        _decision_fidelity, _oracle_capacity_for_state,
     )
 
 import run_experiment as RE
@@ -63,7 +64,9 @@ def _mean(values):
     return float(np.mean(values)) if values else float("nan")
 
 
-def _runner(variant, n_agents, seed, device, core_budget, candidate_max_degree):
+def _runner(
+    variant, n_agents, seed, device, core_budget, candidate_max_degree=None
+):
     # Every variant in a matched seed/population cell must start from the exact
     # same parameter RNG state.  Without this reset, sequential construction
     # confounds architecture differences with different random initialisation.
@@ -80,7 +83,11 @@ def _runner(variant, n_agents, seed, device, core_budget, candidate_max_degree):
     })
     # The Paper-B scalability panel measures bounded candidate-edge execution,
     # not an all-pairs system with a small full-core only.  Full-Explicit is
-    # deliberately exempt because it is the dense upper reference.
+    # deliberately exempt because it is the dense upper reference.  Direct
+    # helper calls default to a candidate budget equal to the explicit budget;
+    # the CLI still passes its prespecified d_max explicitly.
+    if candidate_max_degree is None:
+        candidate_max_degree = int(core_budget)
     if variant != "Full-Explicit":
         cfg["candidate_max_degree"] = int(candidate_max_degree)
     if variant == "Full-Explicit":
@@ -117,9 +124,31 @@ def _decision_probe_with_latency(runner, n_states, seed):
         for state in bank:
             runner.env.restore_state(copy.deepcopy(state))
             obs = runner.env._get_obs_all()
+            np_state = np.random.get_state()
+            py_state = random.getstate()
+            torch_state = torch.get_rng_state()
+            cuda_state = (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            )
+            forcer = getattr(runner, "forcer", None)
+            forcer_state = (
+                copy.deepcopy(forcer.state_dict())
+                if forcer is not None and callable(getattr(forcer, "state_dict", None))
+                else None
+            )
             started = time.perf_counter()
             result = runner._select_actions_population(obs)
             latencies.append(time.perf_counter() - started)
+            # The scaling probe is observational.  It may time the complete
+            # action-selection path, but it must not advance forcing counters or
+            # RNG streams used by the subsequent run.
+            np.random.set_state(np_state)
+            random.setstate(py_state)
+            torch.set_rng_state(torch_state)
+            if cuda_state is not None:
+                torch.cuda.set_rng_state_all(cuda_state)
+            if forcer_state is not None:
+                forcer.load_state_dict(forcer_state)
             if (
                 isinstance(result, tuple) and len(result) == 2
                 and isinstance(result[1], dict)
@@ -130,9 +159,7 @@ def _decision_probe_with_latency(runner, n_states, seed):
                     [cache["value_cache"][ego] for ego in range(runner.n_agents)],
                     dtype=np.float64,
                 )
-                actions_arr = np.asarray(
-                    [selected[ego] for ego in range(runner.n_agents)], dtype=np.int64
-                )
+                actions_arr = np.argmax(logits_arr, axis=-1).astype(np.int64)
             elif isinstance(result, tuple) and len(result) == 3:
                 # PureMeanField keeps its historical action-selection interface.
                 # Reconstruct the same masked policy logits for a comparable
@@ -160,7 +187,7 @@ def _decision_probe_with_latency(runner, n_states, seed):
                     )
                     logits_arr = raw_logits.detach().cpu().numpy().astype(np.float64)
                 values_arr = np.asarray(values_np, dtype=np.float64)
-                actions_arr = np.asarray(selected, dtype=np.int64)
+                actions_arr = np.argmax(logits_arr, axis=-1).astype(np.int64)
             else:
                 raise RuntimeError("unsupported scaling decision-probe interface")
             logits.append(logits_arr)
@@ -177,6 +204,7 @@ def _decision_probe_with_latency(runner, n_states, seed):
         "inference_latency_mean_ms": float(np.mean(latency)),
         "inference_latency_p50_ms": float(np.percentile(latency, 50)),
         "inference_latency_p95_ms": float(np.percentile(latency, 95)),
+        "inference_latency_protocol": "side_effect_restored_full_action_selection",
     }
 
 
@@ -204,7 +232,7 @@ def _candidate_oracle_recall_at_degree(
             bank_seed=int(seed), min_remaining_steps=int(horizon),
         )
         for state_index, state in enumerate(bank):
-            capacities, _ = _oracle_capacity_direction_for_state(
+            capacities = _oracle_capacity_for_state(
                 env, state, horizon=int(horizon), discount=float(discount),
                 trials=int(trials),
                 seed=int(seed) + 100003 * int(state_index),
@@ -254,8 +282,8 @@ def main(argv=None):
         help="Oracle-only state-bank size for the top-C candidate-recall gate.",
     )
     parser.add_argument(
-        "--candidate-recall-horizon", type=int, default=8,
-        help="Clone-state response horizon used by the candidate-recall oracle.",
+        "--candidate-recall-horizon", type=int, default=1,
+        help="One-step clone-state capacity horizon used by the candidate-recall oracle.",
     )
     parser.add_argument(
         "--candidate-recall-trials", type=int, default=2,
@@ -273,11 +301,11 @@ def main(argv=None):
     if (
         args.candidate_max_degree <= 0
         or args.candidate_recall_states <= 0
-        or args.candidate_recall_horizon <= 0
+        or args.candidate_recall_horizon != 1
         or args.candidate_recall_trials <= 0
         or not 0.0 <= args.candidate_recall_min <= 1.0
     ):
-        parser.error("candidate recall budgets must be positive and its minimum must lie in [0, 1]")
+        parser.error("candidate recall requires horizon=1, positive budgets, and minimum in [0, 1]")
     rows = []
     for seed in args.seeds:
         for n_agents in args.agent_counts:
@@ -338,6 +366,10 @@ def main(argv=None):
                     "measured_edge_count": int(
                         history.get("measured_edge_count", [0])[-1]
                     ) if history.get("measured_edge_count") else 0,
+                    "E_t": int(history.get("E_t", [0])[-1])
+                    if history.get("E_t") else 0,
+                    "K_t": int(history.get("K_t", [0])[-1])
+                    if history.get("K_t") else 0,
                     "mean_candidate_degree": _mean(history.get("d_bar", [])),
                     "candidate_construction_subquadratic": bool(
                         history.get("candidate_construction_subquadratic", [False])[-1]

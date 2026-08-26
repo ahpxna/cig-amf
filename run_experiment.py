@@ -197,11 +197,10 @@ def default_cfg():
         # and looked like literal thresholds, which made the paper/config
         # contract misleading.
         "belief_tau_enter": 0.005,
-        "belief_tau_in": 0.005,
-        "belief_tau_out": 0.00175,
-        # Deprecated ratio alias retained for old configs; canonical runtime
-        # uses literal G-scale tau_in/tau_out values above.
-        "belief_hysteresis_ratio": 0.35 / 0.55,
+        "belief_tau_exit": 0.00175,
+        # Deprecated ratio alias retained only for external legacy configs;
+        # canonical runtime uses the literal G-scale enter/exit values above.
+        "belief_hysteresis_ratio": 0.35,
         "seed_core_top_k": 3,
         # Fixed oracle truth cardinality.  Evaluation never adapts the target
         # core size to a model's predicted core, which would inflate F1.
@@ -369,6 +368,8 @@ def default_cfg():
         "heads_w_influence": 1.0,
 
         "drift_warmup_batches": 200,
+        "drift_batch_size": 256,
+        "drift_window": 20,
         "drift_recalibrate_after": 15,
         "drift_train_batches": 5,
 

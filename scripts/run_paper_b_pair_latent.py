@@ -98,6 +98,8 @@ def _base_cfg(seed, core_budget):
         "min_core_size": int(core_budget),
         "belief_adaptive_k_min": int(core_budget),
         "max_core_size": int(core_budget),
+        "causal_horizon": 1,
+        "proxy_n_horizons": 1,
         "periph_require_full_signature": True,
         "periph_allow_legacy_items": False,
         "strict_causal_profile": True,
@@ -241,9 +243,12 @@ def _probe_state_bank(runner, bank):
                 [cache["value_cache"][ego] for ego in range(runner.n_agents)],
                 dtype=np.float64,
             ))
-            actions.append(np.asarray(
-                [selected[ego] for ego in range(runner.n_agents)], dtype=np.int64,
-            ))
+            # Fidelity compares the policy decision rule, not epsilon-forced
+            # sampled actions.  The cached logits are already valid-action
+            # masked by PolicyValueNet.
+            actions.append(np.argmax(
+                np.asarray(cache["policy_logits"], dtype=np.float64), axis=-1
+            ).astype(np.int64))
     finally:
         runner.env.restore_state(outer)
     return {
@@ -279,7 +284,7 @@ def _oracle_capacity_table(seed, checkpoint, core_budget, device, n_states=2):
             runner.env, state,
             horizon=int(runner.cfg["causal_horizon"]),
             discount=float(runner.cfg["discount"]),
-            trials=1,
+            trials=8,
             seed=bank_seed + index * 100003,
         )
         for index, state in enumerate(bank)
@@ -383,11 +388,25 @@ def _matched_history_probe(
         runner, oracle_capacity, core_budget,
         full=bool(cfg.get("full_explicit_reference", False)),
     )
-    replay_pair_history(
-        runner, traces, train_bc=True,
-        bc_steps=max(1, int(cfg.get("bc_train_steps", 1))),
-    )
-    return _probe_state_bank(runner, bank), runner
+    # Probe only states whose recurrent representation has been advanced by
+    # exactly the same teacher history.  Restoring an intermediate environment
+    # snapshot after replaying the *entire* history creates the invalid hybrid
+    # (s_t, h_{t'}).
+    probes = []
+    for trace in traces:
+        replay_pair_history(
+            runner, [trace], train_bc=True,
+            bc_steps=max(1, int(cfg.get("bc_train_steps", 1))),
+        )
+        terminal = terminal_states([trace], n_states=1)
+        probes.append(_probe_state_bank(runner, terminal))
+    if not probes:
+        raise ValueError("matched-history probe requires non-empty teacher traces")
+    probe = {
+        key: np.concatenate([item[key] for item in probes], axis=0)
+        for key in ("logits", "values", "actions")
+    }
+    return probe, runner
 
 
 def _promotion_panel(
@@ -446,7 +465,7 @@ def _promotion_panel(
             runner, [trace], train_bc=True,
             bc_steps=max(1, int(runner.cfg.get("bc_train_steps", 1))),
         )
-        bank = terminal_states([trace], n_states=4)
+        bank = terminal_states([trace], n_states=1)
         fidelity = _decision_fidelity(
             _probe_state_bank(runner, bank), _probe_state_bank(reference, bank)
         )
@@ -571,7 +590,10 @@ def main(argv=None):
         teacher_traces = collect_teacher_trajectory(
             teacher, max(1, int(args.episodes))
         )
-        fidelity_bank = terminal_states(teacher_traces, n_states=4)
+        fidelity_bank = [
+            copy.deepcopy(trace[-1]["env_snapshot_after_step"])
+            for trace in teacher_traces if trace
+        ]
         variants = {}
         for name in selected_variants:
             variants[name] = _run_variant(

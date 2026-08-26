@@ -126,6 +126,12 @@ def main(argv=None):
 
     if len(set(contract_hashes)) != 1:
         raise RuntimeError("no-change residual runs used inconsistent H2 null contracts")
+    sequence_lengths = [len(sequence) for sequence in sequences]
+    if len(set(sequence_lengths)) != 1:
+        raise RuntimeError(
+            "no-change CUSUM sequences must share one frozen monitoring horizon; "
+            f"received lengths={sequence_lengths}"
+        )
     _atomic_json(args.out, {
         "protocol": COLLECTION_PROTOCOL,
         "no_change_only": True,
@@ -134,7 +140,7 @@ def main(argv=None):
         "checkpoint_sha256_by_seed": checkpoint_hashes,
         "reference_config_hash": contract_hashes[0],
         "contract": contract,
-        "monitoring_horizon": int(max(len(sequence) for sequence in sequences)),
+        "monitoring_horizon": int(sequence_lengths[0]),
         "z_sequences": sequences,
     })
     print(json.dumps({"out": os.path.abspath(args.out)}, indent=2))

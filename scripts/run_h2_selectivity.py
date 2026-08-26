@@ -241,10 +241,11 @@ def _fixed_estimand_panel(
     structural_factor,
     behavioral_factor,
     seed,
-    n_states=2,
+    n_states=8,
     horizon=8,
     discount=0.97,
-    n_trials=2,
+    n_trials=8,
+    core_budget=3,
 ):
     """Evaluate C and D on matched cloned states with fixed continuation."""
     if not all(
@@ -264,12 +265,19 @@ def _fixed_estimand_panel(
         )
         for raw_state in bank:
             state = copy.deepcopy(raw_state)
-            if structural_factor:
-                state["active_lane"] = {
-                    zone: ("B" if lane == "A" else "A")
-                    for zone, lane in state["active_lane"].items()
-                }
             env.restore_state(state)
+            apply_oracle = getattr(env, "apply_factorial_intervention_for_oracle", None)
+            if not callable(apply_oracle):
+                raise RuntimeError(
+                    "H2 fixed estimand panel requires the canonical oracle "
+                    "factorial-intervention adapter"
+                )
+            apply_oracle(
+                structural=bool(structural_factor),
+                behavioral=False,
+                behavior_mode="selfish",
+            )
+            state = env.clone_state()
             egos = _agents_with_roles(env, H2_EVALUATION_EGO_ROLES)
             targets = _agents_with_roles(env, H2_MANIPULATED_NEIGHBOR_ROLES)
             for ego in egos:
@@ -328,7 +336,7 @@ def _fixed_estimand_panel(
                 int(target)
                 for target, _ in sorted(
                     targets.items(), key=lambda item: item[1], reverse=True
-                )[:3]
+                )[:int(core_budget)]
             ]
             for ego, targets in capacity_mean_by_ego.items()
         }
@@ -341,6 +349,7 @@ def _fixed_estimand_panel(
             "horizon": int(horizon),
             "discount": float(discount),
             "n_trials": int(n_trials),
+            "core_budget": int(core_budget),
             "capacity_mean_by_ego": capacity_mean_by_ego,
             "oracle_core_by_ego": oracle_core_by_ego,
         }
@@ -1013,6 +1022,7 @@ def run_one(
             seed=seed,
             horizon=int(cfg["causal_horizon"]),
             discount=float(cfg["discount"]),
+            core_budget=int(cfg.get("max_core_size", 3)),
         )
     estimand_panel = copy.deepcopy(cached_estimand_panel)
     if estimand_panel is None:
@@ -1023,6 +1033,7 @@ def run_one(
             seed=seed,
             horizon=int(cfg["causal_horizon"]),
             discount=float(cfg["discount"]),
+            core_budget=int(cfg.get("max_core_size", 3)),
         )
 
     evaluation_egos = _agents_with_roles(env, H2_EVALUATION_EGO_ROLES)
@@ -1459,6 +1470,7 @@ def _cached_estimand_panels(seed, run_dir):
             and int(payload.get("seed", -1)) == int(seed)
             and int(payload.get("horizon", -1)) == int(cfg["causal_horizon"])
             and np.isclose(float(payload.get("discount", -1.0)), float(cfg["discount"]))
+            and int(payload.get("core_budget", -1)) == int(cfg.get("max_core_size", 3))
         ):
             def _restore_integer_keys(panel):
                 panel = copy.deepcopy(panel)
@@ -1501,6 +1513,7 @@ def _cached_estimand_panels(seed, run_dir):
         seed=int(seed),
         horizon=int(cfg["causal_horizon"]),
         discount=float(cfg["discount"]),
+        core_budget=int(cfg.get("max_core_size", 3)),
     )
     pre = _fixed_estimand_panel(
         structural_factor=False, behavioral_factor=False, **common
@@ -1520,6 +1533,7 @@ def _cached_estimand_panels(seed, run_dir):
         "seed": int(seed),
         "horizon": int(cfg["causal_horizon"]),
         "discount": float(cfg["discount"]),
+        "core_budget": int(cfg.get("max_core_size", 3)),
         "pre": pre,
         "cells": cells,
     }

@@ -72,7 +72,7 @@ class ScientificGateLadderTests(unittest.TestCase):
         self.assertGreater(row["comparison_count"], 0)
         self.assertTrue(np.isfinite(row["random_advantage_mean"]))
 
-    def test_final_validator_modular_failures_reduce_scope_not_core(self):
+    def test_final_validator_retained_h3_failures_block_full_paper_support(self):
         from scripts import validate_scientific_gates as VG
 
         with tempfile.TemporaryDirectory() as root:
@@ -105,9 +105,13 @@ class ScientificGateLadderTests(unittest.TestCase):
                 report, code = VG.validate(
                     root, prechecks, None, "confirmatory", min_external_seeds=3
                 )
-        self.assertEqual(code, VG.EXIT_SUPPORTED)
+        self.assertEqual(code, VG.EXIT_UNSUPPORTED)
         self.assertTrue(report["core_gates_pass"])
-        self.assertEqual(report["claim_scope"]["latency"], "DELETE_OR_GATE_OUT")
+        self.assertEqual(report["overall_status"], "NOT_SUPPORTED")
+        self.assertEqual(
+            report["claim_scope"]["latency"],
+            "RETAINED_BUT_RECOVERY_UNSUPPORTED",
+        )
         self.assertEqual(report["claim_scope"]["trigger_tracking"], "DELETE_OR_GATE_OUT")
         self.assertEqual(report["claim_scope"]["generalisation"], "CUSTOM_DOMAIN_ONLY")
         self.assertEqual(
@@ -135,7 +139,8 @@ class ScientificGateLadderTests(unittest.TestCase):
             with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as handle:
                 json.dump({
                     "profile": "full", "environment": "rware",
-                    "provenance_complete": True, "external_pin_match": True,
+                    "provenance_complete": True, "source_git_clean": True,
+                    "external_pin_match": True,
                     "paired_generalization_models_present": True,
                     "seeds": [1, 2, 3], "episodes": 50,
                     "h1_support_by_seed": {

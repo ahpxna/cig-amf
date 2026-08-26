@@ -108,8 +108,8 @@ class AuditHardeningTests(unittest.TestCase):
 
     def test_cusum_artifact_rejects_impossible_ranges(self):
         bad = {
-            "calibration_protocol": "page_cusum_no_change_v2",
-            "source_protocol": "cusum_no_change_residual_collection_v2",
+            "calibration_protocol": "page_cusum_no_change_v3_provenance",
+            "source_protocol": "cusum_no_change_residual_collection_v3_fixed_horizon",
             "no_change_only": True,
             "source": {"path": "/missing", "sha256": "0" * 64},
             "cusum_allowance": -999,
@@ -120,6 +120,7 @@ class AuditHardeningTests(unittest.TestCase):
             "reference_config_hash": "1" * 64,
             "n_no_change_trajectories": 40,
             "monitoring_horizon": 10,
+            "source_checkpoint_sha256_by_seed": {"1": "2" * 64},
         }
         with self.assertRaises(ValueError):
             validate_calibration_artifact(bad, verify_source=False)

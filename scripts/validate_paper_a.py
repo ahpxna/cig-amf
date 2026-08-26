@@ -1,4 +1,4 @@
-"""Validate Paper-A Q/C/D recovery, selectivity, tracking, and optional latency."""
+"""Validate the retained Paper-A Q/C/D, latency, and tracking claim set."""
 
 import argparse
 import json
@@ -227,23 +227,19 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
     h3_latency_supported = bool(latency_status["supported"])
     h3_tracking_supported = bool(tracking_status["supported"])
 
-    # The gate ladder treats both latency and the online CUSUM/tracking trigger
-    # as modular contributions.  H1 Q/C/D recovery plus H2 structural/behavioural
-    # separation define the Paper-A causal core.  A failed optional mechanism
-    # must shrink the submitted claim set rather than incorrectly falsify the
-    # already-supported causal estimands.
-    core_supported = bool(h1["supported"] and h2["supported"])
-    all_modules_supported = bool(
-        core_supported and h3_latency_supported and h3_tracking_supported
+    # H1/H2 can be reported separately as supported causal estimands, but the
+    # submitted Paper-A claim set explicitly retains latency and H3 tracking.
+    # A failed latency gate is therefore negative evidence for the latency-
+    # recovery claim; it must not be rewritten as if the module were optional
+    # or deleted from the method after seeing the result.
+    core_estimands_supported = bool(h1["supported"] and h2["supported"])
+    full_claim_set_supported = bool(
+        core_estimands_supported and h3_latency_supported and h3_tracking_supported
     )
-    if core_supported and h3_latency_supported and h3_tracking_supported:
-        overall_status = "SUPPORTED_WITH_LATENCY_AND_TRACKING"
-    elif core_supported and h3_tracking_supported:
-        overall_status = "SUPPORTED_LATENCY_GATED_OUT"
-    elif core_supported and h3_latency_supported:
-        overall_status = "SUPPORTED_TRACKING_GATED_OUT"
-    elif core_supported:
-        overall_status = "SUPPORTED_OPTIONAL_MODULES_GATED_OUT"
+    if full_claim_set_supported:
+        overall_status = "SUPPORTED"
+    elif core_estimands_supported:
+        overall_status = "PARTIALLY_SUPPORTED_RETAINED_H3_NOT_ESTABLISHED"
     else:
         overall_status = "NOT_SUPPORTED"
 
@@ -254,20 +250,22 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
         "H2": h2,
         "H3a_latency": latency_status,
         "H3b_tracking": tracking_status,
-        "submitted_claim_set_supported": core_supported,
-        "full_hypothesis_set_supported": all_modules_supported,
-        "all_optional_modules_supported": all_modules_supported,
+        "core_estimands_supported": core_estimands_supported,
+        "submitted_claim_set_supported": full_claim_set_supported,
+        "full_hypothesis_set_supported": full_claim_set_supported,
         "latency": latency_status,
         "latency_policy": (
-            "H3a latency is separately gated and optional. Oracle or learned "
-            "latency failure gates out only the latency contribution."
+            "Latency is a retained Paper-A estimand. Oracle/learned gate failure "
+            "is reported as failure to establish latency recovery in the tested "
+            "environment; it does not delete the latency module post hoc."
         ),
         "tracking_policy": (
-            "H3b CUSUM/tracking is separately gated and optional. Failure of "
-            "the frozen behavioural false-alarm or recovery gate removes the "
-            "trigger/tracking contribution without rewriting H1/H2."
+            "H3b CUSUM/tracking is retained in the submitted H3 claim set. "
+            "Failure of the frozen behavioural false-alarm or recovery gate "
+            "prevents full Paper-A support while leaving H1/H2 estimand results "
+            "reportable on their own."
         ),
-    }, VC.EXIT_SUPPORTED if core_supported else VC.EXIT_UNSUPPORTED
+    }, VC.EXIT_SUPPORTED if full_claim_set_supported else VC.EXIT_UNSUPPORTED
 
 
 def main(argv=None):

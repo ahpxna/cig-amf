@@ -1844,8 +1844,15 @@ class SharedAblationBase:
                 continue
             try:
                 action_index = int(action_source[other])
-            except (KeyError, IndexError, TypeError):
-                action_index = 0
+            except (KeyError, IndexError, TypeError) as exc:
+                raise KeyError(
+                    f"raw causal context is missing the co-action for neighbour {other}"
+                ) from exc
+            if action_index < 0 or action_index >= self.action_dim:
+                raise ValueError(
+                    f"raw causal context contains invalid co-action {action_index} "
+                    f"for neighbour {other}"
+                )
             rows.append(
                 adapter.neighbour_features(ego, other, action_index)
             )
@@ -1858,6 +1865,49 @@ class SharedAblationBase:
         if table.shape[1] != adapter.context_item_dim:
             raise RuntimeError("environment adapter context item dimension mismatch")
         return table, np.ones((table.shape[0],), dtype=np.float32)
+
+    def _raw_proxy_context_block(self, ego, current_actions=None):
+        """Build one raw all-neighbour ContextBlock for proxy replay.
+
+        Paper-A ablations must use the same partition-independent measurement
+        boundary as Final-CIGAMF; storing only per-target legacy summaries is
+        not sufficient for the literal DeepSets/sum-minus-target path.
+        """
+        adapter = getattr(self, "env_adapter", None)
+        if adapter is None:
+            adapter = resolve_env_adapter(self.env, action_dim=self.action_dim)
+        action_source = (
+            current_actions
+            if current_actions is not None
+            else getattr(self.env, "last_actions", {})
+        )
+        ids = [int(j) for j in range(self.n_agents) if int(j) != int(ego)]
+        rows = []
+        for other in ids:
+            try:
+                action = int(action_source[other])
+            except (KeyError, IndexError, TypeError) as exc:
+                raise KeyError(
+                    f"raw causal context block is missing the co-action for neighbour {other}"
+                ) from exc
+            if action < 0 or action >= self.action_dim:
+                raise ValueError(
+                    f"raw causal context block contains invalid co-action {action} "
+                    f"for neighbour {other}"
+                )
+            rows.append(adapter.neighbour_features(int(ego), other, action))
+        items = (
+            np.stack(rows, axis=0).astype(np.float32)
+            if rows else np.zeros((0, adapter.context_item_dim), dtype=np.float32)
+        )
+        return {
+            "context_block_id": (
+                int(getattr(self, "_interaction_step", 0)) * max(1, self.n_agents)
+                + int(ego)
+            ),
+            "neighbor_ids": np.asarray(ids, dtype=np.int64),
+            "items": items,
+        }
 
     def _periph_context_excluding(self, ego, exclude_j):
         if not self.use_multi_memory:
@@ -1893,6 +1943,7 @@ class SharedAblationBase:
             "periph_context_excluding": {},
             "proxy_context_excluding": {},
             "proxy_context_items_excluding": {},
+            "proxy_context_blocks": {},
             "value_cache": {},
             # [FIX-X1] Match final_runner by capturing geometry at this
             # timestep so replay_builder constructs time-aligned x_ij.
@@ -1981,6 +2032,9 @@ class SharedAblationBase:
 
         actions_list = [actions[agent] for agent in range(self.n_agents)]
         for ego in range(self.n_agents):
+            cache["proxy_context_blocks"][ego] = self._raw_proxy_context_block(
+                ego, current_actions=actions_list
+            )
             for j in range(self.n_agents):
                 if j != ego:
                     cache["proxy_context_excluding"][ego][j] = (
@@ -2046,6 +2100,7 @@ class SharedAblationBase:
                     "proxy_context_items_excluding": cache[
                         "proxy_context_items_excluding"
                     ],
+                    "proxy_context_blocks": cache["proxy_context_blocks"],
                     "valid_action_masks": cache["valid_action_masks"],
                     "value_cache": cache["value_cache"],
                     "geom_snapshot": cache["geom_snapshot"],   # [FIX-X1]

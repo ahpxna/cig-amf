@@ -94,10 +94,12 @@ class RevisedScientificContractTests(unittest.TestCase):
         )
         self.assertGreater(pushed, 0)
         sample = runner.proxy.buffer[0]
+        self.assertIn("context_block", sample)
         self.assertEqual(
-            sample["context_items"].shape[1],
+            np.asarray(sample["context_block"]["items"]).shape[1],
             runner.env_adapter.context_item_dim,
         )
+        self.assertIsNotNone(sample.get("target_context_position"))
 
     def test_drift_residual_is_discounted_full_horizon_return(self):
         detector = DriftDetector(
@@ -332,7 +334,7 @@ class RevisedScientificContractTests(unittest.TestCase):
             use_vmap_ensemble=False,
         )
         proxy._predict_all_actions = lambda **_: torch.tensor(
-            [[[[0.0, 0.0, 0.0], [1e-8, 1e-8, 1e-8]]]],
+            [[[[0.0, 0.0, 0.0], [0.5e-8, 0.5e-8, 0.5e-8]]]],
             dtype=torch.float32,
         )
         out = proxy.score_batch_full(
@@ -572,6 +574,8 @@ class RevisedScientificContractTests(unittest.TestCase):
                         "pair_feat": np.asarray([0.0], dtype=np.float32),
                         "z_core_excl_j": np.asarray([0.0], dtype=np.float32),
                         "m_periph_excl_j": np.asarray([0.0], dtype=np.float32),
+                        "context_items": np.asarray([[episode, repeat]], dtype=np.float32),
+                        "context_mask": np.asarray([1.0], dtype=np.float32),
                         "policy_probs_j": np.asarray([0.25, 0.75], dtype=np.float32),
                         "behaviour_prob_j": 0.5,
                         "target_return_h": float(action + episode),

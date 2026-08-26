@@ -34,6 +34,10 @@ class CDDecompositionTests(unittest.TestCase):
         runner.action_dim = 3
         runner.core_dim = 11
         runner.periph_dim = 13
+        runner.candidate_neighbors_by_ego = {
+            ego: [j for j in range(runner.n_agents) if j != ego]
+            for ego in range(runner.n_agents)
+        }
         return runner
 
     def test_raw_proxy_context_is_partition_independent_and_leave_one_out(self):

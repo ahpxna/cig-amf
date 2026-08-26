@@ -98,8 +98,8 @@ class BayesLightBeliefState:
         lambda_0: float = 0.12,
         uncertainty_scale: float = 2.0,
         tau: float = 0.10,
-        tau_in: float = 0.62,
-        tau_out: float = 0.46,
+        tau_in: Optional[float] = None,
+        tau_out: Optional[float] = None,
         weak_prior_top_k: int = 2,
         min_core_size: int = 1,
         max_core_size: int = 4,
@@ -121,8 +121,14 @@ class BayesLightBeliefState:
         self.lambda_0 = float(lambda_0)
         self.uncertainty_scale = float(uncertainty_scale)
         self.tau = float(tau)
-        self.tau_in = float(tau_in)
-        self.tau_out = float(tau_out)
+        # Canonical callers pass literal G-scale hysteresis thresholds.  For
+        # direct/legacy construction that only supplies ``tau``, preserve the
+        # old single-threshold meaning instead of silently applying the stale
+        # probability-scale defaults 0.62/0.46 to an LCB score.
+        self.tau_in = float(self.tau if tau_in is None else tau_in)
+        self.tau_out = float(0.35 * self.tau_in if tau_out is None else tau_out)
+        if self.tau_out > self.tau_in:
+            raise ValueError("tau_out must not exceed tau_in for hysteresis")
 
         self.weak_prior_top_k = int(weak_prior_top_k)
         self.min_core_size = max(0, int(min_core_size))

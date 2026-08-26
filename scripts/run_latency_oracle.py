@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Oracle gate for the optional lag-specific causal latency contribution.
+"""Oracle falsification gate for the retained lag-specific latency estimand.
 
 The gate measures a one-time action intervention followed by the same fixed
 reference continuation policy in both branches.  It does not train a latency
-head and does not make a paper claim.  A failed gate therefore records that
-latency must remain absent from the learned signature rather than turning a
-diagnostic failure into an execution failure.
+head.  Failure is negative evidence for latency recovery in this environment;
+it does not delete latency from the method or learned signal schema post hoc.
 """
 import argparse
 import json

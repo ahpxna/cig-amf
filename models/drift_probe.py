@@ -275,12 +275,16 @@ class DriftDetector:
 
     # ------------------------------------------------------------------
 
-    def train_batches(self, buffer, n_batches: int = 1) -> float:
-        """Train live (frozen never touched) model."""
+    def train_batches(
+        self, buffer, n_batches: int = 1, min_episode_id: Optional[int] = None
+    ) -> float:
+        """Train the live witness without crossing a declared regime boundary."""
         losses = []
 
         for _ in range(int(n_batches)):
-            got = self._batch(buffer, self.batch_size)
+            got = self._batch(
+                buffer, self.batch_size, min_episode_id=min_episode_id
+            )
 
             if got is None:
                 break
@@ -329,19 +333,26 @@ class DriftDetector:
         self.cusum_stat = 0.0
         self.latest_standardized_residual = 0.0
 
-    def measure(self, buffer, n: int = 512) -> Optional[float]:
-        """
-        Evaluate the frozen model on the newest data.
+    def measure(self, buffer, n: Optional[int] = None) -> Optional[float]:
+        """Evaluate the frozen model with the calibrated residual statistic.
 
-        Draw from the end of the buffer rather than randomly because the
-        question is whether the world changed recently. Return the mean
-        absolute error of the reconstructed discounted H-step return.
+        Calibration uses the mean residual of ``batch_size`` complete rows, so
+        monitoring must use the same row count.  Using 512 newest rows while
+        calibrating on 256-row batches changes the null statistic itself.
         """
         if self.frozen is None or buffer is None or len(buffer) == 0:
             return None
 
-        buf = [sample for sample in list(buffer)[-int(n):]
-               if bool(sample.get("horizon_complete", True))]
+        size = int(self.batch_size if n is None else n)
+        if size != int(self.batch_size):
+            raise ValueError(
+                "drift monitoring batch size must equal the calibrated batch_size"
+            )
+        complete = [
+            sample for sample in buffer
+            if bool(sample.get("horizon_complete", True))
+        ]
+        buf = complete[-size:]
         if not buf:
             return None
 
@@ -489,6 +500,13 @@ class DriftDetector:
         alpha = float(false_alarm_target)
         if not 0.0 < alpha < 1.0:
             raise ValueError("false_alarm_target must lie strictly between zero and one")
+        lengths = [len(np.asarray(v).reshape(-1)) for v in z_sequences]
+        if not lengths or any(length <= 0 for length in lengths):
+            raise ValueError("CUSUM calibration requires non-empty sequences")
+        if len(set(lengths)) != 1:
+            raise ValueError(
+                "CUSUM false-alarm calibration requires one frozen monitoring horizon"
+            )
         maxima = cls.page_cusum_maxima(z_sequences, allowance)
         threshold = float(np.quantile(maxima, 1.0 - alpha, method="higher"))
         observed = float(np.mean(maxima > threshold))
@@ -498,7 +516,7 @@ class DriftDetector:
             "target_false_alarm_rate": alpha,
             "observed_false_alarm_rate": observed,
             "n_no_change_trajectories": int(maxima.size),
-            "monitoring_horizon": int(max(len(np.asarray(v).reshape(-1)) for v in z_sequences)),
+            "monitoring_horizon": int(lengths[0]),
             "maxima": maxima.tolist(),
         }
 
@@ -537,9 +555,17 @@ class DriftDetector:
                 "z": 0.0,
             }
 
-        # After freezing, the live model keeps training for the next snapshot.
-        # The frozen witness is never updated.
-        self.train_batches(buffer, n_train_batches)
+        # After a trigger, the replacement witness may adapt only on replay
+        # from the new regime.  Mixing pre-trigger rows into the live model
+        # makes the subsequent "new-regime" snapshot a mixed-regime witness.
+        adaptation_min_episode = (
+            self.recalibration_reference_min_episode
+            if self.pending_recalibration_at is not None
+            else None
+        )
+        self.train_batches(
+            buffer, n_train_batches, min_episode_id=adaptation_min_episode
+        )
 
         # Re-freeze only after the adaptation delay, then calibrate the new
         # witness exclusively on post-trigger samples before monitoring resumes.
@@ -548,23 +574,65 @@ class DriftDetector:
             and episode >= self.pending_recalibration_at
         ):
             min_episode_id = self.recalibration_reference_min_episode
-            # Do not replace a valid frozen witness until the replay contains
-            # at least one complete post-trigger sample.  Otherwise snapshot()
-            # would clear the pending recalibration marker and strand the
-            # detector in a permanently-not-ready state.
-            if self._batch(buffer, 1, min_episode_id=min_episode_id) is None:
+            # Fail closed before replacing the currently valid witness.  The
+            # new regime must contain at least one full calibration-sized batch
+            # of complete rows; checking only one row lets snapshot() destroy
+            # the old calibrated witness before calibration can succeed.
+            eligible = [
+                sample for sample in buffer
+                if bool(sample.get("horizon_complete", True))
+                and sample.get("episode_id") is not None
+                and int(sample["episode_id"]) >= int(min_episode_id)
+            ]
+            if len(eligible) < int(self.batch_size):
                 return {
                     "phase": "reference_recalibration",
                     "batches": int(self.n_batches_trained),
                     "residual": None,
                     "z": 0.0,
                 }
-            self.snapshot(episode)
-            calibration = self.calibrate_reference(
-                buffer,
-                n_batches=max(20, int(self.window)),
-                min_episode_id=min_episode_id,
+            # Calibrate a temporary frozen copy first.  If calibration fails,
+            # restore the old calibrated witness and keep waiting rather than
+            # invalidating the detector.
+            import copy
+            old_frozen = self.frozen
+            old_state = (
+                self.reference_mean, self.reference_std,
+                self.reference_sample_count, list(self.residual_history),
+                self.cusum_stat, self.latest_standardized_residual,
+                self.last_snapshot_episode, self.n_snapshots,
+                self.pending_recalibration_at,
             )
+            candidate = copy.deepcopy(self.live).to(self.device)
+            for parameter in candidate.parameters():
+                parameter.requires_grad_(False)
+            candidate.eval()
+            self.frozen = candidate
+            try:
+                calibration = self.calibrate_reference(
+                    buffer,
+                    n_batches=max(20, int(self.window)),
+                    min_episode_id=min_episode_id,
+                )
+            except RuntimeError:
+                self.frozen = old_frozen
+                (
+                    self.reference_mean, self.reference_std,
+                    self.reference_sample_count, old_history,
+                    self.cusum_stat, self.latest_standardized_residual,
+                    self.last_snapshot_episode, self.n_snapshots,
+                    self.pending_recalibration_at,
+                ) = old_state
+                self.residual_history[:] = old_history
+                return {
+                    "phase": "reference_recalibration",
+                    "batches": int(self.n_batches_trained),
+                    "residual": None,
+                    "z": 0.0,
+                }
+            self.last_snapshot_episode = episode
+            self.n_snapshots += 1
+            self.pending_recalibration_at = None
             self.recalibration_reference_min_episode = None
             return {
                 "phase": "recalibrated",
