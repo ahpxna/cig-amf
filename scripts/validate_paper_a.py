@@ -67,9 +67,10 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
     if learned_latency is not None and not learned_pass:
         latency_gate_reason = "learned latency calibration did not pass"
     latency_status = {
-        "status": "SUPPORTED" if learned_pass else "GATED_OUT",
+        "status": "SUPPORTED" if learned_pass else "NOT_SUPPORTED",
         "supported": learned_pass,
-        "optional": True,
+        "optional": False,
+        "retained_estimand": True,
         "gate_reason": None if learned_pass else latency_gate_reason,
         "oracle_artifact_present": oracle_latency is not None,
         "oracle_gate_pass": oracle_pass,
@@ -90,6 +91,8 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
                 "learned_oracle_center_rank_correlation",
                 "zero_lag_baseline_mae",
                 "terminal_lag_baseline_mae",
+                "cumulative_signflip_baseline_mae",
+                "learned_beats_cumulative_signflip_baseline",
                 "n_seeds",
                 "per_seed_gate_pass_fraction",
                 "n_valid",
@@ -102,12 +105,12 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
             "overall_status": "SMOKE_ONLY",
             "H1": {"status": "SMOKE_ONLY", "supported": False},
             "H2": {"status": "SMOKE_ONLY", "supported": False},
-            "H3a_latency": latency_status,
-            "H3b_tracking": {"status": "SMOKE_ONLY", "supported": False},
+            "H3_latency": latency_status,
+            "H4_tracking": {"status": "SMOKE_ONLY", "supported": False},
         }, VC.EXIT_SMOKE_ONLY
     h1 = VC._h1_status(h1_rows)
     h2 = VC._h2_status(h2_rows, h1_supported=h1["supported"])
-    # H3b's prespecified primary comparator is the otherwise matched tracker
+    # H4's prespecified primary comparator is the otherwise matched tracker
     # without change-triggered re-estimation.  Other tracker variants are
     # mechanism diagnostics/trade-offs and must not turn a valid primary
     # comparison into a false rejection.
@@ -121,7 +124,7 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
             control_by_seed = {int(row["seed"]): row for row in h2_rows if row.get("model") == control}
             if set(final_by_seed) != set(control_by_seed):
                 raise CR.ResultValidationError(
-                    f"H3b unpaired recovery rows for {control}"
+                    f"H4 unpaired recovery rows for {control}"
                 )
             final_latency = [float(final_by_seed[seed]["recovery_latency"])
                              for seed in sorted(final_by_seed)]
@@ -218,14 +221,14 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
             "frozen_target": (false_alarm_targets[0] if one_frozen_target else float("nan")),
         },
         "rule": (
-            "H3b requires faster recovery than matched NoDetector while "
+            "H4 requires faster recovery than matched NoDetector while "
             "meeting the frozen no-change behavioural false-alarm target. "
             "Control non-recovery is right-censored; Final non-recovery fails. Fixed-rate, fast, "
             "no-uncertainty, and no-two-timescale arms are diagnostics."
         ),
     }
     h3_latency_supported = bool(latency_status["supported"])
-    h3_tracking_supported = bool(tracking_status["supported"])
+    h4_tracking_supported = bool(tracking_status["supported"])
 
     # H1/H2 can be reported separately as supported causal estimands, but the
     # submitted Paper-A claim set explicitly retains latency and H3 tracking.
@@ -234,12 +237,12 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
     # or deleted from the method after seeing the result.
     core_estimands_supported = bool(h1["supported"] and h2["supported"])
     full_claim_set_supported = bool(
-        core_estimands_supported and h3_latency_supported and h3_tracking_supported
+        core_estimands_supported and h3_latency_supported and h4_tracking_supported
     )
     if full_claim_set_supported:
         overall_status = "SUPPORTED"
     elif core_estimands_supported:
-        overall_status = "PARTIALLY_SUPPORTED_RETAINED_H3_NOT_ESTABLISHED"
+        overall_status = "PARTIALLY_SUPPORTED_RETAINED_H3_OR_H4_NOT_ESTABLISHED"
     else:
         overall_status = "NOT_SUPPORTED"
 
@@ -248,8 +251,8 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
         "overall_status": overall_status,
         "H1": h1,
         "H2": h2,
-        "H3a_latency": latency_status,
-        "H3b_tracking": tracking_status,
+        "H3_latency": latency_status,
+        "H4_tracking": tracking_status,
         "core_estimands_supported": core_estimands_supported,
         "submitted_claim_set_supported": full_claim_set_supported,
         "full_hypothesis_set_supported": full_claim_set_supported,
@@ -260,7 +263,7 @@ def validate(run_root, h1_seeds, h2_seeds, protocol_mode):
             "environment; it does not delete the latency module post hoc."
         ),
         "tracking_policy": (
-            "H3b CUSUM/tracking is retained in the submitted H3 claim set. "
+            "H4 CUSUM/tracking is retained in the submitted claim set. "
             "Failure of the frozen behavioural false-alarm or recovery gate "
             "prevents full Paper-A support while leaving H1/H2 estimand results "
             "reportable on their own."

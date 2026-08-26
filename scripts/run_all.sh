@@ -54,6 +54,19 @@ CIG_PAPER_B_CANDIDATE_RECALL_STATES="${CIG_PAPER_B_CANDIDATE_RECALL_STATES:-}"
 CIG_PAPER_B_CANDIDATE_RECALL_HORIZON="${CIG_PAPER_B_CANDIDATE_RECALL_HORIZON:-8}"
 CIG_PAPER_B_CANDIDATE_RECALL_TRIALS="${CIG_PAPER_B_CANDIDATE_RECALL_TRIALS:-2}"
 CIG_PAPER_B_CANDIDATE_RECALL_MIN="${CIG_PAPER_B_CANDIDATE_RECALL_MIN:-0.80}"
+CIG_PAPER_B_CANDIDATE_RECALL_STABILITY_MIN="${CIG_PAPER_B_CANDIDATE_RECALL_STABILITY_MIN:-0.80}"
+CIG_PAPER_B_CANDIDATE_RECALL_STABLE_FRACTION_MIN="${CIG_PAPER_B_CANDIDATE_RECALL_STABLE_FRACTION_MIN:-0.80}"
+CIG_PAPER_B_MAX_REL_REWARD_DROP="${CIG_PAPER_B_MAX_REL_REWARD_DROP:-0.10}"
+CIG_PAPER_B_MAX_REL_LOGIT_INCREASE="${CIG_PAPER_B_MAX_REL_LOGIT_INCREASE:-0.25}"
+CIG_PAPER_B_MAX_REL_VALUE_INCREASE="${CIG_PAPER_B_MAX_REL_VALUE_INCREASE:-0.25}"
+CIG_PAPER_B_MAX_ACTION_DROP="${CIG_PAPER_B_MAX_ACTION_DROP:-0.05}"
+# If the caller does not provide development artifacts, confirmatory mode
+# generates them automatically on source-hash-scoped, disjoint development seeds.
+CIG_DEV_H1_SEED_TEXT="${CIG_DEV_H1_SEEDS:-901 902 903 904 905 906 907 908}"
+CIG_DEV_CUSUM_SEED_TEXT="${CIG_DEV_CUSUM_SEEDS:-1001 1002 1003 1004 1005 1006 1007 1008 1009 1010 1011 1012 1013 1014 1015 1016 1017 1018 1019 1020 1021 1022 1023 1024 1025 1026 1027 1028 1029 1030 1031 1032 1033 1034 1035 1036 1037 1038 1039 1040}"
+CIG_DEV_H1_STATES_PER_SEED="${CIG_DEV_H1_STATES_PER_SEED:-100}"
+CIG_DEV_CUSUM_EPISODES="${CIG_DEV_CUSUM_EPISODES:-200}"
+CIG_DEV_CUSUM_PRETRAIN_EPISODES="${CIG_DEV_CUSUM_PRETRAIN_EPISODES:-60}"
 
 usage() {
   sed -n '2,18p' "$0"
@@ -120,6 +133,7 @@ if [ "$CIG_QUICK" -eq 1 ]; then
   CIG_H3_EPISODES="${CIG_H3_EPISODES:-60}"
   CIG_LATENCY_TRAIN_EPISODES="${CIG_LATENCY_TRAIN_EPISODES:-2}"
   CIG_PAPER_B_SELECTOR_STATES="${CIG_PAPER_B_SELECTOR_STATES:-2}"
+  CIG_PAPER_B_CORE_BUDGETS="${CIG_PAPER_B_CORE_BUDGETS:-2}"
   CIG_MODE="quick"
 else
   CIG_PAPER_B_CANDIDATE_RECALL_STATES="${CIG_PAPER_B_CANDIDATE_RECALL_STATES:-4}"
@@ -134,6 +148,7 @@ else
   CIG_H3_EPISODES="${CIG_H3_EPISODES:-200}"
   CIG_LATENCY_TRAIN_EPISODES="${CIG_LATENCY_TRAIN_EPISODES:-200}"
   CIG_PAPER_B_SELECTOR_STATES="${CIG_PAPER_B_SELECTOR_STATES:-8}"
+  CIG_PAPER_B_CORE_BUDGETS="${CIG_PAPER_B_CORE_BUDGETS:-2 3 4 5}"
   CIG_MODE="confirmatory"
 fi
 
@@ -166,6 +181,8 @@ fi
 read -r -a CIG_H1_SEED_ARRAY <<< "$CIG_H1_SEED_TEXT"
 read -r -a CIG_H23_SEED_ARRAY <<< "$CIG_H23_SEED_TEXT"
 read -r -a CIG_GATE_SEED_ARRAY <<< "$CIG_GATE_SEED_TEXT"
+read -r -a CIG_DEV_H1_SEED_ARRAY <<< "$CIG_DEV_H1_SEED_TEXT"
+read -r -a CIG_DEV_CUSUM_SEED_ARRAY <<< "$CIG_DEV_CUSUM_SEED_TEXT"
 if [ "${#CIG_H1_SEED_ARRAY[@]}" -eq 0 ] || [ "${#CIG_H23_SEED_ARRAY[@]}" -eq 0 ] || [ "${#CIG_GATE_SEED_ARRAY[@]}" -eq 0 ]; then
   echo "CIG_RUN_SEEDS resolved to an empty seed list." >&2
   exit 2
@@ -179,17 +196,22 @@ case "$CIG_RUN_LEGACY_H3" in
     ;;
 esac
 
+CIG_SOURCE_TREE_HASH="$($CIG_PYTHON scripts/source_tree_hash.py)"
+if [ -z "$CIG_SOURCE_TREE_HASH" ]; then
+  echo "Could not compute confirmatory source-tree hash." >&2
+  exit 2
+fi
 if [ "$CIG_MODE" = "confirmatory" ] && [ "${CIG_ALLOW_DIRTY_CONFIRMATORY:-0}" != "1" ]; then
-  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
-    echo "Confirmatory mode requires a Git worktree." >&2; exit 2;
-  }
-  git rev-parse --verify HEAD >/dev/null 2>&1 || {
-    echo "Confirmatory mode requires a valid Git HEAD." >&2; exit 2;
-  }
-  if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
-    echo "Confirmatory mode requires a clean git worktree. Commit the frozen source first." >&2
-    echo "Use --quick or CIG_ALLOW_DIRTY_CONFIRMATORY=1 only for non-confirmatory development." >&2
-    exit 2
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git rev-parse --verify HEAD >/dev/null 2>&1 || {
+      echo "Git worktree exists but has no valid HEAD." >&2; exit 2;
+    }
+    if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+      echo "Confirmatory mode requires a clean Git worktree when Git metadata is present." >&2
+      exit 2
+    fi
+  else
+    echo "INFO: no Git metadata found; using frozen content-addressed source SHA-256 $CIG_SOURCE_TREE_HASH"
   fi
 fi
 for CIG_SEED in "${CIG_H1_SEED_ARRAY[@]}" "${CIG_H23_SEED_ARRAY[@]}" "${CIG_GATE_SEED_ARRAY[@]}"; do
@@ -241,6 +263,47 @@ for CIG_SEED in "${CIG_GATE_SEED_ARRAY[@]}"; do
   esac
 done
 
+if [ "$CIG_MODE" = "confirmatory" ]; then
+  # Development seeds matter only for artifacts that will actually be generated
+  # in this invocation.  Pre-supplied frozen artifacts must not be rejected
+  # merely because the caller did not also provide unused development seeds.
+  CIG_NEED_AUTO_H1_DEV=0
+  CIG_NEED_AUTO_CUSUM_DEV=0
+  if [ -z "$CIG_H1_THRESHOLD_CALIBRATION" ] && [ -z "$CIG_H1_ORACLE_SUPPORT" ]; then
+    CIG_NEED_AUTO_H1_DEV=1
+  fi
+  if [ -z "$CIG_CUSUM_CALIBRATION" ]; then
+    CIG_NEED_AUTO_CUSUM_DEV=1
+  fi
+  CIG_SEEN_DEV_SEEDS=" "
+  if [ "$CIG_NEED_AUTO_H1_DEV" -eq 1 ]; then
+    if [ "${#CIG_DEV_H1_SEED_ARRAY[@]}" -lt 5 ]; then
+      echo "Automatic H1 development calibration requires at least 5 disjoint seeds." >&2; exit 2
+    fi
+    for CIG_DEV_SEED in "${CIG_DEV_H1_SEED_ARRAY[@]}"; do
+      case "$CIG_DEV_SEED" in *[!0-9]*|"") echo "H1 development seeds must be non-negative integers." >&2; exit 2;; esac
+      case "$CIG_SEEN_DEV_SEEDS" in *" $CIG_DEV_SEED "*) echo "Duplicate development seed $CIG_DEV_SEED is pseudo-replication." >&2; exit 2;; esac
+      case " ${CIG_H1_SEED_ARRAY[*]} ${CIG_H23_SEED_ARRAY[*]} ${CIG_GATE_SEED_ARRAY[*]} " in
+        *" $CIG_DEV_SEED "*) echo "Development seed $CIG_DEV_SEED overlaps confirmatory/precheck seeds." >&2; exit 2;;
+      esac
+      CIG_SEEN_DEV_SEEDS="$CIG_SEEN_DEV_SEEDS$CIG_DEV_SEED "
+    done
+  fi
+  if [ "$CIG_NEED_AUTO_CUSUM_DEV" -eq 1 ]; then
+    if [ "${#CIG_DEV_CUSUM_SEED_ARRAY[@]}" -lt 40 ]; then
+      echo "Automatic CUSUM calibration requires at least 40 independent development trajectories/seeds." >&2; exit 2
+    fi
+    for CIG_DEV_SEED in "${CIG_DEV_CUSUM_SEED_ARRAY[@]}"; do
+      case "$CIG_DEV_SEED" in *[!0-9]*|"") echo "CUSUM development seeds must be non-negative integers." >&2; exit 2;; esac
+      case "$CIG_SEEN_DEV_SEEDS" in *" $CIG_DEV_SEED "*) echo "Duplicate/reused development seed $CIG_DEV_SEED is pseudo-replication." >&2; exit 2;; esac
+      case " ${CIG_H1_SEED_ARRAY[*]} ${CIG_H23_SEED_ARRAY[*]} ${CIG_GATE_SEED_ARRAY[*]} " in
+        *" $CIG_DEV_SEED "*) echo "Development seed $CIG_DEV_SEED overlaps confirmatory/precheck seeds." >&2; exit 2;;
+      esac
+      CIG_SEEN_DEV_SEEDS="$CIG_SEEN_DEV_SEEDS$CIG_DEV_SEED "
+    done
+  fi
+fi
+
 for CIG_EPISODE_BUDGET in "$CIG_H2_EPISODES" "$CIG_H2_PRETRAIN_EPISODES" "$CIG_H3_EPISODES" \
   "$CIG_LATENCY_ORACLE_STATES" "$CIG_LATENCY_ORACLE_TRIALS" \
   "$CIG_LATENCY_TRAIN_EPISODES" "$CIG_GATE_ALLOCATION_EPISODES" \
@@ -290,24 +353,80 @@ for CIG_AGENT_COUNT in $CIG_PAPER_B_SCALING_AGENTS; do
       ;;
   esac
 done
+CIG_SEEN_CORE_BUDGETS=" "
+for CIG_CORE_BUDGET in $CIG_PAPER_B_CORE_BUDGETS; do
+  case "$CIG_CORE_BUDGET" in
+    *[!0-9]*|""|0)
+      echo "CIG_PAPER_B_CORE_BUDGETS must contain positive integers." >&2
+      exit 2
+      ;;
+  esac
+  case "$CIG_SEEN_CORE_BUDGETS" in
+    *" $CIG_CORE_BUDGET "*)
+      echo "CIG_PAPER_B_CORE_BUDGETS contains duplicate budget $CIG_CORE_BUDGET." >&2
+      exit 2
+      ;;
+  esac
+  CIG_SEEN_CORE_BUDGETS="$CIG_SEEN_CORE_BUDGETS$CIG_CORE_BUDGET "
+done
 
 if [ "$CIG_QUICK" -eq 0 ]; then
+  # Supply both H1 development artifacts explicitly, or neither.  When neither
+  # is supplied, build a source-hash-scoped development calibration exactly once.
+  if { [ -n "$CIG_H1_THRESHOLD_CALIBRATION" ] && [ -z "$CIG_H1_ORACLE_SUPPORT" ]; } || \
+     { [ -z "$CIG_H1_THRESHOLD_CALIBRATION" ] && [ -n "$CIG_H1_ORACLE_SUPPORT" ]; }; then
+    echo "Provide both CIG_H1_THRESHOLD_CALIBRATION and CIG_H1_ORACLE_SUPPORT, or neither." >&2
+    exit 2
+  fi
+  CIG_DEV_DIR="${CIG_DEV_DIR:-$CIG_ROOT/results/development_calibration/$CIG_SOURCE_TREE_HASH}"
+  mkdir -p "$CIG_DEV_DIR"
   if [ -z "$CIG_H1_THRESHOLD_CALIBRATION" ]; then
-    echo "Confirmatory H1 requires CIG_H1_THRESHOLD_CALIBRATION." >&2
-    echo "Generate an oracle-only artifact with calibrate_h1_oracle_thresholds.py." >&2
-    exit 2
+    CIG_H1_DEV_ROOT="$CIG_DEV_DIR/h1"
+    CIG_H1_PAIR_ROWS="$CIG_H1_DEV_ROOT/tiny_oracle_pair_rows.csv"
+    CIG_H1_THRESHOLD_CALIBRATION="$CIG_DEV_DIR/h1_thresholds.json"
+    CIG_H1_ORACLE_SUPPORT="$CIG_DEV_DIR/h1_oracle_support_validated.json"
+    if [ ! -s "$CIG_H1_THRESHOLD_CALIBRATION" ] || [ ! -s "$CIG_H1_ORACLE_SUPPORT" ]; then
+      echo "=== automatic development calibration: H1 oracle support/thresholds ==="
+      rm -rf "$CIG_H1_DEV_ROOT"
+      "$CIG_PYTHON" scripts/collect_h1_oracle_support.py \
+        --seeds "${CIG_DEV_H1_SEED_ARRAY[@]}" \
+        --states-per-seed "$CIG_DEV_H1_STATES_PER_SEED" \
+        --h1-eval-uniform-mass 0.10 --out-root "$CIG_H1_DEV_ROOT" || exit 2
+      "$CIG_PYTHON" scripts/calibrate_h1_oracle_thresholds.py \
+        --oracle-pair-rows "$CIG_H1_PAIR_ROWS" \
+        --capacity-min-effect 0.01 --direction-min-effect 0.005 \
+        --h1-target-policy-mode scripted_uniform_mixture \
+        --h1-eval-uniform-mass 0.10 --out "$CIG_H1_THRESHOLD_CALIBRATION" || exit 2
+      "$CIG_PYTHON" scripts/validate_h1_oracle_support.py \
+        --oracle-pair-rows "$CIG_H1_PAIR_ROWS" \
+        --capacity-threshold 0.01 --direction-threshold 0.005 \
+        --h1-target-policy-mode scripted_uniform_mixture \
+        --h1-eval-uniform-mass 0.10 --out "$CIG_H1_ORACLE_SUPPORT" || exit 2
+    fi
   fi
-  if [ ! -f "$CIG_H1_THRESHOLD_CALIBRATION" ]; then
-    echo "H1 threshold calibration file does not exist: $CIG_H1_THRESHOLD_CALIBRATION" >&2
-    exit 2
+  if [ ! -f "$CIG_H1_THRESHOLD_CALIBRATION" ] || [ ! -f "$CIG_H1_ORACLE_SUPPORT" ]; then
+    echo "H1 development calibration artifacts are missing." >&2; exit 2
   fi
-  if [ -z "$CIG_H1_ORACLE_SUPPORT" ] || [ ! -f "$CIG_H1_ORACLE_SUPPORT" ]; then
-    echo "Confirmatory H1 requires CIG_H1_ORACLE_SUPPORT from validate_h1_oracle_support.py." >&2
-    exit 2
+  if [ -z "$CIG_CUSUM_CALIBRATION" ]; then
+    CIG_CUSUM_NULL="$CIG_DEV_DIR/cusum_no_change.json"
+    CIG_CUSUM_CALIBRATION="$CIG_DEV_DIR/cusum_calibration.json"
+    if [ ! -s "$CIG_CUSUM_CALIBRATION" ]; then
+      echo "=== automatic development calibration: CUSUM no-change threshold ==="
+      "$CIG_PYTHON" scripts/collect_cusum_no_change.py \
+        --seeds "${CIG_DEV_CUSUM_SEED_ARRAY[@]}" \
+        --episodes "$CIG_DEV_CUSUM_EPISODES" \
+        --pretrain-episodes "$CIG_DEV_CUSUM_PRETRAIN_EPISODES" \
+        --max-steps 30 --eval-every 1 --device "$CIG_DEVICE" \
+        --out "$CIG_CUSUM_NULL" || exit 2
+      "$CIG_PYTHON" scripts/calibrate_cusum_threshold.py \
+        --no-change-z-json "$CIG_CUSUM_NULL" --allowance 0.5 \
+        --false-alarm-target 0.05 --min-trajectories 40 \
+        --development-seeds "${CIG_DEV_CUSUM_SEED_ARRAY[@]}" \
+        --out "$CIG_CUSUM_CALIBRATION" || exit 2
+    fi
   fi
-  if [ -z "$CIG_CUSUM_CALIBRATION" ] || [ ! -f "$CIG_CUSUM_CALIBRATION" ]; then
-    echo "Confirmatory H2/H3 requires CIG_CUSUM_CALIBRATION from calibrate_cusum_threshold.py." >&2
-    exit 2
+  if [ ! -f "$CIG_CUSUM_CALIBRATION" ]; then
+    echo "CUSUM calibration artifact is missing." >&2; exit 2
   fi
   if [ "${#CIG_H1_SEED_ARRAY[@]}" -lt 8 ]; then
     echo "Confirmatory H1 requires at least 8 unique paired seeds." >&2
@@ -350,6 +469,7 @@ printf 'category\tlabel\texit_code\telapsed_seconds\tlog\n' > "$CIG_STATUS_TSV"
   printf 'mode=%s\n' "$CIG_MODE"
   printf 'python=%s\n' "$CIG_PYTHON"
   printf 'device=%s\n' "$CIG_DEVICE"
+  printf 'source_tree_sha256=%s\n' "$CIG_SOURCE_TREE_HASH"
   printf 'profile=%s\n' "$([ "$CIG_CLAIMS_ONLY" -eq 1 ] && printf claims-only || printf complete)"
   printf 'legacy_h3=%s\n' "$CIG_RUN_LEGACY_H3"
   printf 'h1_seeds=%s\n' "${CIG_H1_SEED_ARRAY[*]}"
@@ -368,6 +488,9 @@ printf 'category\tlabel\texit_code\telapsed_seconds\tlog\n' > "$CIG_STATUS_TSV"
   printf 'paper_b_candidate_recall_horizon=%s\n' "$CIG_PAPER_B_CANDIDATE_RECALL_HORIZON"
   printf 'paper_b_candidate_recall_trials=%s\n' "$CIG_PAPER_B_CANDIDATE_RECALL_TRIALS"
   printf 'paper_b_candidate_recall_min=%s\n' "$CIG_PAPER_B_CANDIDATE_RECALL_MIN"
+  printf 'paper_b_candidate_recall_stability_min=%s\n' "$CIG_PAPER_B_CANDIDATE_RECALL_STABILITY_MIN"
+  printf 'paper_b_candidate_recall_stable_fraction_min=%s\n' "$CIG_PAPER_B_CANDIDATE_RECALL_STABLE_FRACTION_MIN"
+  printf 'paper_b_core_budgets=%s\n' "$CIG_PAPER_B_CORE_BUDGETS"
   printf 'h1_threshold_calibration=%s\n' "$CIG_H1_THRESHOLD_CALIBRATION"
   printf 'h1_oracle_support=%s\n' "$CIG_H1_ORACLE_SUPPORT"
   printf 'cusum_calibration=%s\n' "$CIG_CUSUM_CALIBRATION"
@@ -764,11 +887,18 @@ run_logged "scalability" "Paper-B reward-compute-memory scaling" "67_paper_b_sca
   "$CIG_PYTHON" scripts/run_paper_b_scaling.py \
   --seeds "${CIG_H23_SEED_ARRAY[@]}" \
   --agent-counts $CIG_PAPER_B_SCALING_AGENTS \
+  --core-budgets $CIG_PAPER_B_CORE_BUDGETS \
   --candidate-max-degree "$CIG_PAPER_B_CANDIDATE_MAX_DEGREE" \
   --candidate-recall-states "$CIG_PAPER_B_CANDIDATE_RECALL_STATES" \
   --candidate-recall-horizon "$CIG_PAPER_B_CANDIDATE_RECALL_HORIZON" \
   --candidate-recall-trials "$CIG_PAPER_B_CANDIDATE_RECALL_TRIALS" \
   --candidate-recall-min "$CIG_PAPER_B_CANDIDATE_RECALL_MIN" \
+  --candidate-recall-stability-min "$CIG_PAPER_B_CANDIDATE_RECALL_STABILITY_MIN" \
+  --candidate-recall-stable-fraction-min "$CIG_PAPER_B_CANDIDATE_RECALL_STABLE_FRACTION_MIN" \
+  --candidate-max-relative-reward-drop "$CIG_PAPER_B_MAX_REL_REWARD_DROP" \
+  --candidate-max-relative-logit-error-increase "$CIG_PAPER_B_MAX_REL_LOGIT_INCREASE" \
+  --candidate-max-relative-value-error-increase "$CIG_PAPER_B_MAX_REL_VALUE_INCREASE" \
+  --candidate-max-action-agreement-drop "$CIG_PAPER_B_MAX_ACTION_DROP" \
   --episodes "$CIG_H3_EPISODES" \
   --device "$CIG_DEVICE" \
   --out-root "$CIG_RUN_DIR/paper_b_scaling"
@@ -829,6 +959,14 @@ run_paper_validation "Validate scientific gate ladder G0-G9" "74_validate_scient
 # ---------------------------------------------------------------------------
 # 9. Final manifest summary.
 # ---------------------------------------------------------------------------
+CIG_SOURCE_TREE_HASH_END="$($CIG_PYTHON scripts/source_tree_hash.py)"
+if [ "$CIG_SOURCE_TREE_HASH_END" != "$CIG_SOURCE_TREE_HASH" ]; then
+  CIG_OPERATIONAL_FAILURES+=("source tree mutated during run")
+  echo "FAIL: source tree SHA-256 changed during the run." >&2
+fi
+printf 'source_tree_sha256_start=%s\nsource_tree_sha256_end=%s\n' \
+  "$CIG_SOURCE_TREE_HASH" "$CIG_SOURCE_TREE_HASH_END" \
+  > "$CIG_RUN_DIR/source_tree_integrity.txt"
 echo
 echo "=== [9/9] Final summary ==="
 echo "Passed commands: $CIG_PASSES"

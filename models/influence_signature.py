@@ -301,6 +301,10 @@ class InfluenceSignatureTracker:
 
         self._n_obs: Dict[Tuple[int, int], int] = {}
 
+    def live_pair_count(self) -> int:
+        """Number of live typed pair profiles retained by the tracker."""
+        return int(len(self._n_obs))
+
     def reconcile_candidate_pairs(self, candidate_neighbors_by_ego):
         """Evict live signature buffers for pairs outside the current candidates."""
         active = {

@@ -29,6 +29,7 @@ from models.peripheral_memory import (
     ITEM_LATENCY_VALID,
     ITEM_REL_ROW,
     ITEM_SIGMA_CAPACITY,
+    ITEM_SIGMA_DIRECTION,
     LEGACY_ITEM_DIM,
 )
 
@@ -302,6 +303,12 @@ class SingleMeanPeripheral(nn.Module):
         full_count = 0
         legacy_count = 0
         for neighbor_id in ids:
+            action_j = int(last_actions[neighbor_id])
+            if action_j < 0 or action_j >= self.action_dim:
+                raise ValueError(
+                    f"peripheral action for neighbour={neighbor_id} must lie in "
+                    f"[0, {self.action_dim}), got {action_j}"
+                )
             signal = None
             if causal_pair_signals is not None:
                 signal = causal_pair_signals.get(int(neighbor_id))
@@ -375,16 +382,24 @@ class SingleMeanPeripheral(nn.Module):
                             "context validity disagrees with typed CausalPairSignal"
                         )
                 context_valid = typed_context_valid
+                latency_normalized = float(signal.normalized_latency)
+                latency_valid = float(bool(signal.latency_representation_valid))
             else:
                 context_valid = 0.0 if context_validity is None else float(
                     context_validity.get(int(neighbor_id), 0.0)
                 )
+                latency_normalized = 0.0
+                latency_valid = 0.0
             if not np.isfinite(context_valid):
                 raise ValueError("context_validity must be finite")
+            if not np.isfinite(latency_normalized):
+                raise ValueError("normalized latency must be finite")
             rows.append([
-                float(int(last_actions[neighbor_id])),
+                float(action_j),
                 *[float(value) for value in signature],
                 context_valid,
+                latency_normalized,
+                latency_valid,
                 *[float(value) for value in relation],
             ])
 

@@ -392,10 +392,10 @@ class FinalReleaseHardeningTests(unittest.TestCase):
         self.assertFalse(report["submitted_claim_set_supported"])
         self.assertEqual(
             report["overall_status"],
-            "PARTIALLY_SUPPORTED_RETAINED_H3_NOT_ESTABLISHED",
+            "PARTIALLY_SUPPORTED_RETAINED_H3_OR_H4_NOT_ESTABLISHED",
         )
-        self.assertFalse(report["H3a_latency"]["supported"])
-        self.assertFalse(report["H3a_latency"]["oracle_artifact_present"])
+        self.assertFalse(report["H3_latency"]["supported"])
+        self.assertFalse(report["H3_latency"]["oracle_artifact_present"])
         self.assertEqual(code, PA.VC.EXIT_UNSUPPORTED)
 
     def test_paper_a_failed_tracking_blocks_full_claim_set(self):
@@ -417,10 +417,10 @@ class FinalReleaseHardeningTests(unittest.TestCase):
              mock.patch.object(PA.VC, "_h2_status", return_value={"supported": True, "status": "SUPPORTED"}):
             report, code = PA.validate(root, [1], [2], "confirmatory")
         self.assertFalse(report["submitted_claim_set_supported"])
-        self.assertFalse(report["H3b_tracking"]["supported"])
+        self.assertFalse(report["H4_tracking"]["supported"])
         self.assertEqual(
             report["overall_status"],
-            "PARTIALLY_SUPPORTED_RETAINED_H3_NOT_ESTABLISHED",
+            "PARTIALLY_SUPPORTED_RETAINED_H3_OR_H4_NOT_ESTABLISHED",
         )
         self.assertEqual(code, PA.VC.EXIT_UNSUPPORTED)
 

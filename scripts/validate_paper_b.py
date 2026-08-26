@@ -85,9 +85,45 @@ def _load_scaling(root, expected_seeds):
     minimum = float(recall.get("minimum", float("nan")))
     if not math.isfinite(minimum) or not 0.0 <= minimum <= 1.0:
         raise ValueError("scaling manifest has an invalid candidate-recall minimum")
-    for key in ("states", "horizon", "trials"):
+    for key in ("states", "horizon", "trials", "independent_replicates"):
         if int(recall.get(key, 0)) <= 0:
             raise ValueError(f"scaling candidate-recall protocol omits positive {key}")
+    if str(recall.get("target_k_rule", "")).strip() != (
+        "max tested explicit core budget clipped to d_max and N-1"
+    ):
+        raise ValueError("scaling candidate-recall protocol omits the frozen top-k* rule")
+    stability_min = float(recall.get("stability_min", float("nan")))
+    if not math.isfinite(stability_min) or not 0.0 <= stability_min <= 1.0:
+        raise ValueError("scaling manifest omits a valid oracle ranking-stability gate")
+    stable_fraction_min = float(recall.get("stable_fraction_min", float("nan")))
+    if not math.isfinite(stable_fraction_min) or not 0.0 <= stable_fraction_min <= 1.0:
+        raise ValueError("scaling manifest omits a valid stable-ranking fraction gate")
+    budgets = [int(k) for k in manifest.get("core_budgets", [])]
+    if not budgets or len(set(budgets)) != len(budgets) or any(k <= 0 for k in budgets):
+        raise ValueError("scaling manifest omits a unique positive core-budget sweep")
+    agent_counts = sorted({int(row["n_agents"]) for row in rows})
+    observed = {
+        (int(row["seed"]), int(row["n_agents"]), int(row["core_budget"]), row["variant"])
+        for row in rows
+    }
+    expected = {
+        (int(seed), int(n), min(int(k), int(n) - 1), variant)
+        for seed in expected_seeds for n in agent_counts for k in budgets
+        for variant in EXPECTED_SCALING
+    }
+    if observed != expected:
+        raise ValueError("scaling seed x population x core-budget x variant matrix is incomplete")
+    degradation = manifest.get("candidate_degradation_gate")
+    if not isinstance(degradation, dict) or degradation.get("reference_variant") != "Semantic-Free-Unrestricted":
+        raise ValueError("scaling manifest omits the frozen dynamic-vs-unrestricted gate")
+    for key in (
+        "max_relative_reward_drop", "max_relative_logit_error_increase",
+        "max_relative_value_error_increase", "max_action_agreement_drop",
+        "reward_denominator_floor", "error_denominator_floor",
+    ):
+        value = float(degradation.get(key, float("nan")))
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"invalid frozen candidate degradation threshold: {key}")
     return rows, manifest
 
 
@@ -167,6 +203,14 @@ def _load_adaptive_budget(root, expected_seeds):
             "pilot-frozen adaptive comparator is not matched in pooled confirmatory cost"
         )
     manifest["realised_confirmatory_cost_gap"] = float(realised_gap)
+    saturation_max = float(manifest.get("max_boundary_saturation_fraction", float("nan")))
+    if not math.isfinite(saturation_max) or not 0.0 <= saturation_max < 1.0:
+        raise ValueError("adaptive-budget manifest omits frozen saturation threshold")
+    for row in rows:
+        if row["variant"] == "Adaptive-K":
+            rate = float(row.get("boundary_saturation_rate", float("nan")))
+            if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+                raise ValueError("Adaptive-K row omits boundary_saturation_rate")
     return rows, manifest
 
 
@@ -342,6 +386,26 @@ def validate(run_root, expected_seeds, protocol_mode):
         allocation, "C-Core", "AbsD-Core",
         "action_agreement_to_full_explicit", panel="selector_isolation",
     )
+    allocation_fidelity_comparators = (
+        "AbsD-Core", "Attention-Core", "Random-Core", "Correlation-Core",
+        "WeakPrior-Core",
+    )
+    c_fidelity_by_comparator = {}
+    for comparator in allocation_fidelity_comparators:
+        c_fidelity_by_comparator[comparator] = {
+            "logit": [-value for value in _paired(
+                allocation, "C-Core", comparator,
+                "policy_logit_l2_to_full_explicit", panel="selector_isolation",
+            )],
+            "value": [-value for value in _paired(
+                allocation, "C-Core", comparator,
+                "value_mae_to_full_explicit", panel="selector_isolation",
+            )],
+            "action": _paired(
+                allocation, "C-Core", comparator,
+                "action_agreement_to_full_explicit", panel="selector_isolation",
+            ),
+        }
     pair_retrieval = [
         -value for value in _paired(
             pair_rows, "Recurrent-BC-CD-Contrastive", "Recurrent-BC",
@@ -364,6 +428,25 @@ def validate(run_root, expected_seeds, protocol_mode):
         pair_rows, "Recurrent-BC-CD-Contrastive", "Recurrent-BC",
         "action_agreement_to_full_explicit",
     )
+    pair_structural_baselines = (
+        "Shared-Neighbor-State", "Pooled-Neighbor", "Explicit-FF-BC",
+    )
+    pair_fidelity_by_baseline = {}
+    for baseline in pair_structural_baselines:
+        pair_fidelity_by_baseline[baseline] = {
+            "logit": [-value for value in _paired(
+                pair_rows, "Recurrent-BC-CD-Contrastive", baseline,
+                "policy_logit_l2_to_full_explicit",
+            )],
+            "value": [-value for value in _paired(
+                pair_rows, "Recurrent-BC-CD-Contrastive", baseline,
+                "value_mae_to_full_explicit",
+            )],
+            "action": _paired(
+                pair_rows, "Recurrent-BC-CD-Contrastive", baseline,
+                "action_agreement_to_full_explicit",
+            ),
+        }
     warm_start_transient = [-value for value in _paired(
         pair_rows, "Recurrent-BC-CD", "Recurrent-BC-CD-NoWarmStart",
         "post_promotion_bc_loss",
@@ -417,6 +500,18 @@ def validate(run_root, expected_seeds, protocol_mode):
     semantic_vs_unconstrained = _paired(
         periphery_rows, "Semantic-Free", "Unconstrained", "mean_reward"
     )
+    semantic_vs_unconstrained_logit = [-value for value in _paired(
+        periphery_rows, "Semantic-Free", "Unconstrained",
+        "policy_logit_l2_to_full_explicit",
+    )]
+    semantic_vs_unconstrained_value = [-value for value in _paired(
+        periphery_rows, "Semantic-Free", "Unconstrained",
+        "value_mae_to_full_explicit",
+    )]
+    semantic_vs_unconstrained_action = _paired(
+        periphery_rows, "Semantic-Free", "Unconstrained",
+        "action_agreement_to_full_explicit",
+    )
     capacity_vs_absd_pooling = _paired(
         periphery_rows, "Semantic-Free", "AbsD-Pooling", "mean_reward"
     )
@@ -424,58 +519,123 @@ def validate(run_root, expected_seeds, protocol_mode):
         periphery_rows, "Semantic-Free", "Attention-Mean", "mean_reward"
     )
     agent_counts = sorted({int(row["n_agents"]) for row in scaling_rows})
+    core_budgets = sorted({int(row["core_budget"]) for row in scaling_rows})
     scaling_pareto = []
     semantic_frontier_flags = []
+    candidate_reward_degradation = []
+    candidate_logit_degradation = []
+    candidate_value_degradation = []
+    candidate_action_degradation = []
+    candidate_degradation_pass_flags = []
+    degradation_gate = scaling_manifest["candidate_degradation_gate"]
+    reward_tol = float(degradation_gate["max_relative_reward_drop"])
+    logit_tol = float(degradation_gate["max_relative_logit_error_increase"])
+    value_tol = float(degradation_gate["max_relative_value_error_increase"])
+    action_tol = float(degradation_gate["max_action_agreement_drop"])
+    reward_floor = float(degradation_gate["reward_denominator_floor"])
+    error_floor = float(degradation_gate["error_denominator_floor"])
+
+    # H3b is genuinely across core budgets. For each matched seed/population
+    # cell, determine whether at least one Semantic-Free budget contributes a
+    # non-dominated reward/throughput/memory operating point.
     for n_agents in agent_counts:
-        by_variant = {}
-        for row in scaling_rows:
-            if int(row["n_agents"]) != n_agents:
-                continue
-            by_variant.setdefault(row["variant"], {})[int(row["seed"])] = row
-        if set(by_variant) != EXPECTED_SCALING:
-            raise ValueError(f"scaling variants missing at N={n_agents}")
-        semantic = by_variant["Semantic-Free"]
-        single = by_variant["Single-Mean"]
-        full = by_variant["Full-Explicit"]
-        pure = by_variant["PureMeanField"]
-        if set(semantic) != set(single) or set(semantic) != set(full) or set(semantic) != set(pure):
-            raise ValueError(f"scaling seeds are unpaired at N={n_agents}")
-        for seed in sorted(semantic):
-            points = {
-                variant: {
-                    "reward": float(values[seed]["mean_reward"]),
-                    "throughput": float(values[seed]["throughput_total"]),
-                    "memory": float(values[seed]["representation_memory_bytes"]),
-                }
-                for variant, values in by_variant.items()
-            }
-            subject = points["Semantic-Free"]
-            dominated = any(
-                other != "Semantic-Free"
-                and candidate["reward"] >= subject["reward"]
-                and candidate["throughput"] >= subject["throughput"]
-                and candidate["memory"] <= subject["memory"]
-                and (
-                    candidate["reward"] > subject["reward"]
-                    or candidate["throughput"] > subject["throughput"]
-                    or candidate["memory"] < subject["memory"]
+        for seed in expected_seeds:
+            cell = [
+                row for row in scaling_rows
+                if int(row["n_agents"]) == int(n_agents)
+                and int(row["seed"]) == int(seed)
+            ]
+            points = []
+            for row in cell:
+                points.append({
+                    "variant": row["variant"],
+                    "core_budget": int(row["core_budget"]),
+                    "reward": float(row["mean_reward"]),
+                    "throughput": float(row["throughput_total"]),
+                    "memory": float(row["representation_memory_bytes"]),
+                    "row": row,
+                })
+            semantic_points = [p for p in points if p["variant"] == "Semantic-Free"]
+            if len(semantic_points) != len(core_budgets):
+                raise ValueError(
+                    f"Semantic-Free core-budget sweep incomplete at N={n_agents}, seed={seed}"
                 )
-                for other, candidate in points.items()
-            )
-            semantic_frontier_flags.append(0.0 if dominated else 1.0)
-            scaling_pareto.append({
-                "n_agents": n_agents,
-                "seed": seed,
-                "reward_vs_single": float(semantic[seed]["mean_reward"]) - float(single[seed]["mean_reward"]),
-                "throughput_vs_full": float(semantic[seed]["throughput_total"]) - float(full[seed]["throughput_total"]),
-                "memory_vs_full": float(full[seed]["representation_memory_bytes"]) - float(semantic[seed]["representation_memory_bytes"]),
-                "reward_vs_pure_mean_field": float(semantic[seed]["mean_reward"]) - float(pure[seed]["mean_reward"]),
-            })
+            any_nondominated = False
+            for subject in semantic_points:
+                dominated = any(
+                    other is not subject
+                    and other["reward"] >= subject["reward"]
+                    and other["throughput"] >= subject["throughput"]
+                    and other["memory"] <= subject["memory"]
+                    and (
+                        other["reward"] > subject["reward"]
+                        or other["throughput"] > subject["throughput"]
+                        or other["memory"] < subject["memory"]
+                    )
+                    for other in points
+                )
+                any_nondominated = any_nondominated or (not dominated)
+                budget = subject["core_budget"]
+                same_budget = {
+                    p["variant"]: p for p in points if p["core_budget"] == budget
+                }
+                required = {
+                    "Single-Mean", "Full-Explicit", "PureMeanField",
+                    "Semantic-Free-Unrestricted",
+                }
+                if not required.issubset(same_budget):
+                    raise ValueError("scaling budget cell omits required comparators")
+                scaling_pareto.append({
+                    "n_agents": n_agents,
+                    "seed": seed,
+                    "core_budget": budget,
+                    "reward_vs_single": subject["reward"] - same_budget["Single-Mean"]["reward"],
+                    "throughput_vs_full": subject["throughput"] - same_budget["Full-Explicit"]["throughput"],
+                    "memory_vs_full": same_budget["Full-Explicit"]["memory"] - subject["memory"],
+                    "reward_vs_pure_mean_field": subject["reward"] - same_budget["PureMeanField"]["reward"],
+                    "nondominated": 0.0 if dominated else 1.0,
+                })
+
+                # H4 compares dynamic candidate restriction against the exact
+                # same Semantic-Free architecture with unrestricted pair scan.
+                dyn = subject["row"]
+                unres = same_budget["Semantic-Free-Unrestricted"]["row"]
+                reward_drop = max(
+                    0.0, float(unres["mean_reward"]) - float(dyn["mean_reward"])
+                ) / max(reward_floor, abs(float(unres["mean_reward"])))
+                logit_inc = max(
+                    0.0,
+                    float(dyn["policy_logit_l2_to_full_explicit"])
+                    - float(unres["policy_logit_l2_to_full_explicit"]),
+                ) / max(error_floor, abs(float(unres["policy_logit_l2_to_full_explicit"])))
+                value_inc = max(
+                    0.0,
+                    float(dyn["value_mae_to_full_explicit"])
+                    - float(unres["value_mae_to_full_explicit"]),
+                ) / max(error_floor, abs(float(unres["value_mae_to_full_explicit"])))
+                action_drop = max(
+                    0.0,
+                    float(unres["action_agreement_to_full_explicit"])
+                    - float(dyn["action_agreement_to_full_explicit"]),
+                )
+                candidate_reward_degradation.append(reward_drop)
+                candidate_logit_degradation.append(logit_inc)
+                candidate_value_degradation.append(value_inc)
+                candidate_action_degradation.append(action_drop)
+                candidate_degradation_pass_flags.append(float(
+                    reward_drop <= reward_tol + 1e-12
+                    and logit_inc <= logit_tol + 1e-12
+                    and value_inc <= value_tol + 1e-12
+                    and action_drop <= action_tol + 1e-12
+                ))
+            semantic_frontier_flags.append(1.0 if any_nondominated else 0.0)
+
     pareto_reward = [row["reward_vs_single"] for row in scaling_pareto]
     pareto_throughput = [row["throughput_vs_full"] for row in scaling_pareto]
     pareto_memory = [row["memory_vs_full"] for row in scaling_pareto]
     pareto_pure_mean = [row["reward_vs_pure_mean_field"] for row in scaling_pareto]
     adaptive_reward_vs_matched, adaptive_logit_vs_matched = [], []
+    adaptive_value_vs_matched, adaptive_action_vs_matched = [], []
     for seed in expected_seeds:
         subset = [row for row in adaptive_rows if int(row["seed"]) == int(seed)]
         adaptive = next(row for row in subset if row["variant"] == "Adaptive-K")
@@ -491,6 +651,14 @@ def validate(run_root, expected_seeds, protocol_mode):
             float(matched["policy_logit_l2_to_full_explicit"])
             - float(adaptive["policy_logit_l2_to_full_explicit"])
         )
+        adaptive_value_vs_matched.append(
+            float(matched["value_mae_to_full_explicit"])
+            - float(adaptive["value_mae_to_full_explicit"])
+        )
+        adaptive_action_vs_matched.append(
+            float(adaptive["action_agreement_to_full_explicit"])
+            - float(matched["action_agreement_to_full_explicit"])
+        )
     # Scaling rows must include the paper-promised fidelity and latency metrics.
     bounded_edge_accounting_valid = True
     candidate_oracle_recall_valid = True
@@ -500,12 +668,22 @@ def validate(run_root, expected_seeds, protocol_mode):
     candidate_provider_contract_valid = True
     candidate_occupancy_gate_valid = True
     candidate_provider_work_bound_valid = True
+    candidate_state_eviction_valid = True
+    candidate_oracle_stability_valid = True
     candidate_recall_protocol = scaling_manifest["candidate_oracle_recall"]
     candidate_recall_minimum = float(candidate_recall_protocol["minimum"])
     if int(candidate_recall_protocol.get("horizon", 0)) <= 0:
         raise ValueError("Paper-B candidate recall requires a positive structural horizon")
     if int(candidate_recall_protocol.get("trials", 0)) < 2:
         raise ValueError("Paper-B candidate recall requires repeated CRN trials")
+    if int(candidate_recall_protocol.get("independent_replicates", 0)) < 2:
+        raise ValueError("Paper-B candidate recall requires independent oracle ranking replicas")
+    candidate_stability_minimum = float(candidate_recall_protocol.get("stability_min", float("nan")))
+    candidate_stable_fraction_minimum = float(
+        candidate_recall_protocol.get("stable_fraction_min", float("nan"))
+    )
+    if not math.isfinite(candidate_stability_minimum):
+        raise ValueError("Paper-B candidate recall omits ranking stability threshold")
     for row in scaling_rows:
         for key in (
             "policy_logit_l2_to_full_explicit", "value_mae_to_full_explicit",
@@ -539,9 +717,9 @@ def validate(run_root, expected_seeds, protocol_mode):
                 raise ValueError(f"scaling row omits valid {key}")
         variant = row["variant"]
         n_agents = int(row["n_agents"])
-        if variant == "Full-Explicit":
-            # This is intentionally the dense upper reference, never evidence
-            # for candidate-restricted edge scaling.
+        if variant in {"Full-Explicit", "Semantic-Free-Unrestricted"}:
+            # Dense references are never evidence for candidate-restricted
+            # edge scaling. Semantic-Free-Unrestricted is the H4 pruning control.
             continue
         if variant == "PureMeanField":
             # Mean field has no directed pair-state allocation.
@@ -556,15 +734,52 @@ def validate(run_root, expected_seeds, protocol_mode):
             raise ValueError("scaling K_t must satisfy 0 <= K_t <= E_t")
         if d_max <= 0 or edges < 0 or edges > n_agents * d_max:
             bounded_edge_accounting_valid = False
+        e_max = int(float(row.get("E_t_max", -1)))
+        k_max_seen = int(float(row.get("K_t_max", -1)))
+        shadow_final = int(float(row.get("shadow_pair_count_final", -1)))
+        belief_final = int(float(row.get("belief_pair_count_final", -1)))
+        full_final = int(float(row.get("full_state_pair_count_final", -1)))
+        sig_final = int(float(row.get("signature_pair_count_final", -1)))
+        shadow_max = int(float(row.get("shadow_pair_count_max", -1)))
+        belief_max = int(float(row.get("belief_pair_count_max", -1)))
+        full_max = int(float(row.get("full_state_pair_count_max", -1)))
+        sig_max = int(float(row.get("signature_pair_count_max", -1)))
+        if not (
+            e_max >= e_t >= 0 and k_max_seen >= k_t >= 0
+            and shadow_final == e_t and belief_final == e_t
+            and 0 <= full_final <= k_t and 0 <= sig_final <= e_t
+            and 0 <= shadow_max <= e_max and 0 <= belief_max <= e_max
+            and 0 <= full_max <= k_max_seen and 0 <= sig_max <= e_max
+        ):
+            candidate_state_eviction_valid = False
         recall = float(row.get("candidate_oracle_recall_at_degree", float("nan")))
         comparisons = int(row.get("candidate_oracle_recall_comparisons", 0))
+        evaluated_stable = int(row.get("candidate_oracle_recall_evaluated_ego_states", 0))
+        jaccard_mean = float(row.get("candidate_oracle_ranking_jaccard_mean", float("nan")))
+        stable_fraction = float(row.get("candidate_oracle_stable_fraction", float("nan")))
+        unresolved = int(row.get("candidate_oracle_unresolved_ego_states", -1))
+        target_k = int(row.get("candidate_oracle_target_k", 0))
+        expected_target_k = min(
+            d_max, max(min(int(k), n_agents - 1) for k in core_budgets)
+        )
+        if target_k != expected_target_k or target_k <= 0 or target_k > d_max:
+            candidate_oracle_recall_valid = False
         if (
             int(row.get("candidate_recall_applicable", 0)) != 1
             or not math.isfinite(recall)
             or comparisons <= 0
+            or evaluated_stable <= 0
             or recall < candidate_recall_minimum
         ):
             candidate_oracle_recall_valid = False
+        if (
+            not math.isfinite(jaccard_mean)
+            or not math.isfinite(stable_fraction)
+            or stable_fraction + 1e-12 < candidate_stable_fraction_minimum
+            or unresolved < 0
+            or int(row.get("candidate_oracle_replicates", 0)) < 2
+        ):
+            candidate_oracle_stability_valid = False
         construction_flag = str(
             row.get("candidate_construction_subquadratic", "false")
         ).strip().lower()
@@ -646,11 +861,60 @@ def validate(run_root, expected_seeds, protocol_mode):
         "scaling_semantic_pareto_nondominated": semantic_frontier_flags,
         "adaptive_minus_matched_fixed_reward": adaptive_reward_vs_matched,
         "adaptive_minus_matched_fixed_logit_fidelity": adaptive_logit_vs_matched,
+        "adaptive_minus_matched_fixed_value_fidelity": adaptive_value_vs_matched,
+        "adaptive_minus_matched_fixed_action_agreement": adaptive_action_vs_matched,
     }
+    for comparator, values in c_fidelity_by_comparator.items():
+        tag = comparator.lower().replace("-core", "").replace("-", "_")
+        metrics[f"c_core_minus_{tag}_logit_fidelity_error"] = values["logit"]
+        metrics[f"c_core_minus_{tag}_value_fidelity_error"] = values["value"]
+        metrics[f"c_core_minus_{tag}_action_agreement"] = values["action"]
+    for baseline, values in pair_fidelity_by_baseline.items():
+        tag = baseline.lower().replace("-", "_")
+        metrics[f"full_pair_minus_{tag}_logit_fidelity_error"] = values["logit"]
+        metrics[f"full_pair_minus_{tag}_value_fidelity_error"] = values["value"]
+        metrics[f"full_pair_minus_{tag}_action_agreement"] = values["action"]
+    metrics.update({
+        "semantic_free_minus_unconstrained_logit_fidelity_error": semantic_vs_unconstrained_logit,
+        "semantic_free_minus_unconstrained_value_fidelity_error": semantic_vs_unconstrained_value,
+        "semantic_free_minus_unconstrained_action_agreement": semantic_vs_unconstrained_action,
+        "candidate_relative_reward_degradation": candidate_reward_degradation,
+        "candidate_relative_logit_error_increase": candidate_logit_degradation,
+        "candidate_relative_value_error_increase": candidate_value_degradation,
+        "candidate_action_agreement_drop": candidate_action_degradation,
+        "candidate_degradation_pass": candidate_degradation_pass_flags,
+        "adaptive_boundary_saturation_rate": [
+            float(row["boundary_saturation_rate"])
+            for row in adaptive_rows if row["variant"] == "Adaptive-K"
+        ],
+    })
     cis = {
         key: VC._bootstrap_mean_ci(value, seed=4100 + index)
         for index, (key, value) in enumerate(metrics.items())
     }
+    c_fidelity_all = all(
+        cis[f"c_core_minus_{comp.lower().replace('-core','').replace('-','_')}_logit_fidelity_error"][0] > 0.0
+        and cis[f"c_core_minus_{comp.lower().replace('-core','').replace('-','_')}_value_fidelity_error"][0] > 0.0
+        and cis[f"c_core_minus_{comp.lower().replace('-core','').replace('-','_')}_action_agreement"][0] > 0.0
+        for comp in allocation_fidelity_comparators
+    )
+    pair_fidelity_all = all(
+        cis[f"full_pair_minus_{base.lower().replace('-','_')}_logit_fidelity_error"][0] > 0.0
+        and cis[f"full_pair_minus_{base.lower().replace('-','_')}_value_fidelity_error"][0] > 0.0
+        and cis[f"full_pair_minus_{base.lower().replace('-','_')}_action_agreement"][0] > 0.0
+        for base in pair_structural_baselines
+    )
+    adaptive_saturation_limit = float(
+        adaptive_manifest["max_boundary_saturation_fraction"]
+    )
+    adaptive_saturation_ok = all(
+        float(row["boundary_saturation_rate"]) < adaptive_saturation_limit + 1e-12
+        for row in adaptive_rows if row["variant"] == "Adaptive-K"
+    )
+    candidate_degradation_ok = bool(
+        candidate_degradation_pass_flags
+        and all(value > 0.5 for value in candidate_degradation_pass_flags)
+    )
     primary_conditions = {
         "C_selector_beats_absD_at_equal_budget": cis[
             "c_core_minus_absd_selector_f1"
@@ -682,6 +946,9 @@ def validate(run_root, expected_seeds, protocol_mode):
         "C_allocation_improves_value_fidelity_over_absD": cis[
             "c_core_minus_absd_value_fidelity_error"
         ][0] > 0.0,
+        "H1a_C_improves_full_explicit_decision_fidelity_over_all_stated_comparators": bool(
+            c_fidelity_all
+        ),
         "CD_contrastive_latent_improves_profile_retrieval": cis[
             "bc_minus_full_cd_retrieval_mae"
         ][0] > 0.0,
@@ -694,6 +961,9 @@ def validate(run_root, expected_seeds, protocol_mode):
         "CD_contrastive_latent_improves_value_fidelity": cis[
             "full_cd_minus_bc_value_fidelity_error"
         ][0] > 0.0,
+        "H2a_full_pair_representation_beats_shared_pooled_and_feedforward": bool(
+            pair_fidelity_all
+        ),
         "shadow_warm_start_reduces_post_promotion_transient": cis[
             "warm_start_minus_no_warm_post_promotion_bc_loss"
         ][0] > 0.0 and cis[
@@ -724,9 +994,11 @@ def validate(run_root, expected_seeds, protocol_mode):
                 if row["variant"] == "Semantic-Free"
             )
         ),
-        "semantic_routing_beats_unconstrained_soft_slots": cis[
-            "semantic_free_minus_unconstrained_reward"
-        ][0] > 0.0,
+        "semantic_routing_beats_unconstrained_soft_slots": (
+            cis["semantic_free_minus_unconstrained_logit_fidelity_error"][0] > 0.0
+            and cis["semantic_free_minus_unconstrained_value_fidelity_error"][0] > 0.0
+            and cis["semantic_free_minus_unconstrained_action_agreement"][0] > 0.0
+        ),
         "semantic_memory_extends_reward_compute_pareto_frontier": (
             cis["scaling_semantic_pareto_nondominated"][0] > 0.5
         ),
@@ -734,11 +1006,26 @@ def validate(run_root, expected_seeds, protocol_mode):
             float(adaptive_manifest.get("realised_confirmatory_cost_gap", float("inf")))
             <= 0.5 + 1e-9
         ),
+        "adaptive_budget_does_not_saturate_at_boundaries_on_most_updates": bool(
+            adaptive_saturation_ok
+        ),
+        "H1b_adaptive_budget_improves_decision_fidelity_at_matched_compute": (
+            cis["adaptive_minus_matched_fixed_logit_fidelity"][0] > 0.0
+            and cis["adaptive_minus_matched_fixed_value_fidelity"][0] > 0.0
+            and cis["adaptive_minus_matched_fixed_action_agreement"][0] > 0.0
+        ),
         "candidate_restricted_edge_accounting_is_valid": bool(
             bounded_edge_accounting_valid
         ),
         "candidate_restricted_oracle_recall_is_valid": bool(
             candidate_oracle_recall_valid
+        ),
+        "candidate_oracle_ranking_stability_is_valid": bool(
+            candidate_oracle_stability_valid
+        ),
+        "candidate_pair_state_eviction_is_O_Et": bool(candidate_state_eviction_valid),
+        "candidate_reward_and_fidelity_degradation_is_within_frozen_bounds": bool(
+            candidate_degradation_ok
         ),
         "dynamic_candidate_provider_contract_is_valid": bool(
             candidate_provider_contract_valid
@@ -756,6 +1043,9 @@ def validate(run_root, expected_seeds, protocol_mode):
         "population_linear_scaling_claim_is_eligible": bool(
             bounded_edge_accounting_valid
             and candidate_oracle_recall_valid
+            and candidate_oracle_stability_valid
+            and candidate_state_eviction_valid
+            and candidate_degradation_ok
             and candidate_construction_linear_valid
             and feature_snapshot_linear_valid
             and candidate_provider_contract_valid
@@ -786,6 +1076,7 @@ def validate(run_root, expected_seeds, protocol_mode):
         "paired_ci95": cis,
         "warm_start_promotion_events": warm_start_events,
         "scaling_agent_counts": agent_counts,
+        "scaling_core_budgets": core_budgets,
         "scaling_manifest": scaling_manifest,
     }, VC.EXIT_SUPPORTED if supported else VC.EXIT_UNSUPPORTED
 

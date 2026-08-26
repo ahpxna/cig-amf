@@ -2376,6 +2376,21 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                 uniform_valid_j = np.zeros_like(target_pi_j)
                 if valid_count_j > 0:
                     uniform_valid_j[valid_mask_j] = 1.0 / float(valid_count_j)
+                learned_q_j = np.asarray(
+                    learned_scores["q"][j], dtype=np.float64
+                )[valid_mask_j]
+                oracle_q_j = np.asarray(
+                    oracle_scores["q"][j], dtype=np.float64
+                )[valid_mask_j]
+                if valid_count_j >= 2:
+                    learned_q_centered = learned_q_j - float(np.mean(learned_q_j))
+                    oracle_q_centered = oracle_q_j - float(np.mean(oracle_q_j))
+                    q_centered_diff = learned_q_centered - oracle_q_centered
+                    pair_q_centered_rmse = float(np.sqrt(np.mean(q_centered_diff ** 2)))
+                    pair_q_centered_mae = float(np.mean(np.abs(q_centered_diff)))
+                else:
+                    pair_q_centered_rmse = float("nan")
+                    pair_q_centered_mae = float("nan")
                 rows.append({
                     "seed": int(args.seed),
                     "state_idx": int(state_idx),
@@ -2411,6 +2426,8 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
                     "target_policy_l1_to_uniform": float(
                         np.sum(np.abs(target_pi_j - uniform_valid_j))
                     ),
+                    "q_centered_rmse": pair_q_centered_rmse,
+                    "q_centered_mae": pair_q_centered_mae,
                     "abs_error": float(abs(
                         learned_scores["capacity"][j]
                         - oracle_scores["capacity"][j]
@@ -2574,6 +2591,26 @@ def _evaluate_h1_exact_protocol(runner, tiny_env, args, tiny_cfg):
         "q_centered_oracle_sq_sum": q_sq_oracle,
         "q_centered_value_count": q_value_count,
         "support_poor_pair_count_mean": int(len(support_poor_rows)),
+        "support_poor_q_centered_rmse_mean": (
+            float(np.mean([
+                row["q_centered_rmse"] for row in support_poor_rows
+                if np.isfinite(float(row.get("q_centered_rmse", float("nan"))))
+            ]))
+            if any(
+                np.isfinite(float(row.get("q_centered_rmse", float("nan"))))
+                for row in support_poor_rows
+            ) else float("nan")
+        ),
+        "support_poor_q_centered_mae_mean": (
+            float(np.mean([
+                row["q_centered_mae"] for row in support_poor_rows
+                if np.isfinite(float(row.get("q_centered_mae", float("nan"))))
+            ]))
+            if any(
+                np.isfinite(float(row.get("q_centered_mae", float("nan"))))
+                for row in support_poor_rows
+            ) else float("nan")
+        ),
         "support_poor_capacity_mae_mean": (
             float(np.mean([row["capacity_abs_error"] for row in support_poor_rows]))
             if support_poor_rows else float("nan")

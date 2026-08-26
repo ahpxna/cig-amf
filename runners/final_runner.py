@@ -573,6 +573,11 @@ class FinalCIGAMFRunner:
             "d_bar": [],
             "k_bar": [],
             "active_core_pair_count": [],
+            "shadow_pair_count": [],
+            "full_state_pair_count": [],
+            "belief_pair_count": [],
+            "signature_pair_count": [],
+            "degree_limited_ego_count": [],
             "causal_latency_valid_fraction": [],
             "causal_latency_onset_valid_fraction": [],
             "causal_latency_cm_mean": [],
@@ -2936,6 +2941,19 @@ class FinalCIGAMFRunner:
             "active_core_pair_count": int(
                 len(getattr(self.pair_rel_module, "active_core_pairs", ()))
             ),
+            "shadow_pair_count": int(len(getattr(self.pair_rel_module, "shadow_states", {}))),
+            "full_state_pair_count": int(len(getattr(self.pair_rel_module, "full_states", {}))),
+            "belief_pair_count": int(sum(
+                len(module.neighbor_ids) for module in self.belief_modules.values()
+            )),
+            "signature_pair_count": int(
+                self.sig_tracker.live_pair_count()
+                if hasattr(self.sig_tracker, "live_pair_count") else 0
+            ),
+            "degree_limited_ego_count": int(sum(
+                bool(getattr(module, "core_budget_degree_limited", False))
+                for module in self.belief_modules.values()
+            )),
             "N": int(self.n_agents),
             "E_t": edge_count,
             "K_t": core_pair_count,
@@ -3328,6 +3346,14 @@ class FinalCIGAMFRunner:
                 self.history.setdefault("active_core_pair_count", []).append(
                     int(snapshot.get("active_core_pair_count", 0))
                 )
+                for _state_key in (
+                    "shadow_pair_count", "full_state_pair_count",
+                    "belief_pair_count", "signature_pair_count",
+                    "degree_limited_ego_count",
+                ):
+                    self.history.setdefault(_state_key, []).append(
+                        int(snapshot.get(_state_key, 0))
+                    )
                 self.history.setdefault("causal_latency_valid_fraction", []).append(
                     float(snapshot.get("causal_latency_valid_fraction", 0.0))
                 )

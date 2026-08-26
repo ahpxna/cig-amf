@@ -158,15 +158,24 @@ class BayesLightBeliefState:
         self.kappa = float(kappa)
         self.alpha_decay = float(alpha_decay)
         self.adaptive_k = bool(adaptive_k)
-        # There is one lower capacity bound.  Keeping a second adaptive-only
-        # minimum allowed _apply_capacity() to first fill to one value and
-        # then prune to another, so ``min_core_size`` was not a true minimum.
-        if adaptive_k_min is not None and int(adaptive_k_min) != self.min_core_size:
+        # There is one configured lower capacity bound.  Validate aliases on
+        # that configured scale *before* clamping to the current dynamic
+        # candidate degree.  A sparse topology may legitimately expose fewer
+        # neighbours than k_min; the effective lower bound then becomes the
+        # available degree rather than turning a valid sparse state into a
+        # constructor error.
+        if (
+            adaptive_k_min is not None
+            and int(adaptive_k_min) != self._configured_min_core_size
+        ):
             raise ValueError(
-                "adaptive_k_min must equal min_core_size; the core budget has "
-                "a single lower bound"
+                "adaptive_k_min must equal configured min_core_size; the core "
+                "budget has a single lower bound before dynamic degree clamping"
             )
         self.adaptive_k_min = self.min_core_size
+        self.core_budget_degree_limited = bool(
+            self.min_core_size < self._configured_min_core_size
+        )
         self.signed_balance = float(np.clip(signed_balance, 0.0, 1.0))
         self.sigma_alpha_max = max(float(sigma_alpha_max), self.sigma_floor)
 
@@ -287,6 +296,9 @@ class BayesLightBeliefState:
             self.max_core_size = min(self._configured_max_core_size, len(new_ids))
         self.min_core_size = min(self._configured_min_core_size, self.max_core_size)
         self.adaptive_k_min = self.min_core_size
+        self.core_budget_degree_limited = bool(
+            self.min_core_size < self._configured_min_core_size
+        )
 
         old_core = set(self.core_set)
         self.core_set.intersection_update(new_ids)

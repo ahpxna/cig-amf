@@ -72,7 +72,8 @@ KEEP_KEYS = (
     "direction_row_aipw_signed_mae_mean",
     "direction_row_aipw_signed_spearman_mean",
     "direction_row_aipw_sign_agreement_mean",
-    "support_poor_pair_count_mean", "support_poor_capacity_mae_mean",
+    "support_poor_pair_count_mean", "support_poor_q_centered_rmse_mean",
+    "support_poor_q_centered_mae_mean", "support_poor_capacity_mae_mean",
     "support_poor_direction_mae_mean",
     "capacity_uncertainty_error_spearman", "capacity_risk_at_50pct_coverage",
     "direction_uncertainty_error_spearman", "direction_risk_at_50pct_coverage",
@@ -341,7 +342,8 @@ def _variant_means(rows, variant):
         "direction_crossfit_aipw_signed_mae_mean",
         "direction_crossfit_aipw_sign_agreement_mean",
         "realised_forcing_rate", "heldout_policy_return_mean_per_agent",
-        "support_poor_pair_count_mean", "support_poor_capacity_mae_mean",
+        "support_poor_pair_count_mean", "support_poor_q_centered_rmse_mean",
+        "support_poor_q_centered_mae_mean", "support_poor_capacity_mae_mean",
         "support_poor_direction_mae_mean",
     ):
         fallback = aliases.get(key)
@@ -556,6 +558,15 @@ def _forcing_reporting(rows):
         ),
     )
     cost_summary = _paired_bootstrap_summary(cost_pairs, seed_offset=2)
+    support_poor_q = _paired_bootstrap_summary(
+        _paired_differences(
+            rows, "plugin_eps000", "plugin_eps005",
+            lambda no_forcing, forcing: (
+                float(no_forcing["support_poor_q_centered_rmse_mean"])
+                - float(forcing["support_poor_q_centered_rmse_mean"])
+            ),
+        ), seed_offset=3,
+    )
     support_poor_capacity = _paired_bootstrap_summary(
         _paired_differences(
             rows, "plugin_eps000", "plugin_eps005",
@@ -563,7 +574,7 @@ def _forcing_reporting(rows):
                 float(no_forcing["support_poor_capacity_mae_mean"])
                 - float(forcing["support_poor_capacity_mae_mean"])
             ),
-        ), seed_offset=3,
+        ), seed_offset=4,
     )
     support_poor_direction = _paired_bootstrap_summary(
         _paired_differences(
@@ -572,7 +583,7 @@ def _forcing_reporting(rows):
                 float(no_forcing["support_poor_direction_mae_mean"])
                 - float(forcing["support_poor_direction_mae_mean"])
             ),
-        ), seed_offset=4,
+        ), seed_offset=5,
     )
     endpoints = [
         row for row in rows
@@ -600,13 +611,14 @@ def _forcing_reporting(rows):
         "forcing_return_cost_paired_bootstrap": cost_summary,
         "forcing_return_cost_measured": return_endpoint_complete,
         "support_poor_endpoint": {
-            "subset": "pre-forcing observed-action natural policy mass below frozen threshold",
+            "subset": "pre-forcing target-policy entropy below frozen threshold",
+            "primary_metric": "centered response-surface RMSE",
+            "q_centered_rmse_eps0_minus_eps005": support_poor_q,
             "capacity_mae_eps0_minus_eps005": support_poor_capacity,
             "direction_mae_eps0_minus_eps005": support_poor_direction,
-            "prediction_pass": bool(
-                support_poor_capacity["ci95_low"] > 0.0
-                or support_poor_direction["ci95_low"] > 0.0
-            ),
+            # Paper A is response-surface first: forcing support is adjudicated
+            # on Q in under-supported strata. C/D remain secondary projections.
+            "prediction_pass": bool(support_poor_q["ci95_low"] > 0.0),
         },
         "reporting_complete": bool(
             realised_rate_complete and return_endpoint_complete

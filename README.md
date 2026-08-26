@@ -3,7 +3,7 @@
 CIG-AMF is a research codebase for two linked MARL studies:
 
 1. **Paper A — Causal Influence Spectrum**: interventional response recovery,
-   structural capacity `C`, behavioural direction `D`, optional gated latency,
+   structural capacity `C`, behavioural direction `D`, retained validity-masked latency,
    and regime-wise structural tracking.
 2. **Paper B — CIG-AMF**: capacity-aware allocation of explicit pair modelling
    and direction-aware peripheral compression.

@@ -303,6 +303,12 @@ class H1ClaimGateTests(unittest.TestCase):
                     "realised_forcing_rate": forcing_rate,
                     "heldout_policy_return_mean_per_agent": heldout_return,
                     "support_poor_pair_count_mean": 32.0,
+                    "support_poor_q_centered_rmse_mean": (
+                        0.40 if variant == "plugin_eps000" else 0.20
+                    ),
+                    "support_poor_q_centered_mae_mean": (
+                        0.32 if variant == "plugin_eps000" else 0.16
+                    ),
                     "support_poor_capacity_mae_mean": (
                         0.40 if variant == "plugin_eps000" else 0.20
                     ),

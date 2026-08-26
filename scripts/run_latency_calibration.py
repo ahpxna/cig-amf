@@ -46,6 +46,46 @@ def _centre(spectrum):
     return float(np.dot(np.arange(values.size), values) / total)
 
 
+def _cumulative_signflip_latency(g_lag, valid_mask, policy_action, discount, eps=1e-9):
+    """Legacy cumulative-return sign-flip latency heuristic.
+
+    Direct lag responses are integrated into cumulative Q_h(a).  At each
+    horizon we form the same policy-relative contrast D_h used by Paper A,
+    using the factual pre-forcing scripted action as a one-hot policy and q
+    uniform over the state-valid action set.  The heuristic reports the first
+    lag whose non-zero cumulative sign differs from the first non-zero sign.
+    If no sign reversal occurs it reports lag zero ("no detected delay").
+
+    This is intentionally a baseline, not the proposed latency estimator.
+    """
+    g = np.asarray(g_lag, dtype=np.float64)
+    valid = np.asarray(valid_mask, dtype=bool)
+    if g.ndim != 2 or valid.ndim != 1 or g.shape[0] != valid.size:
+        raise ValueError("sign-flip baseline requires [A,H] responses and [A] mask")
+    actions = np.flatnonzero(valid)
+    if actions.size < 2 or int(policy_action) not in set(actions.tolist()):
+        return 0, False
+    q = np.zeros(valid.size, dtype=np.float64)
+    q[actions] = 1.0 / float(actions.size)
+    pi = np.zeros(valid.size, dtype=np.float64)
+    pi[int(policy_action)] = 1.0
+    contrast = pi - q
+    cumulative = np.zeros(valid.size, dtype=np.float64)
+    first_sign = 0
+    for ell in range(g.shape[1]):
+        cumulative += (float(discount) ** ell) * g[:, ell]
+        d_h = float(np.dot(contrast, cumulative))
+        sign = 1 if d_h > eps else (-1 if d_h < -eps else 0)
+        if sign == 0:
+            continue
+        if first_sign == 0:
+            first_sign = sign
+            continue
+        if sign != first_sign:
+            return int(ell), True
+    return 0, False
+
+
 def _oracle_spectrum(env, state, ego, source, horizon, trials, seed):
     profiles = []
     for action in np.flatnonzero(
@@ -139,6 +179,13 @@ def run(seed, train_episodes, states, horizon, trials, device):
                     seed=(int(seed) + 1) * 1000003 + state_index * 101 + source * 17,
                 )
                 learned = np.asarray(out["c_lag_mu"][source_index], dtype=np.float64)
+                valid_mask = np.asarray(
+                    runner.env_adapter.valid_action_mask(source), dtype=bool
+                )
+                signflip_latency, signflip_detected = _cumulative_signflip_latency(
+                    np.asarray(out["g_lag_mu"][source_index], dtype=np.float64),
+                    valid_mask, actions[source], float(cfg["discount"]),
+                )
                 rows.append({
                     "seed": int(seed),
                     "state_index": int(state_index),
@@ -149,6 +196,8 @@ def run(seed, train_episodes, states, horizon, trials, device):
                     "learned_spectrum": learned.tolist(),
                     "oracle_center": _centre(oracle),
                     "learned_center": _centre(learned),
+                    "cumulative_signflip_latency": int(signflip_latency),
+                    "cumulative_signflip_detected": int(signflip_detected),
                 })
     finally:
         runner.proxy.effect_mode = old_mode
@@ -176,12 +225,24 @@ def run(seed, train_episodes, states, horizon, trials, device):
         )))
         if valid else float("nan")
     )
+    signflip_baseline_mae = (
+        float(np.mean([
+            abs(float(row["true_delay"]) - float(row["cumulative_signflip_latency"]))
+            for row in valid
+        ])) if valid else float("nan")
+    )
+    signflip_detection_fraction = (
+        float(np.mean([float(row["cumulative_signflip_detected"]) for row in valid]))
+        if valid else float("nan")
+    )
     gate_pass = bool(
         len(valid) >= 8 and delay_rank >= 0.50 and delay_mae <= 2.0
         and oracle_alignment >= 0.50
+        and np.isfinite(signflip_baseline_mae)
+        and delay_mae < signflip_baseline_mae
     )
     return {
-        "protocol_version": "learned_latency_capacity_spectrum_v2",
+        "protocol_version": "learned_latency_capacity_spectrum_v3_signflip",
         "gate_pass": gate_pass,
         "seed": int(seed),
         "train_episodes": int(train_episodes),
@@ -196,6 +257,12 @@ def run(seed, train_episodes, states, horizon, trials, device):
         "learned_oracle_center_rank_correlation": oracle_alignment,
         "zero_lag_baseline_mae": zero_baseline_mae,
         "terminal_lag_baseline_mae": terminal_baseline_mae,
+        "cumulative_signflip_baseline_mae": signflip_baseline_mae,
+        "cumulative_signflip_detection_fraction": signflip_detection_fraction,
+        "learned_beats_cumulative_signflip_baseline": bool(
+            np.isfinite(delay_mae) and np.isfinite(signflip_baseline_mae)
+            and delay_mae < signflip_baseline_mae
+        ),
         "learned_beats_zero_lag_baseline": bool(
             np.isfinite(delay_mae) and delay_mae < zero_baseline_mae
         ),
@@ -246,6 +313,12 @@ def run_many(seeds, train_episodes, states, horizon, trials, device):
         "terminal_lag_baseline_mae": [
             result["terminal_lag_baseline_mae"] for result in per_seed
         ],
+        "cumulative_signflip_baseline_mae": [
+            result["cumulative_signflip_baseline_mae"] for result in per_seed
+        ],
+        "cumulative_signflip_detection_fraction": [
+            result["cumulative_signflip_detection_fraction"] for result in per_seed
+        ],
     }
     aggregate = {
         key: _bootstrap_mean_ci(values, seed=7193 + index)
@@ -259,12 +332,11 @@ def run_many(seeds, train_episodes, states, horizon, trials, device):
         and aggregate["learned_delay_rank_correlation"][0] >= 0.50
         and aggregate["learned_oracle_center_rank_correlation"][0] >= 0.50
         and learned_mae <= 2.0
-        and learned_mae < aggregate["zero_lag_baseline_mae"][0]
-        and learned_mae < aggregate["terminal_lag_baseline_mae"][0]
+        and learned_mae < aggregate["cumulative_signflip_baseline_mae"][0]
     )
     rows = [row for result in per_seed for row in result["rows"]]
     return {
-        "protocol_version": "learned_latency_capacity_spectrum_multiseed_v1",
+        "protocol_version": "learned_latency_capacity_spectrum_multiseed_v2_signflip",
         "gate_pass": gate_pass,
         "seeds": seeds,
         "n_seeds": len(seeds),
@@ -285,6 +357,15 @@ def run_many(seeds, train_episodes, states, horizon, trials, device):
         ][0],
         "zero_lag_baseline_mae": aggregate["zero_lag_baseline_mae"][0],
         "terminal_lag_baseline_mae": aggregate["terminal_lag_baseline_mae"][0],
+        "cumulative_signflip_baseline_mae": aggregate[
+            "cumulative_signflip_baseline_mae"
+        ][0],
+        "cumulative_signflip_detection_fraction": aggregate[
+            "cumulative_signflip_detection_fraction"
+        ][0],
+        "learned_beats_cumulative_signflip_baseline": bool(
+            learned_mae < aggregate["cumulative_signflip_baseline_mae"][0]
+        ),
         "bootstrap_mean_ci95": aggregate,
         "per_seed": [
             {key: value for key, value in result.items() if key != "rows"}

@@ -115,6 +115,10 @@ def _run(seed, episodes, device, variant, k_min, k_max, n_agents=24):
         "core_size_variance": float(np.var(history.get("mean_core_size", [0.0]))),
         "mean_hit_min_rate": _mean(item["hit_min_rate"] for item in saturation),
         "mean_hit_max_rate": _mean(item["hit_max_rate"] for item in saturation),
+        "boundary_saturation_rate": min(1.0, max(0.0,
+            _mean(item["hit_min_rate"] for item in saturation)
+            + _mean(item["hit_max_rate"] for item in saturation)
+        )),
         "mean_effective_max_k": _mean(item["effective_max_k"] for item in saturation),
         "throughput_total": _mean(history.get("throughput_total_agent_steps_per_sec", [])),
         "matched_to_adaptive": 0,
@@ -140,6 +144,10 @@ def main(argv=None):
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--agent-count", type=int, default=24)
     parser.add_argument(
+        "--max-boundary-saturation-fraction", type=float, default=0.50,
+        help="Frozen H1b gate: Adaptive-K may not sit at k_min/k_max on most updates.",
+    )
+    parser.add_argument(
         "--out-root", default=os.path.join(ROOT, "results", "paper_b_adaptive_budget")
     )
     args = parser.parse_args(argv)
@@ -152,6 +160,7 @@ def main(argv=None):
     if (
         args.episodes <= 0 or args.k_min < 1 or args.k_max < args.k_min
         or args.agent_count <= args.k_max
+        or not 0.0 <= args.max_boundary_saturation_fraction < 1.0
     ):
         parser.error("invalid episode or adaptive-budget bounds")
 
@@ -229,6 +238,7 @@ def main(argv=None):
         "k_min": int(args.k_min),
         "k_max": int(args.k_max),
         "agent_count": int(args.agent_count),
+        "max_boundary_saturation_fraction": float(args.max_boundary_saturation_fraction),
         "variants": variants,
         "matching_rule": (
             "single fixed k frozen from disjoint pilot Adaptive-K mean K_t/N; "
