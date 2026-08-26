@@ -299,7 +299,7 @@ try:
 
     check("directional output remains signed", bool(np.any(out["mu"] < 0)))
     check("mu_per_h shape [B,H]", out["mu_per_h"].shape == (8, H))
-    check("proxy output has no ungated latency field (5D signature)", "latency" not in out)
+    check("allocator projection remains 5D while latency is retained in the typed masked profile", "latency" not in out)
     check("capacity range is nonnegative", bool(np.all(out["mu_range"] >= -1e-6)))
 
     dis = px.get_diagnostics()["ensemble_disagreement"]

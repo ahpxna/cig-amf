@@ -567,6 +567,41 @@ class PairRelationalModule:
     # Warm-start and summaries
     # ============================================================
 
+    def reconcile_candidate_sets(self, candidate_neighbors_by_ego):
+        """Atomically reconcile live pair state with a dynamic candidate map.
+
+        Retained pairs preserve shadow/full state. Newly visible pairs receive a
+        zero shadow state and are not promoted automatically. Removed pairs lose
+        both shadow and full recurrent state so persistent memory stays O(E_t).
+        Historical BC replay remains separate and is intentionally untouched.
+        """
+        supplied = dict(candidate_neighbors_by_ego or {})
+        normalized = {}
+        target_pairs = set()
+        for ego in range(self.n_agents):
+            raw = tuple(int(j) for j in supplied.get(ego, ()))
+            if len(raw) != len(set(raw)):
+                raise ValueError("candidate set contains duplicate neighbour IDs")
+            if any(j == ego or j < 0 or j >= self.n_agents for j in raw):
+                raise ValueError("candidate set contains invalid neighbour IDs")
+            normalized[int(ego)] = raw
+            target_pairs.update((int(ego), int(j)) for j in raw)
+
+        current_pairs = set(self.shadow_states)
+        added = target_pairs - current_pairs
+        removed = current_pairs - target_pairs
+        with torch.no_grad():
+            for pair in removed:
+                self.shadow_states.pop(pair, None)
+                self.full_states.pop(pair, None)
+                self.active_core_pairs.discard(pair)
+            for pair in added:
+                self.shadow_states[pair] = torch.zeros(
+                    1, self.shadow_dim, dtype=torch.float32, device=self.device
+                )
+        self.candidate_neighbors_by_ego = normalized
+        return added, removed
+
     def warm_start_if_promoted(self, ego_id, promoted_ids):
         """
         When j is promoted into core C_i:
@@ -792,6 +827,7 @@ class PairRelationalModule:
         s_prev_snapshot=None,
         cd_target_fn=None,
         max_cd_target_age: Optional[int] = None,
+        candidate_neighbors_by_ego=None,
     ):
         """
         Add supervised one-step behavioural prediction samples.
@@ -819,11 +855,16 @@ class PairRelationalModule:
                 s_t = shadow_encoder(x_shadow_t, s_prev)
             so gradient updates full_encoder and shadow_encoder, not only bc_head.
         """
+        candidate_map = (
+            self.candidate_neighbors_by_ego
+            if candidate_neighbors_by_ego is None
+            else candidate_neighbors_by_ego
+        )
         for ego in range(self.n_agents):
             obs_i = self._get_from_container(observations, ego)
             action_i = self._get_from_container(actions, ego)
 
-            for j in self.candidate_neighbors_by_ego[int(ego)]:
+            for j in candidate_map[int(ego)]:
 
                 pair = (int(ego), int(j))
 

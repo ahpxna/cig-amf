@@ -71,8 +71,14 @@ def _load_scaling(root, expected_seeds):
     degree = int(manifest.get("candidate_max_degree", 0))
     if degree <= 0:
         raise ValueError("scaling manifest omits a positive candidate_max_degree")
-    if not manifest.get("candidate_policy"):
-        raise ValueError("scaling manifest omits the frozen candidate policy")
+    if manifest.get("candidate_policy") != (
+        "dynamic adapter-owned policy-independent pre-measurement candidate set"
+    ):
+        raise ValueError("scaling manifest must declare the dynamic pre-measurement candidate policy")
+    if manifest.get("candidate_update_protocol") != "refresh_before_measurement_each_step":
+        raise ValueError("scaling manifest must refresh dynamic candidates before each measurement step")
+    if int(manifest.get("candidate_max_cell_occupancy", 0)) <= 0:
+        raise ValueError("scaling manifest omits a frozen positive cell-occupancy gate")
     recall = manifest.get("candidate_oracle_recall")
     if not isinstance(recall, dict):
         raise ValueError("scaling manifest omits the oracle candidate-recall protocol")
@@ -489,12 +495,15 @@ def validate(run_root, expected_seeds, protocol_mode):
     bounded_edge_accounting_valid = True
     candidate_oracle_recall_valid = True
     candidate_construction_subquadratic_valid = True
+    candidate_construction_linear_valid = True
+    feature_snapshot_linear_valid = True
+    candidate_provider_contract_valid = True
+    candidate_occupancy_gate_valid = True
+    candidate_provider_work_bound_valid = True
     candidate_recall_protocol = scaling_manifest["candidate_oracle_recall"]
     candidate_recall_minimum = float(candidate_recall_protocol["minimum"])
-    if int(candidate_recall_protocol.get("horizon", -1)) != 1:
-        raise ValueError(
-            "Paper-B candidate recall must use the one-step capacity oracle"
-        )
+    if int(candidate_recall_protocol.get("horizon", 0)) <= 0:
+        raise ValueError("Paper-B candidate recall requires a positive structural horizon")
     if int(candidate_recall_protocol.get("trials", 0)) < 2:
         raise ValueError("Paper-B candidate recall requires repeated CRN trials")
     for row in scaling_rows:
@@ -506,7 +515,7 @@ def validate(run_root, expected_seeds, protocol_mode):
             if not math.isfinite(float(row.get(key, float("nan")))):
                 raise ValueError(f"scaling row omits finite {key}")
         if row.get("inference_latency_protocol") != (
-            "deterministic_policy_inference_without_sampling_or_epsilon_forcing"
+            "deterministic_policy_inference_without_training_cache_sampling_or_epsilon_forcing"
         ):
             raise ValueError(
                 "scaling latency must measure deterministic policy inference without forcing"
@@ -561,6 +570,44 @@ def validate(run_root, expected_seeds, protocol_mode):
         ).strip().lower()
         if construction_flag not in {"1", "true", "yes"}:
             candidate_construction_subquadratic_valid = False
+        linear_flag = str(
+            row.get("candidate_construction_linear_candidate", "false")
+        ).strip().lower()
+        if linear_flag not in {"1", "true", "yes"}:
+            candidate_construction_linear_valid = False
+        feature_linear_flag = str(
+            row.get("feature_snapshot_linear_candidate", "false")
+        ).strip().lower()
+        if feature_linear_flag not in {"1", "true", "yes"}:
+            feature_snapshot_linear_valid = False
+        provider = str(row.get("candidate_provider", "")).strip()
+        if provider != "omni_linked_cell_dynamic":
+            candidate_provider_contract_valid = False
+        occupancy = int(float(row.get("candidate_cell_occupancy_max", -1)))
+        occupancy_cap = int(scaling_manifest.get("candidate_max_cell_occupancy", 0))
+        if occupancy < 0 or occupancy_cap <= 0 or occupancy > occupancy_cap:
+            candidate_occupancy_gate_valid = False
+        provider_work = float(row.get("candidate_provider_work_units", float("nan")))
+        stencil = int(scaling_manifest.get("candidate_stencil_radius", -1))
+        if stencil < 0 or not math.isfinite(provider_work) or provider_work < 0.0:
+            candidate_provider_work_bound_valid = False
+        else:
+            # Linked-cell refresh: one population insertion per agent plus at
+            # most one candidate check per occupant in each cell of the fixed
+            # stencil.  A frozen occupancy cap therefore yields a linear
+            # certificate for the measured provider path.
+            stencil_cells = (2 * stencil + 1) ** 2
+            structural_linear_bound = n_agents * (1 + stencil_cells * occupancy_cap)
+            if provider_work > structural_linear_bound + 1e-9:
+                candidate_provider_work_bound_valid = False
+        if not str(row.get("candidate_last_hash", "")).strip():
+            candidate_provider_contract_valid = False
+        for key in (
+            "candidate_refresh_ms", "candidate_churn", "candidate_added_pairs",
+            "candidate_removed_pairs", "candidate_cell_occupancy_mean",
+        ):
+            if not math.isfinite(float(row.get(key, float("nan")))):
+                candidate_provider_contract_valid = False
 
     metrics = {
         "c_core_minus_absd_selector_f1": c_vs_d,
@@ -693,6 +740,15 @@ def validate(run_root, expected_seeds, protocol_mode):
         "candidate_restricted_oracle_recall_is_valid": bool(
             candidate_oracle_recall_valid
         ),
+        "dynamic_candidate_provider_contract_is_valid": bool(
+            candidate_provider_contract_valid
+        ),
+        "dynamic_candidate_occupancy_gate_is_valid": bool(
+            candidate_occupancy_gate_valid
+        ),
+        "dynamic_candidate_provider_work_bound_is_valid": bool(
+            candidate_provider_work_bound_valid
+        ),
         # Bounded measured edges alone are not a population-linear claim: a
         # dense candidate constructor remains quadratic.  This condition is
         # deliberately separate so the report can retain honest O(E) results
@@ -700,7 +756,11 @@ def validate(run_root, expected_seeds, protocol_mode):
         "population_linear_scaling_claim_is_eligible": bool(
             bounded_edge_accounting_valid
             and candidate_oracle_recall_valid
-            and candidate_construction_subquadratic_valid
+            and candidate_construction_linear_valid
+            and feature_snapshot_linear_valid
+            and candidate_provider_contract_valid
+            and candidate_occupancy_gate_valid
+            and candidate_provider_work_bound_valid
         ),
     }
     secondary_predictions = {

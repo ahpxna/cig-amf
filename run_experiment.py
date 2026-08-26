@@ -121,6 +121,13 @@ def default_cfg():
         # None preserves the dense reference protocol; only a positive bound
         # may be reported as candidate-restricted scaling.
         "candidate_max_degree": None,
+        # Dynamic pre-measurement candidate refresh.  Dense reference runs keep
+        # candidate_max_degree=None; bounded scaling panels enable the cell-list
+        # provider and refresh before measurement each environment step.
+        "candidate_refresh_interval": 1,
+        "candidate_cell_width": 4.0,
+        "candidate_stencil_radius": 1,
+        "candidate_radius": None,
         "discount": 0.97,
         "causal_horizon": 8,
 
@@ -300,6 +307,9 @@ def default_cfg():
         # explicitly named diagnostic; confirmatory DR is fitted offline.
         "proxy_use_doubly_robust": False,
         "proxy_iw_clip": 10.0,
+        # Canonical Paper-A response regression is unweighted factual-head MSE.
+        # True enables only the explicitly named IPW response-loss ablation.
+        "proxy_response_ipw_ablation": False,
         "proxy_bootstrap_ratio": 0.8,
         "proxy_use_belief_input": False,
         # x_ij is supplied by the environment adapter and contains only

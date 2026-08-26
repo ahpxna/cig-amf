@@ -131,8 +131,10 @@ class BayesLightBeliefState:
             raise ValueError("tau_out must not exceed tau_in for hysteresis")
 
         self.weak_prior_top_k = int(weak_prior_top_k)
-        self.min_core_size = max(0, int(min_core_size))
-        self.max_core_size = int(max_core_size)
+        self._configured_min_core_size = max(0, int(min_core_size))
+        self._configured_max_core_size = int(max_core_size)
+        self.min_core_size = int(self._configured_min_core_size)
+        self.max_core_size = int(self._configured_max_core_size)
 
         self.sigma_floor = float(sigma_floor)
         self.eps = float(eps)
@@ -221,6 +223,83 @@ class BayesLightBeliefState:
         self.n_core_updates = 0
         self.n_hit_max = 0
         self.n_hit_min = 0
+
+    def reconcile_neighbors(self, neighbor_ids):
+        """Reconcile live structural belief with a dynamic candidate set.
+
+        Retained candidates keep all online tracker state. Added candidates start
+        from neutral capacity / high uncertainty. Removed candidates are evicted
+        from live belief/history/core state; historical response replay is owned by
+        the replay system and is intentionally unaffected.
+        """
+        new_ids = [int(j) for j in neighbor_ids]
+        if len(new_ids) != len(set(new_ids)) or any(j == self.ego_id for j in new_ids):
+            raise ValueError("dynamic belief candidate IDs are malformed")
+        old_pos = dict(self._pos)
+        old_ids = list(self.neighbor_ids)
+        retained = set(old_ids) & set(new_ids)
+        added = set(new_ids) - set(old_ids)
+        removed = set(old_ids) - set(new_ids)
+
+        n = len(new_ids)
+        mu = np.full(n, self.MU_INIT, dtype=np.float64)
+        sigma = np.full(n, self.SIGMA_INIT, dtype=np.float64)
+        bias = np.ones(n, dtype=np.float64)
+        mu_init = np.full(n, self.MU_INIT, dtype=np.float64)
+        sigma_init = np.full(n, self.SIGMA_INIT, dtype=np.float64)
+        n_updates = np.zeros(n, dtype=np.int64)
+        p_core = np.full(n, 0.5, dtype=np.float64)
+        for pos, j in enumerate(new_ids):
+            if j not in retained:
+                continue
+            old = old_pos[j]
+            mu[pos] = self._mu_arr[old]
+            sigma[pos] = self._sigma_arr[old]
+            bias[pos] = self._bias_corr_arr[old]
+            mu_init[pos] = self._mu_init_arr[old]
+            sigma_init[pos] = self._sigma_init_arr[old]
+            n_updates[pos] = self._n_updates_arr[old]
+            p_core[pos] = self._p_core_arr[old]
+
+        old_mu_hist = self.mu_history
+        old_sigma_hist = self.sigma_history
+        old_p_hist = self.p_history
+        self.neighbor_ids = new_ids
+        self._pos = {j: i for i, j in enumerate(new_ids)}
+        self._mu_arr, self._sigma_arr = mu, sigma
+        self._bias_corr_arr = bias
+        self._mu_init_arr, self._sigma_init_arr = mu_init, sigma_init
+        self._n_updates_arr, self._p_core_arr = n_updates, p_core
+        self.mu_bar = dict(zip(new_ids, mu.tolist()))
+        self.sigma_bar = dict(zip(new_ids, sigma.tolist()))
+        self.p_core = dict(zip(new_ids, p_core.tolist()))
+        self.n_updates = dict(zip(new_ids, n_updates.tolist()))
+        self._bias_corr = dict(zip(new_ids, bias.tolist()))
+        self._mu_init = dict(zip(new_ids, mu_init.tolist()))
+        self._sigma_init = dict(zip(new_ids, sigma_init.tolist()))
+        self.mu_history = {j: list(old_mu_hist.get(j, ())) for j in new_ids}
+        self.sigma_history = {j: list(old_sigma_hist.get(j, ())) for j in new_ids}
+        self.p_history = {j: list(old_p_hist.get(j, ())) for j in new_ids}
+
+        if self._configured_max_core_size <= 0:
+            self.max_core_size = len(new_ids)
+        else:
+            self.max_core_size = min(self._configured_max_core_size, len(new_ids))
+        self.min_core_size = min(self._configured_min_core_size, self.max_core_size)
+        self.adaptive_k_min = self.min_core_size
+
+        old_core = set(self.core_set)
+        self.core_set.intersection_update(new_ids)
+        self.prev_core_set.intersection_update(new_ids)
+        self.seeded_core_set.intersection_update(new_ids)
+        self.last_promoted = set()
+        self.last_demoted = set(old_core - self.core_set)
+        self.last_core_switch_count = len(self.last_demoted)
+        if old_core != self.core_set:
+            self.core_history.append(set(self.core_set))
+            if len(self.core_history) > 500:
+                self.core_history = self.core_history[-500:]
+        return added, removed
 
     # =====================================================================
     # Helper

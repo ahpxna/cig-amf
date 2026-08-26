@@ -348,7 +348,7 @@ class LocalCounterfactualProxyEnsemble:
 
     "signed_policy_contrast"  (confirmatory H1)
         w = E_{a~pi}[f(s,a)] - E_{a~q}[f(s,a)], where q is uniform over
-        candidate actions, pi is supplied via policy_probs_j, and the factual
+        the complete state-valid action set, pi is supplied via policy_probs_j, and the factual
         action is logged under behaviour b. Positive values preserve the
         operational meaning "the current neighbour policy is beneficial
         relative to random behaviour." This stochastic-policy contrast has a
@@ -422,6 +422,7 @@ class LocalCounterfactualProxyEnsemble:
         context_item_dim: int = 0,
         debug_verbose: bool = False,
         forced_only_training: bool = False,
+        response_ipw_ablation: bool = False,
     ):
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
@@ -433,6 +434,10 @@ class LocalCounterfactualProxyEnsemble:
         self.context_item_dim = int(context_item_dim)
         self.debug_verbose = bool(debug_verbose)
         self.forced_only_training = bool(forced_only_training)
+        # Paper A canonical response regression is the masked factual-head
+        # loss. Epsilon forcing supplies support; inverse-propensity weighting
+        # is a separately named variance-sensitive ablation, not the default.
+        self.response_ipw_ablation = bool(response_ipw_ablation)
         self.n_ensemble = int(n_ensemble)
         self.hidden = int(hidden)
         self.lr = float(lr)
@@ -1426,37 +1431,27 @@ class LocalCounterfactualProxyEnsemble:
             gather_idx = aj_e.view(E_, B_, 1, 1).expand(E_, B_, 1, H_)
             preds = torch.gather(preds_all, dim=2, index=gather_idx).squeeze(2)  # [E, B, H]
 
-            # ----------------------------------------------------------------
-            # [FIX-HC1] HEAD COLLAPSE: connect epsilon-forcing to training loss.
-            #
-            # Causal chain confirmed by the gather operation above:
-            #   loss = MSE(gather(preds_all, a_j), target)
-            #     -> each sample sends gradient to only one of |A| heads
-            #     -> rare-action heads remain near initialization
-            #     -> std_a f_theta(a) approximates initialization noise
-            #     -> plug-in contrast f(a_j) - sum_a pi(a) f(a) ~ 0
-            #     -> mu ~ 0 (measured mean_mu 0.117 vs W* ~1.5, a 13x gap)
-            #
-            # Epsilon-forcing is the only mechanism that evenly covers rare
-            # heads, but forced samples were previously used only for DR
-            # correction through b_j on the scoring path, not head training.
-            # The generated counterfactuals were therefore left unused.
-            #
-            # Weight by clipped 1/b_j so rare-action heads receive gradients
-            # inversely proportional to rarity. Normalize to mean one to
-            # preserve the effective learning-rate scale.
-            # ----------------------------------------------------------------
-            iw = torch.clamp(
-                1.0 / torch.clamp(bobs_e, min=1.0 / self.iw_clip, max=1.0),
-                max=self.iw_clip,
-            )                                                    # [E, B]
-            iw = iw / torch.clamp(iw.mean(dim=1, keepdim=True), min=1e-8)
-
+            # Canonical Paper-A response regression: every factual row
+            # supervises only the executed action head and every valid lag
+            # target receives equal regression weight. Randomized forcing is
+            # responsible for action support/overlap; it is not silently
+            # converted into an inverse-propensity response-regression loss.
+            # A clipped IPW response loss remains available only as an
+            # explicitly named ablation because it changes the finite-sample
+            # objective and can sharply amplify variance.
             sq_raw = F.mse_loss(preds, tgt_e, reduction="none")
             sq = (sq_raw * target_valid_e).sum(dim=2) / torch.clamp(
                 target_valid_e.sum(dim=2), min=1.0
             )
-            per_member_loss = (sq * iw).mean(dim=1)  # [E]
+            if self.response_ipw_ablation:
+                iw = torch.clamp(
+                    1.0 / torch.clamp(bobs_e, min=1.0 / self.iw_clip, max=1.0),
+                    max=self.iw_clip,
+                )
+                iw = iw / torch.clamp(iw.mean(dim=1, keepdim=True), min=1e-8)
+                per_member_loss = (sq * iw).mean(dim=1)
+            else:
+                per_member_loss = sq.mean(dim=1)  # [E]
 
             loss = per_member_loss.sum()  # Backpropagate the component sum.
             # Components remain independent: each propagates only to its own

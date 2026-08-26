@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Protocol, runtime_checkable
 
+import hashlib
+import json
+import time
+
 import numpy as np
 
 
@@ -268,10 +272,99 @@ class OmniArenaAdapter:
         )
 
     def candidate_neighbors(self, ego, max_degree):
-        """Policy-independent bounded candidates for Eq. (28)."""
+        """Legacy per-ego candidate query; dense and not used for O(N) claims."""
         ids = [j for j in range(self.n_agents) if int(j) != int(ego)]
+        if max_degree is None:
+            return ids
         ids.sort(key=lambda j: (-self.weak_prior_score(ego, j), int(j)))
         return ids[: int(max_degree)]
+
+    def candidate_neighbors_population(
+        self, max_degree, *, cell_width=4.0, stencil_radius=1, radius=None
+    ):
+        """Dynamic linked-cell candidate map from current observable geometry.
+
+        The cell map is built once per refresh and shared across all egos.  This
+        provider uses no learned causal score, policy output, core assignment, or
+        recurrent state.  Its linear-complexity label remains conditional on
+        bounded local cell occupancy, which is returned as telemetry.
+        """
+        started = time.perf_counter()
+        n = int(self.n_agents)
+        if max_degree is None:
+            mapping = {i: tuple(j for j in range(n) if j != i) for i in range(n)}
+            return mapping, {
+                "provider": "dense_all_pairs",
+                "provider_complexity": "quadratic",
+                "provider_work_units": int(n * max(0, n - 1)),
+                "cell_occupancy_mean": float(n),
+                "cell_occupancy_max": int(n),
+                "local_pair_checks": int(n * max(0, n - 1)),
+                "candidate_refresh_ms": float((time.perf_counter() - started) * 1000.0),
+                "candidate_construction_subquadratic": False,
+                "candidate_construction_linear_candidate": False,
+                "feature_snapshot_subquadratic": True,
+                "feature_snapshot_linear_candidate": True,
+            }
+        d_max = int(max_degree)
+        if d_max <= 0:
+            raise ValueError("max_degree must be positive or None")
+        width = float(cell_width)
+        if not np.isfinite(width) or width <= 0.0:
+            raise ValueError("candidate cell_width must be positive and finite")
+        stencil = int(stencil_radius)
+        if stencil < 0:
+            raise ValueError("candidate stencil_radius must be non-negative")
+        rad = None if radius is None else float(radius)
+        if rad is not None and (not np.isfinite(rad) or rad <= 0.0):
+            raise ValueError("candidate radius must be positive and finite")
+
+        positions = np.asarray([self.env.positions[i] for i in range(n)], dtype=np.float64)
+        if positions.shape != (n, 2):
+            raise ValueError("Omni dynamic candidates require 2-D observable positions")
+        cells = {}
+        keys = []
+        for i, pos in enumerate(positions):
+            key = (int(np.floor(pos[0] / width)), int(np.floor(pos[1] / width)))
+            keys.append(key)
+            cells.setdefault(key, []).append(int(i))
+        occupancies = [len(v) for v in cells.values()] or [0]
+        mapping = {}
+        local_checks = 0
+        for ego in range(n):
+            cx, cy = keys[ego]
+            local = []
+            for dx in range(-stencil, stencil + 1):
+                for dy in range(-stencil, stencil + 1):
+                    for j in cells.get((cx + dx, cy + dy), ()):
+                        if int(j) == int(ego):
+                            continue
+                        local_checks += 1
+                        if rad is not None:
+                            dist = float(np.abs(positions[j] - positions[ego]).sum())
+                            if dist > rad:
+                                continue
+                        local.append(int(j))
+            local = sorted(
+                set(local), key=lambda j: (-self.weak_prior_score(ego, j), int(j))
+            )
+            mapping[int(ego)] = tuple(local[:d_max])
+        return mapping, {
+            "provider": "omni_linked_cell_dynamic",
+            "provider_complexity": "linear_under_bounded_occupancy",
+            "provider_work_units": int(n + local_checks),
+            "cell_occupancy_mean": float(np.mean(occupancies)),
+            "cell_occupancy_max": int(max(occupancies)),
+            "local_pair_checks": int(local_checks),
+            "candidate_refresh_ms": float((time.perf_counter() - started) * 1000.0),
+            "candidate_construction_subquadratic": True,
+            "candidate_construction_linear_candidate": True,
+            "feature_snapshot_subquadratic": True,
+            "feature_snapshot_linear_candidate": True,
+            "cell_width": float(width),
+            "stencil_radius": int(stencil),
+            "radius": None if rad is None else float(rad),
+        }
 
     def feature_snapshot(self):
         return {
@@ -568,6 +661,67 @@ def compact_relation_features(adapter, ego, target, width):
     out = np.zeros((int(width),), dtype=np.float32)
     out[:min(out.size, raw.size)] = raw[:min(out.size, raw.size)]
     return out
+
+
+def candidate_map_hash(candidate_map) -> str:
+    """Stable SHA-256 binding for an ordered directed candidate interface."""
+    canonical = {
+        str(int(ego)): [int(j) for j in candidate_map[int(ego)]]
+        for ego in sorted(int(k) for k in candidate_map)
+    }
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_dynamic_candidate_map(
+    adapter: CausalMultiAgentEnvAdapter,
+    max_degree: Optional[int],
+    *,
+    cell_width=4.0,
+    stencil_radius=1,
+    radius=None,
+):
+    """Build the current candidate map plus auditable complexity telemetry."""
+    started = time.perf_counter()
+    population = getattr(adapter, "candidate_neighbors_population", None)
+    if callable(population):
+        mapping, telemetry = population(
+            max_degree, cell_width=cell_width,
+            stencil_radius=stencil_radius, radius=radius,
+        )
+    else:
+        mapping = {
+            ego: tuple(bounded_candidate_neighbors(adapter, ego, max_degree))
+            for ego in range(int(adapter.n_agents))
+        }
+        telemetry = {
+            "provider": "legacy_per_ego_dense_scan",
+            "provider_complexity": "quadratic_or_unknown",
+            "provider_work_units": int(int(adapter.n_agents) * max(0, int(adapter.n_agents) - 1)),
+            "cell_occupancy_mean": float("nan"),
+            "cell_occupancy_max": -1,
+            "local_pair_checks": int(sum(len(v) for v in mapping.values())),
+            "candidate_construction_subquadratic": False,
+            "candidate_construction_linear_candidate": False,
+            "feature_snapshot_subquadratic": False,
+            "feature_snapshot_linear_candidate": False,
+        }
+    normalized = {}
+    n = int(adapter.n_agents)
+    for ego in range(n):
+        ids = tuple(int(j) for j in mapping.get(ego, ()))
+        if len(ids) != len(set(ids)) or any(j == ego or j < 0 or j >= n for j in ids):
+            raise ValueError("dynamic candidate provider returned invalid directed IDs")
+        if max_degree is not None and len(ids) > int(max_degree):
+            raise ValueError("dynamic candidate provider exceeded max_degree")
+        normalized[int(ego)] = ids
+    telemetry = dict(telemetry or {})
+    telemetry.setdefault("candidate_refresh_ms", float((time.perf_counter() - started) * 1000.0))
+    telemetry["candidate_map_hash"] = candidate_map_hash(normalized)
+    telemetry["E_t"] = int(sum(len(v) for v in normalized.values()))
+    telemetry["mean_candidate_degree"] = float(telemetry["E_t"] / max(1, n))
+    telemetry["max_candidate_degree"] = int(max((len(v) for v in normalized.values()), default=0))
+    return normalized, telemetry
 
 
 def bounded_candidate_neighbors(

@@ -41,7 +41,7 @@ except ModuleNotFoundError:
     )
 
 import run_experiment as RE
-from envs.causal_adapter import bounded_candidate_neighbors, resolve_env_adapter
+from envs.causal_adapter import build_dynamic_candidate_map, resolve_env_adapter
 from runners.h3_ablation_runner import H3NoMultiMemoryRunner
 
 
@@ -72,7 +72,8 @@ def _mean(values):
 
 
 def _runner(
-    variant, n_agents, seed, device, core_budget, candidate_max_degree=None
+    variant, n_agents, seed, device, core_budget, candidate_max_degree=None,
+    candidate_cell_width=4.0, candidate_stencil_radius=1, candidate_radius=None,
 ):
     # Every variant in a matched seed/population cell must start from the exact
     # same parameter RNG state.  Without this reset, sequential construction
@@ -97,6 +98,10 @@ def _runner(
         candidate_max_degree = int(core_budget)
     if variant != "Full-Explicit":
         cfg["candidate_max_degree"] = int(candidate_max_degree)
+        cfg["candidate_refresh_interval"] = 1
+        cfg["candidate_cell_width"] = float(candidate_cell_width)
+        cfg["candidate_stencil_radius"] = int(candidate_stencil_radius)
+        cfg["candidate_radius"] = candidate_radius
     if variant == "Full-Explicit":
         # Configure the reference before construction so the runner's
         # episode-zero invariant activates every pair immediately.
@@ -130,13 +135,20 @@ def _set_periphery_diagnostics(runner, enabled):
 
 
 def _select_for_probe(runner, obs):
-    """Deterministic architecture inference; never sample or epsilon-force."""
+    """Deterministic policy inference without forcing or training-cache work."""
     selector = runner._select_actions_population
     parameters = inspect.signature(selector).parameters
+    kwargs = {}
     if "apply_forcing" in parameters:
-        return selector(obs, apply_forcing=False)
-    # PureMeanField has no intervention controller in this interface.
-    return selector(obs)
+        kwargs["apply_forcing"] = False
+    if "collect_training_cache" in parameters:
+        kwargs["collect_training_cache"] = False
+    if "force_candidate_refresh" in parameters:
+        # State-bank probes restore different environment states without
+        # advancing the runner interaction counter.  Force a candidate refresh
+        # so every probed state uses Gamma(O_t), not the first bank state's set.
+        kwargs["force_candidate_refresh"] = True
+    return selector(obs, **kwargs)
 
 
 def _sync_device(runner):
@@ -230,7 +242,7 @@ def _decision_probe_with_latency(runner, n_states, seed):
         "inference_latency_p50_ms": float(np.percentile(latency, 50)),
         "inference_latency_p95_ms": float(np.percentile(latency, 95)),
         "inference_latency_protocol": (
-            "deterministic_policy_inference_without_sampling_or_epsilon_forcing"
+            "deterministic_policy_inference_without_training_cache_sampling_or_epsilon_forcing"
         ),
     }
 
@@ -321,8 +333,9 @@ def _runtime_memory_probe(runner, n_states, seed):
 
 def _candidate_oracle_recall_at_degree(
     env, *, n_states, max_degree, horizon, discount, trials, seed,
+    cell_width=4.0, stencil_radius=1, radius=None,
 ):
-    """Certify whether the fixed candidate provider retains oracle top-C edges.
+    """Certify the same dynamic candidate rule used by runtime on oracle states.
 
     Candidate construction is deliberately evaluated independently of learned
     allocation.  For each bank state and ego, the unrestricted clone-state
@@ -358,9 +371,11 @@ def _candidate_oracle_recall_at_degree(
                 ][:int(max_degree)]
                 if not oracle_rank:
                     continue
-                candidate_ids = set(bounded_candidate_neighbors(
-                    adapter, int(ego), int(max_degree),
-                ))
+                candidate_map, _telemetry = build_dynamic_candidate_map(
+                    adapter, int(max_degree), cell_width=float(cell_width),
+                    stencil_radius=int(stencil_radius), radius=radius,
+                )
+                candidate_ids = set(candidate_map[int(ego)])
                 hits += sum(target in candidate_ids for target in oracle_rank)
                 comparisons += len(oracle_rank)
                 evaluated_ego_states += 1
@@ -393,8 +408,16 @@ def main(argv=None):
         help="Oracle-only state-bank size for the top-C candidate-recall gate.",
     )
     parser.add_argument(
-        "--candidate-recall-horizon", type=int, default=1,
-        help="One-step clone-state capacity horizon used by the candidate-recall oracle.",
+        "--candidate-recall-horizon", type=int,
+        default=int(RE.default_cfg()["causal_horizon"]),
+        help="Primary structural horizon used by the dynamic candidate-recall oracle.",
+    )
+    parser.add_argument("--candidate-cell-width", type=float, default=4.0)
+    parser.add_argument("--candidate-stencil-radius", type=int, default=1)
+    parser.add_argument("--candidate-radius", type=float, default=None)
+    parser.add_argument(
+        "--candidate-max-cell-occupancy", type=int, default=16,
+        help="Frozen maximum cell occupancy allowed for the strict linear-provider label.",
     )
     parser.add_argument(
         "--candidate-recall-trials", type=int, default=2,
@@ -412,11 +435,14 @@ def main(argv=None):
     if (
         args.candidate_max_degree <= 0
         or args.candidate_recall_states <= 0
-        or args.candidate_recall_horizon != 1
+        or args.candidate_recall_horizon <= 0
         or args.candidate_recall_trials <= 0
+        or args.candidate_cell_width <= 0.0
+        or args.candidate_stencil_radius < 0
+        or args.candidate_max_cell_occupancy <= 0
         or not 0.0 <= args.candidate_recall_min <= 1.0
     ):
-        parser.error("candidate recall requires horizon=1, positive budgets, and minimum in [0, 1]")
+        parser.error("candidate recall requires positive budgets/horizon and minimum in [0, 1]")
     rows = []
     for seed in args.seeds:
         for n_agents in args.agent_counts:
@@ -441,12 +467,18 @@ def main(argv=None):
                 discount=float(oracle_cfg["discount"]),
                 trials=int(args.candidate_recall_trials),
                 seed=probe_seed + 700001,
+                cell_width=float(args.candidate_cell_width),
+                stencil_radius=int(args.candidate_stencil_radius),
+                radius=args.candidate_radius,
             )
             for variant in VARIANTS:
                 runner = _runner(
                     variant, n_agents, seed, args.device,
                     min(args.core_budget, int(n_agents) - 1),
                     degree,
+                    float(args.candidate_cell_width),
+                    int(args.candidate_stencil_radius),
+                    args.candidate_radius,
                 )
                 history = runner.run(n_episodes=int(args.episodes), eval_every=10)
                 memory = _memory_accounting(runner)
@@ -488,6 +520,24 @@ def main(argv=None):
                     "candidate_construction_subquadratic": bool(
                         history.get("candidate_construction_subquadratic", [False])[-1]
                     ) if history.get("candidate_construction_subquadratic") else False,
+                    "candidate_construction_linear_candidate": bool(
+                        history.get("candidate_construction_linear_candidate", [False])[-1]
+                    ) if history.get("candidate_construction_linear_candidate") else False,
+                    "feature_snapshot_subquadratic": bool(
+                        history.get("feature_snapshot_subquadratic", [False])[-1]
+                    ) if history.get("feature_snapshot_subquadratic") else False,
+                    "feature_snapshot_linear_candidate": bool(
+                        history.get("feature_snapshot_linear_candidate", [False])[-1]
+                    ) if history.get("feature_snapshot_linear_candidate") else False,
+                    "candidate_refresh_ms": _mean(history.get("candidate_refresh_ms", [])),
+                    "candidate_provider_work_units": _mean(history.get("candidate_provider_work_units", [])),
+                    "candidate_cell_occupancy_mean": _mean(history.get("candidate_cell_occupancy_mean", [])),
+                    "candidate_cell_occupancy_max": max(history.get("candidate_cell_occupancy_max", [-1])),
+                    "candidate_churn": _mean(history.get("candidate_churn", [])),
+                    "candidate_added_pairs": _mean(history.get("candidate_added_pairs", [])),
+                    "candidate_removed_pairs": _mean(history.get("candidate_removed_pairs", [])),
+                    "candidate_last_hash": str(history.get("candidate_map_hash", [""])[-1]) if history.get("candidate_map_hash") else "",
+                    "candidate_provider": str(history.get("candidate_provider", ["unknown"])[-1]) if history.get("candidate_provider") else "unknown",
                     "mean_reward": _mean(history.get("mean_reward", [])),
                     "reward_per_agent": _mean(history.get("reward_per_agent", [])),
                     "throughput_total": _mean(
@@ -515,17 +565,22 @@ def main(argv=None):
         "complete": True, "seeds": args.seeds, "agent_counts": args.agent_counts,
         "episodes": args.episodes,
         "candidate_max_degree": int(args.candidate_max_degree),
-        "candidate_policy": "adapter-owned, policy-independent weak-prior candidate set",
+        "candidate_policy": "dynamic adapter-owned policy-independent pre-measurement candidate set",
+        "candidate_update_protocol": "refresh_before_measurement_each_step",
+        "candidate_cell_width": float(args.candidate_cell_width),
+        "candidate_stencil_radius": int(args.candidate_stencil_radius),
+        "candidate_radius": args.candidate_radius,
+        "candidate_max_cell_occupancy": int(args.candidate_max_cell_occupancy),
         "candidate_oracle_recall": {
             "minimum": float(args.candidate_recall_min),
             "states": int(args.candidate_recall_states),
             "horizon": int(args.candidate_recall_horizon),
             "trials": int(args.candidate_recall_trials),
-            "definition": "unrestricted oracle positive-C top-min(d_max,n_positive) recall",
+            "definition": "dynamic-state unrestricted oracle positive-C top-min(d_max,n_positive) recall using the same runtime provider",
         },
         "full_explicit_reference_is_dense": True,
         "inference_latency_protocol": (
-            "deterministic_policy_inference_without_sampling_or_epsilon_forcing"
+            "deterministic_policy_inference_without_training_cache_sampling_or_epsilon_forcing"
         ),
         "runtime_memory_protocol": (
             "separate_deterministic_probe_sampled_process_rss_and_torch_cuda_peaks"

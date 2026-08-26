@@ -1,11 +1,14 @@
 """
-influence_signature.py — CAUSAL INFLUENCE SIGNATURES, the central novelty.
+influence_signature.py — typed CIG-AMF influence-profile transport.
 
 =============================================================================
 ONE-SENTENCE IDEA
 =============================================================================
-Do not compress a neighbour's response into one scalar. Retain structural
-capacity, behavioural direction, separate uncertainties, and contextuality.
+Do not compress a learned interventional response surface into one scalar too
+early. Transport structural capacity, behavioural direction, separate
+uncertainties, contextuality, and validity-masked response latency to the
+architecture, while keeping the allocator projection distinct from the full
+retained profile.
 
 =============================================================================
 WHY ONE SCALAR IS INSUFFICIENT
@@ -44,31 +47,15 @@ Dimensions 3 and 4 are fundamentally different and easy to confuse:
                            SCIC/CAI call situation-dependent influence
 
 =============================================================================
-DISTINCTION FROM THE CLOSEST PRIOR WORK
+SCIENTIFIC POSITIONING
 =============================================================================
-  ROMA/RODE/SIRD/LDSA/ACORM (role-based MARL):
-      Roles are inferred from OBSERVATIONS such as trajectories, behaviour,
-      and environmental effects, so they are correlational. Roles are GLOBAL
-      and condition THAT SAME AGENT'S POLICY. Their blind spot is that two
-      stationary vehicles—one blocking ego and one parked harmlessly—look
-      behaviourally identical and receive the SAME role. A counterfactual
-      signature separates them by asking whether ego's outcome would change
-      if the neighbour acted differently.
-
-  Jaques / SCIC / MAGIC (causal-influence MARL):
-      These methods also use interventions, but convert influence into an
-      INTRINSIC REWARD that answers "what should I DO?" rather than using it
-      to structure a representation.
-
-  Pieroth ICML 2024 (TIM/SIM):
-      This work measures influence structure but DELIBERATELY AVOIDS
-      counterfactual actions. Its max-minus-min quantity is UNSIGNED and its
-      goal is DESCRIPTIVE. The Final Remarks explicitly identify using TIM/SIM
-      to improve learning as FUTURE WORK.
-
-  The open cell addressed here is:
-      (SIGNED, MULTIDIMENSIONAL, EGO-CENTRIC interventional signal)
-      x (MEMORY ORGANIZATION and CAPACITY ALLOCATION).
+Influence measurement, multi-step causal influence, dynamic interaction graphs,
+and role discovery are prior art.  The paper-level claim is narrower: CIG-AMF
+derives task-specific coordinates from a shared interventional response surface
+and assigns them different architectural jobs.  C controls expensive-capacity
+allocation; D controls policy-contrast semantics; latency remains typed temporal
+information.  This module implements that transport contract and does not claim
+that causal influence estimation itself is novel.
 =============================================================================
 """
 
@@ -313,6 +300,30 @@ class InfluenceSignatureTracker:
         self._latency_horizon_hist: Dict[Tuple[int, int], deque] = {}
 
         self._n_obs: Dict[Tuple[int, int], int] = {}
+
+    def reconcile_candidate_pairs(self, candidate_neighbors_by_ego):
+        """Evict live signature buffers for pairs outside the current candidates."""
+        active = {
+            (int(ego), int(j))
+            for ego, ids in dict(candidate_neighbors_by_ego or {}).items()
+            for j in ids
+            if int(ego) != int(j)
+        }
+        stores = (
+            self._capacity_hist, self._direction_hist,
+            self._sigma_capacity_hist, self._sigma_direction_hist,
+            self._context_capacity, self._latency_hist,
+            self._latency_valid_hist, self._latency_onset_hist,
+            self._latency_onset_valid_hist, self._latency_peak_hist,
+            self._latency_horizon_hist, self._n_obs,
+        )
+        removed = set()
+        for store in stores:
+            for key in list(store.keys()):
+                if key not in active:
+                    removed.add(key)
+                    store.pop(key, None)
+        return removed
 
     # =====================================================================
     # Updates

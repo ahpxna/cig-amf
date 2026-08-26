@@ -142,7 +142,7 @@ class Round9ScientificContractTests(unittest.TestCase):
         _probe, latency = _decision_probe_with_latency(runner, n_states=1, seed=331)
         self.assertEqual(
             latency["inference_latency_protocol"],
-            "deterministic_policy_inference_without_sampling_or_epsilon_forcing",
+            "deterministic_policy_inference_without_training_cache_sampling_or_epsilon_forcing",
         )
         self.assertEqual(pickle.dumps(runner.forcer.state_dict()), pickle.dumps(before))
 

@@ -3,7 +3,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from envs.causal_adapter import bounded_candidate_neighbors, resolve_env_adapter
+from envs.causal_adapter import (
+    build_dynamic_candidate_map, candidate_map_hash, resolve_env_adapter,
+)
 from models.structural_proxy import (
     LocalCounterfactualProxyEnsemble,
 )
@@ -111,21 +113,49 @@ class FinalCIGAMFRunner:
         self.obs_dim = int(self.env_adapter.obs_dim)
         self.action_dim = int(self.env_adapter.max_action_dim)
         self.candidate_max_degree = self.cfg.get("candidate_max_degree", None)
-        self.candidate_neighbors_by_ego = {
-            ego: bounded_candidate_neighbors(
-                self.env_adapter, ego, self.candidate_max_degree
-            )
-            for ego in range(self.n_agents)
+        self.candidate_refresh_interval = max(
+            1, int(self.cfg.get("candidate_refresh_interval", 1))
+        )
+        self.candidate_cell_width = float(self.cfg.get("candidate_cell_width", 4.0))
+        self.candidate_stencil_radius = int(
+            self.cfg.get("candidate_stencil_radius", 1)
+        )
+        self.candidate_radius = self.cfg.get("candidate_radius", None)
+        if self.candidate_radius is not None:
+            self.candidate_radius = float(self.candidate_radius)
+        self.candidate_epoch = 0
+        self._last_candidate_refresh_step = -1
+        self._candidate_refresh_totals = {
+            "refreshes": 0, "added": 0, "removed": 0,
+            "provider_work_units": 0, "refresh_ms": 0.0,
         }
-        self.measured_edge_count = int(sum(
-            len(ids) for ids in self.candidate_neighbors_by_ego.values()
-        ))
-        # Current reference adapters construct bounded candidates by a dense
-        # weak-prior scan.  The edge set is bounded, but the constructor is
-        # not yet subquadratic; keep this explicit so scaling reports cannot
-        # overclaim population-linear execution.
+        self.candidate_neighbors_by_ego, self._candidate_telemetry = (
+            build_dynamic_candidate_map(
+                self.env_adapter, self.candidate_max_degree,
+                cell_width=self.candidate_cell_width,
+                stencil_radius=self.candidate_stencil_radius,
+                radius=self.candidate_radius,
+            )
+        )
+        self.candidate_map_hash = str(
+            self._candidate_telemetry["candidate_map_hash"]
+        )
+        self.measured_edge_count = int(self._candidate_telemetry["E_t"])
         self.candidate_construction_subquadratic = bool(
-            getattr(self.env_adapter, "candidate_construction_subquadratic", False)
+            self._candidate_telemetry.get(
+                "candidate_construction_subquadratic", False
+            )
+        )
+        self.candidate_construction_linear_candidate = bool(
+            self._candidate_telemetry.get(
+                "candidate_construction_linear_candidate", False
+            )
+        )
+        self.feature_snapshot_subquadratic = bool(
+            self._candidate_telemetry.get("feature_snapshot_subquadratic", False)
+        )
+        self.feature_snapshot_linear_candidate = bool(
+            self._candidate_telemetry.get("feature_snapshot_linear_candidate", False)
         )
 
         self.core_dim = int(cfg["core_dim"])
@@ -186,6 +216,21 @@ class FinalCIGAMFRunner:
         proxy_context_item_dim = cfg.get("proxy_context_item_dim")
         if proxy_context_item_dim is None:
             proxy_context_item_dim = self.env_adapter.context_item_dim
+        if confirmatory or strict_causal_profile:
+            if bool(cfg.get("proxy_use_belief_input", False)):
+                raise ValueError(
+                    "paper-locked response measurement forbids belief-summary "
+                    "self-conditioning"
+                )
+            if int(proxy_context_item_dim) <= 0:
+                raise ValueError(
+                    "paper-locked response measurement requires raw partition-"
+                    "independent leave-one-target context"
+                )
+            if int(proxy_pair_feat_dim) <= 0:
+                raise ValueError(
+                    "paper-locked response measurement requires target pair x_ij"
+                )
 
         self.proxy = LocalCounterfactualProxyEnsemble(
             obs_dim=self.obs_dim,
@@ -221,6 +266,7 @@ class FinalCIGAMFRunner:
             context_item_dim=proxy_context_item_dim,
             debug_verbose=cfg.get("debug_verbose", False),
             forced_only_training=cfg.get("proxy_forced_only_training", False),
+            response_ipw_ablation=cfg.get("proxy_response_ipw_ablation", False),
         )
 
         self.pair_rel_module = PairRelationalModule(
@@ -509,6 +555,19 @@ class FinalCIGAMFRunner:
             "measured_edge_count": [],
             "candidate_max_degree": [],
             "candidate_construction_subquadratic": [],
+            "candidate_construction_linear_candidate": [],
+            "feature_snapshot_subquadratic": [],
+            "feature_snapshot_linear_candidate": [],
+            "candidate_epoch": [],
+            "candidate_map_hash": [],
+            "candidate_provider": [],
+            "candidate_refresh_ms": [],
+            "candidate_provider_work_units": [],
+            "candidate_cell_occupancy_mean": [],
+            "candidate_cell_occupancy_max": [],
+            "candidate_added_pairs": [],
+            "candidate_removed_pairs": [],
+            "candidate_churn": [],
             "E_t": [],
             "K_t": [],
             "d_bar": [],
@@ -665,8 +724,85 @@ class FinalCIGAMFRunner:
     # ============================================================
 
     def _candidate_ids(self, ego):
-        """Measured neighbour set N_i^t fixed before causal allocation."""
+        """Measured neighbour set for the current candidate epoch."""
         return list(self.candidate_neighbors_by_ego[int(ego)])
+
+    def _refresh_dynamic_candidates(self, *, force=False):
+        """Refresh the pre-measurement candidate interface and live pair state.
+
+        Retained pairs preserve online state. Added pairs start with neutral/high-
+        uncertainty belief and zero shadow state. Removed pairs are demoted and
+        evicted from live pair-indexed modules so persistent memory follows E_t.
+        Historical response replay remains timestamped evidence and is untouched.
+        """
+        step = int(getattr(self, "_interaction_step", 0))
+        if (
+            not bool(force)
+            and self._last_candidate_refresh_step >= 0
+            and step - self._last_candidate_refresh_step < self.candidate_refresh_interval
+        ):
+            return dict(self._candidate_telemetry)
+        new_map, telemetry = build_dynamic_candidate_map(
+            self.env_adapter, self.candidate_max_degree,
+            cell_width=self.candidate_cell_width,
+            stencil_radius=self.candidate_stencil_radius,
+            radius=self.candidate_radius,
+        )
+        old_map = self.candidate_neighbors_by_ego
+        old_pairs = {(int(e), int(j)) for e, ids in old_map.items() for j in ids}
+        new_pairs = {(int(e), int(j)) for e, ids in new_map.items() for j in ids}
+        added = new_pairs - old_pairs
+        removed = old_pairs - new_pairs
+        union = old_pairs | new_pairs
+        churn = float(len(added) + len(removed)) / float(max(1, len(union)))
+
+        self.pair_rel_module.reconcile_candidate_sets(new_map)
+        for ego in range(self.n_agents):
+            self.belief_modules[ego].reconcile_neighbors(new_map[int(ego)])
+        self.sig_tracker.reconcile_candidate_pairs(new_map)
+        for key in list(self._profile_update_step.keys()):
+            if key not in new_pairs:
+                self._profile_update_step.pop(key, None)
+        self.candidate_neighbors_by_ego = {
+            int(ego): tuple(int(j) for j in ids) for ego, ids in new_map.items()
+        }
+        self.pair_rel_module.reconcile_core_sets(
+            {ego: belief.get_core_set() for ego, belief in self.belief_modules.items()},
+            warm_start=bool(self.cfg.get("pair_warm_start", True)),
+        )
+        self._reset_exclusion_caches()
+
+        self.candidate_epoch += 1
+        self._last_candidate_refresh_step = step
+        self.candidate_map_hash = str(telemetry["candidate_map_hash"])
+        self.measured_edge_count = int(telemetry["E_t"])
+        self.candidate_construction_subquadratic = bool(
+            telemetry.get("candidate_construction_subquadratic", False)
+        )
+        self.candidate_construction_linear_candidate = bool(
+            telemetry.get("candidate_construction_linear_candidate", False)
+        )
+        self.feature_snapshot_subquadratic = bool(
+            telemetry.get("feature_snapshot_subquadratic", False)
+        )
+        self.feature_snapshot_linear_candidate = bool(
+            telemetry.get("feature_snapshot_linear_candidate", False)
+        )
+        telemetry = dict(telemetry)
+        telemetry.update({
+            "candidate_epoch": int(self.candidate_epoch),
+            "candidate_added_pairs": int(len(added)),
+            "candidate_removed_pairs": int(len(removed)),
+            "candidate_churn": float(churn),
+        })
+        self._candidate_telemetry = telemetry
+        totals = self._candidate_refresh_totals
+        totals["refreshes"] += 1
+        totals["added"] += len(added)
+        totals["removed"] += len(removed)
+        totals["provider_work_units"] += int(telemetry.get("provider_work_units", 0))
+        totals["refresh_ms"] += float(telemetry.get("candidate_refresh_ms", 0.0))
+        return dict(telemetry)
 
     def _build_belief_items_for_ego(self, ego):
         belief_state = self.belief_modules[ego].get_state_dict()
@@ -1217,7 +1353,10 @@ class FinalCIGAMFRunner:
         }
         return executed.astype(np.float32), scripted.astype(np.float32), diagnostics
 
-    def _select_actions_population(self, obs_all, *, apply_forcing=True):
+    def _select_actions_population(
+        self, obs_all, *, apply_forcing=True, collect_training_cache=True,
+        force_candidate_refresh=False,
+    ):
         """
         Batched policy forward for the full population.
 
@@ -1225,6 +1364,9 @@ class FinalCIGAMFRunner:
         while excluding-j context remains cached by ego/j so proxy samples
         match action-time context.
         """
+        # The dynamic candidate rule is evaluated before every pair-specific
+        # measurement or representation update for the current environment state.
+        self._refresh_dynamic_candidates(force=bool(force_candidate_refresh))
         actions = {}
         # Core latents, geometry, last actions, beliefs, and influence
         # signatures all change over time. Set-membership-only cache keys are
@@ -1248,7 +1390,16 @@ class FinalCIGAMFRunner:
             # construct x_ij at sample creation time. It cannot be reconstructed
             # after the episode because env.positions then contains final state.
             # Cost is negligible: 24 coordinates and 24 zone IDs per timestep.
-            "geom_snapshot": self.env_adapter.feature_snapshot(),
+            "geom_snapshot": (
+                self.env_adapter.feature_snapshot()
+                if bool(collect_training_cache) else None
+            ),
+            "candidate_epoch": int(self.candidate_epoch),
+            "candidate_map_hash": str(self.candidate_map_hash),
+            "candidate_neighbors_by_ego": {
+                int(ego): tuple(int(j) for j in ids)
+                for ego, ids in self.candidate_neighbors_by_ego.items()
+            },
         }
 
         obs_batch = []
@@ -1299,17 +1450,14 @@ class FinalCIGAMFRunner:
             cache["proxy_context_excluding"][ego] = {}
             cache["pair_signal_cache"][ego] = pair_signals
 
-            for j in self._candidate_ids(ego):
-
-                cache["core_context_excluding"][ego][j] = self._core_context_excluding(
-                    ego,
-                    j,
-                )
-
-                cache["periph_context_excluding"][ego][j] = self._periph_context_excluding(
-                    ego,
-                    j,
-                )
+            if bool(collect_training_cache):
+                for j in self._candidate_ids(ego):
+                    cache["core_context_excluding"][ego][j] = self._core_context_excluding(
+                        ego, j,
+                    )
+                    cache["periph_context_excluding"][ego][j] = self._periph_context_excluding(
+                        ego, j,
+                    )
 
             obs_batch.append(self.env_adapter.observation(obs_all, ego))
             core_batch.append(core_summary_np)
@@ -1435,17 +1583,17 @@ class FinalCIGAMFRunner:
             actions[ego] = int(actions_list[ego])
             cache["value_cache"][ego] = float(values_np[ego])
 
-        # Causal contexts condition on executed co-actions.  Build one raw
-        # block per ego, then derive each legacy summary by sum-minus-target;
-        # no O(N^3) copied leave-one-out tables are created or retained.
+        # Causal replay contexts are training-cache state and are deliberately
+        # excluded from deterministic policy-inference latency probes.
         cache["proxy_context_blocks"] = {}
-        for ego in range(self.n_agents):
-            block = self._raw_proxy_context_block(ego, current_actions=actions_list)
-            cache["proxy_context_blocks"][ego] = block
-            for j in self._candidate_ids(ego):
-                cache["proxy_context_excluding"][ego][j] = (
-                    self._raw_proxy_context_excluding_from_block(block, j)
-                )
+        if bool(collect_training_cache):
+            for ego in range(self.n_agents):
+                block = self._raw_proxy_context_block(ego, current_actions=actions_list)
+                cache["proxy_context_blocks"][ego] = block
+                for j in self._candidate_ids(ego):
+                    cache["proxy_context_excluding"][ego][j] = (
+                        self._raw_proxy_context_excluding_from_block(block, j)
+                    )
 
         cache["forced_mask"] = forced_mask
         cache["action_execution_records"] = (
@@ -1528,7 +1676,9 @@ class FinalCIGAMFRunner:
         prev_actions = None
         prev_env_snapshot_before_step = None
         prev_h_snapshot = None
+        prev_s_snapshot = None
         prev_forced_mask = None
+        prev_candidate_neighbors_by_ego = None
 
         while not done:
             actions_dict, cache = self._select_actions_population(obs_all)
@@ -1536,6 +1686,7 @@ class FinalCIGAMFRunner:
 
             env_snapshot_before_step = self.env_adapter.clone_state()
             h_snapshot_before_latent_update = self.pair_rel_module.clone_full_states_np()
+            s_snapshot_before_latent_update = self.pair_rel_module.clone_shadow_states_np()
 
             next_obs_all, rewards, done, info = self.env_adapter.step(actions_list)
             env_snapshot_after_step = self.env_adapter.clone_state()
@@ -1572,10 +1723,16 @@ class FinalCIGAMFRunner:
                     "pair_signal_cache": cache.get("pair_signal_cache", {}),
                     "structure_regime_id": self._current_structure_regime_id(),
                     "policy_version": int(self._policy_version),
+                    "candidate_epoch": int(cache.get("candidate_epoch", 0)),
+                    "candidate_map_hash": str(cache.get("candidate_map_hash", "")),
+                    "candidate_neighbors_by_ego": cache.get(
+                        "candidate_neighbors_by_ego", {}
+                    ),
                     
                     "env_snapshot_before_step": env_snapshot_before_step,
                     "env_snapshot_after_step": env_snapshot_after_step,
                     "h_snapshot_before_latent_update": h_snapshot_before_latent_update,
+                    "s_snapshot_before_latent_update": s_snapshot_before_latent_update,
                     "info": info,
                     "terminated": bool(
                         isinstance(info, dict) and info.get("terminated", False)
@@ -1610,11 +1767,13 @@ class FinalCIGAMFRunner:
                     next_actions_are_pre_forcing=True,
                     env=self.env,
                     h_prev_snapshot=prev_h_snapshot,
+                    s_prev_snapshot=prev_s_snapshot,
                     cd_target_fn=self._cd_target_for_pair,
                     max_cd_target_age=self.cfg.get(
                         "cd_target_max_age_steps",
                         self.cfg.get("cd_target_max_age_episodes", 1),
                     ),
+                    candidate_neighbors_by_ego=prev_candidate_neighbors_by_ego,
                 )
 
                 self.env_adapter.restore_state(env_snapshot_after_step)
@@ -1650,7 +1809,12 @@ class FinalCIGAMFRunner:
             prev_actions = list(actions_list)
             prev_env_snapshot_before_step = env_snapshot_before_step
             prev_h_snapshot = h_snapshot_before_latent_update
+            prev_s_snapshot = s_snapshot_before_latent_update
             prev_forced_mask = cache["forced_mask"]
+            prev_candidate_neighbors_by_ego = {
+                int(ego): tuple(int(j) for j in ids)
+                for ego, ids in cache.get("candidate_neighbors_by_ego", {}).items()
+            }
 
             self._interaction_step += 1
 
@@ -2740,6 +2904,35 @@ class FinalCIGAMFRunner:
             "candidate_construction_subquadratic": bool(
                 self.candidate_construction_subquadratic
             ),
+            "candidate_construction_linear_candidate": bool(
+                self.candidate_construction_linear_candidate
+            ),
+            "feature_snapshot_subquadratic": bool(self.feature_snapshot_subquadratic),
+            "feature_snapshot_linear_candidate": bool(self.feature_snapshot_linear_candidate),
+            "candidate_epoch": int(self.candidate_epoch),
+            "candidate_map_hash": str(self.candidate_map_hash),
+            "candidate_provider": str(self._candidate_telemetry.get("provider", "unknown")),
+            "candidate_refresh_ms": float(
+                self._candidate_telemetry.get("candidate_refresh_ms", 0.0)
+            ),
+            "candidate_provider_work_units": int(
+                self._candidate_telemetry.get("provider_work_units", 0)
+            ),
+            "candidate_cell_occupancy_mean": float(
+                self._candidate_telemetry.get("cell_occupancy_mean", float("nan"))
+            ),
+            "candidate_cell_occupancy_max": int(
+                self._candidate_telemetry.get("cell_occupancy_max", -1)
+            ),
+            "candidate_added_pairs": int(
+                self._candidate_telemetry.get("candidate_added_pairs", 0)
+            ),
+            "candidate_removed_pairs": int(
+                self._candidate_telemetry.get("candidate_removed_pairs", 0)
+            ),
+            "candidate_churn": float(
+                self._candidate_telemetry.get("candidate_churn", 0.0)
+            ),
             "active_core_pair_count": int(
                 len(getattr(self.pair_rel_module, "active_core_pairs", ()))
             ),
@@ -3088,6 +3281,45 @@ class FinalCIGAMFRunner:
                 )
                 self.history.setdefault("candidate_construction_subquadratic", []).append(
                     bool(snapshot.get("candidate_construction_subquadratic", False))
+                )
+                self.history.setdefault("candidate_construction_linear_candidate", []).append(
+                    bool(snapshot.get("candidate_construction_linear_candidate", False))
+                )
+                self.history.setdefault("feature_snapshot_subquadratic", []).append(
+                    bool(snapshot.get("feature_snapshot_subquadratic", False))
+                )
+                self.history.setdefault("feature_snapshot_linear_candidate", []).append(
+                    bool(snapshot.get("feature_snapshot_linear_candidate", False))
+                )
+                self.history.setdefault("candidate_epoch", []).append(
+                    int(snapshot.get("candidate_epoch", 0))
+                )
+                self.history.setdefault("candidate_map_hash", []).append(
+                    str(snapshot.get("candidate_map_hash", ""))
+                )
+                self.history.setdefault("candidate_provider", []).append(
+                    str(snapshot.get("candidate_provider", "unknown"))
+                )
+                self.history.setdefault("candidate_refresh_ms", []).append(
+                    float(snapshot.get("candidate_refresh_ms", 0.0))
+                )
+                self.history.setdefault("candidate_provider_work_units", []).append(
+                    int(snapshot.get("candidate_provider_work_units", 0))
+                )
+                self.history.setdefault("candidate_cell_occupancy_mean", []).append(
+                    float(snapshot.get("candidate_cell_occupancy_mean", float("nan")))
+                )
+                self.history.setdefault("candidate_cell_occupancy_max", []).append(
+                    int(snapshot.get("candidate_cell_occupancy_max", -1))
+                )
+                self.history.setdefault("candidate_added_pairs", []).append(
+                    int(snapshot.get("candidate_added_pairs", 0))
+                )
+                self.history.setdefault("candidate_removed_pairs", []).append(
+                    int(snapshot.get("candidate_removed_pairs", 0))
+                )
+                self.history.setdefault("candidate_churn", []).append(
+                    float(snapshot.get("candidate_churn", 0.0))
                 )
                 self.history.setdefault("E_t", []).append(int(snapshot.get("E_t", 0)))
                 self.history.setdefault("K_t", []).append(int(snapshot.get("K_t", 0)))
