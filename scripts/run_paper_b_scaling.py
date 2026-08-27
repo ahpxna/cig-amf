@@ -546,6 +546,11 @@ def main(argv=None):
             f"{args.candidate_recall_horizon}"
         )
     for n_agents in args.agent_counts:
+        if any(int(budget) >= int(n_agents) for budget in args.core_budgets):
+            parser.error(
+                "confirmatory scaling budgets must satisfy k <= N-1 for every "
+                "population; cross-population clipping is not allowed"
+            )
         effective = [
             min(int(budget), int(n_agents) - 1)
             for budget in args.core_budgets

@@ -1,6 +1,7 @@
 """Fail-closed exact-grid contracts for Paper-B adaptive-budget artifacts."""
 
 import csv
+import hashlib
 import json
 import tempfile
 import unittest
@@ -56,14 +57,18 @@ class PaperBAdaptiveBudgetContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             panel_root = Path(root) / "paper_b_adaptive_budget"
             panel_root.mkdir()
-            with (panel_root / "manifest.json").open("w", encoding="utf-8") as handle:
-                json.dump(manifest, handle)
-            with (
-                panel_root / "summary_paper_b_adaptive_budget.csv"
-            ).open("w", newline="", encoding="utf-8") as handle:
+            summary_path = panel_root / "summary_paper_b_adaptive_budget.csv"
+            with summary_path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
                 writer.writeheader()
                 writer.writerows(rows)
+            manifest = dict(manifest)
+            manifest["summary_row_count"] = len(rows)
+            manifest["summary_sha256"] = hashlib.sha256(
+                summary_path.read_bytes()
+            ).hexdigest()
+            with (panel_root / "manifest.json").open("w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
             return _load_adaptive_budget(root, expected_seeds, protocol_mode=mode)
 
     def test_adaptive_accepts_full_fixed_k_grid(self):

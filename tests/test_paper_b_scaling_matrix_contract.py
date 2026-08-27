@@ -117,7 +117,7 @@ class PaperBScalingMatrixContractTests(unittest.TestCase):
     def test_scaling_loader_rejects_clipping_collision(self):
         seeds, populations, budgets = [7], [5], [4, 5]
         rows = self._rows(seeds, populations, budgets)
-        with self.assertRaisesRegex(ValueError, "collapses after clipping"):
+        with self.assertRaisesRegex(ValueError, "cross-population clipping"):
             self._load(rows, self._manifest(seeds, populations, budgets), seeds)
 
 

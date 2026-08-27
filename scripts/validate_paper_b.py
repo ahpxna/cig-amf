@@ -259,6 +259,11 @@ def _validate_scaling_matrix(rows, manifest, expected_seeds):
         raise ValueError("scaling manifest variant contract mismatch")
 
     for n_agents in agent_counts:
+        if any(int(budget) >= int(n_agents) for budget in budgets):
+            raise ValueError(
+                "confirmatory scaling budgets must satisfy k <= N-1 for every "
+                "population; cross-population clipping is not allowed"
+            )
         effective = tuple(min(int(budget), int(n_agents) - 1) for budget in budgets)
         if len(effective) != len(set(effective)):
             raise ValueError(
@@ -279,14 +284,14 @@ def _validate_scaling_matrix(rows, manifest, expected_seeds):
             raise ValueError("scaling row lies outside the frozen seed/population axes")
         if requested not in budgets or variant not in set(EXPECTED_SCALING):
             raise ValueError("scaling row lies outside the frozen budget/variant axes")
-        expected_effective = min(requested, n_agents - 1)
+        expected_effective = requested
         if effective != expected_effective:
             raise ValueError(
                 "scaling row core_budget does not match the frozen clipping rule"
             )
 
     expected = {
-        (int(seed), int(n_agents), min(int(budget), int(n_agents) - 1), variant)
+        (int(seed), int(n_agents), int(budget), variant)
         for seed in expected_seed_set
         for n_agents in agent_counts
         for budget in budgets
