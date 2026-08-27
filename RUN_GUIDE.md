@@ -136,12 +136,15 @@ behavioural intervention or a ground-truth latency oracle.  Do not enable a
 capability flag merely to make the manifest green.
 
 Actual Final-CIGAMF architecture-generalization training is separate from the
-capability manifest.  Full-profile external evidence uses protocol v4: matched
+capability manifest.  Full-profile external evidence uses protocol v5: matched
 training is followed by fresh paired **frozen-policy** evaluation episodes.
 Final-CIGAMF may use epsilon forcing while training to acquire causal support,
 but G8 never compares those intervention-inclusive training returns against a
-baseline that does not force actions.  Frozen evaluation disables learning,
-representation updates, and epsilon forcing for every model.
+baseline that does not force actions.  Frozen evaluation disables trainable
+policy/representation updates and epsilon forcing for every model, while
+keeping recurrent deployment-time inference (including pair-latent filtering)
+active.  Each fresh evaluation episode restores the same trained inference
+checkpoint before entering its paired environment seed.
 
 ```bash
 python scripts/run_external_training.py \
@@ -162,7 +165,9 @@ A full run writes three hash-bound CSV artifacts plus `manifest.json`:
 
 G8 recomputes each seed/model evaluation mean from the episode-level frozen
 evaluation artifact and verifies SHA-256 plus row-count bindings before using
-any reward value.  Legacy v3 external artifacts that contain only training
+any reward value.  Legacy v3/v4 external artifacts do not satisfy the v5
+recurrent-inference evaluation contract and must not be relabelled or reused as
+v5 evidence.  Older artifacts that contain only training
 returns are intentionally rejected by the v4 G8 validator; rerun them under the
 frozen protocol rather than relabelling them.
 

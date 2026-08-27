@@ -1754,8 +1754,14 @@ class FinalCIGAMFRunner:
             representation_frozen = bool(
                 self.cfg.get("freeze_representation_state", False)
             )
+            representation_learning_state_frozen = bool(
+                self.cfg.get(
+                    "freeze_representation_learning_state",
+                    representation_frozen,
+                )
+            )
             if (
-                not representation_frozen
+                not representation_learning_state_frozen
                 and
                 prev_obs_all is not None
                 and prev_actions is not None

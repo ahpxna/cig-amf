@@ -270,8 +270,16 @@ def _external_gate(external_root, min_seeds, min_episodes):
             rule="only full-profile paired external runs count as generalisation evidence",
             failure_action="scope claims explicitly to the custom/primary domain only",
         )
-    if manifest.get("evaluation_mode") != "fresh_seed_frozen_policy_no_learning_no_forcing":
+    if manifest.get("evaluation_mode") != (
+        "fresh_seed_frozen_policy_no_learning_no_forcing_recurrent_inference"
+    ):
         raise ValueError("external evaluation mode is not the frozen-policy protocol")
+    if manifest.get("evaluation_recurrent_inference_active") is not True:
+        raise ValueError("external evaluation disabled recurrent deployment inference")
+    if manifest.get("evaluation_representation_learning_state_frozen") is not True:
+        raise ValueError("external evaluation did not freeze representation-learning state")
+    if manifest.get("evaluation_representation_state_frozen") is not False:
+        raise ValueError("external evaluation incorrectly froze recurrent representation state")
     if int(manifest.get("evaluation_seed_offset", -1)) != int(EXTERNAL_EVAL_SEED_OFFSET):
         raise ValueError("external evaluation seed offset violates the frozen protocol")
 
@@ -438,6 +446,8 @@ def _external_gate(external_root, min_seeds, min_episodes):
             "frozen_eval_reward_advantage_ci95": ci,
             "active_h1_support_all_seeds": support_ready,
             "training_return_used_for_gate": False,
+            "recurrent_inference_active_during_eval": True,
+            "representation_learning_state_frozen_during_eval": True,
         },
         rule=(
             "second benchmark must be pinned/provenanced, use exact paired "

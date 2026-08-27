@@ -135,7 +135,9 @@ class ScientificGateLadderTests(unittest.TestCase):
             "SELECTIVE_REPRESENTATION_ARCHITECTURE_ONLY",
         )
 
-    def _write_external_gate_fixture(self, root, *, tamper_summary=False):
+    def _write_external_gate_fixture(
+        self, root, *, tamper_summary=False, protocol_version=None
+    ):
         from utils.paper_contracts import (
             EXTERNAL_EVAL_SEED_OFFSET,
             EXTERNAL_GENERALIZATION_PROTOCOL_VERSION,
@@ -202,9 +204,17 @@ class ScientificGateLadderTests(unittest.TestCase):
             "external_training_episodes.csv", training_rows
         )
         manifest = {
-            "protocol_version": EXTERNAL_GENERALIZATION_PROTOCOL_VERSION,
+            "protocol_version": (
+                EXTERNAL_GENERALIZATION_PROTOCOL_VERSION
+                if protocol_version is None else protocol_version
+            ),
             "profile": "full", "environment": "rware",
-            "evaluation_mode": "fresh_seed_frozen_policy_no_learning_no_forcing",
+            "evaluation_mode": (
+                "fresh_seed_frozen_policy_no_learning_no_forcing_recurrent_inference"
+            ),
+            "evaluation_recurrent_inference_active": True,
+            "evaluation_representation_learning_state_frozen": True,
+            "evaluation_representation_state_frozen": False,
             "evaluation_seed_offset": EXTERNAL_EVAL_SEED_OFFSET,
             "provenance_complete": True, "source_git_clean": True,
             "external_pin_match": True,
@@ -252,6 +262,17 @@ class ScientificGateLadderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             self._write_external_gate_fixture(root, tamper_summary=True)
             with self.assertRaisesRegex(ValueError, "SHA-256 binding mismatch"):
+                VG._external_gate(root, min_seeds=3, min_episodes=50)
+
+    def test_external_g8_rejects_legacy_v4_semantics(self):
+        from scripts import validate_scientific_gates as VG
+
+        with tempfile.TemporaryDirectory() as root:
+            self._write_external_gate_fixture(
+                root,
+                protocol_version="external_matched_training_v4_frozen_policy_eval",
+            )
+            with self.assertRaisesRegex(ValueError, "protocol version mismatch"):
                 VG._external_gate(root, min_seeds=3, min_episodes=50)
 
 

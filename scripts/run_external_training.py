@@ -1,15 +1,17 @@
 """Run matched project models on one normalized external benchmark.
 
-Protocol v4 separates *training* from the model-comparison estimand used by
+Protocol v5 separates *training* from the model-comparison estimand used by
 G8.  Final-CIGAMF deliberately executes epsilon-forced actions while training
 to acquire causal support; PureMeanField does not.  Training return is thus a
 useful diagnostic but not a fair learned-policy comparator.  After training,
 every model is evaluated on fresh paired environment seeds with policy
-learning, representation updates, and epsilon forcing disabled.
+learning, representation-training updates, and epsilon forcing disabled while
+deployment-time recurrent inference remains active.
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import json
@@ -145,10 +147,20 @@ def _forcing_fraction(runner):
 def _forcer_snapshot(forcer):
     if forcer is None:
         return None
+    state_dict = getattr(forcer, "state_dict", None)
+    if callable(state_dict):
+        return {
+            "kind": "state_dict",
+            "state": copy.deepcopy(state_dict()),
+            "last_execution_records": copy.deepcopy(
+                getattr(forcer, "last_execution_records", ())
+            ),
+        }
     eps_per_agent = getattr(forcer, "_eps_per_agent", None)
     if isinstance(eps_per_agent, np.ndarray):
         eps_per_agent = eps_per_agent.copy()
     return {
+        "kind": "attributes",
         "eps_initial": float(getattr(forcer, "eps_initial", 0.0)),
         "eps": float(getattr(forcer, "eps", 0.0)),
         "anneal_to": getattr(forcer, "anneal_to", None),
@@ -173,7 +185,18 @@ def _set_forcer_off(forcer):
 def _restore_forcer(forcer, snapshot):
     if forcer is None or snapshot is None:
         return
+    if snapshot.get("kind") == "state_dict":
+        load_state_dict = getattr(forcer, "load_state_dict", None)
+        if not callable(load_state_dict):
+            raise RuntimeError("forcer snapshot requires load_state_dict()")
+        load_state_dict(copy.deepcopy(snapshot["state"]))
+        forcer.last_execution_records = copy.deepcopy(
+            snapshot.get("last_execution_records", ())
+        )
+        return
     for key, value in snapshot.items():
+        if key == "kind":
+            continue
         setattr(forcer, key, value)
 
 
@@ -182,6 +205,100 @@ def _evaluation_seed(train_seed, eval_index):
     # seeds.  The exact rule is written into the manifest and independently
     # checked by G8.
     return int(EXTERNAL_EVAL_SEED_OFFSET + int(train_seed) * 10_000 + int(eval_index))
+
+
+def _clone_tensor_mapping(mapping):
+    out = {}
+    for key, value in dict(mapping or {}).items():
+        if hasattr(value, "detach") and callable(value.detach):
+            out[key] = value.detach().clone()
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+def _capture_external_inference_state(runner):
+    """Capture mutable deployment state that a rollout may advance.
+
+    Frozen-policy evaluation freezes *learning*, not recurrent inference.  A
+    recurrent policy is therefore allowed to update z_ij/s_ij within an
+    episode, but every fresh evaluation episode must start from the same
+    trained checkpoint.  This snapshot intentionally excludes environment
+    state because every evaluation episode gets a freshly constructed env.
+    """
+    state = {
+        "interaction_step": copy.deepcopy(getattr(runner, "_interaction_step", None)),
+        "attrs": {},
+        "pair": None,
+    }
+    for name in (
+        "belief_modules",
+        "sig_tracker",
+        "candidate_neighbors_by_ego",
+        "candidate_epoch",
+        "candidate_map_hash",
+        "measured_edge_count",
+        "candidate_construction_subquadratic",
+        "candidate_construction_linear_candidate",
+        "feature_snapshot_subquadratic",
+        "feature_snapshot_linear_candidate",
+        "_last_candidate_refresh_step",
+        "_candidate_telemetry",
+        "_candidate_refresh_totals",
+        "_profile_update_step",
+    ):
+        if hasattr(runner, name):
+            state["attrs"][name] = copy.deepcopy(getattr(runner, name))
+
+    pair = getattr(runner, "pair_rel_module", None)
+    if pair is not None:
+        state["pair"] = {
+            "full_states": _clone_tensor_mapping(getattr(pair, "full_states", {})),
+            "shadow_states": _clone_tensor_mapping(getattr(pair, "shadow_states", {})),
+            "pooled_states": _clone_tensor_mapping(getattr(pair, "pooled_states", {})),
+            "active_core_pairs": set(getattr(pair, "active_core_pairs", set())),
+            "candidate_neighbors_by_ego": copy.deepcopy(
+                getattr(pair, "candidate_neighbors_by_ego", {})
+            ),
+        }
+    return state
+
+
+def _restore_external_inference_state(runner, state):
+    if state.get("interaction_step") is not None and hasattr(runner, "_interaction_step"):
+        runner._interaction_step = copy.deepcopy(state["interaction_step"])
+    for name, value in state.get("attrs", {}).items():
+        setattr(runner, name, copy.deepcopy(value))
+
+    pair_state = state.get("pair")
+    pair = getattr(runner, "pair_rel_module", None)
+    if pair is not None and pair_state is not None:
+        device = getattr(runner, "device", None)
+
+        def _restore_map(mapping):
+            out = _clone_tensor_mapping(mapping)
+            if device is not None:
+                for key, value in list(out.items()):
+                    if hasattr(value, "to") and callable(value.to):
+                        out[key] = value.to(device)
+            return out
+
+        pair.full_states = _restore_map(pair_state["full_states"])
+        pair.shadow_states = _restore_map(pair_state["shadow_states"])
+        pair.pooled_states = _restore_map(pair_state["pooled_states"])
+        pair.active_core_pairs = set(pair_state["active_core_pairs"])
+        pair.candidate_neighbors_by_ego = copy.deepcopy(
+            pair_state["candidate_neighbors_by_ego"]
+        )
+        # The external evaluator freezes representation-learning state, so the
+        # potentially large BC replay buffer is guaranteed read-only.  Do not
+        # clone it once per fresh eval episode: that would turn a 20-episode
+        # evaluation into repeated O(buffer_size) memory copies for no change
+        # in policy semantics.
+
+    reset_caches = getattr(runner, "_reset_exclusion_caches", None)
+    if callable(reset_caches):
+        reset_caches()
 
 
 def _evaluate_frozen_policy(
@@ -193,9 +310,10 @@ def _evaluate_frozen_policy(
 
     Evaluation calls ``collect_episode`` directly: no policy optimizer,
     replay/proxy push, graph update, scheduler step, or semantic recalibration
-    is executed.  Final-CIGAMF additionally freezes representation-state
-    updates and has its epsilon-forcing controller hard-disabled.  Every model
-    sees the same fresh evaluation seeds for a given training seed.
+    is executed.  Final-CIGAMF keeps recurrent deployment inference active but
+    freezes representation-training state and hard-disables epsilon forcing.
+    Every fresh episode restores the same trained inference checkpoint before
+    entering its paired environment seed.
     """
     original_env = getattr(runner, "env", None)
     original_adapter = getattr(runner, "env_adapter", None)
@@ -205,12 +323,19 @@ def _evaluate_frozen_policy(
 
     sentinel = object()
     old_freeze_rep = cfg.get("freeze_representation_state", sentinel)
-    cfg["freeze_representation_state"] = True
+    old_freeze_rep_learning = cfg.get(
+        "freeze_representation_learning_state", sentinel
+    )
+    # Recurrent z/s filtering is part of deployment inference and must stay
+    # active.  Only representation *training-data* updates are frozen.
+    cfg["freeze_representation_state"] = False
+    cfg["freeze_representation_learning_state"] = True
 
     original_interaction_step = getattr(runner, "_interaction_step", sentinel)
     forcer = getattr(runner, "forcer", None)
     forcer_state = _forcer_snapshot(forcer)
     _set_forcer_off(forcer)
+    inference_state = _capture_external_inference_state(runner)
 
     rows = []
     try:
@@ -219,6 +344,7 @@ def _evaluate_frozen_policy(
             if original_interaction_step is not sentinel else None
         )
         for eval_index in range(int(eval_episodes)):
+            _restore_external_inference_state(runner, inference_state)
             eval_seed = _evaluation_seed(train_seed, eval_index)
             RE.set_global_seed(eval_seed)
             eval_env = build_environment(
@@ -271,12 +397,17 @@ def _evaluate_frozen_policy(
                 "config_fingerprint_sha256": str(config_fingerprint),
             })
     finally:
+        _restore_external_inference_state(runner, inference_state)
         runner.env = original_env
         runner.env_adapter = original_adapter
         if old_freeze_rep is sentinel:
             cfg.pop("freeze_representation_state", None)
         else:
             cfg["freeze_representation_state"] = old_freeze_rep
+        if old_freeze_rep_learning is sentinel:
+            cfg.pop("freeze_representation_learning_state", None)
+        else:
+            cfg["freeze_representation_learning_state"] = old_freeze_rep_learning
         if original_interaction_step is not sentinel:
             runner._interaction_step = original_interaction_step
         _restore_forcer(forcer, forcer_state)
@@ -466,13 +597,18 @@ def main(argv=None):
 
     manifest = {
         "protocol_version": EXTERNAL_GENERALIZATION_PROTOCOL_VERSION,
-        "experiment": "external_matched_training_v4_frozen_policy_eval",
+        "experiment": "external_matched_training_v5_recurrent_frozen_policy_eval",
         "environment": args.environment,
         "models": list(args.models),
         "seeds": [int(seed) for seed in args.seeds],
         "episodes": int(args.episodes),
         "eval_episodes": int(eval_episodes),
-        "evaluation_mode": "fresh_seed_frozen_policy_no_learning_no_forcing",
+        "evaluation_mode": (
+            "fresh_seed_frozen_policy_no_learning_no_forcing_recurrent_inference"
+        ),
+        "evaluation_recurrent_inference_active": True,
+        "evaluation_representation_learning_state_frozen": True,
+        "evaluation_representation_state_frozen": False,
         "evaluation_seed_offset": int(EXTERNAL_EVAL_SEED_OFFSET),
         "evaluation_seed_rule": "offset + train_seed*10000 + eval_index",
         "agent_count_requested": int(args.agent_count),

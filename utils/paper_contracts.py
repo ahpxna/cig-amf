@@ -36,9 +36,10 @@ PAPER_B_ADAPTIVE_MATCHING_RULE = (
 # Training-time return is not a fair model comparator because CIG-AMF's
 # causal-data acquisition deliberately executes epsilon-forced actions while
 # PureMeanField does not.  G8 therefore consumes fresh paired frozen-policy
-# evaluation episodes with learning/representation updates and forcing off.
+# evaluation episodes with trainable/representation-learning updates and
+# forcing off while recurrent deployment-time inference remains active.
 EXTERNAL_GENERALIZATION_PROTOCOL_VERSION = (
-    "external_matched_training_v4_frozen_policy_eval"
+    "external_matched_training_v5_recurrent_frozen_policy_eval"
 )
 EXTERNAL_EVAL_SEED_OFFSET = 1_000_003
 EXTERNAL_G8_MIN_EVAL_EPISODES = 20
