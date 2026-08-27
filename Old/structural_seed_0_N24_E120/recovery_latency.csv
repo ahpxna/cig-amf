@@ -1,7 +1,0 @@
-task,mode,model,seed,shift_episode,shift_eval_index,recovery_latency,baseline,target
-structural,structural_shift,PureMeanField,0,40,3,2,-0.3140833377838135,-0.31834584176540376
-structural,structural_shift,FullExplicitLocal,0,40,3,0,-0.3817708343267441,-0.38122291415929793
-structural,structural_shift,Final-CIGAMF,0,40,3,0,-0.3389166593551636,-0.33312915861606596
-structural,structural_shift,NoBelief,0,40,3,0,-0.37937499582767487,-0.36966666132211684
-structural,structural_shift,NoMultiMemory,0,40,3,0,-0.3882499933242798,-0.3987083226442337
-structural,structural_shift,NoTwoTimescale,0,40,3,0,-0.3856041580438614,-0.37913124114274976

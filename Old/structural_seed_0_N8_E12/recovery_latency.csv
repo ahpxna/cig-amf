@@ -1,2 +1,0 @@
-task,mode,model,seed,shift_episode,shift_eval_index,recovery_latency,baseline,target
-structural,structural_shift,Final-CIGAMF,0,40,40,-1,,
