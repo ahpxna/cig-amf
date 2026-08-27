@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import tempfile
@@ -134,37 +135,124 @@ class ScientificGateLadderTests(unittest.TestCase):
             "SELECTIVE_REPRESENTATION_ARCHITECTURE_ONLY",
         )
 
-    def test_external_g8_requires_paired_full_profile_and_active_support(self):
+    def _write_external_gate_fixture(self, root, *, tamper_summary=False):
+        from utils.paper_contracts import (
+            EXTERNAL_EVAL_SEED_OFFSET,
+            EXTERNAL_GENERALIZATION_PROTOCOL_VERSION,
+        )
+
+        seeds = (1, 2, 3)
+        eval_episodes = 20
+        summary_rows = []
+        eval_rows = []
+        training_rows = []
+        for seed in seeds:
+            common = {
+                "episodes": 50,
+                "eval_episodes": eval_episodes,
+                "max_steps_requested": 30,
+                "max_steps_effective": 30,
+                "config_fingerprint_sha256": "same-config",
+            }
+            summary_rows.append({
+                "model": "Final-CIGAMF", "seed": seed,
+                "mean_reward": -10.0, "eval_mean_reward": 2.0, **common,
+            })
+            summary_rows.append({
+                "model": "PureMeanField", "seed": seed,
+                "mean_reward": 100.0, "eval_mean_reward": 1.0, **common,
+            })
+            for model, reward in (("Final-CIGAMF", 2.0), ("PureMeanField", 1.0)):
+                for index in range(eval_episodes):
+                    eval_rows.append({
+                        "model": model,
+                        "train_seed": seed,
+                        "eval_index": index,
+                        "eval_seed": EXTERNAL_EVAL_SEED_OFFSET + seed * 10_000 + index,
+                        "eval_reward": reward,
+                        "episode_steps": 30,
+                        "max_steps_requested": 30,
+                        "max_steps_effective": 30,
+                        "forcing_count": 0,
+                        "rollout_seconds": 0.01,
+                        "config_fingerprint_sha256": "same-config",
+                    })
+            for model in ("Final-CIGAMF", "PureMeanField"):
+                for episode in range(1, 51):
+                    training_rows.append({
+                        "model": model, "seed": seed, "episode": episode,
+                        "training_reward": -5.0,
+                    })
+
+        def write_csv(name, rows):
+            path = os.path.join(root, name)
+            with open(path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                writer.writeheader(); writer.writerows(rows)
+            with open(path, "rb") as handle:
+                return len(rows), hashlib.sha256(handle.read()).hexdigest()
+
+        summary_count, summary_hash = write_csv(
+            "summary_external_training.csv", summary_rows
+        )
+        eval_count, eval_hash = write_csv(
+            "external_frozen_evaluation.csv", eval_rows
+        )
+        train_count, train_hash = write_csv(
+            "external_training_episodes.csv", training_rows
+        )
+        manifest = {
+            "protocol_version": EXTERNAL_GENERALIZATION_PROTOCOL_VERSION,
+            "profile": "full", "environment": "rware",
+            "evaluation_mode": "fresh_seed_frozen_policy_no_learning_no_forcing",
+            "evaluation_seed_offset": EXTERNAL_EVAL_SEED_OFFSET,
+            "provenance_complete": True, "source_git_clean": True,
+            "external_pin_match": True,
+            "paired_generalization_models_present": True,
+            "not_an_external_allocation_selector_claim": True,
+            "seeds": list(seeds), "episodes": 50,
+            "eval_episodes": eval_episodes,
+            "summary_row_count": summary_count,
+            "summary_sha256": summary_hash,
+            "evaluation_row_count": eval_count,
+            "evaluation_sha256": eval_hash,
+            "training_episode_row_count": train_count,
+            "training_episode_sha256": train_hash,
+            "h1_support_by_seed": {
+                str(seed): {"signal_ready": True} for seed in seeds
+            },
+        }
+        with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+
+        if tamper_summary:
+            # Mutate the reward artifact *after* the manifest binding is frozen.
+            # G8 must reject this before using any reward value.
+            summary_rows[0]["eval_mean_reward"] = 999.0
+            path = os.path.join(root, "summary_external_training.csv")
+            with open(path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(summary_rows[0]))
+                writer.writeheader(); writer.writerows(summary_rows)
+
+    def test_external_g8_uses_bound_frozen_policy_evaluation(self):
         from scripts import validate_scientific_gates as VG
 
         with tempfile.TemporaryDirectory() as root:
-            rows = []
-            for seed in (1, 2, 3):
-                common = {
-                    "episodes": 50,
-                    "max_steps_requested": 30,
-                    "max_steps_effective": 30,
-                    "config_fingerprint_sha256": "same-config",
-                }
-                rows.append({"model": "Final-CIGAMF", "seed": seed, "mean_reward": 2.0, **common})
-                rows.append({"model": "PureMeanField", "seed": seed, "mean_reward": 1.0, **common})
-            with open(os.path.join(root, "summary_external_training.csv"), "w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=["model", "seed", "mean_reward", "episodes", "max_steps_requested", "max_steps_effective", "config_fingerprint_sha256"])
-                writer.writeheader(); writer.writerows(rows)
-            with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as handle:
-                json.dump({
-                    "profile": "full", "environment": "rware",
-                    "provenance_complete": True, "source_git_clean": True,
-                    "external_pin_match": True,
-                    "paired_generalization_models_present": True,
-                    "seeds": [1, 2, 3], "episodes": 50,
-                    "h1_support_by_seed": {
-                        str(seed): {"signal_ready": True} for seed in (1, 2, 3)
-                    },
-                }, handle)
+            self._write_external_gate_fixture(root)
             gate = VG._external_gate(root, min_seeds=3, min_episodes=50)
             self.assertTrue(gate["passed"])
-            self.assertGreater(gate["metrics"]["reward_advantage_ci95"][0], 0.0)
+            self.assertFalse(gate["metrics"]["training_return_used_for_gate"])
+            self.assertGreater(
+                gate["metrics"]["frozen_eval_reward_advantage_ci95"][0], 0.0
+            )
+
+    def test_external_g8_rejects_mutated_summary_after_manifest_binding(self):
+        from scripts import validate_scientific_gates as VG
+
+        with tempfile.TemporaryDirectory() as root:
+            self._write_external_gate_fixture(root, tamper_summary=True)
+            with self.assertRaisesRegex(ValueError, "SHA-256 binding mismatch"):
+                VG._external_gate(root, min_seeds=3, min_episodes=50)
 
 
 if __name__ == "__main__":

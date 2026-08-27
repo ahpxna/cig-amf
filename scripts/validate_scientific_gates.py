@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -18,7 +19,13 @@ from scripts.scientific_gate_common import (
     wilson_interval,
 )
 from scripts.run_latency_oracle import PROTOCOL_VERSION as LATENCY_ORACLE_PROTOCOL
-from utils.paper_contracts import PAPER_B_SELECTOR_ORACLE_HORIZON
+from utils.paper_contracts import (
+    EXTERNAL_EVAL_SEED_OFFSET,
+    EXTERNAL_G8_BOOTSTRAP_SEED,
+    EXTERNAL_G8_MIN_EVAL_EPISODES,
+    EXTERNAL_GENERALIZATION_PROTOCOL_VERSION,
+    PAPER_B_SELECTOR_ORACLE_HORIZON,
+)
 
 PROTOCOL_VERSION = "scientific_gate_ladder_g0_g9_v3_provenance_and_total_memory"
 EXIT_SUPPORTED = 0
@@ -217,17 +224,45 @@ def _cusum_gate(run_root, min_windows):
     )
 
 
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _require_bound_external_csv(root, manifest, filename, count_key, hash_key, label):
+    path = Path(root) / filename
+    rows = load_csv(path, label)
+    expected_count = manifest.get(count_key)
+    expected_hash = str(manifest.get(hash_key, "")).strip().lower()
+    if not isinstance(expected_count, int) or expected_count != len(rows):
+        raise ValueError(f"{label} row-count binding mismatch")
+    if not _sha256(expected_hash):
+        raise ValueError(f"{label} manifest omits a valid SHA-256 binding")
+    actual_hash = _file_sha256(path)
+    if actual_hash != expected_hash:
+        raise ValueError(f"{label} SHA-256 binding mismatch")
+    return rows
+
+
 def _external_gate(external_root, min_seeds, min_episodes):
     if not external_root:
         return gate_record(
             "G8", False, required=False,
             metrics={"external_artifact_present": False},
-            rule="a pinned second benchmark must show active response support and paired Final-CIGAMF reward advantage over PureMeanField",
+            rule=(
+                "a pinned second benchmark must show active response support "
+                "and paired frozen-policy reward advantage over PureMeanField"
+            ),
             failure_action="scope claims explicitly to the custom/primary domain only",
         )
+
     root = Path(external_root)
     manifest = load_json(root / "manifest.json", "external training manifest")
-    rows = load_csv(root / "summary_external_training.csv", "external training")
+    if manifest.get("protocol_version") != EXTERNAL_GENERALIZATION_PROTOCOL_VERSION:
+        raise ValueError("external generalisation protocol version mismatch")
     if manifest.get("profile") != "full":
         return gate_record(
             "G8", False, required=False,
@@ -235,6 +270,25 @@ def _external_gate(external_root, min_seeds, min_episodes):
             rule="only full-profile paired external runs count as generalisation evidence",
             failure_action="scope claims explicitly to the custom/primary domain only",
         )
+    if manifest.get("evaluation_mode") != "fresh_seed_frozen_policy_no_learning_no_forcing":
+        raise ValueError("external evaluation mode is not the frozen-policy protocol")
+    if int(manifest.get("evaluation_seed_offset", -1)) != int(EXTERNAL_EVAL_SEED_OFFSET):
+        raise ValueError("external evaluation seed offset violates the frozen protocol")
+
+    rows = _require_bound_external_csv(
+        root, manifest, "summary_external_training.csv",
+        "summary_row_count", "summary_sha256", "external training summary",
+    )
+    evaluation_rows = _require_bound_external_csv(
+        root, manifest, "external_frozen_evaluation.csv",
+        "evaluation_row_count", "evaluation_sha256", "external frozen evaluation",
+    )
+    _require_bound_external_csv(
+        root, manifest, "external_training_episodes.csv",
+        "training_episode_row_count", "training_episode_sha256",
+        "external training episode artifact",
+    )
+
     by_model = {}
     for row in rows:
         seed = int(row["seed"])
@@ -242,15 +296,77 @@ def _external_gate(external_root, min_seeds, min_episodes):
         if seed in by_model.setdefault(model, {}):
             raise ValueError(f"duplicate external row for model={model} seed={seed}")
         by_model[model][seed] = row
+
     final = by_model.get("Final-CIGAMF", {})
     pure = by_model.get("PureMeanField", {})
     common = sorted(set(final).intersection(pure))
     manifest_seeds = sorted(int(seed) for seed in manifest.get("seeds", []))
     exact_pairing = bool(common and common == manifest_seeds)
-    deltas = [float(final[s]["mean_reward"]) - float(pure[s]["mean_reward"]) for s in common]
-    if not all(math.isfinite(value) for value in deltas):
-        raise ValueError("external reward comparison contains non-finite values")
-    ci = bootstrap_mean_ci(deltas, seed=4800)
+
+    eval_episodes = int(manifest.get("eval_episodes", 0))
+    expected_models = {"Final-CIGAMF", "PureMeanField"}
+    eval_cells = {}
+    for row in evaluation_rows:
+        model = str(row.get("model", ""))
+        train_seed = int(row["train_seed"])
+        eval_index = int(row["eval_index"])
+        eval_seed = int(row["eval_seed"])
+        key = (model, train_seed, eval_index)
+        if key in eval_cells:
+            raise ValueError(f"duplicate external evaluation cell: {key}")
+        expected_eval_seed = int(
+            EXTERNAL_EVAL_SEED_OFFSET + train_seed * 10_000 + eval_index
+        )
+        if eval_seed != expected_eval_seed:
+            raise ValueError("external evaluation seed violates the frozen pairing rule")
+        if int(row.get("forcing_count", -1)) != 0:
+            raise ValueError("external frozen evaluation contains forced actions")
+        if int(row.get("max_steps_effective", -1)) != int(row.get("max_steps_requested", -2)):
+            raise ValueError("external frozen evaluation violated the requested step cap")
+        eval_cells[key] = row
+
+    expected_eval_cells = {
+        (model, seed, index)
+        for model in expected_models
+        for seed in manifest_seeds
+        for index in range(eval_episodes)
+    }
+    if set(eval_cells) != expected_eval_cells:
+        missing = len(expected_eval_cells - set(eval_cells))
+        extra = len(set(eval_cells) - expected_eval_cells)
+        raise ValueError(
+            "external frozen evaluation matrix mismatch: "
+            f"missing={missing} extra={extra}"
+        )
+
+    # Recompute each seed/model frozen-policy mean from the bound episode-level
+    # evaluation artifact.  The summary is an index, not an authority.
+    recomputed_eval_means = {}
+    for model in expected_models:
+        for seed in manifest_seeds:
+            values = [
+                float(eval_cells[(model, seed, index)]["eval_reward"])
+                for index in range(eval_episodes)
+            ]
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError("external frozen evaluation contains non-finite reward")
+            recomputed_eval_means[(model, seed)] = float(sum(values) / len(values))
+            row = by_model.get(model, {}).get(seed)
+            if row is None:
+                continue
+            claimed = float(row.get("eval_mean_reward", "nan"))
+            if not math.isfinite(claimed) or not math.isclose(
+                claimed, recomputed_eval_means[(model, seed)], rel_tol=0.0, abs_tol=1e-9
+            ):
+                raise ValueError("external summary does not match frozen evaluation rows")
+
+    deltas = [
+        recomputed_eval_means[("Final-CIGAMF", seed)]
+        - recomputed_eval_means[("PureMeanField", seed)]
+        for seed in common
+    ]
+    ci = bootstrap_mean_ci(deltas, seed=EXTERNAL_G8_BOOTSTRAP_SEED)
+
     support = manifest.get("h1_support_by_seed", {})
     support_ready = bool(
         exact_pairing
@@ -262,6 +378,14 @@ def _external_gate(external_root, min_seeds, min_episodes):
         and all(
             int(final[seed].get("episodes", 0)) >= int(min_episodes)
             and int(pure[seed].get("episodes", 0)) >= int(min_episodes)
+            for seed in common
+        )
+    )
+    eval_budget_ok = bool(
+        eval_episodes >= int(EXTERNAL_G8_MIN_EVAL_EPISODES)
+        and all(
+            int(final[seed].get("eval_episodes", 0)) == eval_episodes
+            and int(pure[seed].get("eval_episodes", 0)) == eval_episodes
             for seed in common
         )
     )
@@ -280,14 +404,16 @@ def _external_gate(external_root, min_seeds, min_episodes):
             for seed in common
         )
     )
+
     passed = bool(
         manifest.get("provenance_complete") is True
         and manifest.get("source_git_clean") is True
         and manifest.get("external_pin_match") is True
         and manifest.get("paired_generalization_models_present") is True
+        and manifest.get("not_an_external_allocation_selector_claim") is True
         and exact_pairing
         and len(common) >= int(min_seeds)
-        and episode_budget_ok and step_cap_ok and config_match
+        and episode_budget_ok and eval_budget_ok and step_cap_ok and config_match
         and support_ready
         and math.isfinite(ci[0]) and ci[0] > 0.0
     )
@@ -295,24 +421,33 @@ def _external_gate(external_root, min_seeds, min_episodes):
         "G8", passed, required=False,
         metrics={
             "environment": manifest.get("environment"),
+            "external_protocol_version": manifest.get("protocol_version"),
             "external_pin_match": manifest.get("external_pin_match"),
             "provenance_complete": manifest.get("provenance_complete"),
             "source_git_clean": manifest.get("source_git_clean"),
             "paired_seed_count": len(common),
             "min_paired_seeds": int(min_seeds),
             "exact_manifest_seed_pairing": exact_pairing,
-            "minimum_episodes": int(min_episodes),
-            "episode_budget_ok": episode_budget_ok,
+            "minimum_training_episodes": int(min_episodes),
+            "training_episode_budget_ok": episode_budget_ok,
+            "minimum_frozen_eval_episodes": int(EXTERNAL_G8_MIN_EVAL_EPISODES),
+            "frozen_eval_episode_budget_ok": eval_budget_ok,
             "effective_max_steps_match_requested": step_cap_ok,
             "paired_config_fingerprint_match": config_match,
-            "Final_minus_PureMeanField_reward_by_seed": deltas,
-            "reward_advantage_ci95": ci,
+            "Final_minus_PureMeanField_frozen_eval_reward_by_seed": deltas,
+            "frozen_eval_reward_advantage_ci95": ci,
             "active_h1_support_all_seeds": support_ready,
+            "training_return_used_for_gate": False,
         },
-        rule="second benchmark must be pinned/provenanced, use exact paired full-profile seeds/configs with the preregistered minimum training budget and effective step cap, exhibit active action-response support on every seed, and show a positive paired reward advantage over PureMeanField",
+        rule=(
+            "second benchmark must be pinned/provenanced, use exact paired "
+            "full-profile training cells and fresh paired frozen-policy evaluation "
+            "seeds with no learning or epsilon forcing, expose active action-response "
+            "support on every training seed, and show a positive paired frozen-policy "
+            "reward advantage over PureMeanField"
+        ),
         failure_action="scope claims explicitly to the custom/primary domain only",
     )
-
 
 def _pareto_gate(run_root, g7_passed, core_gates_passed):
     paper_a = load_json(Path(run_root) / "paper_a_claim_status.json", "Paper-A claim report")

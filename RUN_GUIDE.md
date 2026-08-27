@@ -136,19 +136,40 @@ behavioural intervention or a ground-truth latency oracle.  Do not enable a
 capability flag merely to make the manifest green.
 
 Actual Final-CIGAMF architecture-generalization training is separate from the
-capability manifest:
+capability manifest.  Full-profile external evidence uses protocol v4: matched
+training is followed by fresh paired **frozen-policy** evaluation episodes.
+Final-CIGAMF may use epsilon forcing while training to acquire causal support,
+but G8 never compares those intervention-inclusive training returns against a
+baseline that does not force actions.  Frozen evaluation disables learning,
+representation updates, and epsilon forcing for every model.
 
 ```bash
 python scripts/run_external_training.py \
-  --environment rware --seeds 0 1 2 3 4 \
-  --episodes 100 --agent-count 6 --max-steps 60 \
+  --environment rware \
+  --models Final-CIGAMF PureMeanField \
+  --seeds 0 1 2 3 4 \
+  --episodes 100 --eval-episodes 20 \
+  --agent-count 6 --max-steps 60 \
+  --profile full \
   --out results/external_rware_training
 ```
 
+A full run writes three hash-bound CSV artifacts plus `manifest.json`:
+
+- `summary_external_training.csv` — training diagnostics and frozen-eval means;
+- `external_training_episodes.csv` — episode-level training history;
+- `external_frozen_evaluation.csv` — fresh paired frozen-policy evaluation rows.
+
+G8 recomputes each seed/model evaluation mean from the episode-level frozen
+evaluation artifact and verifies SHA-256 plus row-count bindings before using
+any reward value.  Legacy v3 external artifacts that contain only training
+returns are intentionally rejected by the v4 G8 validator; rerun them under the
+frozen protocol rather than relabelling them.
+
 For CityFlow, pass `--config-path /abs/path/to/config.json` when automatic
-example-config discovery is not appropriate.  External training evidence is
-an architecture/generalization result; it is not automatically an H1/H2 or
-latency claim.
+example-config discovery is not appropriate.  External reward evidence is a
+frozen-policy architecture/generalization result; it is not automatically an
+H1/H2, latency, or external core-selector claim.
 
 ## External benchmark runtime isolation
 

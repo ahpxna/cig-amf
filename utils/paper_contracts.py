@@ -31,3 +31,15 @@ PAPER_B_ADAPTIVE_BUDGET_PROTOCOL_VERSION = (
 PAPER_B_ADAPTIVE_MATCHING_RULE = (
     "nearest_integer_pilot_mean_core_cost_v1"
 )
+
+# External generalisation is evaluated only after matched training has ended.
+# Training-time return is not a fair model comparator because CIG-AMF's
+# causal-data acquisition deliberately executes epsilon-forced actions while
+# PureMeanField does not.  G8 therefore consumes fresh paired frozen-policy
+# evaluation episodes with learning/representation updates and forcing off.
+EXTERNAL_GENERALIZATION_PROTOCOL_VERSION = (
+    "external_matched_training_v4_frozen_policy_eval"
+)
+EXTERNAL_EVAL_SEED_OFFSET = 1_000_003
+EXTERNAL_G8_MIN_EVAL_EPISODES = 20
+EXTERNAL_G8_BOOTSTRAP_SEED = 4800
