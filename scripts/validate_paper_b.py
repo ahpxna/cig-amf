@@ -153,10 +153,14 @@ def _validate_summary_binding(manifest, summary_path, rows, label, *, required):
         raise ValueError(f"{label} summary SHA-256 does not match its manifest")
 
 
-def _load_panel(
-    root, directory, filename, expected_variants, expected_seeds,
-    expected_panels=None, protocol_mode="quick",
-):
+def _read_panel_artifact(root, directory, filename, *, protocol_mode="quick"):
+    """Read one completed panel and bind its manifest to its summary bytes.
+
+    This is deliberately schema-agnostic: callers own the definition of a
+    logical experiment cell.  Fixed panels and population/budget sweeps have
+    different Cartesian grids and must not share an implicit `(variant, seed)`
+    assumption.
+    """
     panel_root = os.path.join(root, directory)
     with open(os.path.join(panel_root, "manifest.json"), encoding="utf-8") as handle:
         manifest = json.load(handle)
@@ -168,6 +172,17 @@ def _load_panel(
     _validate_summary_binding(
         manifest, summary_path, rows, directory,
         required=(protocol_mode == "confirmatory"),
+    )
+    return rows, manifest
+
+
+def _load_fixed_panel(
+    root, directory, filename, expected_variants, expected_seeds,
+    expected_panels=None, protocol_mode="quick",
+):
+    """Load a panel whose frozen cells are `(variant, seed)`-shaped."""
+    rows, manifest = _read_panel_artifact(
+        root, directory, filename, protocol_mode=protocol_mode,
     )
     if expected_panels is None:
         expected = {
@@ -194,11 +209,104 @@ def _load_panel(
     return rows, manifest
 
 
-def _load_scaling(root, expected_seeds, protocol_mode="quick"):
-    rows, manifest = _load_panel(
-        root, "paper_b_scaling", "summary_paper_b_scaling.csv",
-        EXPECTED_SCALING, expected_seeds, protocol_mode=protocol_mode,
+def _unique_int_axis(values, label, *, minimum=1):
+    """Validate one manifest-owned integer experiment axis without coercion loss."""
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"{label} must be a non-empty list")
+    output = []
+    for raw in values:
+        if isinstance(raw, bool):
+            raise ValueError(f"{label} must contain integers")
+        try:
+            numeric = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} must contain integers") from exc
+        if not math.isfinite(numeric) or not numeric.is_integer():
+            raise ValueError(f"{label} must contain integers")
+        value = int(numeric)
+        if value < int(minimum):
+            raise ValueError(f"{label} values must be >= {minimum}")
+        output.append(value)
+    if len(output) != len(set(output)):
+        raise ValueError(f"{label} contains duplicates")
+    return tuple(output)
+
+
+def _validate_scaling_matrix(rows, manifest, expected_seeds):
+    """Enforce the manifest-owned 4-D scaling grid and clipping contract."""
+    expected_seed_set = {int(seed) for seed in expected_seeds}
+    if not expected_seed_set:
+        raise ValueError("scaling expected seed contract is empty")
+    manifest_seeds = _unique_int_axis(
+        manifest.get("seeds"), "scaling seeds", minimum=0,
     )
+    if set(manifest_seeds) != expected_seed_set:
+        raise ValueError("scaling manifest seed contract mismatch")
+    agent_counts = _unique_int_axis(
+        manifest.get("agent_counts"), "scaling agent_counts", minimum=2,
+    )
+    budgets = _unique_int_axis(
+        manifest.get("core_budgets"), "scaling core_budgets", minimum=1,
+    )
+    manifest_variants = manifest.get("variants")
+    if (
+        not isinstance(manifest_variants, list)
+        or len(manifest_variants) != len(set(manifest_variants))
+        or set(manifest_variants) != set(EXPECTED_SCALING)
+    ):
+        raise ValueError("scaling manifest variant contract mismatch")
+
+    for n_agents in agent_counts:
+        effective = tuple(min(int(budget), int(n_agents) - 1) for budget in budgets)
+        if len(effective) != len(set(effective)):
+            raise ValueError(
+                "scaling core-budget contract collapses after clipping "
+                f"at N={n_agents}"
+            )
+
+    for row in rows:
+        try:
+            seed = int(row["seed"])
+            n_agents = int(row["n_agents"])
+            requested = int(row["requested_core_budget"])
+            effective = int(row["core_budget"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("scaling row has an invalid cell schema") from exc
+        variant = row.get("variant")
+        if seed not in expected_seed_set or n_agents not in agent_counts:
+            raise ValueError("scaling row lies outside the frozen seed/population axes")
+        if requested not in budgets or variant not in set(EXPECTED_SCALING):
+            raise ValueError("scaling row lies outside the frozen budget/variant axes")
+        expected_effective = min(requested, n_agents - 1)
+        if effective != expected_effective:
+            raise ValueError(
+                "scaling row core_budget does not match the frozen clipping rule"
+            )
+
+    expected = {
+        (int(seed), int(n_agents), min(int(budget), int(n_agents) - 1), variant)
+        for seed in expected_seed_set
+        for n_agents in agent_counts
+        for budget in budgets
+        for variant in EXPECTED_SCALING
+    }
+    _require_exact_matrix(
+        rows,
+        expected,
+        lambda row: (
+            int(row["seed"]), int(row["n_agents"]),
+            int(row["core_budget"]), row["variant"],
+        ),
+        "scaling seed x population x core-budget x variant",
+    )
+
+
+def _load_scaling(root, expected_seeds, protocol_mode="quick"):
+    rows, manifest = _read_panel_artifact(
+        root, "paper_b_scaling", "summary_paper_b_scaling.csv",
+        protocol_mode=protocol_mode,
+    )
+    _validate_scaling_matrix(rows, manifest, expected_seeds)
     degree = int(manifest.get("candidate_max_degree", 0))
     if degree <= 0:
         raise ValueError("scaling manifest omits a positive candidate_max_degree")
@@ -233,23 +341,6 @@ def _load_scaling(root, expected_seeds, protocol_mode="quick"):
     stable_fraction_min = float(recall.get("stable_fraction_min", float("nan")))
     if not math.isfinite(stable_fraction_min) or not 0.0 <= stable_fraction_min <= 1.0:
         raise ValueError("scaling manifest omits a valid stable-ranking fraction gate")
-    budgets = [int(k) for k in manifest.get("core_budgets", [])]
-    if not budgets or len(set(budgets)) != len(budgets) or any(k <= 0 for k in budgets):
-        raise ValueError("scaling manifest omits a unique positive core-budget sweep")
-    agent_counts = sorted({int(row["n_agents"]) for row in rows})
-    expected = {
-        (int(seed), int(n), min(int(k), int(n) - 1), variant)
-        for seed in expected_seeds for n in agent_counts for k in budgets
-        for variant in EXPECTED_SCALING
-    }
-    _require_exact_matrix(
-        rows, expected,
-        lambda row: (
-            int(row["seed"]), int(row["n_agents"]),
-            int(row["core_budget"]), row["variant"],
-        ),
-        "scaling seed x population x core-budget x variant",
-    )
     degradation = manifest.get("candidate_degradation_gate")
     if not isinstance(degradation, dict) or degradation.get("reference_variant") != "Semantic-Free-Unrestricted":
         raise ValueError("scaling manifest omits the frozen dynamic-vs-unrestricted gate")
@@ -272,20 +363,9 @@ def _mean_finite(values):
 
 
 def _load_adaptive_budget(root, expected_seeds, protocol_mode="quick"):
-    panel_root = os.path.join(root, "paper_b_adaptive_budget")
-    with open(os.path.join(panel_root, "manifest.json"), encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    if not manifest.get("complete"):
-        raise ValueError("paper_b_adaptive_budget manifest is incomplete")
-    summary_path = os.path.join(panel_root, "summary_paper_b_adaptive_budget.csv")
-    with open(
-        summary_path,
-        newline="", encoding="utf-8",
-    ) as handle:
-        rows = list(csv.DictReader(handle))
-    _validate_summary_binding(
-        manifest, summary_path, rows, "adaptive-budget",
-        required=(protocol_mode == "confirmatory"),
+    rows, manifest = _read_panel_artifact(
+        root, "paper_b_adaptive_budget", "summary_paper_b_adaptive_budget.csv",
+        protocol_mode=protocol_mode,
     )
     _require_unique_cells(
         rows, lambda row: (row["variant"], int(row["seed"])),
@@ -388,17 +468,17 @@ def _paired(rows, treatment, control, metric, panel=None):
 
 
 def validate(run_root, expected_seeds, protocol_mode):
-    allocation, allocation_manifest = _load_panel(
+    allocation, allocation_manifest = _load_fixed_panel(
         run_root, "paper_b_allocation", "summary_paper_b_allocation.csv",
         EXPECTED_ALLOCATION, expected_seeds,
         expected_panels={"selector_isolation", "end_to_end"},
         protocol_mode=protocol_mode,
     )
-    pair_rows, _ = _load_panel(
+    pair_rows, _ = _load_fixed_panel(
         run_root, "paper_b_pair_latent", "summary_paper_b_pair_latent.csv",
         EXPECTED_PAIR, expected_seeds, protocol_mode=protocol_mode,
     )
-    periphery_rows, _ = _load_panel(
+    periphery_rows, _ = _load_fixed_panel(
         run_root, "paper_b_periphery", "summary_paper_b_periphery.csv",
         EXPECTED_PERIPHERY, expected_seeds, protocol_mode=protocol_mode,
     )

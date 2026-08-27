@@ -2304,6 +2304,15 @@ class FinalCIGAMFRunner:
                 b_batch.append(belief_summary)
                 neighbor_ids.append(j)
 
+            # Candidate-restricted scaling permits an ego to have no measured
+            # neighbours in a sparse local state.  The candidate refresh has
+            # already reconciled this belief/core state to the empty set; there
+            # is no response surface to score here.  In particular, do not
+            # manufacture a padded pair or call ``np.stack`` on an empty action
+            # mask batch, because either would change the candidate contract.
+            if not neighbor_ids:
+                continue
+
             # Prepare optional DR inputs: observed_returns and behaviour_probs
             observed_returns_batch = None
             behaviour_probs_obs_batch = None

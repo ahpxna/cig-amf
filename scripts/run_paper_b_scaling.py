@@ -513,6 +513,12 @@ def main(argv=None):
         args.core_budgets = [int(args.core_budget)]
     if not args.seeds or any(value <= 1 for value in args.agent_counts):
         parser.error("seeds and agent counts greater than one are required")
+    if len(args.seeds) != len(set(args.seeds)):
+        parser.error("--seeds must contain unique values")
+    if len(args.agent_counts) != len(set(args.agent_counts)):
+        parser.error("--agent-counts must contain unique values")
+    if len(args.core_budgets) != len(set(args.core_budgets)):
+        parser.error("--core-budgets must contain unique values")
     if (
         args.candidate_max_degree <= 0
         or args.candidate_recall_states <= 0
@@ -539,6 +545,17 @@ def main(argv=None):
             f"{PAPER_B_SELECTOR_ORACLE_HORIZON}; received "
             f"{args.candidate_recall_horizon}"
         )
+    for n_agents in args.agent_counts:
+        effective = [
+            min(int(budget), int(n_agents) - 1)
+            for budget in args.core_budgets
+        ]
+        if len(effective) != len(set(effective)):
+            parser.error(
+                "core-budget sweep collapses after clipping "
+                f"at n_agents={n_agents}: requested={list(args.core_budgets)}, "
+                f"effective={effective}"
+            )
     rows = []
     for seed in args.seeds:
         for n_agents in args.agent_counts:
