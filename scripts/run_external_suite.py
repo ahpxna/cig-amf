@@ -8,7 +8,6 @@ remain blocked unless the adapter declares those scientific contracts.
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 from pathlib import Path
 import sys
@@ -53,7 +52,12 @@ def _runtime_smoke(env):
     next_obs, rewards, done, info = env.step(actions)
     if len(next_obs) != env.n_agents or len(rewards) != env.n_agents:
         raise RuntimeError("step did not return a population transition")
-    env.restore_state(copy.deepcopy(before))
+    # ``clone_state`` snapshots are opaque adapter-owned objects.  The
+    # generic suite must not assume they are compatible with Python's
+    # ``copy.deepcopy`` (the pinned CybORG/Gym RNG object is not).
+    # ``restore_state`` is the public snapshot contract and is responsible
+    # for any adapter-specific copying needed during restoration.
+    env.restore_state(before)
     restored = env._get_obs_all()
     if len(restored) != env.n_agents:
         raise RuntimeError("clone/restore did not restore a population state")
