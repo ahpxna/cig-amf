@@ -22,6 +22,8 @@ except ModuleNotFoundError:
     from scripts import run_paper_b_periphery as PB_PERIPHERY
     from scripts import run_paper_b_scaling as PB_SCALING
 from utils.paper_contracts import (
+    PAPER_B_ADAPTIVE_BUDGET_PROTOCOL_VERSION,
+    PAPER_B_ADAPTIVE_MATCHING_RULE,
     PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION,
     PAPER_B_PROMOTION_WINDOW_STEPS,
     PAPER_B_SELECTOR_ORACLE_HORIZON,
@@ -367,22 +369,41 @@ def _load_adaptive_budget(root, expected_seeds, protocol_mode="quick"):
         root, "paper_b_adaptive_budget", "summary_paper_b_adaptive_budget.csv",
         protocol_mode=protocol_mode,
     )
-    _require_unique_cells(
-        rows, lambda row: (row["variant"], int(row["seed"])),
-        "adaptive-budget",
+    if protocol_mode == "confirmatory" and manifest.get("protocol_version") != (
+        PAPER_B_ADAPTIVE_BUDGET_PROTOCOL_VERSION
+    ):
+        raise ValueError("adaptive-budget confirmatory protocol version mismatch")
+    k_min = int(manifest.get("k_min", 0))
+    k_max = int(manifest.get("k_max", 0))
+    if k_min < 1 or k_max < k_min:
+        raise ValueError("invalid adaptive-budget bounds")
+    expected_variants = [
+        "Adaptive-K",
+        *[f"Fixed-K-{k}" for k in range(k_min, k_max + 1)],
+        "Full-Explicit",
+    ]
+    if manifest.get("variants") != expected_variants:
+        raise ValueError("adaptive-budget manifest variant grid mismatch")
+    expected_seed_set = {int(seed) for seed in expected_seeds}
+    manifest_seeds = _unique_int_axis(
+        manifest.get("seeds"), "adaptive-budget seeds", minimum=0,
     )
-    seeds = {int(row["seed"]) for row in rows}
-    if seeds != set(expected_seeds):
-        raise ValueError("adaptive-budget seed matrix mismatch")
-    matched_names = set()
+    if set(manifest_seeds) != expected_seed_set:
+        raise ValueError("adaptive-budget manifest seed contract mismatch")
+    expected_cells = {
+        (variant, int(seed))
+        for seed in expected_seed_set
+        for variant in expected_variants
+    }
+    _require_exact_matrix(
+        rows,
+        expected_cells,
+        lambda row: (row["variant"], int(row["seed"])),
+        "paper_b_adaptive_budget",
+    )
+    if manifest.get("matching_rule_id") != PAPER_B_ADAPTIVE_MATCHING_RULE:
+        raise ValueError("adaptive-budget matching rule identifier mismatch")
     manifest_matched = str(manifest.get("matched_fixed_variant", "")).strip()
-    if not manifest_matched.startswith("Fixed-K-"):
-        raise ValueError("adaptive-budget manifest omits the pooled matched fixed-k variant")
-    matching_rule = str(manifest.get("matching_rule", ""))
-    if "disjoint pilot" not in matching_rule or "no reward" not in matching_rule:
-        raise ValueError(
-            "adaptive-budget comparator must be frozen on disjoint pilot cost only"
-        )
     matching_seeds = [int(seed) for seed in manifest.get("matching_seeds", [])]
     if (
         not matching_seeds
@@ -397,11 +418,20 @@ def _load_adaptive_budget(root, expected_seeds, protocol_mode="quick"):
     pilot_cost = float(manifest.get("pilot_adaptive_core_cost_per_ego", float("nan")))
     if not math.isfinite(pilot_cost):
         raise ValueError("adaptive-budget manifest omits finite pilot matching cost")
+    expected_matched_k = int(math.floor(pilot_cost + 0.5))
+    expected_matched_k = max(k_min, min(k_max, expected_matched_k))
+    expected_matched_variant = f"Fixed-K-{expected_matched_k}"
+    if manifest_matched != expected_matched_variant:
+        raise ValueError(
+            "adaptive-budget matched comparator does not follow the frozen "
+            "pilot-cost rule"
+        )
+    matched_names = set()
     for seed in expected_seeds:
         subset = [row for row in rows if int(row["seed"]) == int(seed)]
         names = {row["variant"] for row in subset}
-        if "Adaptive-K" not in names or "Full-Explicit" not in names:
-            raise ValueError("adaptive-budget panel omits required variants")
+        if names != set(expected_variants):
+            raise ValueError("adaptive-budget row grid mismatch")
         fixed = [row for row in subset if row["variant"].startswith("Fixed-K-")]
         matched = [row for row in fixed if int(row.get("matched_to_adaptive", 0)) == 1]
         if not fixed or len(matched) != 1:

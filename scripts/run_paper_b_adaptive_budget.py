@@ -24,6 +24,10 @@ except ModuleNotFoundError:
     from scripts.run_paper_b_allocation import _decision_fidelity, _decision_probe
 
 import run_experiment as RE
+from utils.paper_contracts import (
+    PAPER_B_ADAPTIVE_BUDGET_PROTOCOL_VERSION,
+    PAPER_B_ADAPTIVE_MATCHING_RULE,
+)
 
 
 def _atomic_json(path, payload):
@@ -235,6 +239,7 @@ def main(argv=None):
         summary_sha256 = hashlib.sha256(handle.read()).hexdigest()
     _atomic_json(os.path.join(out_root, "manifest.json"), {
         "experiment": "paper_b_entropy_adaptive_budget",
+        "protocol_version": PAPER_B_ADAPTIVE_BUDGET_PROTOCOL_VERSION,
         "complete": True,
         "seeds": [int(seed) for seed in args.seeds],
         "episodes": int(args.episodes),
@@ -243,7 +248,8 @@ def main(argv=None):
         "agent_count": int(args.agent_count),
         "max_boundary_saturation_fraction": float(args.max_boundary_saturation_fraction),
         "variants": variants,
-        "matching_rule": (
+        "matching_rule_id": PAPER_B_ADAPTIVE_MATCHING_RULE,
+        "matching_rule_description": (
             "single fixed k frozen from disjoint pilot Adaptive-K mean K_t/N; "
             "nearest integer within [k_min,k_max]; no reward or confirmatory trajectory used"
         ),

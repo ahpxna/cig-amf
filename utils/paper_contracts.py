@@ -21,3 +21,13 @@ PAPER_B_CANDIDATE_RECALL_PROTOCOL_VERSION = (
 # Paper B H2b evaluates a promotion transient over one frozen decision window.
 # This is intentionally independent of a run's end-to-end episode budget.
 PAPER_B_PROMOTION_WINDOW_STEPS = 10
+
+# Paper B's adaptive-budget result is an exact grid experiment: every fixed
+# integer budget in [k_min, k_max] is observed, while one comparator is chosen
+# solely from disjoint-pilot Adaptive-K representation cost.
+PAPER_B_ADAPTIVE_BUDGET_PROTOCOL_VERSION = (
+    "paper_b_adaptive_budget_v3_exact_grid"
+)
+PAPER_B_ADAPTIVE_MATCHING_RULE = (
+    "nearest_integer_pilot_mean_core_cost_v1"
+)
