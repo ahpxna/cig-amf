@@ -167,9 +167,11 @@ G8 recomputes each seed/model evaluation mean from the episode-level frozen
 evaluation artifact and verifies SHA-256 plus row-count bindings before using
 any reward value.  Legacy v3/v4 external artifacts do not satisfy the v5
 recurrent-inference evaluation contract and must not be relabelled or reused as
-v5 evidence.  Older artifacts that contain only training
-returns are intentionally rejected by the v4 G8 validator; rerun them under the
-frozen protocol rather than relabelling them.
+v5 evidence.  The v5 evaluator also resets the disabled epsilon-forcer
+checkpoint (including RNG/counters) before every fresh evaluation episode.
+Older artifacts that contain only training returns are intentionally rejected
+by the v5 G8 validator; rerun them under the frozen protocol rather than
+relabelling them.
 
 For CityFlow, pass `--config-path /abs/path/to/config.json` when automatic
 example-config discovery is not appropriate.  External reward evidence is a

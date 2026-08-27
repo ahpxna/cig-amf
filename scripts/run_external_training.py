@@ -335,6 +335,11 @@ def _evaluate_frozen_policy(
     forcer = getattr(runner, "forcer", None)
     forcer_state = _forcer_snapshot(forcer)
     _set_forcer_off(forcer)
+    # Freeze the *disabled* forcer checkpoint too.  Even with epsilon=0,
+    # apply() may consume its private RNG and advance diagnostic counters.
+    # Every fresh evaluation episode must therefore start from the same
+    # disabled-forcer state, not merely restore it after the whole block.
+    eval_forcer_state = _forcer_snapshot(forcer)
     inference_state = _capture_external_inference_state(runner)
 
     rows = []
@@ -345,6 +350,7 @@ def _evaluate_frozen_policy(
         )
         for eval_index in range(int(eval_episodes)):
             _restore_external_inference_state(runner, inference_state)
+            _restore_forcer(forcer, eval_forcer_state)
             eval_seed = _evaluation_seed(train_seed, eval_index)
             RE.set_global_seed(eval_seed)
             eval_env = build_environment(
@@ -609,6 +615,7 @@ def main(argv=None):
         "evaluation_recurrent_inference_active": True,
         "evaluation_representation_learning_state_frozen": True,
         "evaluation_representation_state_frozen": False,
+        "evaluation_forcer_checkpoint_reset_each_episode": True,
         "evaluation_seed_offset": int(EXTERNAL_EVAL_SEED_OFFSET),
         "evaluation_seed_rule": "offset + train_seed*10000 + eval_index",
         "agent_count_requested": int(args.agent_count),

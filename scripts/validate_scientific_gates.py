@@ -280,6 +280,10 @@ def _external_gate(external_root, min_seeds, min_episodes):
         raise ValueError("external evaluation did not freeze representation-learning state")
     if manifest.get("evaluation_representation_state_frozen") is not False:
         raise ValueError("external evaluation incorrectly froze recurrent representation state")
+    if manifest.get("evaluation_forcer_checkpoint_reset_each_episode") is not True:
+        raise ValueError(
+            "external evaluation did not reset the disabled forcer checkpoint per episode"
+        )
     if int(manifest.get("evaluation_seed_offset", -1)) != int(EXTERNAL_EVAL_SEED_OFFSET):
         raise ValueError("external evaluation seed offset violates the frozen protocol")
 
@@ -448,6 +452,7 @@ def _external_gate(external_root, min_seeds, min_episodes):
             "training_return_used_for_gate": False,
             "recurrent_inference_active_during_eval": True,
             "representation_learning_state_frozen_during_eval": True,
+            "forcer_checkpoint_reset_each_eval_episode": True,
         },
         rule=(
             "second benchmark must be pinned/provenanced, use exact paired "

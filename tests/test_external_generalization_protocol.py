@@ -1,4 +1,4 @@
-"""Regression tests for external v4 train/evaluate separation."""
+"""Regression tests for external v5 recurrent frozen-policy evaluation."""
 from __future__ import annotations
 
 import unittest
@@ -110,6 +110,7 @@ class _Runner:
         self._interaction_step = 11
         self.calls = 0
         self.start_states = []
+        self.forcer_start_states = []
 
     def collect_episode(self):
         self.calls += 1
@@ -117,6 +118,12 @@ class _Runner:
         assert self.cfg["freeze_representation_learning_state"] is True
         assert self.forcer.eps == 0.0
         assert self.forcer.eps_initial == 0.0
+        # Each fresh episode must start from the exact same disabled-forcer
+        # checkpoint, including RNG and counters.
+        self.forcer_start_states.append(pickle.dumps(
+            copy.deepcopy(self.forcer.state_dict()),
+            protocol=pickle.HIGHEST_PROTOCOL,
+        ))
         # Real EpsilonForcedActionController.apply() consumes its private RNG
         # even at eps=0, so frozen evaluation must restore that RNG exactly.
         self.forcer.rng.rand(2)
@@ -196,6 +203,8 @@ class ExternalGeneralizationProtocolTests(unittest.TestCase):
         self.assertEqual(runner.forcer.last_execution_records, ("sentinel",))
         self.assertEqual(runner._interaction_step, 11)
         self.assertEqual(runner.start_states, [4.0, 4.0])
+        self.assertEqual(len(runner.forcer_start_states), 2)
+        self.assertEqual(runner.forcer_start_states[0], runner.forcer_start_states[1])
         self.assertEqual(float(runner.pair_rel_module.shadow_states[(0, 1)][0]), 4.0)
         self.assertIs(runner.env_adapter, original_adapter)
 

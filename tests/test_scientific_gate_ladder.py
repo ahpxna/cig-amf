@@ -215,6 +215,7 @@ class ScientificGateLadderTests(unittest.TestCase):
             "evaluation_recurrent_inference_active": True,
             "evaluation_representation_learning_state_frozen": True,
             "evaluation_representation_state_frozen": False,
+            "evaluation_forcer_checkpoint_reset_each_episode": True,
             "evaluation_seed_offset": EXTERNAL_EVAL_SEED_OFFSET,
             "provenance_complete": True, "source_git_clean": True,
             "external_pin_match": True,
@@ -262,6 +263,21 @@ class ScientificGateLadderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             self._write_external_gate_fixture(root, tamper_summary=True)
             with self.assertRaisesRegex(ValueError, "SHA-256 binding mismatch"):
+                VG._external_gate(root, min_seeds=3, min_episodes=50)
+
+
+    def test_external_g8_rejects_missing_per_episode_forcer_reset_contract(self):
+        from scripts import validate_scientific_gates as VG
+
+        with tempfile.TemporaryDirectory() as root:
+            self._write_external_gate_fixture(root)
+            manifest_path = os.path.join(root, "manifest.json")
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            manifest.pop("evaluation_forcer_checkpoint_reset_each_episode", None)
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+            with self.assertRaisesRegex(ValueError, "disabled forcer checkpoint"):
                 VG._external_gate(root, min_seeds=3, min_episodes=50)
 
     def test_external_g8_rejects_legacy_v4_semantics(self):
