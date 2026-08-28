@@ -438,6 +438,7 @@ def main(argv=None):
             seed=seed, device=args.device, n_agents=args.n_agents,
             episodes=args.allocation_episodes, max_steps=args.allocation_max_steps,
             k=args.core_k, horizon=args.allocation_oracle_horizon,
+            trials=args.oracle_trials,
             core_refresh_every=args.allocation_core_refresh_every,
             final_window=args.allocation_final_window,
         ) for seed in args.seeds

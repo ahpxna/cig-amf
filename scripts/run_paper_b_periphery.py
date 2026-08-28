@@ -308,6 +308,11 @@ def _cfg(seed, core_budget):
         "periph_use_uniform_mix": False,
         "strict_causal_profile": True,
         "semantic_router_frozen": True,
+        # The oracle selector is fixed, while proxy/signature/profile learning
+        # must remain live.  Freezing graph updates would make the semantic
+        # panel scientifically vacuous by suppressing all typed profile work.
+        "freeze_graph_updates": False,
+        "force_graph_update_every_episode": True,
         "causal_horizon": 1,
         "proxy_n_horizons": 1,
     })
@@ -321,10 +326,17 @@ def _env(seed):
     )
 
 
+def _common_pretrain_cfg(seed, core_budget):
+    """Train the shared proxy before any clone-oracle table exists."""
+    cfg = _cfg(seed, core_budget)
+    cfg["core_selection_mode"] = "structural_capacity"
+    return cfg
+
+
 def _common_checkpoint(seed, core_budget, device, pretrain_episodes=60):
     RE.set_global_seed(seed)
     runner = RE.make_runner(
-        "Final-CIGAMF", _env(seed), _cfg(seed, core_budget), device
+        "Final-CIGAMF", _env(seed), _common_pretrain_cfg(seed, core_budget), device
     )
     runner.run(n_episodes=int(pretrain_episodes), eval_every=max(1, int(pretrain_episodes)))
     checkpoint = _capture_frozen_learning_checkpoint(runner)
@@ -348,9 +360,25 @@ def _seed_oracle_core(runner, core_budget, table, full_explicit=False):
             key=lambda neighbor: float(row.get(int(neighbor), 0.0)),
             reverse=True,
         )
-        belief.set_fixed_core(
+        target = list(
             belief.neighbor_ids if full_explicit else ranked[:int(core_budget)]
         )
+        # Restoring the common checkpoint also restores its former belief
+        # limits.  Without resetting these limits, ``set_fixed_core`` silently
+        # truncates a Full-Explicit arm back to the checkpoint's k-core.
+        target_size = len(target)
+        belief.adaptive_k = False
+        belief._configured_min_core_size = target_size
+        belief._configured_max_core_size = target_size
+        belief.min_core_size = target_size
+        belief.max_core_size = target_size
+        belief.adaptive_k_min = target_size
+        belief.set_fixed_core(target)
+        if set(belief.get_core_set()) != set(target):
+            raise RuntimeError(
+                f"failed to seed exact fixed core for ego={ego}: "
+                f"expected={sorted(target)}, actual={sorted(belief.get_core_set())}"
+            )
     runner.pair_rel_module.reconcile_core_sets(
         {ego: belief.get_core_set() for ego, belief in runner.belief_modules.items()}
     )
@@ -598,6 +626,19 @@ def main(argv=None):
     _atomic_json(os.path.join(out_root, "manifest.json"), {
         "experiment": "paper_b_fixed_core_periphery",
         "complete": True,
+        # This runner is an engineering/representation-isolation protocol.  It
+        # does not instantiate the information-query oracle required by the
+        # current Paper-08 proposal.  Keep these fields explicit and false so
+        # a completed plumbing run cannot be mistaken for scientific support.
+        "scientific_scope": "periphery_representation_isolation_only",
+        "information_channel_gate_pass": False,
+        "same_q_opposite_information_gate_pass": False,
+        "information_oracle_sha256": None,
+        "scientific_grid_ready": False,
+        "scientific_limitation": (
+            "no information-query oracle or same-Q/opposite-information "
+            "intervention is implemented in this runner"
+        ),
         "seeds": args.seeds,
         "episodes": args.episodes,
         "pretrain_episodes": args.pretrain_episodes,
