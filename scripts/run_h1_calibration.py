@@ -959,6 +959,11 @@ def main(argv=None):
                     "causal_horizon": 1,
                     "proxy_iw_clip": 2000.0,
                     "tiny_horizon": 1,
+                    "tiny_proxy_train_episodes": int(
+                        args_cli.tiny_proxy_train_episodes
+                    ),
+                    "tiny_states": int(args_cli.tiny_states),
+                    "max_steps": int(args_cli.max_steps),
                     "forcer_anneal_to": float(cfg_over["eps"]),
                     "h1_target_policy_mode": cfg["h1_target_policy_mode"],
                     "h1_eval_uniform_mass": float(cfg["h1_eval_uniform_mass"]),
